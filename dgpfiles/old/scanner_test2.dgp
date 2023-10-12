@@ -1,0 +1,189 @@
+from dataguzzler_python import dgpy
+import spatialnde2 as snde
+
+include(dgpy,"dgpy_startup.dpi") # If you get a NameError here, be sure you are executing this file with dataguzzler-python
+
+include(dgpy,"matplotlib.dpi")
+
+include(dgpy,"pint.dpi")
+
+include(snde,"recdb.dpi")
+include(snde,"recdb_gui.dpi")
+
+import time
+
+import rclpy
+rclpy.init()
+
+import dgpython_rosmotion as rosm
+
+global ros
+ros = rosm.motion('ros', 'tool0', 'world')
+
+
+import dgpython_nidaqmx as daqmx
+daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
+
+daq.SampleRate = 10*ur.kHz
+daq.SampsPerChan = 100
+
+
+transact = recdb.start_transaction()
+avgrealchan = recdb.define_channel('/avgreal', "main", recdb.raw())
+avgimagchan = recdb.define_channel('/avgimag', "main", recdb.raw())
+scanrealchan = recdb.define_channel('/scanreal', "main", recdb.raw())
+scanimagchan = recdb.define_channel('/scanimag', "main", recdb.raw())
+
+accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
+                                                      snde.math_parameter_unsigned_const(100),
+                                                      snde.math_parameter_int_const(-1)],
+                                                    [ snde.shared_string("/accum_real") ],
+                                                    "/",
+                                                    False,
+                                                    False,
+                                                    False,
+                                                    snde.math_definition("accumulator real definition"),
+                                                    None)
+recdb.add_math_function(accumulator_real ,False)
+accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
+                                                      snde.math_parameter_unsigned_const(100),
+                                                      snde.math_parameter_int_const(-1)],
+                                                    [ snde.shared_string("/accum_imag") ],
+                                                    "/",
+                                                    False,
+                                                    False,
+                                                    False,
+                                                    snde.math_definition("accumulator imag definition"),
+                                                    None)
+recdb.add_math_function(accumulator_imag ,False)
+
+
+
+
+
+transact.end_transaction()
+
+def capturedata():
+    g = recdb.latest_globalrev()
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai1')
+    ch2data = np.mean(rec.data())
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
+    ch1data = np.mean(rec.data())
+    transact = recdb.start_transaction()
+    rec1 = snde.create_ndarray_ref(recdb, avgrealchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    rec2 = snde.create_ndarray_ref(recdb, avgimagchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    g = transact.end_transaction()
+    rec1.rec.metadata = rec.rec.metadata
+    rec2.rec.metadata = rec.rec.metadata
+    rec1.rec.mark_metadata_done()
+    rec2.rec.mark_metadata_done()
+    rec1.allocate_storage(ch1data.shape, True)
+    rec2.allocate_storage(ch2data.shape, True)
+    rec1.assign_double(0, ch1data)
+    rec2.assign_double(0, ch2data)
+    rec1.rec.mark_data_ready()
+    rec2.rec.mark_data_ready()
+    g.wait_complete()
+
+def plotdata(dx, dy, inix, iniy):
+    g = recdb.latest_globalrev()
+    recreal = g.get_ndarray_ref('/accum_real')
+    realdata = recreal.data().reshape([10,10])
+    recimag = g.get_ndarray_ref('/accum_imag')
+    imagdata = recimag.data().reshape([10,10])
+    transact = recdb.start_transaction()
+    rec1 = snde.create_ndarray_ref(recdb, scanrealchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    rec2 = snde.create_ndarray_ref(recdb, scanimagchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    g = transact.end_transaction()
+    metadata = snde.constructible_metadata()
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis0_step', dx, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis0_inival', inix, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis0_units', 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis0_coord', 'X Position'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis1_step', dy, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis1_inival', iniy, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis1_units', 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-axis1_coord', 'Y Position'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-ampl_units', 'V'))
+    metadata.AddMetaDatum(snde.metadatum('nde_array-ampl_coord', 'Voltage'))
+    rec1.rec.metadata = metadata
+    rec2.rec.metadata = metadata
+    rec1.rec.mark_metadata_done()
+    rec2.rec.mark_metadata_done()
+    rec1.allocate_storage(realdata.shape, True)
+    rec2.allocate_storage(imagdata.shape, True)
+    rec1.data()[:] = realdata
+    rec2.data()[:] = imagdata
+    rec1.rec.mark_data_ready()
+    rec2.rec.mark_data_ready()
+
+
+def runscan(t1, t2, n):
+
+    x = np.linspace(t1.transform.translation.x, t2.transform.translation.x, n)
+    y = np.linspace(t1.transform.translation.y, t2.transform.translation.y, n)
+
+    xx, yy = np.meshgrid(x,y)
+
+    for i in range(n):
+        for j in range(n):
+            print("Moving to (x = %.6f, y = %.6f)" % (x[i], y[j]))
+            t2.transform.translation.x = x[i]
+            t2.transform.translation.y = y[j]
+            ros.Move(t2)
+            time.sleep(5)
+            capturedata()
+
+    plotdata(x[1]-x[0], y[1]-y[0], x[0], y[0])
+
+def runscan3(t1, t2, t3, t4, t5, t6, tm1, tm2, tm3, n1, n2, n3):
+
+    x1 = np.linspace(t1.transform.translation.x, t2.transform.translation.x, n1)
+    y1 = np.linspace(t1.transform.translation.y, t2.transform.translation.y, n1)
+    x2 = np.linspace(t3.transform.translation.x, t4.transform.translation.x, n2)
+    y2 = np.linspace(t3.transform.translation.y, t4.transform.translation.y, n2)
+    x3 = np.linspace(t5.transform.translation.x, t6.transform.translation.x, n3)
+    y3 = np.linspace(t5.transform.translation.y, t6.transform.translation.y, n3)
+ 
+
+    xx1, yy1 = np.meshgrid(x1,y1)
+    xx2, yy2 = np.meshgrid(x2,y2)
+    xx3, yy3 = np.meshgrid(x3,y3)
+
+    ros.Move(tm1)
+
+    for i in range(n1):
+        for j in range(n1):
+            print("Moving to (x = %.6f, y = %.6f)" % (x1[i], y1[j]))
+            t2.transform.translation.x = x1[i]
+            t2.transform.translation.y = y1[j]
+            ros.Move(t2)
+            time.sleep(5)
+            capturedata()
+    
+    ros.Move(tm1)
+    ros.Move(tm2)
+
+    for i in range(n2):
+        for j in range(n2):
+            print("Moving to (x = %.6f, y = %.6f)" % (x2[i], y2[j]))
+            t4.transform.translation.x = x2[i]
+            t4.transform.translation.y = y2[j]
+            ros.Move(t4)
+            time.sleep(5)
+            capturedata()
+
+    ros.Move(tm2)
+    ros.Move(tm3)
+
+
+    for i in range(n3):
+        for j in range(n3):
+            print("Moving to (x = %.6f, y = %.6f)" % (x3[i], y3[j]))
+            t6.transform.translation.x = x3[i]
+            t6.transform.translation.y = y3[j]
+            ros.Move(t6)
+            time.sleep(5)
+            capturedata()
+
+    

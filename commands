@@ -1,0 +1,47 @@
+Physical UR10e:
+	Terminal to initiate connection between PC and UR10e:
+		source /data/sources.bash
+		ros2 launch afrl_ur_launch ex-ur10e-1.launch.py ur_type:=ur10e robot_ip:=192.168.1.101 launch_rviz:=false
+
+	Terminal to launch RViz:
+		source /data/sources.bash		
+		ros2 launch afrl_ur_launch ur_moveit.launch.py ur_type:=ur10e robot_ip:=192.168.1.101 launch_rviz:=true
+
+	Terminal for Dataguzzler <-> ROS communication:
+		source /data/sources.bash
+		ros2 launch dgpython_ros2_actionserver dgpython_action_server.launch.py
+
+	Terminal to launch Dataguzzler
+		source /data/sources.bash
+		dataguzzler-python /data/scannertest.dgp 
+
+UR Simulator:
+	Terminal to launch simulator
+		source /data/sources.bash
+		ros2 run ur_robot_driver start_ursim.sh -m ur10e
+	
+	Terminal to initiate connection between PC and simulated UR10e:
+		source /data/sources.bash
+		ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.56.101 launch_rviz:=false
+
+	Terminal to launch Rviz:
+		source /data/sources.bash
+		ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur10e robot_ip:=192.168.56.101 launch_rviz:=true
+
+Use Fake Hardware:
+	Terminal to launch and connect to fake hardware
+		source /data/sources.bash
+		ros2 launch ur_bringup ur_control.launch.py ur_type:=ur10e robot_ip:=192.168.1.101 use_fake_hardware:=true launch_rviz:=false
+	
+	Terminal to launch Rviz:
+		source /data/sources.bash
+		ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur10e robot_ip:=192.168.1.101 launch_rviz:=true
+
+
+
+Note: Temp location for afrl-ros: source workspace/ros_ur_driver/install/setup.bash
+
+
+[(pos1,pos2,pos3,5,5), (pos1, pos2, pos3, 5, 5)]
+[pos4, pos8]
+
