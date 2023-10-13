@@ -206,7 +206,9 @@ def demoscan(t1, t2, t3, m, n):
     uprime = np.linspace(0 , maguprime, m) 
     vprime = np.linspace(0, magvprime, n)
     u = u / maguprime 
-    uu, vv = np.meshgrid(vprime, uprime) 
+    uu, vv = np.meshgrid(uprime, vprime) 
+    uu = uu.T
+    vv = vv.T
     
 
     # Creating array of zeros 
@@ -219,8 +221,8 @@ def demoscan(t1, t2, t3, m, n):
     vv += p1[1]
     ww += p1[2]
     
-    for i in range(m):
-        for j in range (n):
+    for j in range(n):
+        for i in range (m):
             print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
             t3.transform.translation.x = uu[i,j]
             t3.transform.translation.y = vv[i,j]
