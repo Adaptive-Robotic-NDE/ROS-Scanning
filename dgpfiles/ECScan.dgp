@@ -61,7 +61,7 @@ def capturedata():
     rec2.rec.mark_data_ready()
     g.wait_complete()
 
-def plotdata(dx, dy, inix, iniy, n, m):
+def SimpleScan_PlotData(dx, dy, inix, iniy, n, m):
     g = recdb.latest_globalrev()
     recreal = g.get_ndarray_ref('/accum_real')
     realdata = recreal.data().reshape([n,m])
@@ -92,9 +92,48 @@ def plotdata(dx, dy, inix, iniy, n, m):
     rec2.data()[:] = imagdata
     rec1.rec.mark_data_ready()
     rec2.rec.mark_data_ready()
+
+def Sliced2DScan_PlotData(dx, dy, inix, iniy, n, m, nslice):
+    g = recdb.latest_globalrev()
+    recreal = g.get_ndarray_ref('/accum_real')
+    realdata = recreal.data().reshape([n,m])
+    mapdata = np.array([j for k in range(nslice) for j in range(k, n , nslice)])
+    mapdata = [(x,y) for (x,y) in zip(mapdata, range(n))]
+    mapdata.sort()
+    mapdata = [i[1] for i in mapdata]
+    realdataout = realdata[:,mapdata]
+    recimag = g.get_ndarray_ref('/accum_imag')
+    imagdata = recimag.data().reshape([n,m])
+    imagdataout = imagdata[:,mapdata]
+    transact = recdb.start_transaction()
+    rec1 = snde.create_ndarray_ref(recdb, scanrealchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    rec2 = snde.create_ndarray_ref(recdb, scanimagchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    g = transact.end_transaction()
+    metadata = snde.constructible_metadata()
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_scale', dx, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_offset', inix, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_units', 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_coord', 'X Position'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_scale', dy, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_offset', iniy, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_units', 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_coord', 'Y Position'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_units', 'V'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_coord', 'Voltage'))
+    rec1.rec.metadata = metadata
+    rec2.rec.metadata = metadata
+    rec1.rec.mark_metadata_done()
+    rec2.rec.mark_metadata_done()
+    rec1.allocate_storage(realdataout.shape, True)
+    rec2.allocate_storage(imagdataout.shape, True)
+    rec1.data()[:] = realdataout
+    rec2.data()[:] = imagdataout
+    rec1.rec.mark_data_ready()
+    rec2.rec.mark_data_ready()
+
    
 
-def runscan(t1, t2, n, m):
+def SimpleXYScan(t1, t2, n, m):
 
     x = np.linspace(t1.transform.translation.x, t2.transform.translation.x, n)
     y = np.linspace(t1.transform.translation.y, t2.transform.translation.y, m)
@@ -142,10 +181,11 @@ def runscan(t1, t2, n, m):
             ros.Move(t2)           
             capturedata()
 
-    plotdata(x[1]-x[0], y[1]-y[0], x[0], y[0], n, m)
+    SimpleScan_PlotData(x[1]-x[0], y[1]-y[0], x[0], y[0], n, m)
+    return (x[1]-x[0], y[1]-y[0], x[0], y[0], n, m)
     
         
-def demoscan(t1, t2, t3, m, n):
+def Scan2DPlane(t1, t2, t3, m, n):
 	
     p1 = np.array([t1.transform.translation.x, t1.transform.translation.y, t1.transform.translation.z])
     p2 = np.array([t2.transform.translation.x, t2.transform.translation.y, t2.transform.translation.z])
@@ -230,13 +270,108 @@ def demoscan(t1, t2, t3, m, n):
             ros.Move(t3)           
             capturedata()
 
-    plotdata(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n)
+    SimpleScan_PlotData(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n)
+    return (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n)
 
+
+def Scan2DPlaneSliced(t1, t2, t3, m, n):
+
+    p1 = np.array([t1.transform.translation.x, t1.transform.translation.y, t1.transform.translation.z])
+    p2 = np.array([t2.transform.translation.x, t2.transform.translation.y, t2.transform.translation.z])
+    p3 = np.array([t3.transform.translation.x, t3.transform.translation.y, t3.transform.translation.z])
+
+    global accumulator_real, accumulator_imag
+    transact = recdb.start_transaction()
+    if accumulator_real is not None:
+        recdb.delete_math_function(accumulator_real)
+    if accumulator_imag is not None:
+        recdb.delete_math_function(accumulator_imag)
+
+    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
+                                                          snde.math_parameter_unsigned_const(n*m),
+                                                          snde.math_parameter_int_const(-1),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False)],
+                                                        [ snde.shared_string("/accum_real") ],
+                                                        "/",
+                                                        False,
+                                                        False,
+                                                        False,
+                                                        snde.math_definition("accumulator real definition"),
+                                                        None)
+    recdb.add_math_function(accumulator_real ,False)
+    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
+                                                          snde.math_parameter_unsigned_const(n*m),
+                                                          snde.math_parameter_int_const(-1),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False)],
+                                                        [ snde.shared_string("/accum_imag") ],
+                                                        "/",
+                                                        False,
+                                                        False,
+                                                        False,
+                                                        snde.math_definition("accumulator imag definition"),
+                                                        None)
+    recdb.add_math_function(accumulator_imag ,False)
+    transact.end_transaction()
+
+
+    ux, uy, uz = u = p2-p1
+    vx, vy, vz = v = p3-p1
+    w = np.array([uy*vz-uz*vy, uz*vx-ux*vz, ux*vy-uy*vx])
+    #Normalize the cross product to get the magnitude of 1 
+    w = w/np.linalg.norm(w)
+    v = np.cross(w, u)
+    v = v/np.linalg.norm(v)
+    
+    d = -np.sum(v*p1)
+    #minumum distance 
+    r = np.abs(np.sum(v * p3) + d)/np.sqrt(np.sum(v*v))
+    
+    maguprime = np.linalg.norm(u)
+    magvprime = r
+
+    uprime = np.linspace(0 , maguprime, m)
+    vprime = np.linspace(0, magvprime, n)
+    u = u / maguprime
+    uu, vv = np.meshgrid(vprime, uprime)
+
+
+    # Creating array of zeros 
+    ww = np.zeros(uu.shape)
+
+    rot = np.dstack([u, v, w])[0,:,:]
+    
+    uu, vv, ww = np.einsum( 'ji, mni -> jmn', rot, np.dstack([uu, vv, ww]))
+    uu += p1[0]
+    vv += p1[1]
+    ww += p1[2]
+    
+    ustep = uprime[1]-uprime[0]
+    if ustep <= .0008:
+        nslice = int(np.ceil(.0008/ustep))
+    else:
+        nslice = 1
+
+    for i in range(m):
+        for k in range(nslice):
+            for j in range (k, n, nslice):
+                print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
+                t3.transform.translation.x = uu[i,j]
+                t3.transform.translation.y = vv[i,j]
+                t3.transform.translation.z = ww[i,j]
+                ros.Move(t3)
+                capturedata()
+
+    Sliced2DScan_PlotData(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
+
+    args = (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
+    return args
 
 
 def runscansets(scanlist, waypoints):
     for i, step in enumerate(scanlist):
-        demoscan(*step)
+        Scan2DPlane(*step)
         for waypoint in waypoints[i]:
             ros.Move(waypoint)
 
