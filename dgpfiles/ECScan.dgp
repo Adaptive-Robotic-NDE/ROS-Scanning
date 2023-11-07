@@ -29,7 +29,9 @@ daq.SampsPerChan = 100
 
 
 from progress.bar import IncrementalBar
-
+from geometry_msgs.msg import TransformStamped
+import time
+from collections import deque
 
 transact = recdb.start_transaction()
 avgrealchan = recdb.define_channel('/avgreal', "main", recdb.raw())
@@ -43,7 +45,9 @@ accumulator_real = None
 accumulator_imag = None
 
 def capturedata():
-    g = recdb.latest_globalrev()
+    monitor = recdb.start_monitoring_globalrevs()
+    g = monitor.wait_next(recdb)
+    monitor.close(recdb)
     rec = g.get_ndarray_ref('/PXI1Slot2/ai1')
     ch2data = np.mean(rec.data())
     rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
@@ -358,21 +362,44 @@ def Scan2DPlaneSliced(t1, t2, t3, m, n):
         nslice = int(np.ceil(.0008/ustep))
     else:
         nslice = 1
+
+
+    tout = TransformStamped()
+    tout.transform.rotation.x = t3.transform.rotation.x
+    tout.transform.rotation.y = t3.transform.rotation.y
+    tout.transform.rotation.z = t3.transform.rotation.z
+    tout.transform.rotation.w = t3.transform.rotation.w
+
     
+    try:
+        # We don't need ros.t while scanning -- disable for performance
+        ros.WaitPauseAcquisition() 
+
+        rate = ros.create_rate(4)
         
-    with IncrementalBar("Scanning...", max=m*n) as bar:
-        for j in range(n):
-            for k in range(nslice):
-                for i in range (k, m, nslice):
-                    #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-                    t3.transform.translation.x = uu[i,j]
-                    t3.transform.translation.y = vv[i,j]
-                    t3.transform.translation.z = ww[i,j]
-                    res = ros.Move(t3)
-                    if res.result.success != True:
-                        raise Exception("Move Failed")
-                    capturedata()
-                    bar.next()
+        with IncrementalBar("Scanning...", max=m*n, suffix='%(index)d/%(max)d [Elapsed: %(elapsed_td)s -- Remaining: %(eta_td)s -- Avg: %(avg).2f s]') as bar:
+            for j in range(n):
+                for k in range(nslice):
+                    for i in range (k, m, nslice):
+                        #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
+                        tout.transform.translation.x = uu[i,j]
+                        tout.transform.translation.y = vv[i,j]
+                        tout.transform.translation.z = ww[i,j]
+                        res = ros.Move(tout)
+                        if res.result.success != True:
+                            raise Exception("Move Failed")
+                        capturedata()
+                        bar.next()
+                        rate.sleep()
+                        #if bar.avg > 0.4:
+                        #    time.sleep(5)
+                        #    bar._xput = deque(maxlen=bar.sma_window)
+                        #    bar.avg = 0.0
+                        #    bar._avg_update_ts = time.time()
+                        #    bar._ts = time.time()
+    finally:
+        # Restarting ros.t
+        ros.WaitUnPauseAcquisition()
     
     Sliced2DScan_PlotData(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
     args = (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
