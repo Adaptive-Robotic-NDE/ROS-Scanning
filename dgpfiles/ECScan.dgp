@@ -18,7 +18,7 @@ rclpy.init()
 import dgpython_rosmotion as rosm
 
 global ros
-ros = rosm.motion('ros', 'tool0', 'world')
+ros = rosm.motion('ros', 'probe_end', 'world')
 
 
 import dgpython_nidaqmx as daqmx
@@ -40,9 +40,11 @@ scanrealchan = recdb.define_channel('/scanreal', "main", recdb.raw())
 scanimagchan = recdb.define_channel('/scanimag', "main", recdb.raw())
 transact.end_transaction()
 
-global accumulator_real, accumulator_imag
+global accumulator_real, accumulator_imag, ndaccumulator_real, ndaccumulator_imag
 accumulator_real = None
 accumulator_imag = None
+ndaccumulator_real = None
+ndaccumulator_imag = None
 
 def capturedata():
     monitor = recdb.start_monitoring_globalrevs()
@@ -286,43 +288,7 @@ def Scan2DPlaneSliced(t1, t2, t3, m, n):
 
     p1 = np.array([t1.transform.translation.x, t1.transform.translation.y, t1.transform.translation.z])
     p2 = np.array([t2.transform.translation.x, t2.transform.translation.y, t2.transform.translation.z])
-    p3 = np.array([t3.transform.translation.x, t3.transform.translation.y, t3.transform.translation.z])
-
-    global accumulator_real, accumulator_imag
-    transact = recdb.start_transaction()
-    if accumulator_real is not None:
-        recdb.delete_math_function(accumulator_real)
-    if accumulator_imag is not None:
-        recdb.delete_math_function(accumulator_imag)
-    
-    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_real") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator real definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_real ,False)
-    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_imag") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator imag definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_imag ,False)
-    transact.end_transaction()
-  
+    p3 = np.array([t3.transform.translation.x, t3.transform.translation.y, t3.transform.translation.z]) 
   
     ux, uy, uz = u = p2-p1
     vx, vy, vz = v = p3-p1
@@ -369,6 +335,104 @@ def Scan2DPlaneSliced(t1, t2, t3, m, n):
     tout.transform.rotation.y = t3.transform.rotation.y
     tout.transform.rotation.z = t3.transform.rotation.z
     tout.transform.rotation.w = t3.transform.rotation.w
+
+    # Calculate mapping for math channel
+    mapdata = np.array([j for k in range(nslice) for j in range(k, m , nslice)])
+
+    # This isn't needed here -- it reverses the process
+    #mapdata = [(x,y) for (x,y) in zip(mapdata, range(m))]
+    #mapdata.sort()
+    #mapdata = [i[1] for i in mapdata]
+
+    accummap = [int(i) for i in (np.repeat(np.array(mapdata).reshape([m,1]), n, axis=1) + np.repeat(np.arange(n).reshape(1,n), m, axis=0)*m).T.flatten()]
+
+
+    # Reset Math Channels
+    global accumulator_real, accumulator_imag, ndaccumulator_real, ndaccumulator_imag
+    transact = recdb.start_transaction()
+    if accumulator_real is not None:
+        recdb.delete_math_function(accumulator_real)
+    if accumulator_imag is not None:
+        recdb.delete_math_function(accumulator_imag)
+    if ndaccumulator_real is not None:
+        recdb.delete_math_function(ndaccumulator_real)
+    if ndaccumulator_imag is not None:
+        recdb.delete_math_function(ndaccumulator_imag)
+
+    chanmetadata = snde.constructible_metadata()
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_coord","X Axis"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_units","mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_offset",uu[0,0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_scale",uprime[1] - uprime[0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_coord","Y Axis"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_units","mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_offset",vv[0,0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_scale", vprime[1] - vprime[0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_coord","Amplitude"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_units","Volts"))
+    
+    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
+                                                          snde.math_parameter_unsigned_const(n*m),
+                                                          snde.math_parameter_int_const(-1),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False)],
+                                                        [ snde.shared_string("/accum_real") ],
+                                                        "/",
+                                                        False,
+                                                        False,
+                                                        False,
+                                                        snde.math_definition("accumulator real definition"),
+                                                        None)
+    recdb.add_math_function(accumulator_real ,False)
+    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
+                                                          snde.math_parameter_unsigned_const(n*m),
+                                                          snde.math_parameter_int_const(-1),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False)],
+                                                        [ snde.shared_string("/accum_imag") ],
+                                                        "/",
+                                                        False,
+                                                        False,
+                                                        False,
+                                                        snde.math_definition("accumulator imag definition"),
+                                                        None)
+    recdb.add_math_function(accumulator_imag ,False)
+
+    ndaccumulator_real = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
+                                                               snde.math_parameter_indexvec_const([n,m]),
+                                                               snde.math_parameter_indexvec_const(accummap),
+                                                               snde.math_parameter_sndeindex_const(int(m*n)),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_metadata_const(chanmetadata)],
+                                                             [ snde.shared_string("/ndaccum_real") ],
+                                                             "/",
+                                                             False,
+                                                             False,
+                                                             False,
+                                                             snde.math_definition("nd accumulator real definition"),
+                                                             None)
+    recdb.add_math_function(ndaccumulator_real ,False)
+    ndaccumulator_imag = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
+                                                               snde.math_parameter_indexvec_const([n,m]),
+                                                               snde.math_parameter_indexvec_const(accummap),
+                                                               snde.math_parameter_sndeindex_const(int(m*n)),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_metadata_const(chanmetadata)],
+                                                             [ snde.shared_string("/ndaccum_imag") ],
+                                                             "/",
+                                                             False,
+                                                             False,
+                                                             False,
+                                                             snde.math_definition("ndaccumulator imag definition"),
+                                                             None)
+    recdb.add_math_function(ndaccumulator_imag ,False)
+
+
+    transact.end_transaction()
 
     
     try:
