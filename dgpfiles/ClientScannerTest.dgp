@@ -56,7 +56,7 @@ daq.SampsPerChan = 100
 raster = False
 
 from progress.bar import IncrementalBar
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import Pose, TransformStamped
 import time
 from collections import deque
 
@@ -852,128 +852,7 @@ def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
     approach = TransformStamped()
     retract = TransformStamped()
 
-    # Calculate mapping for math channel
-    # mapdata = np.array([j for k in range(nslice) for j in range(k, m , nslice)])
-
-
-    # This isn't needed here -- it reverses the process
-    #mapdata = [(x,y) for (x,y) in zip(mapdata, range(m))]
-    #mapdata.sort()
-    #mapdata = [i[1] for i in mapdata]
-
-    # accummap = [int(i) for i in (np.repeat(np.array(mapdata).reshape([m,1]), n, axis=1) + np.repeat(np.arange(n).reshape(1,n), m, axis=0)*m).T.flatten()]
-#    x_near = pose_array.poses[0].position.x
-#    x_far = pose_array.poses[0].position.x
-#    y_near = pose_array.poses[0].position.y
-#    y_far = pose_array.poses[0].position.y
-#
-#    for i in range(m):
-#        if pose_array.poses[i].position.x > x_far:
-#            x_far = pose_array.poses[i].position.x
-#            print(f"Furthest x point: Pose{i} at {pose_array.poses[i].position.x}")
-#        if pose_array.poses[i].position.x < x_near:
-#            x_near = pose_array.poses[i].position.x
-#            print(f"Nearest x point: Pose{i} at {pose_array.poses[i].position.x}")
-#        if pose_array.poses[i].position.y > y_far:
-#            y_far = pose_array.poses[i].position.y
-#            print(f"Furthest y point: Pose{i} at {pose_array.poses[i].position.y}")
-#        if pose_array.poses[i].position.y < y_near:
-#            y_near = pose_array.poses[i].position.y
-#            print(f"Nearest y point: Pose{i} at {pose_array.poses[i].position.y}")
-#    grid_length = x_far - x_near
-#    grid_width = y_far - y_near
-#    print(f"Grid length: {grid_length} mm")
-#    print(f"Grid width: {grid_width} mm")
-#    
     accummap = m-1
-
-    # Reset Math Channels
-#    global accumulator_real, accumulator_imag, ndaccumulator_real, ndaccumulator_imag
-#    transact = recdb.start_transaction()
-#    if accumulator_real is not None:
-#        recdb.delete_math_function(accumulator_real)
-#    if accumulator_imag is not None:
-#        recdb.delete_math_function(accumulator_imag)
-#    if ndaccumulator_real is not None:
-#        recdb.delete_math_function(ndaccumulator_real)
-#    if ndaccumulator_imag is not None:
-#        recdb.delete_math_function(ndaccumulator_imag)
-#
-#    chanmetadata = snde.constructible_metadata()
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_coord","X Axis"))
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_units","mm"))
-#    #chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_offset",uu[0,0], "mm"))
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_scale", point_spacing, "mm"))
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_coord","Y Axis"))
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_units","mm"))
-#    #chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_offset",vv[0,0], "mm"))
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_scale", line_spacing, "mm"))
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_coord","Amplitude"))
-#    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_units","Volts"))
-#    
-#    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
-#                                                          snde.math_parameter_unsigned_const(n*m),
-#                                                          snde.math_parameter_int_const(-1),
-#                                                          snde.math_parameter_bool_const(False),
-#                                                          snde.math_parameter_bool_const(False)],
-#                                                        [ snde.shared_string("/accum_real") ],
-#                                                        "/",
-#                                                        False,
-#                                                        False,
-#                                                        False,
-#                                                        snde.math_definition("accumulator real definition"),
-#                                                        None)
-#    recdb.add_math_function(accumulator_real ,False)
-#    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
-#                                                          snde.math_parameter_unsigned_const(n*m),
-#                                                          snde.math_parameter_int_const(-1),
-#                                                          snde.math_parameter_bool_const(False),
-#                                                          snde.math_parameter_bool_const(False)],
-#                                                        [ snde.shared_string("/accum_imag") ],
-#                                                        "/",
-#                                                        False,
-#                                                        False,
-#                                                        False,
-#                                                        snde.math_definition("accumulator imag definition"),
-#                                                        None)
-#    recdb.add_math_function(accumulator_imag ,False)
-#
-#    ndaccumulator_real = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
-#                                                               snde.math_parameter_indexvec_const([n,m]),
-#                                                               snde.math_parameter_indexvec_const(accummap),
-#                                                               snde.math_parameter_sndeindex_const(int(m*n)),
-#                                                               snde.math_parameter_bool_const(False),
-#                                                               snde.math_parameter_bool_const(False),
-#                                                               snde.math_parameter_bool_const(False),
-#                                                               snde.math_parameter_metadata_const(chanmetadata)],
-#                                                             [ snde.shared_string("/ndaccum_real") ],
-#                                                             "/",
-#                                                             False,
-#                                                             False,
-#                                                             False,
-#                                                             snde.math_definition("nd accumulator real definition"),
-#                                                             None)
-#    recdb.add_math_function(ndaccumulator_real ,False)
-#    ndaccumulator_imag = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
-#                                                               snde.math_parameter_indexvec_const([n,m]),
-#                                                               snde.math_parameter_indexvec_const(accummap),
-#                                                               snde.math_parameter_sndeindex_const(int(m*n)),
-#                                                               snde.math_parameter_bool_const(False),
-#                                                               snde.math_parameter_bool_const(False),
-#                                                               snde.math_parameter_bool_const(False),
-#                                                               snde.math_parameter_metadata_const(chanmetadata)],
-#                                                             [ snde.shared_string("/ndaccum_imag") ],
-#                                                             "/",
-#                                                             False,
-#                                                             False,
-#                                                             False,
-#                                                             snde.math_definition("ndaccumulator imag definition"),
-#                                                             None)
-#    recdb.add_math_function(ndaccumulator_imag ,False)
-
-
-#    transact.end_transaction()
-
     
     try:
         # We don't need ros.t while scanning -- disable for performance
@@ -983,17 +862,13 @@ def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
         
     # Move to start position
         print("Moving to start position")
+        approach.transform.translation.x = pose_array.poses[0].position.x
+        approach.transform.translation.y = pose_array.poses[0].position.y
+        approach.transform.translation.z = pose_array.poses[0].position.z + 0.05
         approach.transform.rotation.x = pose_array.poses[0].orientation.x
         approach.transform.rotation.y = pose_array.poses[0].orientation.y
         approach.transform.rotation.z = pose_array.poses[0].orientation.z
         approach.transform.rotation.w = pose_array.poses[0].orientation.w
-        approach.transform.translation.x = pose_array.poses[0].position.x
-        approach.transform.translation.y = pose_array.poses[0].position.y
-        approach.transform.translation.z = pose_array.poses[0].position.z + 0.05
-
-        print(f"MOving to: {approach.transform.translation.x}, {approach.transform.translation.y}, {approach.transform.translation.z}")
-        print(f"With orientation: {approach.transform.rotation.x}, {approach.transform.rotation.y}, {approach.transform.rotation.z}, {approach.transform.rotation.w}")
-
 
         res = ros.MoveToPose(approach)
         if res.result.success != True:
@@ -1002,13 +877,13 @@ def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
         with IncrementalBar("Scanning...", max=m*n, suffix='%(index)d/%(max)d [Elapsed: %(elapsed_td)s -- Remaining: %(eta_td)s -- Avg: %(avg).2f s]') as bar:
             for e in range(m):
             
+                tout.transform.translation.x = pose_array.poses[e].position.x
+                tout.transform.translation.y = pose_array.poses[e].position.y
+                tout.transform.translation.z = pose_array.poses[e].position.z
                 tout.transform.rotation.x = pose_array.poses[e].orientation.x
                 tout.transform.rotation.y = pose_array.poses[e].orientation.y
                 tout.transform.rotation.z = pose_array.poses[e].orientation.z
                 tout.transform.rotation.w = pose_array.poses[e].orientation.w
-                tout.transform.translation.x = pose_array.poses[e].position.x
-                tout.transform.translation.y = pose_array.poses[e].position.y
-                tout.transform.translation.z = pose_array.poses[e].position.z
     
                 res = ros.MoveToPose(tout)
                 if res.result.success != True:
@@ -1017,77 +892,18 @@ def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
                 bar.next()
                 rate.sleep()
         
-        retract.transform.rotation.x = pose_array.poses[len(pose_array.poses) - 1].orientation.x
-        retract.transform.rotation.y = pose_array.poses[len(pose_array.poses) - 1].orientation.y
-        retract.transform.rotation.z = pose_array.poses[len(pose_array.poses) - 1].orientation.z
-        retract.transform.rotation.w = pose_array.poses[len(pose_array.poses) - 1].orientation.w
-        retract.transform.translation.x = pose_array.poses[len(pose_array.poses) - 1].position.x
-        retract.transform.translation.y = pose_array.poses[len(pose_array.poses) - 1].position.y
-        retract.transform.translation.z = pose_array.poses[len(pose_array.poses) - 1].position.z + 0.05
+        retract.transform.translation.x = pose_array.poses[-1].position.x
+        retract.transform.translation.y = pose_array.poses[-1].position.y
+        retract.transform.translation.z = pose_array.poses[-1].position.z + 0.05
+        retract.transform.rotation.x = 0.0
+        retract.transform.rotation.y = 0.0
+        retract.transform.rotation.z = 1.0
+        retract.transform.rotation.w = 0.0
 
         res = ros.MoveToPose(retract)
         if res.result.success != True:
             raise Exception("Move Failed")
-        
-        #with IncrementalBar("Scanning...", max=m*n, suffix='%(index)d/%(max)d [Elapsed: %(elapsed_td)s -- Remaining: %(eta_td)s -- Avg: %(avg).2f s]') as bar:
-        #    for j in range(n):
-        #        for k in range(nslice):
-        #            if raster:
-        #                if j % 2 == 0:
-        #                    for i in range (k, m, nslice):
-        #                        #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-        #                        tout.transform.translation.x = uu[i,j]
-        #                        tout.transform.translation.y = vv[i,j]
-        #                        tout.transform.translation.z = ww[i,j]
-        #                        res = ros.MoveToPose(tout)
-        #                        if res.result.success != True:
-        #                            raise Exception("Move Failed")
-        #                        capturedata()
-        #                        bar.next()
-        #                        rate.sleep()
-        #                        #if bar.avg > 0.4:
-        #                        #    time.sleep(5)
-        #                        #    bar._xput = deque(maxlen=bar.sma_window)
-        #                        #    bar.avg = 0.0
-        #                        #    bar._avg_update_ts = time.time()
-        #                        #    bar._ts = time.time()
-        #                else:
-        #                    for i in range (m-k-1, -1, -nslice):
-        #                        #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-        #                        tout.transform.translation.x = uu[i,j]
-        #                        tout.transform.translation.y = vv[i,j]
-        #                        tout.transform.translation.z = ww[i,j]
-        #                        res = ros.MoveToPose(tout)
-        #                        if res.result.success != True:
-        #                            raise Exception("Move Failed")
-        #                        capturedata()
-        #                        bar.next()
-        #                        rate.sleep()
-        #                        #if bar.avg > 0.4:
-        #                        #    time.sleep(5)
-        #                        #    bar._xput = deque(maxlen=bar.sma_window)
-        #                        #    bar.avg = 0.0
-        #                        #    bar._avg_update_ts = time.time()
-        #                        #    bar._ts = time.time()
-        #            else:
-        #                for i in range (k, m, nslice):
-        #                    #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-        #                    tout.transform.translation.x = uu[i,j]
-        #                    tout.transform.translation.y = vv[i,j]
-        #                    tout.transform.translation.z = ww[i,j]
-        #                    res = ros.MoveToPose(tout)
-        #                    if res.result.success != True:
-        #                        raise Exception("Move Failed")
-        #                    capturedata()
-        #                    bar.next()
-        #                    rate.sleep()
-        #                    #if bar.avg > 0.4:
-        #                    #    time.sleep(5)
-        #                    #    bar._xput = deque(maxlen=bar.sma_window)
-        #                    #    bar.avg = 0.0
-        #                    #    bar._avg_update_ts = time.time()
-        #                    #    bar._ts = time.time()
-                        
+
 
     finally:
         # Restarting ros.t
