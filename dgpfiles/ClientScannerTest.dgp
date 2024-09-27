@@ -129,7 +129,7 @@ paramdb.AddParam(NumericUnitsParameter,
                 doc="",
                 group="Start Industrial Reconstruction",
                 units="",
-                value=0.005)
+                value=0.001)
 paramdb.AddParam(NumericUnitsParameter,
                 "sdf_trunc",
                 friendlyname="SDF Trunc",
@@ -262,12 +262,14 @@ def demo():
         print(f"{Colors.RESET}Exiting...")
 
 
-def reconstruct():
+def reconstruct(div,ang,length=1.0,width=0.5,x_pos=1.0,y_pos=0.5,z_pos=1.2):
 
     try:
-        pa = ros.reconPoseArray()
+        pa = ros.reconPoseArray(div,ang,length,width,x_pos,y_pos,z_pos)
 
         move_response = ros.Move(pa.poses[0],0.2,0.2)
+
+        # move_response = ros.Move('over_cal_plate',0.2,0.2)
 
         while not move_response.result.success:
             print(f"{Colors.MAGENTA}Moving into position...")
@@ -317,17 +319,24 @@ def reconstruct():
 
         ros.Move("over_cal_plate",0.2,0.2)
 
+        time.sleep(20)
+
         print(f"{Colors.CYAN}Stoping Reconstruction")
+#        stop_res = stop_reconstruction.sendRequest('StopReconstruction',
+#                                                    {'archive_directory':archive_directory.name,
+#                                                     'mesh_filepath':"/home/labuser/Desktop/test.ply",
+#                                                     'normal_filters':normal_filters})
+            
         if move_response.result.success : stop_res = stop_reconstruction.sendRequest('StopReconstruction',
                                                     {'archive_directory':archive_directory.name,
-                                                     'mesh_filepath':mesh_filepath.name,
+                                                     'mesh_filepath':"/home/labuser/Desktop/test.ply",
                                                      'normal_filters':normal_filters})
             
         if stop_res.success : print(f"{Colors.GREEN}Reconstruction Complete!")
 
     except Exception as e:
 
-        print(f"{Colors:RED}{e.message}\n{e.args}")
+        print(f"{Colors.RED}{e}")
 
     finally:
         tempdir.cleanup()
@@ -919,6 +928,29 @@ def Scan2DPlaneSliced(t1, t2, t3, m, n, raster):
     Sliced2DScan_PlotData(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
     args = (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
     return args
+
+def keyScan(full_dome=False, vel=0.05,acc=0.05,slice=9,angle=12,length=0.35,width=0.15,x_pos=0.69, y_pos=-0.09, z_pos=0.946, x_offset=1, output_filepath='/home/labuser/iron_tari/', output_filename='pc.ply'):
+
+    ros.Move('over_curved_geometry',0.1,0.1)
+    slice = 9
+    pa = ros.reconPoseArray(full_dome, slice,angle,length,width,x_pos, y_pos, z_pos, x_offset)
+    pals = list(pa.poses)
+    for i in range(slice):
+        if i % 2 == 1:
+            pals[i*slice:i*slice+slice] = list(reversed(pals[i*slice:i*slice+slice]))
+            ros.get_logger().info(f"Reversing slice [{i*slice}:{i*slice+slice}]")
+
+    ros.Move(pals[0],0.1,0.1)
+    keyence_start.sendRequest('StartKeyRec', {'distance': 0.0005})
+    move1_response = ros.Move(pals[1:],vel,acc)
+    while not move1_response.result.success :
+        ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
+    if move1_response.result.success : move2_response = ros.Move(list(reversed(pals[:-1])),vel,acc)
+    while not move2_response.result.success :
+        ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
+    if move2_response.result.success : stop_response = keyence_stop.sendRequest('StopKeyRec', {'output_filepath': output_filepath, 'output_filename': output_filename})
+    if stop_response.success : ros.Move('over_curved_geometry',0.1,0.1)
+
 
 def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
 
