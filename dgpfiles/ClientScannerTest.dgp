@@ -1,67 +1,73 @@
 from dataguzzler_python import dgpy
 import dgpython_param_manager as param
+from dataguzzler_python import context
+import dgpython_nidaqmx as daqmx
 import spatialnde2 as snde
 import sys
 import math
+import time
 import transforms3d
+import bpy
 
+import numpy as np
+
+import rclpy
+from geometry_msgs.msg import Vector3
 from launch_ros.substitutions import FindPackageShare
 from industrial_reconstruction_msgs.msg import NormalFilterParams, RGBDImageParams, TSDFVolumeParams
 from launch.substitutions import PathJoinSubstitution
+from ur_msgs.srv import SetIO
 import tempfile as tf
-print(sys.executable, sys.version)
-#from pynput.keyboard import Key, Controller
-#from pynput import keyboard
+from progress.bar import IncrementalBar
+from geometry_msgs.msg import Point, Pose, TransformStamped, Quaternion
+import time
+from collections import deque
+import dgpython_rosmotion as rosm
+from dgpython_uniwest import UniWest, ureg, Q_
 
-#keycontrol = Controller()
+#It takes 5 seconds if all 600 some params are refreshed on startup.
+
+# tic = time.time_ns()*ureg('ns')
+# uni =  UniWest('UniWest')
+# toc = time.time_ns()*ureg('ns')
+# print((toc-tic).to('s'))
+# 
+# 
+# uni.ch0_Frequency = 4.5*ureg('MHz')
+# print(uni.ch0_Frequency)
+# uni.ch0_Frequency = 5*ureg('MHz')
+# print(uni.ch0_Frequency)
+
+print(sys.executable, sys.version)
 
 include(dgpy,"dgpy_startup.dpi") # If you get a NameError here, be sure you are executing this file with dataguzzler-python
 
+include(dgpy,"Qt.dpi",prefer_pyqt=False) 
 include(dgpy,"matplotlib.dpi")
 
 include(dgpy,"pint.dpi")
 
-include(snde,"recdb.dpi")
+include(snde,"recdb.dpi",enable_opencl=True)
 include(snde,"recdb_gui.dpi")
 
 include(param, "paramdb.dpi")
 
-import time
-
-import rclpy
 rclpy.init()
-
-import dgpython_rosmotion as rosm
+# counter = 0
+positioner_channel = []
 
 global ros
-ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh='/home/labuser/tari_ws/Probe_uv.x3d')
+ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh='/home/labuser/ecProbe.x3d') #'/home/labuser/tari_ws/Probe_uv.x3d')
 
 include(rosm, "services.dpi")
 
-import dgpython_nidaqmx as daqmx
 daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
 
 daq.SampleRate = 10*ur.kHz
 daq.SampsPerChan = 100
 
-# from tari_clients import tariReconstruction as tr
-# reconstruction = tr.ReconstructionClient()
-# 
-# from tari_clients import tariMeshFilter as tmf
-# meshFilter = tmf.TariMeshFilterClient()
-# 
-# from tari_clients import tariNoether as tn
-# noether = tn.TariNoetherClient("noether")
-# 
-# from tari_clients import poseArrayHandler as pah
-# poseHandler = pah.PoseArrayHandlerClient()
-
 raster = False
-
-from progress.bar import IncrementalBar
-from geometry_msgs.msg import Point, Pose, TransformStamped, Quaternion
-import time
-from collections import deque
+orient_dtype = [('offset', '<f4', (4,)), ('quat', '<f4', (4,))]
 
 transact = recdb.start_transaction()
 avgrealchan = recdb.define_channel('/avgreal', "main", recdb.raw())
@@ -75,8 +81,9 @@ accumulator_real = None
 accumulator_imag = None
 ndaccumulator_real = None
 ndaccumulator_imag = None
+window_size = [800,1200]
 
-paramdb.ShowViewer()
+paramdb.ShowViewer(window_size)
 
 tempdir = tf.TemporaryDirectory(dir='/tmp/', prefix='industrial_reconstruction_meshes_')
 archive_directory = tf.TemporaryDirectory(dir=tempdir.name, prefix='archive_directory')
@@ -90,7 +97,7 @@ paramdb.AddParam(Parameter,
                 friendlyname="Tracking Frame",
                 doc="Optical camera frame for both depth and rgb",
                 group="Start Industrial Reconstruction",
-                value="azure_depth")
+                value="d415_color_optical_frame")
 paramdb.AddParam(Parameter,
                 "relative_frame",
                 friendlyname="Relative Frame",
@@ -128,7 +135,7 @@ paramdb.AddParam(NumericUnitsParameter,
                 friendlyname="Voxel Length",
                 doc="",
                 group="Start Industrial Reconstruction",
-                units="",
+                units="m",
                 value=0.001)
 paramdb.AddParam(NumericUnitsParameter,
                 "sdf_trunc",
@@ -166,8 +173,8 @@ paramdb.AddParam(NumericUnitsParameter,
                 friendlyname="Normal Angle",
                 doc="",
                 group="Stop Industrial Reconstruction",
-                units="",
-                value=120.0)
+                units="deg",
+                value=90.0)
 
     ###MESH FILTER###
 
@@ -194,28 +201,150 @@ paramdb.AddParam(Parameter,
                 friendlyname="Input File",
                 doc="Input mesh filepath for Nother Tool Path Planning",
                 group="Nother Tool Path Planning",
-                value="/home/labuser/tari_ws/src/tari-ros-staging/tari_ur_launch/meshes/AFRL_Demo_Part_Flat.stl")
+                value="/home/labuser/iron_tari/triangulated_cloud.ply")
 paramdb.AddParam(NumericUnitsParameter,
                 "line_spacing",
                 friendlyname="Line Spacing",
                 doc="Spacing between line of poses",
                 group="Nother Tool Path Planning",
-                units="",
+                units="m",
                 value=0.01)
 paramdb.AddParam(NumericUnitsParameter,
                 "point_spacing",
                 friendlyname="Point Spacing",
                 doc="Spacing between points in line",
                 group="Nother Tool Path Planning",
-                units="",
+                units="m",
                 value=0.01)
 paramdb.AddParam(NumericUnitsParameter,
                 "z_offset",
                 friendlyname="Z Offset",
                 doc="",
                 group="Nother Tool Path Planning",
-                units="",
+                units="m",
                 value=0.006)
+paramdb.AddParam(NumericUnitsParameter,
+                "distance_threshold",
+                friendlyname="Distance Threshold",
+                doc="",
+                group="Nother Tool Path Planning",
+                units="m",
+                value=0.1)
+paramdb.AddParam(NumericUnitsParameter,
+                "max_planes",
+                friendlyname="Max Planes",
+                doc="",
+                group="Nother Tool Path Planning",
+                units="m",
+                value=1)
+
+    ###Keyence Start###
+
+paramdb.AddParam(NumericUnitsParameter,
+                 "distance",
+                 friendlyname="Distance",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Start",
+                 units="mm",
+                 value=0.0005)  
+
+    ###Keyence Stop###
+    
+paramdb.AddParam(NumericUnitsParameter,
+                 "mean_k",
+                 friendlyname="Mean K",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="",
+                 value=20)    
+paramdb.AddParam(NumericUnitsParameter,
+                 "dev_thresh",
+                 friendlyname="Dev Threshold",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="",
+                 value=1.0)  
+paramdb.AddParam(NumericUnitsParameter,
+                 "leaf_size",
+                 friendlyname="Leaf Size",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=0.003)  
+paramdb.AddParam(NumericUnitsParameter,
+                 "search_radius",
+                 friendlyname="Search Radius",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=0.5)  
+paramdb.AddParam(NumericUnitsParameter,
+                 "set_mu",
+                 friendlyname="Set Mu",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=2.5)    
+paramdb.AddParam(NumericUnitsParameter,
+                 "max_nearest",
+                 friendlyname="Maximum Nearest Neighbors",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=100)
+paramdb.AddParam(NumericUnitsParameter,
+                 "max_surface_angle",
+                 friendlyname="Maximum Nearest Neighbors",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=math.pi/4)
+paramdb.AddParam(NumericUnitsParameter,
+                 "min_angle",
+                 friendlyname="Maximum Nearest Neighbors",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=math.pi/18)
+paramdb.AddParam(NumericUnitsParameter,
+                 "max_angle",
+                 friendlyname="Maximum Nearest Neighbors",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=2*math.pi/3)
+paramdb.AddParam(NumericUnitsParameter,
+                 "k_search",
+                 friendlyname="K Search",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="mm",
+                 value=20)
+paramdb.AddParam(NumericUnitsParameter,
+                 "radius_search",
+                 friendlyname="Radius Search",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 units="m",
+                 value=0.003)
+paramdb.AddParam(Parameter,
+                 "normal_consistency",
+                 friendlyname="Maximum Nearest Neighbors",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 value=True)    
+paramdb.AddParam(Parameter,
+                 "output_filepath",
+                 friendlyname="Output Filepath",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 value="/home/labuser/iron_tari/")    
+paramdb.AddParam(Parameter,
+                 "output_filename",
+                 friendlyname="Output Name",
+                 doc="",
+                 group="Keyence Mesh Reconstruction Stop",
+                 value="pc.ply")
 class Colors:
     RESET = "\033[0m"
     COLOR_26 = "\033[26m"
@@ -241,7 +370,9 @@ def demo():
                                                                             {'mesh_filename': paramdb.input_file,
                                                                              'line_spacing': paramdb.line_spacing.magnitude,
                                                                              'point_spacing': paramdb.point_spacing.magnitude,
-                                                                             'z_offset': 0.0})
+                                                                             'z_offset': paramdb.z_offset.magnitude,
+                                                                             'distance_threshold': paramdb.distance_threshold.magnitude,
+                                                                             'max_planes': paramdb.max_planes.magnitude})
 
         while not noether_result.success:
             print("Creating Tool Path Plan...")
@@ -261,15 +392,297 @@ def demo():
         tempdir.cleanup()
         print(f"{Colors.RESET}Exiting...")
 
+def startReconstruction():
 
-def reconstruct(div,ang,length=1.0,width=0.5,x_pos=1.0,y_pos=0.5,z_pos=1.2):
+    min_box_values = Vector3(x=0.0, y=0.0, z=0.0)
+    max_box_values = Vector3(x=0.0, y=0.0, z=0.0)
+
+    tsdf_params = TSDFVolumeParams(voxel_length=paramdb.voxel_length.magnitude,
+                                   sdf_trunc=paramdb.sdf_trunc.magnitude,
+                                   min_box_values=min_box_values,
+                                   max_box_values=max_box_values)
+    
+    rgbd_params = RGBDImageParams(depth_scale=paramdb.depth_scale.magnitude,
+                                  depth_trunc=paramdb.depth_trunc.magnitude,
+                                  convert_rgb_to_intensity=paramdb.convert_rgb_to_intensity)
+
+    print(f"{Colors.CYAN}Starting Reconstruction!")
+    print(f"{Colors.GREEN}Archive directory: {archive_directory.name}")
+    print(f"{Colors.GREEN}Output filename: {output_filename.name}")
+    print(f"{Colors.GREEN}Mesh filepath: {mesh_filepath.name}{Colors.RESET}")
+    
+    return start_reconstruction.sendRequest('StartReconstruction',
+                                   { 'tracking_frame':paramdb.tracking_frame,
+                                     'relative_frame':paramdb.relative_frame,
+                                     'translation_distance':paramdb.translation_distance.magnitude,
+                                     'rotational_distance':paramdb.rotational_distance.magnitude,
+                                     'live':paramdb.live,
+                                     'tsdf_params':tsdf_params,
+                                     'rgbd_params':rgbd_params})
+
+def stopReconstruction():
+
+    normal_direction = Vector3(x=0.0, y=0.0, z=1.0)
+    normal_filter = NormalFilterParams(normal_direction=normal_direction, angle=paramdb.angle.magnitude)
+    normal_filters = [normal_filter]
+
+    print(f"{Colors.CYAN}Stoping Reconstruction{Colors.RESET}")
+        
+    return stop_reconstruction.sendRequest('StopReconstruction',
+                                   {'archive_directory':archive_directory.name,
+                                    'mesh_filepath':"/home/labuser/Desktop/test.ply",
+                                    'normal_filters':normal_filters})
+
+def noether():
+
+    print(f"{Colors.BLUE}Noether TPP")
+
+    return noether_client.sendRequest('TariNoether', 
+                                     {'mesh_filename': paramdb.input_file,
+                                      'line_spacing': paramdb.line_spacing.magnitude,
+                                      'point_spacing': paramdb.point_spacing.magnitude,
+                                      'z_offset': paramdb.z_offset.magnitude,
+                                      'distance_threshold': paramdb.distance_threshold.magnitude,
+                                      'max_planes': paramdb.max_planes.magnitude}).noether_pose_array.poses
+
+def keyenceStart():
+
+    print(f"{Colors.GREEN}Keyence Reconstruction Starting")
+
+    return keyence_start.sendRequest('StartKeyRec', {'distance': paramdb.distance.magnitude})
+
+def keyenceStop():
+
+    print(f"{Colors.MAGENTA}Keyence Reconstruction Stopping")
+
+    return keyence_stop.sendRequest('StopKeyRec',
+                            {'mean_k': paramdb.mean_k.magnitude,
+                             'dev_thresh': paramdb.dev_thresh.magnitude,
+                             'leaf_size': paramdb.leaf_size.magnitude,
+                             'output_filepath': paramdb.output_filepath,
+                             'output_filename': paramdb.output_filename,
+                             'search_radius': paramdb.search_radius.magnitude,
+                             'set_mu': paramdb.set_mu.magnitude,
+                             'max_nearest': paramdb.max_nearest.magnitude,
+                             'k_search': paramdb.k_search.magnitude})
+
+def pinSwitch(pin=0):
+
+    if isinstance(pin, int) and 0 <= pin <= 7:
+
+        if ros.svd_msg.digital_out_states[pin].state:
+
+            ros.get_logger().info(f"Pin {pin} is {Colors.GREEN}ON{Colors.RESET}")
+            ros.get_logger().info(f"Switching pin {pin} {Colors.RED}OFF{Colors.RESET}")
+
+            return gpio_client.sendRequest('SetIO',
+                                    {'fun': 1,
+                                     'pin': pin,
+                                     'state': 0.0})
+        
+        else:
+
+            ros.get_logger().info(f"Pin {pin} is {Colors.RED}OFF{Colors.RESET}")
+            ros.get_logger().info(f"Switching pin {pin} {Colors.GREEN}ON{Colors.RESET}")
+
+            return gpio_client.sendRequest('SetIO',
+                                    {'fun': 1,
+                                     'pin': pin,
+                                     'state': 1.0})
+
+def x3dConvert(file="/home/labuser/iron_tari/triangulated_cloud.ply"):
+
+    for obj in bpy.context.scene.objects:
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    if file[-3:] == "ply":
+        bpy.ops.wm.ply_import(filepath=file)  # Update with path to ply
+    elif file[-3:] == "stl":
+        bpy.ops.import_mesh.stl(filepath=file)
+    elif file[-3:] == "obj":
+        bpy.ops.import_scene.obj(filepath=file)
+    else:
+        ros.get_logger().error("Wrong file type")
+        return
+    
+    bpy.ops.object.editmode_toggle()
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(threshold=0.002, use_unselected=True)
+    bpy.ops.mesh.delete_loose(use_faces=True)
+    bpy.ops.mesh.dissolve_degenerate(threshold=0.001)
+    bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='EDGE')
+    bpy.ops.mesh.select_all(action='DESELECT')
+    bpy.ops.mesh.edges_select_sharp()
+    bpy.ops.mesh.mark_seam(clear=False)
+    bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='FACE')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+    bpy.ops.export_scene.x3d(filepath='test.x3d', **{"use_selection": False, 'use_mesh_modifiers':True, 'use_normals': False, 'global_scale':0.001})
+
+def showSpecimen(file="/home/labuser/untitled.x3d"):
+
+#    counter = counter + 1
+#    specimen_model_file = file
+#    specimen_model_tree = '/graphics/specimen_' + str(counter) + '/'
+#    specimen_pose_channel = '/specimen_' + str(counter) + '_pose'
+#    try:
+#        transact = ros.recdb.start_transaction()
+#        specimen_recording = snde.x3d_load_geometry(ros.recdb, ros.graphman, specimen_model_file, 0, 'main', ros.recdb.raw(), specimen_model_tree, None, ['reindex_vertices', 'reindex_tex_vertices'])
+#        specimen_pose_chan = ros.recdb.define_channel(specimen_pose_channel, "main", ros.recdb.raw())
+#        specimen_pose_ref = snde.create_pose_channel_ndarray_ref
+#        (ros.recdb, specimen_pose_chan, ros.recdb.raw(), snde.recdb_path_join(specimen_model_tree, "meshed"))
+#        specimen_pose_ref.allocate_storage([1])
+#        specimen_pose_rec = snde.pose_channel_recording.from_ndarray_recording(specimen_pose_ref.rec)
+#        specimen_pose_ref.data()[0] = np.array(((0.0,0.0,0.0,0),(0.0,0.0,0.0,1.0)),dtype=[('offset', '<f4', (4,)), ('quat', '<f4', (4,))])
+#        specimen_pose_ref.rec.mark_metadata_done()
+#        specimen_pose_ref.rec.mark_data_ready()
+#    finally:
+#        transact.end_transaction()
+
+    ros.specimenMesh(file)
+
+    print(f"{Colors.GREEN}Specimen pose channel: {ros.specimen_pose_channel}{Colors.RESET}")
+
+def joinChannels(x=0.759,y=-0.926,z=-0.475,ox=0,oy=0,oz=0,ow=1,background_channel=None, specimenNum=1):
+
+#    if ros.counter == 0 : return print(f"{Colors.RED}No specimens available{Colors.RESET}")
+#
+#    if background_channel is None : background_channel=ros.specimen_pose_channel[specimenNum-1]
+#
+#    try:
+#        if positioner_channel[specimenNum]:
+#            print(f"Updating positioner_channel[{specimenNum}]")
+#    except e as Exception:
+#        positioner_channel.append("/probe_and_specimen_" + str(specimenNum))
+#        print(f"{Colors.GREEN}Adding channel {positioner_channel[specimenNum]}{Colors.RESET}")
+#        try:
+#            transact = ros.recdb.start_transaction()
+#            positioner_chan = ros.recdb.define_channel(positioner_channel,"main",ros.recdb.raw())
+#        except e as Exception:
+#            print(e)
+#        finally:
+#            transact.end_transaction()
+#
+#
+#    model_channel=snde.recdb_path_join(ros.eoat_model_tree,"meshed")
+#    
+#    print(f"{Colors.MAGENTA}Positioner channel: {positioner_channel}{Colors.RESET}")
+#
+#    model_channel = str(model_channel)
+#    print("Model Channel: %s" % model_channel)
+#    background_channel = str(background_channel)
+#    print("Background Channel: %s" % background_channel)
+#
+#    
+#    try:
+#        transact = ros.recdb.start_transaction()
+#        specimen_position = np.array(((0.759,
+#                                       -0.475,
+#                                       0.926,
+#                                       0),(0,0,0,1)),dtype=orient_dtype)
+#        probe_position = np.array(((ros.t.transform.translation.x,
+#                                    ros.t.transform.translation.y,
+#                                    ros.t.transform.translation.z,
+#                                    0),(
+#                                    ros.t.transform.rotation.x, 
+#                                    ros.t.transform.rotation.y, 
+#                                    ros.t.transform.rotation.z, 
+#                                    ros.t.transform.rotation.w)),
+#                                  dtype=orient_dtype)
+#        vsop = snde.VectorOfStringOrientationPairs([snde.StringOrientationPair('/graphics/specimen_'+ str(specimenNum) +'/meshed',snde.snde_orientation3(specimen_position)), snde.StringOrientationPair('/graphics/probe/meshed',snde.snde_orientation3(probe_position))])
+#        rec = snde.create_assembly_recording(ros.recdb, positioner_chan, ros.recdb.raw(), vsop)
+#    except Exception as e:
+#        print(e)
+#    finally:
+#        transact.end_transaction()
+#        if rec is not None:
+#            rec.mark_data_and_metadata_ready()
+
+    ros.join(x=x,y=y,z=z,ox=ox,oy=oy,oz=oz,ow=ow,specimenNum=specimenNum)
+
+def probeProjectChan(specimenNum=1):
+
+    print(f"{Colors.BLUE}Projecting probe tip data for specimen {specimenNum}{Colors.RESET}")
+
+    specimenIndex = specimenNum - 1
 
     try:
-        pa = ros.reconPoseArray(div,ang,length,width,x_pos,y_pos,z_pos)
 
-        move_response = ros.Move(pa.poses[0],0.2,0.2)
+        transact = ros.recdb.start_transaction()
 
-        # move_response = ros.Move('over_cal_plate',0.2,0.2)
+        include(snde,"project_probe_tip_data_in_transaction.dpi",
+                specimen_model_tree = ros.specimen_model_tree[specimenIndex],
+                specimen_pose_channel = ros.specimen_pose_channel[specimenIndex],
+                probe_pose_channel=ros.eoat_pose_channel,
+                probe_tip_data_channel=ros.specimen_data_channel[specimenIndex],
+                min_dist = -0.2, # starting position for ray tracer, relative to probe tip position, in meters
+                max_dist = 0.3, # ending position for ray tracer, relative to probe tip position, in meters
+                radius = 0.01, # spot size, in nominal parameterization scale, in meters
+                horizontal_pixels = 1282, # horizontal total pixel width in parameterization space
+                vertical_pixels = 1280, # vertical total pixel width in parameterization space
+                projection_channel = "/graphics/projection_" + str(specimenNum),
+                projection_specimen_channel = "/graphics/projection_specimen" + str(specimenNum),
+                )
+        
+    except Exception as e:
+
+        print(e)
+    
+    finally:
+
+        transact.end_transaction()
+
+def mapScan(specimenNum=1):
+
+    if ros.counter == 0: return print(f"{Colors.RED}No specimens available{Colors.RESET}")
+    elif specimenNum > ros.counter: return print(f"{Colors.RED}Specimen number {specimenNum} out of range")
+    else: specimenIndex = specimenNum - 1
+
+    # specimen_model_tree = '/graphics/specimen_' + str(specimenNum) + '/'
+    # specimen_pose_channel = '/specimen_' + str(specimenNum) + '_pose'
+
+    try:
+
+        transact = ros.recdb.start_transaction()
+
+        specimen_data_ref = snde.create_ndarray_ref(ros.recdb,ros.specimen_data_chan[specimenIndex],ros.recdb.raw(),snde.SNDE_RTN_COMPLEXFLOAT64)
+
+        metadata = snde.constructible_metadata()
+        metadata.AddMetaDatum(snde.metadatum("snde_render_goal","SNDE_SRG_PHASEPLANE"))
+        metadata.AddMetaDatum(snde.metadatum("snde_phase_plane_historical_fade",True))
+        metadata.AddMetaDatum(snde.metadatum("nde_array-ampl_coord","Impedance"))
+        metadata.AddMetaDatum(snde.metadatum("nde_array-ampl_units","Volts"))
+
+        specimen_data_ref.rec.metadata=metadata
+
+        specimen_data_ref.rec.mark_metadata_done()
+        specimen_data_ref.allocate_storage( [] )
+
+        specimen_data_ref.assign_complexfloat64([],capture3Ddata())
+        specimen_data_ref.rec.mark_data_ready()
+        
+    except Exception as e:
+
+        print(e)
+
+    finally:
+
+        transact.end_transaction()
+
+def reconstruct(full_dome=False, vel=0.05,acc=0.05,slice=13,angle=12,length=0.3,width=0.4,x_pos=0.5,y_pos=-0.4,z_pos=1.0,x_offset=1):
+
+    try:
+
+        pa = ros.reconPoseArray(full_dome, slice,angle,length,width,x_pos, y_pos, z_pos, x_offset)
+        pals = list(pa.poses)
+        for i in range(slice):
+            if i % 2 == 1:
+                pals[i*slice:i*slice+slice] = list(reversed(pals[i*slice:i*slice+slice]))
+                ros.get_logger().info(f"Reversing slice [{i*slice}:{i*slice+slice}]")
+
+        input("You ready?")
+
+        move_response = ros.Move(pals[0],0.1,0.1)
 
         while not move_response.result.success:
             print(f"{Colors.MAGENTA}Moving into position...")
@@ -279,60 +692,23 @@ def reconstruct(div,ang,length=1.0,width=0.5,x_pos=1.0,y_pos=0.5,z_pos=1.2):
 
         ###START RECONSTRUCTION###
 
-        from geometry_msgs.msg import Vector3
-        min_box_values = Vector3(x=0.0, y=0.0, z=0.0)
-        max_box_values = Vector3(x=0.0, y=0.0, z=0.0)
-        normal_direction = Vector3(x=0.0, y=0.0, z=1.0)
-        normal_filter = NormalFilterParams(normal_direction=normal_direction, angle=paramdb.angle.magnitude)
-        normal_filters = [normal_filter]
-
-        tsdf_params = TSDFVolumeParams(voxel_length=paramdb.voxel_length.magnitude,
-                                       sdf_trunc=paramdb.sdf_trunc.magnitude,
-                                       min_box_values=min_box_values,
-                                       max_box_values=max_box_values)
-        rgbd_params = RGBDImageParams(depth_scale=paramdb.depth_scale.magnitude,
-                                      depth_trunc=paramdb.depth_trunc.magnitude,
-                                      convert_rgb_to_intensity=paramdb.convert_rgb_to_intensity)
-    
-
-        print(f"{Colors.CYAN}Starting Reconstruction!")
-
-        print(f"{Colors.GREEN}Archive directory: {archive_directory.name}")
-        print(f"{Colors.GREEN}Output filename: {output_filename.name}")
-        print(f"{Colors.GREEN}Mesh filepath: {mesh_filepath.name}")
-
+        startReconstruction()
         
-        start_reconstruction.sendRequest('StartReconstruction',
-                                                           { 'tracking_frame':paramdb.tracking_frame,
-                                                             'relative_frame':paramdb.relative_frame,
-                                                             'translation_distance':paramdb.translation_distance.magnitude,
-                                                             'rotational_distance':paramdb.rotational_distance.magnitude,
-                                                             'live':paramdb.live,
-                                                             'tsdf_params':tsdf_params,
-                                                             'rgbd_params':rgbd_params})
+        print(f"{Colors.BLUE}Velocity: {vel}\nAcceleration: {acc}")
         
-        move_response = ros.Move(pa.poses[1:],0.05,0.05)
+        move_response = ros.Move(pals[1:],vel,acc)
 
         while not move_response.result.success:
             print(f"{Colors.MAGENTA}Reconstructing...")
             time.sleep(1)
 
-        ros.Move("over_cal_plate",0.2,0.2)
-
         time.sleep(20)
 
-        print(f"{Colors.CYAN}Stoping Reconstruction")
-#        stop_res = stop_reconstruction.sendRequest('StopReconstruction',
-#                                                    {'archive_directory':archive_directory.name,
-#                                                     'mesh_filepath':"/home/labuser/Desktop/test.ply",
-#                                                     'normal_filters':normal_filters})
+        ###STOP RECONSTRUCTION###
+
+        stop_res = stopReconstruction()
             
-        if move_response.result.success : stop_res = stop_reconstruction.sendRequest('StopReconstruction',
-                                                    {'archive_directory':archive_directory.name,
-                                                     'mesh_filepath':"/home/labuser/Desktop/test.ply",
-                                                     'normal_filters':normal_filters})
-            
-        if stop_res.success : print(f"{Colors.GREEN}Reconstruction Complete!")
+        if stop_res.success : print(f"{Colors.GREEN}Reconstruction Complete!"), ros.Move("over_curved_geometry",0.2,0.2)
 
     except Exception as e:
 
@@ -342,39 +718,14 @@ def reconstruct(div,ang,length=1.0,width=0.5,x_pos=1.0,y_pos=0.5,z_pos=1.2):
         tempdir.cleanup()
         print(f"{Colors.RESET}Exiting...")
             
-
 def runscan():
     
-    # tracking_frame = "d415_color_optical_frame"
-    # relative_frame = "world"
-    # translation_distance = 0.0
-    # rotational_distance = 0.0
-    # live = True
-    # voxel_length = 0.005
-    # sdf_trunc = 0.04
     from geometry_msgs.msg import Vector3
     min_box_values = Vector3(x=0.0, y=0.0, z=0.0)
     max_box_values = Vector3(x=0.0, y=0.0, z=0.0)
-    # depth_scale = 1000.0
-    # depth_trunc = 0.75
-    # convert_rgb_to_intensity = False
-    # archive_directory = "/tmp/industrial_reconstruction_meshes/"
-    # mesh_filepath = "/tmp/industrial_reconstruction_meshes/results.ply"
-    # min_num_faces = 1000
-    # angle = 120.0
     normal_direction = Vector3(x=0.0, y=0.0, z=1.0)
     normal_filter = NormalFilterParams(normal_direction=normal_direction, angle=paramdb.angle.magnitude)
     normal_filters = [normal_filter]
-    # output_filename = "/home/labuser/tari_test/src/tari-ros/tari_ur_launch/meshes/filteredMesh.ply"
-    # color = (0.0, 0.55, 0.44) # Green Tape
-    # threshold = 0.15
-    # line_spacing = 0.001
-    # point_spacing = 0.001
-
-    # with tf.TemporaryDirectory(dir='/tmp/', prefix='industrial_reconstruction_meshes_') as tempdir:
-    #     archive_directory = tf.TemporaryDirectory(dir=tempdir, prefix='archive_directory')
-    #     mesh_filepath = tf.NamedTemporaryFile(dir=tempdir, prefix='reconstruction_results_', suffix='.ply')
-    #     output_filename = tf.NamedTemporaryFile(dir=tempdir, prefix='mesh_filter_results_', suffix='.ply')
 
 
     print(f"{Colors.GREEN}Archive directory: {archive_directory.name}")
@@ -409,10 +760,6 @@ def runscan():
                                                              'live':paramdb.live,
                                                              'tsdf_params':tsdf_params,
                                                              'rgbd_params':rgbd_params})
-            
-        # while start_response.vertices == 0:
-        #     print("Starting Reconstruction...")
-        #     time.sleep(1)
         time.sleep(5)
 
         ###STOP RECONSTRUCTION###
@@ -460,497 +807,62 @@ def runscan():
     finally:
         tempdir.cleanup()
         print(f"{Colors.RESET}Exiting...")
-        
 
+def zedMapping():
 
+    test = zed_map_client.sendRequest("SetBool", {"data": True})
 
-
-def capturedata():
-    monitor = recdb.start_monitoring_globalrevs()
-    g = monitor.wait_next(recdb)
-    monitor.close(recdb)
-    rec = g.get_ndarray_ref('/PXI1Slot2/ai1')
-    ch2data = np.mean(rec.data())
-    rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
-    ch1data = np.mean(rec.data())
-    transact = recdb.start_transaction()
-    rec1 = snde.create_ndarray_ref(recdb, avgrealchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    rec2 = snde.create_ndarray_ref(recdb, avgimagchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    g = transact.end_transaction()
-    rec1.rec.metadata = rec.rec.metadata
-    rec2.rec.metadata = rec.rec.metadata
-    rec1.rec.mark_metadata_done()
-    rec2.rec.mark_metadata_done()
-    rec1.allocate_storage(ch1data.shape, True)
-    rec2.allocate_storage(ch2data.shape, True)
-    rec1.assign_double(0, ch1data)
-    rec2.assign_double(0, ch2data)
-    rec1.rec.mark_data_ready()
-    rec2.rec.mark_data_ready()
-    g.wait_complete()
-
-def SimpleScan_PlotData(dx, dy, inix, iniy, n, m):
-    g = recdb.latest_globalrev()
-    recreal = g.get_ndarray_ref('/accum_real')
-    realdata = recreal.data().reshape([n,m])
-    recimag = g.get_ndarray_ref('/accum_imag')
-    imagdata = recimag.data().reshape([n,m])
-    print(f'{n},{m}')
-    transact = recdb.start_transaction()
-    rec1 = snde.create_ndarray_ref(recdb, scanrealchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    rec2 = snde.create_ndarray_ref(recdb, scanimagchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    g = transact.end_transaction()
-    metadata = snde.constructible_metadata()
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_scale', dx, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_offset', inix, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_units', 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_coord', 'X Position'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_scale', dy, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_offset', iniy, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_units', 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_coord', 'Y Position'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_units', 'V'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_coord', 'Voltage'))
-    rec1.rec.metadata = metadata
-    rec2.rec.metadata = metadata
-    rec1.rec.mark_metadata_done()
-    rec2.rec.mark_metadata_done()
-    rec1.allocate_storage(realdata.shape, True)
-    rec2.allocate_storage(imagdata.shape, True)
-    rec1.data()[:] = realdata
-    rec2.data()[:] = imagdata
-    rec1.rec.mark_data_ready()
-    rec2.rec.mark_data_ready()
-
-def Sliced2DScan_PlotData(dx, dy, inix, iniy, n, m, nslice):
-    g = recdb.latest_globalrev()
-    recreal = g.get_ndarray_ref('/accum_real')
-    realdata = recreal.data().reshape([n,m])
-    mapdata = np.array([j for k in range(nslice) for j in range(k, n , nslice)])
-    mapdata = [(x,y) for (x,y) in zip(mapdata, range(n))]
-    mapdata.sort()
-    mapdata = [i[1] for i in mapdata]
-    realdataout = realdata[:,mapdata]
-    recimag = g.get_ndarray_ref('/accum_imag')
-    imagdata = recimag.data().reshape([n,m])
-    imagdataout = imagdata[:,mapdata]
-    transact = recdb.start_transaction()
-    rec1 = snde.create_ndarray_ref(recdb, scanrealchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    rec2 = snde.create_ndarray_ref(recdb, scanimagchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    g = transact.end_transaction()
-    metadata = snde.constructible_metadata()
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_scale', dx, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_offset', inix, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_units', 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_coord', 'X Position'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_scale', dy, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_offset', iniy, 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_units', 'meters'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_coord', 'Y Position'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_units', 'V'))
-    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_coord', 'Voltage'))
-    rec1.rec.metadata = metadata
-    rec2.rec.metadata = metadata
-    rec1.rec.mark_metadata_done()
-    rec2.rec.mark_metadata_done()
-    rec1.allocate_storage(realdataout.shape, True)
-    rec2.allocate_storage(imagdataout.shape, True)
-    rec1.data()[:] = realdataout
-    rec2.data()[:] = imagdataout
-    rec1.rec.mark_data_ready()
-    rec2.rec.mark_data_ready()
-
-   
-
-def SimpleXYScan(t1, t2, n, m):
-
-    x = np.linspace(t1.transform.translation.x, t2.transform.translation.x, n)
-    y = np.linspace(t1.transform.translation.y, t2.transform.translation.y, m)
-
-    global accumulator_real, accumulator_imag
-    transact = recdb.start_transaction()
-    if accumulator_real is not None:
-        recdb.delete_math_function(accumulator_real)
-    if accumulator_imag is not None:
-        recdb.delete_math_function(accumulator_imag)
-
-    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_real") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator real definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_real ,False)
-    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_imag") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator imag definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_imag ,False)
-    transact.end_transaction()
-    
-    for i in range(n):
-        for j in range(m):
-            print("Moving to (x = %.6f, y = %.6f)" % (x[i], y[j]))
-            t2.transform.translation.x = x[i]
-            t2.transform.translation.y = y[j]
-            ros.Move(t2,0.1,0.1)           
-            capturedata()
-
-    SimpleScan_PlotData(x[1]-x[0], y[1]-y[0], x[0], y[0], n, m)
-    return (x[1]-x[0], y[1]-y[0], x[0], y[0], n, m)
-    
-        
-def Scan2DPlane(t1, t2, t3, m, n):
-	
-    p1 = np.array([t1.transform.translation.x, t1.transform.translation.y, t1.transform.translation.z])
-    p2 = np.array([t2.transform.translation.x, t2.transform.translation.y, t2.transform.translation.z])
-    p3 = np.array([t3.transform.translation.x, t3.transform.translation.y, t3.transform.translation.z])
-
-    global accumulator_real, accumulator_imag
-    transact = recdb.start_transaction()
-    if accumulator_real is not None:
-        recdb.delete_math_function(accumulator_real)
-    if accumulator_imag is not None:
-        recdb.delete_math_function(accumulator_imag)
-
-    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_real") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator real definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_real ,False)
-    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_imag") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator imag definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_imag ,False)
-    transact.end_transaction()
-
-
-    ux, uy, uz = u = p2-p1 
-    vx, vy, vz = v = p3-p1
-
-    w = np.array([uy*vz-uz*vy, uz*vx-ux*vz, ux*vy-uy*vx])
-    #Normalize the cross product to get the magnitude of 1 
-    w = w/np.linalg.norm(w) 
-    v = np.cross(w, u)
-    v = v/np.linalg.norm(v)
-    
-    d = -np.sum(v*p1)
-    #minumum distance 
-    r = np.abs(np.sum(v * p3) + d)/np.sqrt(np.sum(v*v))
-    
-    maguprime = np.linalg.norm(u) 
-    magvprime = r 
-    
-    uprime = np.linspace(0 , maguprime, m) 
-    vprime = np.linspace(0, magvprime, n)
-    u = u / maguprime 
-    uu, vv = np.meshgrid(uprime, vprime) 
-    uu = uu.T
-    vv = vv.T
-    
-
-    # Creating array of zeros 
-    ww = np.zeros(uu.shape) 
-    
-    rot = np.dstack([u, v, w])[0,:,:]
-    
-    uu, vv, ww = np.einsum( 'ji, mni -> jmn', rot, np.dstack([uu, vv, ww]))
-    uu += p1[0] 
-    vv += p1[1]
-    ww += p1[2]
-    
-    for j in range(n):
-        for i in range (m):
-            print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-            t3.transform.translation.x = uu[i,j]
-            t3.transform.translation.y = vv[i,j]
-            t3.transform.translation.z = ww[i,j]
-            ros.Move(t3,0.1,0.1)           
-            capturedata()
-
-    SimpleScan_PlotData(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n)
-    return (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n)
-
-
-def Scan2DPlaneSliced(t1, t2, t3, m, n, raster):
-
-
-    p1 = np.array([t1.transform.translation.x, t1.transform.translation.y, t1.transform.translation.z])
-    p2 = np.array([t2.transform.translation.x, t2.transform.translation.y, t2.transform.translation.z])
-    p3 = np.array([t3.transform.translation.x, t3.transform.translation.y, t3.transform.translation.z]) 
-  
-    ux, uy, uz = u = p2-p1
-    vx, vy, vz = v = p3-p1
-    w = np.array([uy*vz-uz*vy, uz*vx-ux*vz, ux*vy-uy*vx])
-    #Normalize the cross product to get the magnitude of 1 
-    w = w/np.linalg.norm(w)
-    v = np.cross(w, u)
-    v = v/np.linalg.norm(v)
-     
-    d = -np.sum(v*p1)
-    #minumum distance 
-    r = np.abs(np.sum(v * p3) + d)/np.sqrt(np.sum(v*v))
-    
-    maguprime = np.linalg.norm(u)
-    magvprime = r
-  
-    uprime = np.linspace(0 , maguprime, m)
-    vprime = np.linspace(0, magvprime, n)
-    u = u / maguprime
-    uu, vv = np.meshgrid(uprime, vprime)
-    uu = uu.T
-    vv = vv.T
-    
-    
-    # Creating array of zeros 
-    ww = np.zeros(uu.shape)
-
-    rot = np.dstack([u, v, w])[0,:,:]
-    
-    uu, vv, ww = np.einsum( 'ji, mni -> jmn', rot, np.dstack([uu, vv, ww]))
-    uu += p1[0]
-    vv += p1[1]
-    ww += p1[2]
-        
-    ustep = uprime[1]-uprime[0]
-    if ustep <= .0008:
-        nslice = int(np.ceil(.0008/ustep))
+    if not test.success:
+        return zed_map_client.sendRequest("SetBool", {"data": False})
     else:
-        nslice = 1
+        return test
 
+def keyScan(passes=1, x_pos=0.82,y_pos=-0.475,width=0.03,length=0.04,vel=0.04,acc=0.04):
 
-    tout = TransformStamped()
-    tout.transform.rotation.x = t3.transform.rotation.x
-    tout.transform.rotation.y = t3.transform.rotation.y
-    tout.transform.rotation.z = t3.transform.rotation.z
-    tout.transform.rotation.w = t3.transform.rotation.w
+    slice=9
+    pinSwitch(0)
+    ros.Move('over_cal_plate')
 
-    # Calculate mapping for math channel
-    mapdata = np.array([j for k in range(nslice) for j in range(k, m , nslice)])
-
-    # This isn't needed here -- it reverses the process
-    #mapdata = [(x,y) for (x,y) in zip(mapdata, range(m))]
-    #mapdata.sort()
-    #mapdata = [i[1] for i in mapdata]
-
-    accummap = [int(i) for i in (np.repeat(np.array(mapdata).reshape([m,1]), n, axis=1) + np.repeat(np.arange(n).reshape(1,n), m, axis=0)*m).T.flatten()]
-
-
-    # Reset Math Channels
-    global accumulator_real, accumulator_imag, ndaccumulator_real, ndaccumulator_imag
-    transact = recdb.start_transaction()
-    if accumulator_real is not None:
-        recdb.delete_math_function(accumulator_real)
-    if accumulator_imag is not None:
-        recdb.delete_math_function(accumulator_imag)
-    if ndaccumulator_real is not None:
-        recdb.delete_math_function(ndaccumulator_real)
-    if ndaccumulator_imag is not None:
-        recdb.delete_math_function(ndaccumulator_imag)
-
-    chanmetadata = snde.constructible_metadata()
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_coord","X Axis"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_units","mm"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_offset",uu[0,0], "mm"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_scale",uprime[1] - uprime[0], "mm"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_coord","Y Axis"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_units","mm"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_offset",vv[0,0], "mm"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_scale", vprime[1] - vprime[0], "mm"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_coord","Amplitude"))
-    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_units","Volts"))
-    
-    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_real") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator real definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_real ,False)
-    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
-                                                          snde.math_parameter_unsigned_const(n*m),
-                                                          snde.math_parameter_int_const(-1),
-                                                          snde.math_parameter_bool_const(False),
-                                                          snde.math_parameter_bool_const(False)],
-                                                        [ snde.shared_string("/accum_imag") ],
-                                                        "/",
-                                                        False,
-                                                        False,
-                                                        False,
-                                                        snde.math_definition("accumulator imag definition"),
-                                                        None)
-    recdb.add_math_function(accumulator_imag ,False)
-
-    ndaccumulator_real = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
-                                                               snde.math_parameter_indexvec_const([n,m]),
-                                                               snde.math_parameter_indexvec_const(accummap),
-                                                               snde.math_parameter_sndeindex_const(int(m*n)),
-                                                               snde.math_parameter_bool_const(False),
-                                                               snde.math_parameter_bool_const(False),
-                                                               snde.math_parameter_bool_const(False),
-                                                               snde.math_parameter_metadata_const(chanmetadata)],
-                                                             [ snde.shared_string("/ndaccum_real") ],
-                                                             "/",
-                                                             False,
-                                                             False,
-                                                             False,
-                                                             snde.math_definition("nd accumulator real definition"),
-                                                             None)
-    recdb.add_math_function(ndaccumulator_real ,False)
-    ndaccumulator_imag = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
-                                                               snde.math_parameter_indexvec_const([n,m]),
-                                                               snde.math_parameter_indexvec_const(accummap),
-                                                               snde.math_parameter_sndeindex_const(int(m*n)),
-                                                               snde.math_parameter_bool_const(False),
-                                                               snde.math_parameter_bool_const(False),
-                                                               snde.math_parameter_bool_const(False),
-                                                               snde.math_parameter_metadata_const(chanmetadata)],
-                                                             [ snde.shared_string("/ndaccum_imag") ],
-                                                             "/",
-                                                             False,
-                                                             False,
-                                                             False,
-                                                             snde.math_definition("ndaccumulator imag definition"),
-                                                             None)
-    recdb.add_math_function(ndaccumulator_imag ,False)
-
-
-    transact.end_transaction()
-
-    
-    try:
-        # We don't need ros.t while scanning -- disable for performance
-        ros.WaitPauseAcquisition() 
-
-        rate = ros.create_rate(4)
-        
-        with IncrementalBar("Scanning...", max=m*n, suffix='%(index)d/%(max)d [Elapsed: %(elapsed_td)s -- Remaining: %(eta_td)s -- Avg: %(avg).2f s]') as bar:
-            for j in range(n):
-                for k in range(nslice):
-                    if raster:
-                        if j % 2 == 0:
-                            for i in range (k, m, nslice):
-                                #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-                                tout.transform.translation.x = uu[i,j]
-                                tout.transform.translation.y = vv[i,j]
-                                tout.transform.translation.z = ww[i,j]
-                                res = ros.Move(tout,0.1,0.1)
-                                if res.result.success != True:
-                                    raise Exception("Move Failed")
-                                capturedata()
-                                bar.next()
-                                rate.sleep()
-                                #if bar.avg > 0.4:
-                                #    time.sleep(5)
-                                #    bar._xput = deque(maxlen=bar.sma_window)
-                                #    bar.avg = 0.0
-                                #    bar._avg_update_ts = time.time()
-                                #    bar._ts = time.time()
-                        else:
-                            for i in range (m-k-1, -1, -nslice):
-                                #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-                                tout.transform.translation.x = uu[i,j]
-                                tout.transform.translation.y = vv[i,j]
-                                tout.transform.translation.z = ww[i,j]
-                                res = ros.Move(tout,0.1,0.1)
-                                if res.result.success != True:
-                                    raise Exception("Move Failed")
-                                capturedata()
-                                bar.next()
-                                rate.sleep()
-                                #if bar.avg > 0.4:
-                                #    time.sleep(5)
-                                #    bar._xput = deque(maxlen=bar.sma_window)
-                                #    bar.avg = 0.0
-                                #    bar._avg_update_ts = time.time()
-                                #    bar._ts = time.time()
-                    else:
-                        for i in range (k, m, nslice):
-                            #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
-                            tout.transform.translation.x = uu[i,j]
-                            tout.transform.translation.y = vv[i,j]
-                            tout.transform.translation.z = ww[i,j]
-                            res = ros.Move(tout,0.1,0.1)
-                            if res.result.success != True:
-                                raise Exception("Move Failed")
-                            capturedata()
-                            bar.next()
-                            rate.sleep()
-                            #if bar.avg > 0.4:
-                            #    time.sleep(5)
-                            #    bar._xput = deque(maxlen=bar.sma_window)
-                            #    bar.avg = 0.0
-                            #    bar._avg_update_ts = time.time()
-                            #    bar._ts = time.time()
-                        
-
-    finally:
-        # Restarting ros.t
-        ros.WaitUnPauseAcquisition()
-    
-    Sliced2DScan_PlotData(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
-    args = (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
-    return args
-
-def keyScan(full_dome=False, vel=0.05,acc=0.05,slice=9,angle=12,length=0.35,width=0.15,x_pos=0.69, y_pos=-0.09, z_pos=0.946, x_offset=1, output_filepath='/home/labuser/iron_tari/', output_filename='pc.ply'):
-
-    ros.Move('over_curved_geometry',0.1,0.1)
-    slice = 9
-    pa = ros.reconPoseArray(full_dome, slice,angle,length,width,x_pos, y_pos, z_pos, x_offset)
-    pals = list(pa.poses)
+    pals=ros.reconPoseArray(full_dome=True,x=4,y=1,angle=0,x_pos=x_pos,y_pos=y_pos,width=width,length=length).poses
     for i in range(slice):
         if i % 2 == 1:
             pals[i*slice:i*slice+slice] = list(reversed(pals[i*slice:i*slice+slice]))
             ros.get_logger().info(f"Reversing slice [{i*slice}:{i*slice+slice}]")
 
-    ros.Move(pals[0],0.1,0.1)
-    keyence_start.sendRequest('StartKeyRec', {'distance': 0.0005})
-    move1_response = ros.Move(pals[1:],vel,acc)
-    while not move1_response.result.success :
-        ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
-    if move1_response.result.success : move2_response = ros.Move(list(reversed(pals[:-1])),vel,acc)
-    while not move2_response.result.success :
-        ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
-    if move2_response.result.success : stop_response = keyence_stop.sendRequest('StopKeyRec', {'output_filepath': output_filepath, 'output_filename': output_filename})
-    if stop_response.success : ros.Move('over_curved_geometry',0.1,0.1)
+    move0 = ros.Move(pals[0])
 
+    while not move0.result.success :
+        ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
+    
+    keyenceStart()
+
+    try:
+
+        if passes:
+
+
+                for i in range(passes):
+                    move1 = ros.Move(pals[1:],vel,acc)
+
+                    while not move1.result.success :
+                        ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
+                    if move1.result.success : move2 = ros.Move(list(reversed(pals[:-1])),vel,acc)
+                    while not move2.result.success :
+                        ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
+                    keyenceStop()
+
+
+        else:
+
+                move1 = ros.Move(pals[1:],vel,acc)
+                while not move1.result.success :
+                    ros.get_logger().info("Waiting for move to finish...", throttle_duration_sec=2.0)
+                keyenceStop()
+
+    finally:
+
+        ros.Move('over_cal_plate')
+        pinSwitch(0)
 
 def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
 
@@ -1020,32 +932,360 @@ def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
     args = "Happy Birthday" #(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
     return args
 
+def capturedata():
+    monitor = ros.recdb.start_monitoring_globalrevs()
+    g = monitor.wait_next(ros.recdb)
+    monitor.close(ros.recdb)
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai1')
+    ch2data = np.mean(rec.data())
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
+    ch1data = np.mean(rec.data())
+    transact = ros.recdb.start_transaction()
+    rec1 = snde.create_ndarray_ref(ros.recdb, avgrealchan, ros.recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    rec2 = snde.create_ndarray_ref(ros.recdb, avgimagchan, ros.recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    g = transact.end_transaction()
+    rec1.rec.metadata = rec.rec.metadata
+    rec2.rec.metadata = rec.rec.metadata
+    rec1.rec.mark_metadata_done()
+    rec2.rec.mark_metadata_done()
+    rec1.allocate_storage(ch1data.shape, True)
+    rec2.allocate_storage(ch2data.shape, True)
+    rec1.assign_double(0, ch1data)
+    rec2.assign_double(0, ch2data)
+    rec1.rec.mark_data_ready()
+    rec2.rec.mark_data_ready()
+    g.wait_complete()
 
-def runscansets(scanlist, waypoints):
-    for i, step in enumerate(scanlist):
-        Scan2DPlane(*step)
-        for waypoint in waypoints[i]:
-            ros.Move(waypoint,0.1,0.1)
+def Sliced2DScan_PlotData(dx, dy, inix, iniy, n, m, nslice):
+    g = recdb.latest_globalrev()
+    recreal = g.get_ndarray_ref('/accum_real')
+    realdata = recreal.data().reshape([n,m])
+    mapdata = np.array([j for k in range(nslice) for j in range(k, n , nslice)])
+    mapdata = [(x,y) for (x,y) in zip(mapdata, range(n))]
+    mapdata.sort()
+    mapdata = [i[1] for i in mapdata]
+    realdataout = realdata[:,mapdata]
+    recimag = g.get_ndarray_ref('/accum_imag')
+    imagdata = recimag.data().reshape([n,m])
+    imagdataout = imagdata[:,mapdata]
+    transact = recdb.start_transaction()
+    rec1 = snde.create_ndarray_ref(recdb, scanrealchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    rec2 = snde.create_ndarray_ref(recdb, scanimagchan, recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    g = transact.end_transaction()
+    metadata = snde.constructible_metadata()
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_scale', dx, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_offset', inix, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_units', 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis0_coord', 'X Position'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_scale', dy, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_offset', iniy, 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_units', 'meters'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-axis1_coord', 'Y Position'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_units', 'V'))
+    metadata.AddMetaDatum(snde.metadatum('ande_array-ampl_coord', 'Voltage'))
+    rec1.rec.metadata = metadata
+    rec2.rec.metadata = metadata
+    rec1.rec.mark_metadata_done()
+    rec2.rec.mark_metadata_done()
+    rec1.allocate_storage(realdataout.shape, True)
+    rec2.allocate_storage(imagdataout.shape, True)
+    rec1.data()[:] = realdataout
+    rec2.data()[:] = imagdataout
+    rec1.rec.mark_data_ready()
+    rec2.rec.mark_data_ready()
 
-def runscansets2(scanlist, waypoints, loop):
-    e=1
-    if loop:
-        print('You chose to loop!')
+def Scan2DPlaneSliced(t1, t2, t3, m, n, raster):
+
+    p1 = np.array([t1.transform.translation.x, t1.transform.translation.y, t1.transform.translation.z])
+    p2 = np.array([t2.transform.translation.x, t2.transform.translation.y, t2.transform.translation.z])
+    p3 = np.array([t3.transform.translation.x, t3.transform.translation.y, t3.transform.translation.z])
+
+    ux, uy, uz = u = p2-p1
+    vx, vy, vz = v = p3-p1
+    w = np.array([uy*vz-uz*vy, uz*vx-ux*vz, ux*vy-uy*vx])
+    #Normalize the cross product to get the magnitude of 1
+    w = w/np.linalg.norm(w)
+    v = np.cross(w, u)
+    v = v/np.linalg.norm(v)
+
+    d = -np.sum(v*p1)
+    #minumum distance
+    r = np.abs(np.sum(v * p3) + d)/np.sqrt(np.sum(v*v))
+
+    maguprime = np.linalg.norm(u)
+    magvprime = r
+
+    uprime = np.linspace(0 , maguprime, m)
+    vprime = np.linspace(0, magvprime, n)
+    u = u / maguprime
+    uu, vv = np.meshgrid(uprime, vprime)
+    uu = uu.T
+    vv = vv.T
+
+
+    # Creating array of zeros
+    ww = np.zeros(uu.shape)
+
+    rot = np.dstack([u, v, w])[0,:,:]
+
+    uu, vv, ww = np.einsum( 'ji, mni -> jmn', rot, np.dstack([uu, vv, ww]))
+    uu += p1[0]
+    vv += p1[1]
+    ww += p1[2]
+
+    ustep = uprime[1]-uprime[0]
+    if ustep <= .0008:
+        nslice = int(np.ceil(.0008/ustep))
     else:
-        print('No loop :(')
-    while True:
-        for i, step in enumerate(scanlist):
-            Scan2DPlaneSliced(*step)
-            for waypoint in waypoints[i]:
-                ros.Move(waypoint,0.1,0.1)
-        if not loop:
-            print('breaking..')
-            break
-#        elif keyboard.is_pressed('q'):
-#            break
-        else:
-            print(f'Routine ran {e} time(s)')
-            e+=1
-            i=0
+        nslice = 1
 
 
+    tout = TransformStamped()
+    tout.transform.rotation.x = t3.transform.rotation.x
+    tout.transform.rotation.y = t3.transform.rotation.y
+    tout.transform.rotation.z = t3.transform.rotation.z
+    tout.transform.rotation.w = t3.transform.rotation.w
+    # Calculate mapping for math channel
+    mapdata = np.array([j for k in range(nslice) for j in range(k, m , nslice)])
+
+    # This isn't needed here -- it reverses the process
+    #mapdata = [(x,y) for (x,y) in zip(mapdata, range(m))]
+    #mapdata.sort()
+    #mapdata = [i[1] for i in mapdata]
+
+    accummap = [int(i) for i in (np.repeat(np.array(mapdata).reshape([m,1]), n, axis=1) + np.repeat(np.arange(n).reshape(1,n), m, axis=0)*m).T.flatten()]
+
+
+    # Reset Math Channels
+    global accumulator_real, accumulator_imag, ndaccumulator_real, ndaccumulator_imag
+    transact = recdb.start_transaction()
+    if accumulator_real is not None:
+        recdb.delete_math_function(accumulator_real)
+    if accumulator_imag is not None:
+        recdb.delete_math_function(accumulator_imag)
+    if ndaccumulator_real is not None:
+        recdb.delete_math_function(ndaccumulator_real)
+    if ndaccumulator_imag is not None:
+        recdb.delete_math_function(ndaccumulator_imag)
+
+    chanmetadata = snde.constructible_metadata()
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_coord","X Axis"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_units","mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_offset",uu[0,0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_scale",uprime[1] - uprime[0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_coord","Y Axis"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_units","mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_offset",vv[0,0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_scale", vprime[1] - vprime[0], "mm"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_coord","Amplitude"))
+    chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_units","Volts"))
+
+    accumulator_real = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
+                                                          snde.math_parameter_unsigned_const(n*m),
+                                                          snde.math_parameter_int_const(-1),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False)],
+                                                        [ snde.shared_string("/accum_real") ],
+                                                        "/",
+                                                        False,
+                                                        False,
+                                                        False,
+                                                        snde.math_definition("accumulator real definition"),
+                                                        None)
+    recdb.add_math_function(accumulator_real ,False)
+    accumulator_imag = snde.accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
+                                                          snde.math_parameter_unsigned_const(n*m),
+                                                          snde.math_parameter_int_const(-1),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False)],
+                                                        [ snde.shared_string("/accum_imag") ],
+                                                        "/",
+                                                        False,
+                                                        False,
+                                                        False,
+                                                        snde.math_definition("accumulator imag definition"),
+                                                        None)
+    recdb.add_math_function(accumulator_imag ,False)
+
+    ndaccumulator_real = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgreal"),
+                                                               snde.math_parameter_indexvec_const([n,m]),
+                                                               snde.math_parameter_indexvec_const(accummap),
+                                                               snde.math_parameter_sndeindex_const(int(m*n)),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_metadata_const(chanmetadata)],
+                                                             [ snde.shared_string("/ndaccum_real") ],
+                                                             "/",
+                                                             False,
+                                                             False,
+                                                             False,
+                                                             snde.math_definition("nd accumulator real definition"),
+                                                             None)
+    recdb.add_math_function(ndaccumulator_real ,False)
+    ndaccumulator_imag = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/avgimag"),
+                                                               snde.math_parameter_indexvec_const([n,m]),
+                                                               snde.math_parameter_indexvec_const(accummap),
+                                                               snde.math_parameter_sndeindex_const(int(m*n)),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_bool_const(False),
+                                                               snde.math_parameter_metadata_const(chanmetadata)],
+                                                             [ snde.shared_string("/ndaccum_imag") ],
+                                                             "/",
+                                                             False,
+                                                             False,
+                                                             False,
+                                                             snde.math_definition("ndaccumulator imag definition"),
+                                                             None)
+    recdb.add_math_function(ndaccumulator_imag ,False)
+
+    transact.end_transaction()
+
+
+    try:
+        # We don't need ros.t while scanning -- disable for performance
+        ros.WaitPauseAcquisition()
+
+        rate = ros.create_rate(4)
+
+        print(f"{Colors.MAGENTA}nslice = {nslice}{Colors.RESET}")
+
+        # with IncrementalBar("Scanning...", max=m*n, suffix='%(index)d/%(max)d [Elapsed: %(elapsed_td)s -- Remaining: %(eta_td)s -- Avg: %(avg).2f s]') as bar:
+        for j in range(n):
+            for k in range(nslice):
+                if raster:
+                    if j % 2 == 0:
+                        if k % 2 == 0:
+                            for i in range (k, m, nslice):
+                                #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
+                                tout.transform.translation.x = uu[i,j]
+                                tout.transform.translation.y = vv[i,j]
+                                tout.transform.translation.z = ww[i,j]
+                                print(f"i,j: [{i},{j}]")
+                                res = ros.Move(tout)
+                                if res.result.success != True:
+                                    raise Exception("Move Failed")
+                                capturedata()
+                                #bar.next()
+                                rate.sleep()
+                                #if bar.avg > 0.4:
+                                #    time.sleep(5)
+                                #    bar._xput = deque(maxlen=bar.sma_window)
+                                #    bar.avg = 0.0
+                                #    bar._avg_update_ts = time.time()
+                                #    bar._ts = time.time()
+                        else:
+                            for i in range (m-1, -1, -nslice):
+                                #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
+                                tout.transform.translation.x = uu[i,j]
+                                tout.transform.translation.y = vv[i,j]
+                                tout.transform.translation.z = ww[i,j]
+                                print(f"i,j: [{i},{j}]")
+                                res = ros.Move(tout)
+                                if res.result.success != True:
+                                    raise Exception("Move Failed")
+                                capturedata()
+                                #bar.next()
+                                rate.sleep()
+                                #if bar.avg > 0.4:
+                                #    time.sleep(5)
+                                #    bar._xput = deque(maxlen=bar.sma_window)
+                                #    bar.avg = 0.0
+                                #    bar._avg_update_ts = time.time()
+                                #    bar._ts = time.time()
+                    else:
+                        if k % 2 == 0:
+                            for i in range (k, m, nslice):
+                                #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
+                                tout.transform.translation.x = uu[i,j]
+                                tout.transform.translation.y = vv[i,j]
+                                tout.transform.translation.z = ww[i,j]
+                                print(f"i,j: [{i},{j}]")
+                                res = ros.Move(tout)
+                                if res.result.success != True:
+                                    raise Exception("Move Failed")
+                                capturedata()
+                                #bar.next()
+                                rate.sleep()
+                                #if bar.avg > 0.4:
+                                #    time.sleep(5)
+                                #    bar._xput = deque(maxlen=bar.sma_window)
+                                #    bar.avg = 0.0
+                                #    bar._avg_update_ts = time.time()
+                                #    bar._ts = time.time()
+                        else:
+                            for i in range (m-1, -1, -nslice):
+                                #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
+                                tout.transform.translation.x = uu[i,j]
+                                tout.transform.translation.y = vv[i,j]
+                                tout.transform.translation.z = ww[i,j]
+                                print(f"i,j: [{i},{j}]")
+                                res = ros.Move(tout)
+                                if res.result.success != True:
+                                    raise Exception("Move Failed")
+                                capturedata()
+                                #bar.next()
+                                rate.sleep()
+                                #if bar.avg > 0.4:
+                                #    time.sleep(5)
+                                #    bar._xput = deque(maxlen=bar.sma_window)
+                                #    bar.avg = 0.0
+                                #    bar._avg_update_ts = time.time()
+                                #    bar._ts = time.time()
+                else:
+                    for i in range (k, m, nslice):
+                        #print("Moving to (x = %.6f, y = %.6f, z = %.6f)" % (uu[i,j], vv[i, j], ww[i,j]))
+                        tout.transform.translation.x = uu[i,j]
+                        tout.transform.translation.y = vv[i,j]
+                        tout.transform.translation.z = ww[i,j]
+                        print(f"i,j: [{i},{j}]")
+                        res = ros.Move(tout)
+                        if res.result.success != True:
+                            raise Exception("Move Failed")
+                        capturedata()
+                        #bar.next()
+                        rate.sleep()
+                        #if bar.avg > 0.4:
+                        #    time.sleep(5)
+                        #    bar._xput = deque(maxlen=bar.sma_window)
+                        #    bar.avg = 0.0
+                        #    bar._avg_update_ts = time.time()
+                        #    bar._ts = time.time()
+
+
+    finally:
+        # Restarting ros.t
+        ros.WaitUnPauseAcquisition()
+
+    Sliced2DScan_PlotData(uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
+    args = (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
+    return args
+
+def capture3Ddata():
+    print(f"{Colors.MAGENTA}Capturing Data")
+    monitor = ros.recdb.start_monitoring_globalrevs()
+    g = monitor.wait_next(ros.recdb)
+    monitor.close(ros.recdb)
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai1')
+    ch2data = np.mean(rec.data())
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
+    ch1data = np.mean(rec.data())
+    complexdata = ch1data + 1j*ch2data
+    print(f"Complex data = {complexdata}{Colors.RESET}")
+    # transact = ros.recdb.start_transaction()
+    # rec1 = snde.create_ndarray_ref(ros.recdb, avgrealchan, ros.recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    # rec2 = snde.create_ndarray_ref(ros.recdb, avgimagchan, ros.recdb.raw(), snde.SNDE_RTN_FLOAT64)
+    # g = transact.end_transaction()
+    # rec1.rec.metadata = rec.rec.metadata
+    # rec2.rec.metadata = rec.rec.metadata
+    # rec1.rec.mark_metadata_done()
+    # rec2.rec.mark_metadata_done()
+    # rec1.allocate_storage(ch1data.shape, True)
+    # rec2.allocate_storage(ch2data.shape, True)
+    # rec1.assign_double(0, ch1data)
+    # rec2.assign_double(0, ch2data)
+    # rec1.rec.mark_data_ready()
+    # rec2.rec.mark_data_ready()
+    # g.wait_complete()
+    return complexdata
