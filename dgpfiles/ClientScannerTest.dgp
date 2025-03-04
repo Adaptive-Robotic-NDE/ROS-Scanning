@@ -1,26 +1,28 @@
 from dataguzzler_python import dgpy
-import dgpython_param_manager as param
 from dataguzzler_python import context
 import dgpython_nidaqmx as daqmx
 import spatialnde2 as snde
 import sys
-import math
 import time
 import transforms3d
 import bpy
+import statistics
+import math
 
 import numpy as np
 
 import rclpy
-from geometry_msgs.msg import Vector3
 from launch_ros.substitutions import FindPackageShare
 from industrial_reconstruction_msgs.msg import NormalFilterParams, RGBDImageParams, TSDFVolumeParams
 from launch.substitutions import PathJoinSubstitution
 from ur_msgs.srv import SetIO
 import tempfile as tf
 from progress.bar import IncrementalBar
-from geometry_msgs.msg import Point, Pose, TransformStamped, Quaternion
+from geometry_msgs.msg import PointStamped, Pose, PoseArray, TransformStamped, Quaternion, Vector3
 import time
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from tf2_geometry_msgs import do_transform_point
 from collections import deque
 import dgpython_rosmotion as rosm
 from dgpython_uniwest import UniWest, ureg, Q_
@@ -28,7 +30,7 @@ from dgpython_uniwest import UniWest, ureg, Q_
 #It takes 5 seconds if all 600 some params are refreshed on startup.
 
 # tic = time.time_ns()*ureg('ns')
-# uni =  UniWest('UniWest')
+# uni =  UniWest('UniWest',comPort=33,baudRate=9600)
 # toc = time.time_ns()*ureg('ns')
 # print((toc-tic).to('s'))
 # 
@@ -50,301 +52,6 @@ include(dgpy,"pint.dpi")
 include(snde,"recdb.dpi",enable_opencl=True)
 include(snde,"recdb_gui.dpi")
 
-include(param, "paramdb.dpi")
-
-rclpy.init()
-# counter = 0
-positioner_channel = []
-
-global ros
-ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh='/home/labuser/ecProbe.x3d') #'/home/labuser/tari_ws/Probe_uv.x3d')
-
-include(rosm, "services.dpi")
-
-daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
-
-daq.SampleRate = 10*ur.kHz
-daq.SampsPerChan = 100
-
-raster = False
-orient_dtype = [('offset', '<f4', (4,)), ('quat', '<f4', (4,))]
-
-transact = recdb.start_transaction()
-avgrealchan = recdb.define_channel('/avgreal', "main", recdb.raw())
-avgimagchan = recdb.define_channel('/avgimag', "main", recdb.raw())
-scanrealchan = recdb.define_channel('/scanreal', "main", recdb.raw())
-scanimagchan = recdb.define_channel('/scanimag', "main", recdb.raw())
-transact.end_transaction()
-
-global accumulator_real, accumulator_imag, ndaccumulator_real, ndaccumulator_imag
-accumulator_real = None
-accumulator_imag = None
-ndaccumulator_real = None
-ndaccumulator_imag = None
-window_size = [800,1200]
-
-paramdb.ShowViewer(window_size)
-
-tempdir = tf.TemporaryDirectory(dir='/tmp/', prefix='industrial_reconstruction_meshes_')
-archive_directory = tf.TemporaryDirectory(dir=tempdir.name, prefix='archive_directory')
-mesh_filepath = tf.NamedTemporaryFile(dir=tempdir.name, prefix='reconstruction_results_', suffix='.ply')
-output_filename = tf.NamedTemporaryFile(dir=tempdir.name, prefix='mesh_filter_results_', suffix='.ply')
-
-    ###START RECONSTRUCTION###
-
-paramdb.AddParam(Parameter,
-                "tracking_frame",
-                friendlyname="Tracking Frame",
-                doc="Optical camera frame for both depth and rgb",
-                group="Start Industrial Reconstruction",
-                value="d415_color_optical_frame")
-paramdb.AddParam(Parameter,
-                "relative_frame",
-                friendlyname="Relative Frame",
-                doc="Same relative frame as RViz",
-                group="Start Industrial Reconstruction",
-                value="world")
-paramdb.AddParam(NumericUnitsParameter,
-                "translation_distance",
-                friendlyname="Translation Distance",
-                doc="",
-                group="Start Industrial Reconstruction",
-                units="",
-                value=0.0)
-paramdb.AddParam(NumericUnitsParameter,
-                "rotational_distance",
-                friendlyname="Rotational Distance",
-                doc="",
-                group="Start Industrial Reconstruction",
-                units="",
-                value=0.0)
-paramdb.AddParam(Parameter,
-                "live",
-                friendlyname="Live",
-                doc="",
-                group="Start Industrial Reconstruction",
-                value=True)
-paramdb.AddParam(Parameter,
-                "convert_rgb_to_intensity",
-                friendlyname="Convert RGB to Intensity",
-                doc="",
-                group="Start Industrial Reconstruction",
-                value=False)
-paramdb.AddParam(NumericUnitsParameter,
-                "voxel_length",
-                friendlyname="Voxel Length",
-                doc="",
-                group="Start Industrial Reconstruction",
-                units="m",
-                value=0.001)
-paramdb.AddParam(NumericUnitsParameter,
-                "sdf_trunc",
-                friendlyname="SDF Trunc",
-                doc="",
-                group="Start Industrial Reconstruction",
-                units="",
-                value=0.04)
-paramdb.AddParam(NumericUnitsParameter,
-                "depth_scale",
-                friendlyname="Depth Scale",
-                doc="",
-                group="Start Industrial Reconstruction",
-                units="",
-                value=1000.0)
-paramdb.AddParam(NumericUnitsParameter,
-                "depth_trunc",
-                friendlyname="Depth Scale",
-                doc="",
-                group="Start Industrial Reconstruction",
-                units="",
-                value=0.75)
-
-    ###STOP RECONSTRUCTION###
-
-paramdb.AddParam(NumericUnitsParameter,
-                "min_num_faces",
-                friendlyname="Minimum Number of Faces",
-                doc="",
-                group="Stop Industrial Reconstruction",
-                units="",
-                value=1000)
-paramdb.AddParam(NumericUnitsParameter,
-                "angle",
-                friendlyname="Normal Angle",
-                doc="",
-                group="Stop Industrial Reconstruction",
-                units="deg",
-                value=90.0)
-
-    ###MESH FILTER###
-
-paramdb.AddParam(NumericUnitsParameter,
-                "threshold",
-                friendlyname="Threshold",
-                doc="Color Value Threshold",
-                group="Mesh Color Filter",
-                units="",
-                value=0.15)
-
-paramdb.AddParam(NumericUnitsParameter,
-                "color",
-                friendlyname="Color",
-                doc="Color Value in RGB",
-                group="Mesh Color Filter",
-                units="",
-                value=(0.0, 0.55, 0.44))
-
-    ###NOETHER TPP###
-
-paramdb.AddParam(Parameter,
-                "input_file",
-                friendlyname="Input File",
-                doc="Input mesh filepath for Nother Tool Path Planning",
-                group="Nother Tool Path Planning",
-                value="/home/labuser/iron_tari/triangulated_cloud.ply")
-paramdb.AddParam(NumericUnitsParameter,
-                "line_spacing",
-                friendlyname="Line Spacing",
-                doc="Spacing between line of poses",
-                group="Nother Tool Path Planning",
-                units="m",
-                value=0.01)
-paramdb.AddParam(NumericUnitsParameter,
-                "point_spacing",
-                friendlyname="Point Spacing",
-                doc="Spacing between points in line",
-                group="Nother Tool Path Planning",
-                units="m",
-                value=0.01)
-paramdb.AddParam(NumericUnitsParameter,
-                "z_offset",
-                friendlyname="Z Offset",
-                doc="",
-                group="Nother Tool Path Planning",
-                units="m",
-                value=0.006)
-paramdb.AddParam(NumericUnitsParameter,
-                "distance_threshold",
-                friendlyname="Distance Threshold",
-                doc="",
-                group="Nother Tool Path Planning",
-                units="m",
-                value=0.1)
-paramdb.AddParam(NumericUnitsParameter,
-                "max_planes",
-                friendlyname="Max Planes",
-                doc="",
-                group="Nother Tool Path Planning",
-                units="m",
-                value=1)
-
-    ###Keyence Start###
-
-paramdb.AddParam(NumericUnitsParameter,
-                 "distance",
-                 friendlyname="Distance",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Start",
-                 units="mm",
-                 value=0.0005)  
-
-    ###Keyence Stop###
-    
-paramdb.AddParam(NumericUnitsParameter,
-                 "mean_k",
-                 friendlyname="Mean K",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="",
-                 value=20)    
-paramdb.AddParam(NumericUnitsParameter,
-                 "dev_thresh",
-                 friendlyname="Dev Threshold",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="",
-                 value=1.0)  
-paramdb.AddParam(NumericUnitsParameter,
-                 "leaf_size",
-                 friendlyname="Leaf Size",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=0.003)  
-paramdb.AddParam(NumericUnitsParameter,
-                 "search_radius",
-                 friendlyname="Search Radius",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=0.5)  
-paramdb.AddParam(NumericUnitsParameter,
-                 "set_mu",
-                 friendlyname="Set Mu",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=2.5)    
-paramdb.AddParam(NumericUnitsParameter,
-                 "max_nearest",
-                 friendlyname="Maximum Nearest Neighbors",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=100)
-paramdb.AddParam(NumericUnitsParameter,
-                 "max_surface_angle",
-                 friendlyname="Maximum Nearest Neighbors",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=math.pi/4)
-paramdb.AddParam(NumericUnitsParameter,
-                 "min_angle",
-                 friendlyname="Maximum Nearest Neighbors",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=math.pi/18)
-paramdb.AddParam(NumericUnitsParameter,
-                 "max_angle",
-                 friendlyname="Maximum Nearest Neighbors",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=2*math.pi/3)
-paramdb.AddParam(NumericUnitsParameter,
-                 "k_search",
-                 friendlyname="K Search",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="mm",
-                 value=20)
-paramdb.AddParam(NumericUnitsParameter,
-                 "radius_search",
-                 friendlyname="Radius Search",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 units="m",
-                 value=0.003)
-paramdb.AddParam(Parameter,
-                 "normal_consistency",
-                 friendlyname="Maximum Nearest Neighbors",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 value=True)    
-paramdb.AddParam(Parameter,
-                 "output_filepath",
-                 friendlyname="Output Filepath",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 value="/home/labuser/iron_tari/")    
-paramdb.AddParam(Parameter,
-                 "output_filename",
-                 friendlyname="Output Name",
-                 doc="",
-                 group="Keyence Mesh Reconstruction Stop",
-                 value="pc.ply")
 class Colors:
     RESET = "\033[0m"
     COLOR_26 = "\033[26m"
@@ -359,6 +66,53 @@ class Colors:
     MAGENTA = "\033[35m"
     CYAN = "\033[36m"
     WHITE = "\033[37m"
+
+class Azure:
+    cx=1026.55
+    cy=773.586
+    fx=973.347
+    fy=973.203
+
+rclpy.init()
+counter = 0
+positioner_channel = []
+
+global ros
+global n
+ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh='/home/labuser/ecProbe.x3d') #'/home/labuser/tari_ws/Probe_uv.x3d')
+
+include(rosm, "services.dpi")
+include(rosm, "parameters.dpi")
+
+daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
+
+daq.SampleRate = 10*ur.kHz
+daq.SampsPerChan = 100
+
+raster = False
+orient_dtype = [('offset', '<f4', (4,)), ('quat', '<f4', (4,))]
+
+transact = recdb.start_transaction()
+avgrealchan = recdb.define_channel('/avgreal', "main", recdb.raw())
+avgimagchan = recdb.define_channel('/avgimag', "main", recdb.raw())
+scanrealchan = recdb.define_channel('/scanreal', "main", recdb.raw())
+scanimagchan = recdb.define_channel('/scanimag', "main", recdb.raw())
+specimen_model_tree_copy = recdb.define_channel('/graphics/specimen_copy/', "main", recdb.raw())
+specimen_pose_channel_copy = recdb.define_channel('/specimen_pose_copy', "main", recdb.raw())
+probe_pose_channel_copy = recdb.define_channel('/probe_pose_copy', "main", recdb.raw())
+probe_tip_data_channel_copy = recdb.define_channel('/specimen_data_copy', "main", recdb.raw())
+transact.end_transaction()
+
+global accumulator_real, accumulator_imag, ndaccumulator_real, ndaccumulator_imag
+accumulator_real = None
+accumulator_imag = None
+ndaccumulator_real = None
+ndaccumulator_imag = None
+
+tempdir = tf.TemporaryDirectory(dir='/tmp/', prefix='industrial_reconstruction_meshes_')
+archive_directory = tf.TemporaryDirectory(dir=tempdir.name, prefix='archive_directory')
+mesh_filepath = tf.NamedTemporaryFile(dir=tempdir.name, prefix='reconstruction_results_', suffix='.ply')
+output_filename = tf.NamedTemporaryFile(dir=tempdir.name, prefix='mesh_filter_results_', suffix='.ply')
 
 def demo():
     try:
@@ -392,10 +146,269 @@ def demo():
         tempdir.cleanup()
         print(f"{Colors.RESET}Exiting...")
 
-def startReconstruction():
+def center(detection=0):
 
-    min_box_values = Vector3(x=0.0, y=0.0, z=0.0)
-    max_box_values = Vector3(x=0.0, y=0.0, z=0.0)
+    print(f"{Colors.GREEN}Centering detection")
+    print(f"{Colors.GREEN}Intial Positions")
+
+    pixel_x = ros.tracked_detection.detections[detection].bbox.center.position.x
+    pixel_y = ros.tracked_detection.detections[detection].bbox.center.position.y
+
+    detection_coordinates = azureConvert(pixel_x, pixel_y)
+
+    while detection_coordinates is None:
+        pixel_y += 5.0
+        detection_coordinates = azureConvert(pixel_x, pixel_y)
+    
+    point_detection = PointStamped()
+    point_detection.point.x = detection_coordinates[0]
+    point_detection.point.y = detection_coordinates[1]
+    point_detection.point.z = detection_coordinates[2]
+    point_detection.header.frame_id = "azure_rgb"
+
+    point_probe = do_transform_point(point_detection, ros.azure_t)
+
+    pose = Pose()
+    pose.position.x = point_probe.point.x
+    pose.position.y = point_probe.point.y
+    # pose.position.z = point_probe.point.z
+    pose.position.z = ros.t.transform.translation.z
+
+    print(f"Pose after transform: {pose}")
+    
+    ros.Move(pose)
+
+def moveAround():
+
+    try:
+
+        pinSwitch(pin=0,state=True)
+        
+        ros.Move("over_table")
+
+        yoloEnable(False)
+
+        for i in range(len(ros.tracked_detection.detections)):
+            center(i)
+
+        ros.Move(ros.pose_array)
+
+    except Exception as e:
+
+        print(f"Error in execution: {e}")
+
+    finally:
+
+        pinSwitch(pin=0,state=False)
+
+        ros.Move("over_table")
+
+def yoloEnable(enable):
+
+    if enable:
+        print(f"{Colors.CYAN}Enabling YOLO!")
+    else:
+        print(f"{Colors.CYAN}Disabling YOLO!")
+
+    return yolo_enable_client.sendRequest('SetBool',{'enable':enable})
+
+def azureConvert(pixel_x, pixel_y):
+
+    depth_value = ros.depth_image[int(pixel_y),
+                            int(pixel_x)]/1000
+    
+    print(f"depth_value: {depth_value}")
+    print(f"pixel_x: {pixel_x}")
+    print(f"pixel_y: {pixel_y}")
+    
+    if depth_value != 0.0:
+                  
+        x = (pixel_x - Azure.cx) * depth_value / Azure.fx
+        y = (pixel_y - Azure.cy) * depth_value / Azure.fy
+        z = depth_value
+
+        print(f"x: {x}\ny: {y}\nz: {z}\n")
+        return x, y, z
+    
+    else:
+
+        return
+
+def yoloCrop(detection = 0):
+
+    bbox_coordinates = [[0]*2 for _ in range(4)]
+    azure_coordinates = [[0]*3 for _ in range(4)]
+
+    # azure_scale = azure_client.sendRequest('AzureFovScaler', { 'distance': depth_value})
+
+    pixel_x = ros.tracked_detection.detections[detection].bbox.center.position.x
+    pixel_y = ros.tracked_detection.detections[detection].bbox.center.position.y
+
+    detection_coordinates = azureConvert(pixel_x, pixel_y)
+    
+    while detection_coordinates is None:
+        pixel_y += 5.0
+        detection_coordinates = azureConvert(pixel_x, pixel_y)
+
+
+    point_detection = PointStamped()
+    point_detection.point.x = detection_coordinates[0]
+    point_detection.point.y = detection_coordinates[1]
+    point_detection.point.z = detection_coordinates[2]
+    point_detection.header.frame_id = "azure_rgb"
+
+    point_probe = do_transform_point(point_detection, ros.azure_t)
+
+    pose = Pose()
+    pose.position.x = point_probe.point.x
+    pose.position.y = point_probe.point.y
+    pose.position.z = point_probe.point.z
+    # pose.position.z = ros.t.transform.translation.z
+    
+    ros.addPose(pose)
+
+    # input("You ready?")
+    # ros.Move(pose)
+
+    # input("New detection section")
+
+    # if len(ros.detected.detections) == 1:
+    # 
+    #     detection = 0
+
+    pixel_x = ros.detected.detections[detection].bbox.center.position.x
+    pixel_y = ros.detected.detections[detection].bbox.center.position.y
+
+    bbox_x = ros.detected.detections[detection].bbox.size.x/2
+    bbox_y = ros.detected.detections[detection].bbox.size.y/2
+
+    # Point 1 Upper Left
+    bbox_coordinates[0][0] = pixel_x - bbox_x
+    bbox_coordinates[0][1] = pixel_y - bbox_y
+
+    # Point 2 Upper Right
+    bbox_coordinates[1][0] = pixel_x + bbox_x
+    bbox_coordinates[1][1] = pixel_y - bbox_y
+
+    # Point 3 Lower Left
+    bbox_coordinates[2][0] = pixel_x - bbox_x
+    bbox_coordinates[2][1] = pixel_y + bbox_y
+
+    # Point 4 Lower Right
+    bbox_coordinates[3][0] = pixel_x + bbox_x
+    bbox_coordinates[3][1] = pixel_y + bbox_y
+
+    print(f"{bbox_coordinates}")
+
+    points = [[PointStamped()]*2 for _ in range(4)]
+
+    for i in range(len(bbox_coordinates)):
+        print(f"i: {i}")
+        azure_coordinates[i]=azureConvert(bbox_coordinates[i][0], bbox_coordinates[i][1])
+        point = PointStamped()
+        if azure_coordinates[i] is not None:
+            point.point.x = azure_coordinates[i][0]
+            point.point.y = azure_coordinates[i][1]
+            point.point.z = azure_coordinates[i][2]
+            point.header.frame_id = "azure_rgb"
+            points[i][0] = point
+            points[i][1] = do_transform_point(points[i][0], ros.azure_t)
+
+    
+    print(f"{azure_coordinates}")
+
+    options = []
+
+    for i in range(len(azure_coordinates)):
+        if azure_coordinates[i]:
+            options.append(i)
+
+    print(f"options: {options}")
+
+    if (1 in options) and (2 in options) :
+        print("Points 2 and 3 chosen")
+        maxx = points[1][1].point.x
+        minx = points[2][1].point.x
+        maxy = points[2][1].point.y
+        miny = points[1][1].point.y
+        if points[1][1].point.z > points[2][1].point.z:
+            maxz = points[1][1].point.z + 0.05
+            minz = points[2][1].point.z - 0.05
+        elif points[1][1].point.z < points[2][1].point.z:
+            maxz = points[2][1].point.z + 0.05
+            minz = points[1][1].point.z - 0.05
+
+    elif (0 in options) and (3 in options) :
+        print(f"Points 1 and 4 chosen")
+        maxx = points[0][1].point.x
+        minx = points[3][1].point.x
+        maxy = points[3][1].point.y
+        miny = points[0][1].point.y
+        if points[0][1].point.z > points[3][1].point.z:
+            maxz = points[0][1].point.z + 0.05
+            minz = points[3][1].point.z - 0.05
+        elif points[0][1].point.z < points[3][1].point.z:
+            maxz = points[3][1].point.z + 0.05
+            minz = points[0][1].point.z - 0.05
+    
+    elif not (((1 in options) and (2 in options)) or ((0 in options) and (3 in options))):
+
+        print(f"Points {options[0]} and {options[1]} chosen")
+
+        if options[1] - options[0] > 1:
+            maxx = points[options[0]][1].point.x
+            minx = points[options[1]][1].point.x
+            if options[1] + options[0] > 2:
+                print("Options added together > 2")
+                miny = statistics.mean([points[options[1]][1].point.y,points[options[0]][1].point.y])
+                xdis = points[options[0]][1].point.x - points[options[1]][1].point.x
+                ratio = xdis/bbox_x
+                ydis = ratio*bbox_y
+                maxy = miny + ydis
+            else:
+                print("Options added together =< 2")
+                maxy = statistics.mean([points[options[1]][1].point.y,points[options[0]][1].point.y])
+                xdis = points[options[0]][1].point.x - points[options[1]][1].point.x
+                ratio = xdis/bbox_x
+                ydis = ratio*bbox_y
+                miny = maxy - ydis
+
+            maxz = points[options[1]][1].point.z + 0.05
+            minz = points[options[1]][1].point.z - 0.05
+
+            
+        else:
+            print("Options substracted = 1")
+            maxy = points[options[1]][1].point.y
+            miny = points[options[0]][1].point.y
+            maxx = statistics.mean([points[options[1]-1][1].point.x,points[options[0]][1].point.x])
+            ydis = points[options[1]][1].point.y - points[options[0]][1].point.y
+            ratio = ydis/bbox_y
+            xdis = ratio*bbox_x
+            minx = maxx - xdis
+            maxz = points[options[1]][1].point.z + 0.05
+            minz = points[options[1]][1].point.z - 0.05
+    else:
+
+        # return "we tried (y)"
+        print("lol give up")
+
+
+    print(f"maxx = {maxx}")
+    print(f"minx = {minx}")
+    print(f"maxy = {maxy}")
+    print(f"miny = {miny}")
+    print(f"maxz = {maxz}")
+    print(f"minz = {minz}")
+
+    # return maxx, minx, maxy, miny, maxz, minz
+
+    startReconstruction(maxx=maxx,maxy=maxy,maxz=maxz,minx=minx,miny=miny,minz=minz)
+            
+def startReconstruction(maxx=0.0,maxy=0.0,maxz=0.0,minx=0.0,miny=0.0,minz=0.0):
+
+    min_box_values = Vector3(x=minx, y=miny, z=minz)
+    max_box_values = Vector3(x=maxx, y=maxy, z=maxz)
 
     tsdf_params = TSDFVolumeParams(voxel_length=paramdb.voxel_length.magnitude,
                                    sdf_trunc=paramdb.sdf_trunc.magnitude,
@@ -407,9 +420,9 @@ def startReconstruction():
                                   convert_rgb_to_intensity=paramdb.convert_rgb_to_intensity)
 
     print(f"{Colors.CYAN}Starting Reconstruction!")
-    print(f"{Colors.GREEN}Archive directory: {archive_directory.name}")
-    print(f"{Colors.GREEN}Output filename: {output_filename.name}")
-    print(f"{Colors.GREEN}Mesh filepath: {mesh_filepath.name}{Colors.RESET}")
+    print(f"Archive directory: {archive_directory.name}")
+    print(f"Output filename: {output_filename.name}")
+    print(f"Mesh filepath: {mesh_filepath.name}")
     
     return start_reconstruction.sendRequest('StartReconstruction',
                                    { 'tracking_frame':paramdb.tracking_frame,
@@ -426,34 +439,142 @@ def stopReconstruction():
     normal_filter = NormalFilterParams(normal_direction=normal_direction, angle=paramdb.angle.magnitude)
     normal_filters = [normal_filter]
 
-    print(f"{Colors.CYAN}Stoping Reconstruction{Colors.RESET}")
+    print(f"{Colors.GREEN}Stoping Reconstruction")
         
     return stop_reconstruction.sendRequest('StopReconstruction',
-                                   {'archive_directory':archive_directory.name,
-                                    'mesh_filepath':"/home/labuser/Desktop/test.ply",
+                                   {'archive_directory':paramdb.archive_directory,
+                                    'mesh_filepath':paramdb.mesh_filepath,
                                     'normal_filters':normal_filters})
 
-def noether():
+def noether(input=paramdb.input_file, set_o=paramdb.set_orientation, line_spacing=paramdb.line_spacing.magnitude, point_spacing=paramdb.point_spacing.magnitude, z_offset=paramdb.z_offset.magnitude):
 
     print(f"{Colors.BLUE}Noether TPP")
+    
+    q = transforms3d.euler.euler2quat(paramdb.orientation.magnitude[0],paramdb.orientation.magnitude[1],paramdb.orientation.magnitude[2])
+
+    quat = Quaternion(w=q[0],x=q[1],y=q[2],z=q[3])
 
     return noether_client.sendRequest('TariNoether', 
-                                     {'mesh_filename': paramdb.input_file,
-                                      'line_spacing': paramdb.line_spacing.magnitude,
-                                      'point_spacing': paramdb.point_spacing.magnitude,
-                                      'z_offset': paramdb.z_offset.magnitude,
+                                     {'mesh_filename': input,
+                                      'line_spacing': line_spacing,
+                                      'point_spacing': point_spacing,
+                                      'z_offset': z_offset,
                                       'distance_threshold': paramdb.distance_threshold.magnitude,
-                                      'max_planes': paramdb.max_planes.magnitude}).noether_pose_array.poses
+                                      'plane_proj': paramdb.plane_proj,
+                                      'max_planes': paramdb.max_planes.magnitude,
+                                      'set_orientation': set_o,
+                                      'orientation': quat}).noether_pose_array.poses
+
+def noetherDownsample(percentage):
+
+    x = []
+    y = []
+    z = []
+
+    pa=noether()
+    e=[]
+    j = PoseArray()
+
+    lower = 1 - percentage
+    upper = 1 + percentage
+
+    print(f"{Colors.CYAN}Noether output size {len(pa)}")
+
+    for i in range(len(pa)):
+        e.append(list(transforms3d.euler.quat2euler([pa[i].orientation.w,
+                                      pa[i].orientation.x,
+                                      pa[i].orientation.y,
+                                      pa[i].orientation.z])))
+        
+    for i in range(len(e)):
+        for l in range(3):
+            if e[i][l] < 0 or e[i][l] < 0.01:
+                e[i][l] = e[i][l] + 2 * math.pi
+            if l == 0:
+                x.append(e[i][l])
+            if l == 1:
+                y.append(e[i][l])
+            if l == 2:
+                z.append(e[i][l])
+
+    x_mean = statistics.mean(x)
+    y_mean = statistics.mean(y)
+    z_mean = statistics.mean(z)
+
+    print(f"{Colors.MAGENTA}x mean: {x_mean}\ny mean: {y_mean}\nz mean: {z_mean}")
+
+    for i in range(len(e)):
+        if x_mean*lower < e[i][0] < x_mean*upper or y_mean*lower < e[i][1] < y_mean*upper or z_mean*lower < e[i][2] < z_mean*upper:
+            j.poses.append(pa[i])
+
+    q=transforms3d.euler.euler2quat(x_mean,y_mean,z_mean)
+
+
+
+    try:
+        m = j.poses[0]
+
+        j.poses.append(m)
+
+        j.poses[-1].orientation = Quaternion(w=q[0], x=q[1], y=q[2], z=q[3])
+        j.poses[-1].position.z += 0.5
+
+        j.header.frame_id = ros.pose_array.header.frame_id
+
+        ros.pose_pub.publish(j)
+
+    except Exception as e:
+
+        print(e)
+
+    print(f"{Colors.GREEN}Filtered noether output size {len(j.poses)}")
+    
+    return j
+
+def meshFilter(input=paramdb.mesh_filter_input_filepath):
+
+    print(f"{Colors.MAGENTA}Mesh Filter")
+
+    return mesh_filter_client.sendRequest('TariMeshFilter', 
+                                     {'input_filepath': input,
+                                      'output_filepath': paramdb.mesh_filter_output_filepath,
+                                      'color': paramdb.color.magnitude,
+                                      'threshold': paramdb.threshold.magnitude,
+                                      'cutoff': paramdb.cutoff.magnitude,
+                                      'color_filter': paramdb.color_filter,
+                                      'vert_filter': paramdb.vert_filter}).success
+
+def segment():
+
+    print(f"{Colors.BLUE}Mesh Segmentor")
+
+    return segmentor_client.sendRequest('Segmentor', 
+                                     {'input_filepath': paramdb.input_filepath,
+                                      'output': paramdb.output,
+                                      'cluster_tolerance': paramdb.cluster_tolerance.magnitude,
+                                      'min_cluster_size': paramdb.min_cluster_size.magnitude,
+                                      'max_cluster_size': paramdb.max_cluster_size.magnitude,
+                                      'leaf': paramdb.leaf.magnitude,
+                                      'search_radius': paramdb.search_r.magnitude,
+                                      'set_mu': paramdb.set_m.magnitude,
+                                      'depth': paramdb.depth.magnitude,
+                                      'solver_divide': paramdb.solver_divide.magnitude,
+                                      'iso_divide': paramdb.iso_divide.magnitude,
+                                      'point_weight': paramdb.point_weight.magnitude}).success
 
 def keyenceStart():
 
     print(f"{Colors.GREEN}Keyence Reconstruction Starting")
 
-    return keyence_start.sendRequest('StartKeyRec', {'distance': paramdb.distance.magnitude})
+    pinSwitch(pin=1,state=True)
+
+    return keyence_start.sendRequest('StartKeyRec', {'distance': paramdb.distance.magnitude}).success
 
 def keyenceStop():
 
     print(f"{Colors.MAGENTA}Keyence Reconstruction Stopping")
+
+    pinSwitch(pin=1,state=False)
 
     return keyence_stop.sendRequest('StopKeyRec',
                             {'mean_k': paramdb.mean_k.magnitude,
@@ -462,64 +583,73 @@ def keyenceStop():
                              'output_filepath': paramdb.output_filepath,
                              'output_filename': paramdb.output_filename,
                              'search_radius': paramdb.search_radius.magnitude,
+                             'radius_search': paramdb.radius_search.magnitude,
                              'set_mu': paramdb.set_mu.magnitude,
                              'max_nearest': paramdb.max_nearest.magnitude,
-                             'k_search': paramdb.k_search.magnitude})
+                             'k_search': paramdb.k_search.magnitude,
+                             'min': paramdb.min.magnitude,
+                             'max': paramdb.max.magnitude,
+                             'perform_outlier_filtering': paramdb.perform_outlier_filtering}).success
 
-def pinSwitch(pin=0):
+def x3dConvert(input=paramdb.x3d_input_filepath, flip=paramdb.x3d_flip_normals):
 
-    if isinstance(pin, int) and 0 <= pin <= 7:
+    print(f"{Colors.BLUE}X3d Converter")
 
-        if ros.svd_msg.digital_out_states[pin].state:
+    return x3d_converter_client.sendRequest('X3dConverter',
+                                     {'input_filepath': input,
+                                      'output_filepath': paramdb.x3d_output_filepath,
+                                      'flip': flip})
 
-            ros.get_logger().info(f"Pin {pin} is {Colors.GREEN}ON{Colors.RESET}")
-            ros.get_logger().info(f"Switching pin {pin} {Colors.RED}OFF{Colors.RESET}")
-
-            return gpio_client.sendRequest('SetIO',
-                                    {'fun': 1,
-                                     'pin': pin,
-                                     'state': 0.0})
-        
+def curvedGeometry():
+    q = Quaternion(w=0.7012773070207925, x=0.008745344456110877, y=0.008990798433617032, z=0.7127782426193544)
+    x = [0.7715144379308916, 0.7715144379308916, 0.8039578138008607, 0.8049177683617961, 0.8365381260424909, 0.8352284137278279, 0.8651641037694109, 0.866395849201294]
+    y = [0.5426997091743002, 0.6173871068702568]
+    z = 0.9547216477958038
+    for i in range(8):
+        p = Pose()
+        p.orientation = q
+        p.position.z = z
+        if i%4 > 1:
+            p.position.y = y[(i+1)%2]
         else:
+            p.position.y = y[i%2]
+        p.position.x = x[i]
+        ros.addPose(p)
 
-            ros.get_logger().info(f"Pin {pin} is {Colors.RED}OFF{Colors.RESET}")
-            ros.get_logger().info(f"Switching pin {pin} {Colors.GREEN}ON{Colors.RESET}")
+def pinSwitch(pin=0,state=None):
 
-            return gpio_client.sendRequest('SetIO',
-                                    {'fun': 1,
-                                     'pin': pin,
-                                     'state': 1.0})
+    if state is not None:
 
-def x3dConvert(file="/home/labuser/iron_tari/triangulated_cloud.ply"):
+        if isinstance(pin, int) and 0 <= pin <= 7:
 
-    for obj in bpy.context.scene.objects:
-        bpy.data.objects.remove(obj, do_unlink=True)
+            if ros.svd_msg.digital_out_states[pin].state and state:
+                
+                return ros.get_logger().info(f"Pin {pin} is already {Colors.GREEN}ON{Colors.RESET}")
 
-    if file[-3:] == "ply":
-        bpy.ops.wm.ply_import(filepath=file)  # Update with path to ply
-    elif file[-3:] == "stl":
-        bpy.ops.import_mesh.stl(filepath=file)
-    elif file[-3:] == "obj":
-        bpy.ops.import_scene.obj(filepath=file)
+            elif state and not ros.svd_msg.digital_out_states[pin].state:
+
+                ros.get_logger().info(f"Switching pin {pin} {Colors.GREEN}ON{Colors.RESET}")
+
+                return gpio_client.sendRequest('SetIO',
+                                        {'fun': 1,
+                                         'pin': pin,
+                                         'state': 1.0})
+            elif not ros.svd_msg.digital_out_states[pin].state and not state:
+
+                return ros.get_logger().info(f"Pin {pin} is already {Colors.RED}OFF{Colors.RESET}")
+            
+            else:
+                ros.get_logger().info(f"Switching pin {pin} {Colors.RED}OFF{Colors.RESET}")
+
+                return gpio_client.sendRequest('SetIO',
+                                        {'fun': 1,
+                                         'pin': pin,
+                                         'state': 0.0})
     else:
-        ros.get_logger().error("Wrong file type")
-        return
-    
-    bpy.ops.object.editmode_toggle()
-    bpy.ops.mesh.select_all(action='SELECT')
-    bpy.ops.mesh.remove_doubles(threshold=0.002, use_unselected=True)
-    bpy.ops.mesh.delete_loose(use_faces=True)
-    bpy.ops.mesh.dissolve_degenerate(threshold=0.001)
-    bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='EDGE')
-    bpy.ops.mesh.select_all(action='DESELECT')
-    bpy.ops.mesh.edges_select_sharp()
-    bpy.ops.mesh.mark_seam(clear=False)
-    bpy.ops.mesh.select_mode(use_extend=False, use_expand=False, type='FACE')
-    bpy.ops.mesh.select_all(action='SELECT')
-    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-    bpy.ops.export_scene.x3d(filepath='test.x3d', **{"use_selection": False, 'use_mesh_modifiers':True, 'use_normals': False, 'global_scale':0.001})
 
-def showSpecimen(file="/home/labuser/untitled.x3d"):
+        return ros.get_logger().info(f"Set True/False state for ON/OFF pin selection")
+
+def showSpecimen(file="/home/labuser/iron_tari/specimen.x3d"):
 
 #    counter = counter + 1
 #    specimen_model_file = file
@@ -539,70 +669,11 @@ def showSpecimen(file="/home/labuser/untitled.x3d"):
 #    finally:
 #        transact.end_transaction()
 
-    ros.specimenMesh(file)
+    ros.specimenMesh(specimen_mesh=file)
 
     print(f"{Colors.GREEN}Specimen pose channel: {ros.specimen_pose_channel}{Colors.RESET}")
 
-def joinChannels(x=0.759,y=-0.926,z=-0.475,ox=0,oy=0,oz=0,ow=1,background_channel=None, specimenNum=1):
-
-#    if ros.counter == 0 : return print(f"{Colors.RED}No specimens available{Colors.RESET}")
-#
-#    if background_channel is None : background_channel=ros.specimen_pose_channel[specimenNum-1]
-#
-#    try:
-#        if positioner_channel[specimenNum]:
-#            print(f"Updating positioner_channel[{specimenNum}]")
-#    except e as Exception:
-#        positioner_channel.append("/probe_and_specimen_" + str(specimenNum))
-#        print(f"{Colors.GREEN}Adding channel {positioner_channel[specimenNum]}{Colors.RESET}")
-#        try:
-#            transact = ros.recdb.start_transaction()
-#            positioner_chan = ros.recdb.define_channel(positioner_channel,"main",ros.recdb.raw())
-#        except e as Exception:
-#            print(e)
-#        finally:
-#            transact.end_transaction()
-#
-#
-#    model_channel=snde.recdb_path_join(ros.eoat_model_tree,"meshed")
-#    
-#    print(f"{Colors.MAGENTA}Positioner channel: {positioner_channel}{Colors.RESET}")
-#
-#    model_channel = str(model_channel)
-#    print("Model Channel: %s" % model_channel)
-#    background_channel = str(background_channel)
-#    print("Background Channel: %s" % background_channel)
-#
-#    
-#    try:
-#        transact = ros.recdb.start_transaction()
-#        specimen_position = np.array(((0.759,
-#                                       -0.475,
-#                                       0.926,
-#                                       0),(0,0,0,1)),dtype=orient_dtype)
-#        probe_position = np.array(((ros.t.transform.translation.x,
-#                                    ros.t.transform.translation.y,
-#                                    ros.t.transform.translation.z,
-#                                    0),(
-#                                    ros.t.transform.rotation.x, 
-#                                    ros.t.transform.rotation.y, 
-#                                    ros.t.transform.rotation.z, 
-#                                    ros.t.transform.rotation.w)),
-#                                  dtype=orient_dtype)
-#        vsop = snde.VectorOfStringOrientationPairs([snde.StringOrientationPair('/graphics/specimen_'+ str(specimenNum) +'/meshed',snde.snde_orientation3(specimen_position)), snde.StringOrientationPair('/graphics/probe/meshed',snde.snde_orientation3(probe_position))])
-#        rec = snde.create_assembly_recording(ros.recdb, positioner_chan, ros.recdb.raw(), vsop)
-#    except Exception as e:
-#        print(e)
-#    finally:
-#        transact.end_transaction()
-#        if rec is not None:
-#            rec.mark_data_and_metadata_ready()
-
-    ros.join(x=x,y=y,z=z,ox=ox,oy=oy,oz=oz,ow=ow,specimenNum=specimenNum)
-
 def probeProjectChan(specimenNum=1):
-
-    print(f"{Colors.BLUE}Projecting probe tip data for specimen {specimenNum}{Colors.RESET}")
 
     specimenIndex = specimenNum - 1
 
@@ -610,19 +681,35 @@ def probeProjectChan(specimenNum=1):
 
         transact = ros.recdb.start_transaction()
 
+#        include(snde,"project_probe_tip_data_in_transaction.dpi",
+#                specimen_model_tree = ros.specimen_model_tree[specimenIndex],
+#                specimen_pose_channel = ros.specimen_pose_channel[specimenIndex],
+#                probe_pose_channel=ros.eoat_pose_channel,
+#                probe_tip_data_channel=ros.specimen_data_channel[specimenIndex],
+#                min_dist = -0.2, # starting position for ray tracer, relative to probe tip position, in meters
+#                max_dist = 0.3, # ending position for ray tracer, relative to probe tip position, in meters
+#                radius = 0.01, # spot size, in nominal parameterization scale, in meters
+#                horizontal_pixels = 1282, # horizontal total pixel width in parameterization space
+#                vertical_pixels = 1280, # vertical total pixel width in parameterization space
+#                projection_channel = "/graphics/projection_" + str(specimenNum),
+#                projection_specimen_channel = "/graphics/projection_specimen" + str(specimenNum),
+#                )
+
         include(snde,"project_probe_tip_data_in_transaction.dpi",
-                specimen_model_tree = ros.specimen_model_tree[specimenIndex],
-                specimen_pose_channel = ros.specimen_pose_channel[specimenIndex],
-                probe_pose_channel=ros.eoat_pose_channel,
-                probe_tip_data_channel=ros.specimen_data_channel[specimenIndex],
+                specimen_model_tree = ros.specimen_model_tree[specimenIndex], # specimen_model_tree_copy,
+                specimen_pose_channel = '/specimen_pose_copy',
+                probe_pose_channel = '/probe_pose_copy',
+                probe_tip_data_channel = ros.specimen_data_channel[specimenIndex],
                 min_dist = -0.2, # starting position for ray tracer, relative to probe tip position, in meters
                 max_dist = 0.3, # ending position for ray tracer, relative to probe tip position, in meters
                 radius = 0.01, # spot size, in nominal parameterization scale, in meters
                 horizontal_pixels = 1282, # horizontal total pixel width in parameterization space
                 vertical_pixels = 1280, # vertical total pixel width in parameterization space
                 projection_channel = "/graphics/projection_" + str(specimenNum),
-                projection_specimen_channel = "/graphics/projection_specimen" + str(specimenNum),
+                projection_specimen_channel = "/graphics/projection_specimen_" + str(specimenNum),
                 )
+        
+        print(f"{Colors.BLUE}Projecting probe tip data for specimen {specimenNum}{Colors.RESET}")
         
     except Exception as e:
 
@@ -640,13 +727,12 @@ def mapScan(specimenNum=1):
 
     # specimen_model_tree = '/graphics/specimen_' + str(specimenNum) + '/'
     # specimen_pose_channel = '/specimen_' + str(specimenNum) + '_pose'
-
+    data, pp_data, sp_data = capture3Ddata()
     try:
 
-        transact = ros.recdb.start_transaction()
-
-        specimen_data_ref = snde.create_ndarray_ref(ros.recdb,ros.specimen_data_chan[specimenIndex],ros.recdb.raw(),snde.SNDE_RTN_COMPLEXFLOAT64)
-
+        transact = recdb.start_transaction()
+        specimen_data_ref = snde.create_ndarray_ref(recdb,ros.specimen_data_chan[specimenIndex],recdb.raw(),snde.SNDE_RTN_COMPLEXFLOAT32)
+        
         metadata = snde.constructible_metadata()
         metadata.AddMetaDatum(snde.metadatum("snde_render_goal","SNDE_SRG_PHASEPLANE"))
         metadata.AddMetaDatum(snde.metadatum("snde_phase_plane_historical_fade",True))
@@ -658,9 +744,22 @@ def mapScan(specimenNum=1):
         specimen_data_ref.rec.mark_metadata_done()
         specimen_data_ref.allocate_storage( [] )
 
-        specimen_data_ref.assign_complexfloat64([],capture3Ddata())
+        specimen_data_ref.assign_complexfloat64([],data)
         specimen_data_ref.rec.mark_data_ready()
-        
+
+        specimen_pose_ref = snde.create_pose_channel_ndarray_ref(recdb, specimen_pose_channel_copy, recdb.raw(), snde.recdb_path_join(ros.specimen_model_tree[0], "meshed_copy"))
+        specimen_pose_ref.allocate_storage([1])
+        specimen_pose_ref.data()[:] = sp_data
+        specimen_pose_ref.rec.mark_metadata_done()
+        specimen_pose_ref.rec.mark_data_ready()
+
+        eoat_pose_ref = snde.create_pose_channel_ndarray_ref(recdb, probe_pose_channel_copy, recdb.raw(), snde.recdb_path_join(ros.eoat_model_tree, "meshed_copy"))
+        eoat_pose_ref.allocate_storage([1])
+        # eoat_pose_rec = snde.pose_channel_recording.from_ndarray_recording(eoat_pose_ref.rec)
+        eoat_pose_ref.data()[:] = pp_data
+        eoat_pose_ref.rec.mark_metadata_done()
+        eoat_pose_ref.rec.mark_data_ready()
+
     except Exception as e:
 
         print(e)
@@ -817,10 +916,126 @@ def zedMapping():
     else:
         return test
 
+def fullCalScan():
+
+    ros.pose_array.poses = []
+    pinSwitch()
+    ros.Move("over_cal_plate")
+    pinSwitch()
+    try:
+        startReconstruction()
+        time.sleep(30.0)
+        stopReconstruction()
+        meshFilter(input=paramdb.mesh_filepath)
+        n = noether(input=paramdb.mesh_filter_output_filepath, set_o=False)
+        for i in range(len(n)):
+            n[i].position.x += 0.075
+            ros.addPose(n[i])
+        pinSwitch(pin=0,state=True)
+        ros.Move(n[0])
+        keyenceStart()
+        ros.Move(n,0.01,0.01)
+        # ros.Move(n[::-1],0.01,0.01)
+        keyenceStop()
+    finally:
+        ros.Move("over_cal_plate")
+        pinSwitch(pin=0,state=False)
+
+def calScan(liftoff=0,flip=False):
+    
+    pa = PoseArray()
+    p1 = Pose()
+    p2 = Pose()
+    p3 = Pose()
+    q = Quaternion(w=1.0,x=0.0,y=0.0,z=0.0)
+
+    p1.position.x = 0.972
+    p1.position.y = -0.321
+    p1.position.z = 0.9833206691863077
+    p1.orientation = q
+
+    p2.position.x = 1.002
+    p2.position.y = -0.321
+    p2.position.z = 0.9833206691863077
+    p2.orientation = q
+
+    p3.position.x = 0.8973358716012743
+    p3.position.y = -0.3262125374627717
+    p3.position.z = 0.9676927573214988
+    p3.orientation = q
+
+    pa.poses.append(p1)
+    pa.poses.append(p2)
+
+    pinSwitch(pin=0,state=True)
+
+    try:
+
+        ros.Move('over_cal_plate',0.05,0.05)
+
+        pos1 = ros.Move(pa.poses[0])
+        while not pos1.result.success:
+            print("Moving into position...")
+            time.sleep(1)
+        print("Here we go")
+        time.sleep(1)
+        keyenceStart()
+
+        ros.Move(pa.poses[1],0.01,0.01)
+        keyenceStop()
+
+
+    finally:
+
+        ros.Move('over_cal_plate',0.05,0.05)
+        pinSwitch(pin=0,state=False)
+
+    x3d = x3dConvert(input=paramdb.output_filepath+paramdb.output_filename,flip=flip)
+
+    #showSpecimen(file=paramdb.x3d_output_filepath)
+
+    ros.specimenMesh(specimen_mesh=paramdb.x3d_output_filepath,x=x3d.position[0],y=x3d.position[1],z=x3d.position[2])
+    print(f"{Colors.GREEN}Specimen pose channel: {ros.specimen_pose_channel}{Colors.RESET}")
+
+    time.sleep(3)
+    probeProjectChan()
+
+    time.sleep(3)
+    mapScan()
+
+    time.sleep(3)
+
+    try:
+
+        n = noether(input=paramdb.output_filepath+paramdb.output_filename,set_o=True,line_spacing=0.001,point_spacing= 0.001,z_offset=0.0)
+
+        # for i in range(len(n)):
+        #     n[i].position.z += liftoff
+
+
+        approach = n[0]
+        approach.position.z += 0.05
+        pinSwitch(pin=0,state=True)
+        # mid = len(n)//2
+        ros.Move(approach,0.05,0.05)
+        # ros.Move(n[mid],0.05,0.01)
+        # uni.null()
+         
+        for i in range(1,len(n)):
+            ros.Move(n[i],0.05,0.01)
+            mapScan()
+
+    except Exception as e:
+        print(f"Error: {e}")
+    
+    finally:
+        ros.Move('over_cal_plate')
+        pinSwitch(pin=0,state=False)
+
 def keyScan(passes=1, x_pos=0.82,y_pos=-0.475,width=0.03,length=0.04,vel=0.04,acc=0.04):
 
     slice=9
-    pinSwitch(0)
+    pinSwitch(pin=0,state=True)
     ros.Move('over_cal_plate')
 
     pals=ros.reconPoseArray(full_dome=True,x=4,y=1,angle=0,x_pos=x_pos,y_pos=y_pos,width=width,length=length).poses
@@ -862,7 +1077,7 @@ def keyScan(passes=1, x_pos=0.82,y_pos=-0.475,width=0.03,length=0.04,vel=0.04,ac
     finally:
 
         ros.Move('over_cal_plate')
-        pinSwitch(0)
+        pinSwitch(pin=0,state=False)
 
 def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
 
@@ -1262,8 +1477,9 @@ def Scan2DPlaneSliced(t1, t2, t3, m, n, raster):
     args = (uprime[1]-uprime[0], vprime[1]-vprime[0], uu[0,0], vv[0,0], m, n, nslice)
     return args
 
-def capture3Ddata():
-    print(f"{Colors.MAGENTA}Capturing Data")
+def capture3Ddata(specimenIndex=1):
+    # print(f"{Colors.MAGENTA}Capturing Data")
+    # ros.get_logger().info(f"{Colors.MAGENTA}Capturing Data{Colors.RESET}", once=True)
     monitor = ros.recdb.start_monitoring_globalrevs()
     g = monitor.wait_next(ros.recdb)
     monitor.close(ros.recdb)
@@ -1272,20 +1488,10 @@ def capture3Ddata():
     rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
     ch1data = np.mean(rec.data())
     complexdata = ch1data + 1j*ch2data
-    print(f"Complex data = {complexdata}{Colors.RESET}")
-    # transact = ros.recdb.start_transaction()
-    # rec1 = snde.create_ndarray_ref(ros.recdb, avgrealchan, ros.recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    # rec2 = snde.create_ndarray_ref(ros.recdb, avgimagchan, ros.recdb.raw(), snde.SNDE_RTN_FLOAT64)
-    # g = transact.end_transaction()
-    # rec1.rec.metadata = rec.rec.metadata
-    # rec2.rec.metadata = rec.rec.metadata
-    # rec1.rec.mark_metadata_done()
-    # rec2.rec.mark_metadata_done()
-    # rec1.allocate_storage(ch1data.shape, True)
-    # rec2.allocate_storage(ch2data.shape, True)
-    # rec1.assign_double(0, ch1data)
-    # rec2.assign_double(0, ch2data)
-    # rec1.rec.mark_data_ready()
-    # rec2.rec.mark_data_ready()
-    # g.wait_complete()
-    return complexdata
+    # print(f"Complex data = {complexdata}{Colors.RESET}")
+    pp_data = recdb.latest_defined_globalrev().get_ndarray_ref('/probe_pose').data()
+    sp_data = recdb.latest_defined_globalrev().get_ndarray_ref('/specimen_'+str(specimenIndex)+'_pose').data()
+    # print(f"{Colors.CYAN}Probe pose data = {pp_data}")
+    # print(f"{Colors.MAGENTA}Specimen pose data = {sp_data}{Colors.RESET}")
+
+    return complexdata, pp_data, sp_data
