@@ -8,6 +8,8 @@ import transforms3d
 import bpy
 import statistics
 import math
+import copy
+import pickle
 
 import numpy as np
 
@@ -78,11 +80,10 @@ counter = 0
 positioner_channel = []
 
 global ros
-global n
 ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh='/home/labuser/ecProbe.x3d') #'/home/labuser/tari_ws/Probe_uv.x3d')
 
 include(rosm, "services.dpi")
-include(rosm, "parameters.dpi")
+include(rosm, "parameters/parameters.dpi")
 
 daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
 
@@ -149,10 +150,10 @@ def demo():
 def center(detection=0):
 
     print(f"{Colors.GREEN}Centering detection")
-    print(f"{Colors.GREEN}Intial Positions")
+    # print(f"{Colors.GREEN}Intial Positions")
 
-    pixel_x = ros.tracked_detection.detections[detection].bbox.center.position.x
-    pixel_y = ros.tracked_detection.detections[detection].bbox.center.position.y
+    pixel_x = detections[detection].bbox.center.position.x
+    pixel_y = detections[detection].bbox.center.position.y
 
     detection_coordinates = azureConvert(pixel_x, pixel_y)
 
@@ -169,16 +170,307 @@ def center(detection=0):
     point_probe = do_transform_point(point_detection, ros.azure_t)
 
     pose = Pose()
-    pose.position.x = point_probe.point.x
+    pose.position.x = point_probe.point.x - 0.04
     pose.position.y = point_probe.point.y
-    # pose.position.z = point_probe.point.z
-    pose.position.z = ros.t.transform.translation.z
+    pose.position.z = point_probe.point.z + 0.25
+    # pose.position.z = ros.t.transform.translation.z
+    # print(f"Pose after transform: {pose}")
 
-    print(f"Pose after transform: {pose}")
+    ros.addDetection(pose)
+
+    return pose
+
+def centerLine(detection=0):
     
-    ros.Move(pose)
+    try:
 
-def moveAround():
+        ros.center_array.poses = []
+
+        division = 2
+
+        upper_unit = (ros.coordinate_array.poses[1].position.x - ros.yolo_array.poses[detection].position.x)/(2*division)
+        lower_unit = (ros.yolo_array.poses[detection].position.x - ros.coordinate_array.poses[0].position.x)/(2*division)
+
+        for i in range(division,0,-1):
+            pose = Pose()
+            pose.position = copy.deepcopy(ros.yolo_array.poses[detection].position)
+            pose.orientation = copy.deepcopy(ros.yolo_array.poses[detection].orientation)
+            pose.position.x = pose.position.x + upper_unit * i
+            ros.addCenterLine(pose)
+
+        ros.addCenterLine(ros.yolo_array.poses[detection])
+
+        for i in range(division):
+            pose = Pose()
+            pose.position = copy.deepcopy(ros.yolo_array.poses[detection].position)
+            pose.orientation = copy.deepcopy(ros.yolo_array.poses[detection].orientation)
+            pose.position.x = pose.position.x - lower_unit * (i +1)
+            ros.addCenterLine(pose)
+
+    except Exception as e:
+        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+
+def corners(detection=0):
+
+    print(f"{Colors.MAGENTA}Calculating bounding box coordinates")
+    # print(f"{Colors.GREEN}Intial Positions")
+
+    center_x = detections[detection].bbox.center.position.x
+    center_y = detections[detection].bbox.center.position.y
+
+    corner = []
+    orientation = []
+    x_orientation = -0.71/2
+    y_orientation = 0.71/2
+    neg = -1
+
+    half_x = detections[detection].bbox.size.x/2 * neg
+    half_y = detections[detection].bbox.size.y/2 * neg
+
+    for j in range(4):
+        if j % 2 == 0:
+            half_x *= neg
+            x_orientation *= neg
+        half_y *= neg
+        y_orientation *= neg
+        orientation.append(transforms3d.euler.euler2quat(x_orientation,y_orientation,0))
+        corner.append([center_x + half_x, center_y + half_y]) 
+
+    detection_corner_coordinates = []
+    coord = []
+
+    for e in range(4):
+        coord.append(azureConvert(corner[e][0], corner[e][1])) 
+        detection_corner_coordinates.append(azureConvert(corner[e][0], corner[e][1]))
+        if not detection_corner_coordinates[e]:
+            print(f"Corner {e} returned: {detection_corner_coordinates[e]}")
+            detection_corner_coordinates.pop()
+
+    corner_point = [PointStamped()] * 4
+    corner_point_transformed = []
+    for k in range(4):
+        corner_point[k].point.x = detection_corner_coordinates[k][0]
+        corner_point[k].point.y = detection_corner_coordinates[k][1]
+        corner_point[k].point.z = detection_corner_coordinates[k][2]
+        corner_point[k].header.frame_id = "azure_rgb"
+        corner_point_transformed.append(do_transform_point(corner_point[k], ros.azure_t))
+
+    pa = PoseArray()
+    y_offset = 0.1
+    for l in range(4):
+        pose = Pose()
+        if l % 2 == 0:
+            y_offset *= neg
+        pose.position.x = corner_point_transformed[l].point.x - 0.04
+        pose.position.y = corner_point_transformed[l].point.y + y_offset
+        pose.position.z = corner_point_transformed[l].point.z + 0.2
+        pose.orientation = Quaternion(w=orientation[l][0], x=orientation[l][1], y=orientation[l][2], z=orientation[l][3])
+        ros.addCoordinate(pose)
+        # pa.poses.append(pose)
+    last_pos = ros.coordinate_array.poses[-1].position
+    last_ori = ros.coordinate_array.poses[-1].orientation
+    ros.coordinate_array.poses[-1].position = ros.coordinate_array.poses[-2].position
+    ros.coordinate_array.poses[-2].position = last_pos
+    ros.coordinate_array.poses[-1].orientation = ros.coordinate_array.poses[-2].orientation
+    ros.coordinate_array.poses[-2].orientation = last_ori
+
+
+    # print(f"Adding points {pa}")
+
+def keyScan(vel,accel,detection=0):
+
+    ros.pose_array.poses = []
+    n = None
+        
+    n = noetherKeyence()
+    for e in range(len(n)):
+        n[e].position.x += 0.085
+    pinSwitch(pin=0,state=True)
+    ros.addPose(n)
+    decision = int(input("Does this look right? (1=yes/0=no):  "))
+    if not decision:
+        print("Quitting")
+        return False
+    approach = copy.deepcopy(n[0])
+    approach.position.z += 0.1
+
+    try:
+        ros.Move(ros.yolo_array.poses[detection],vel,accel)
+        ros.Move(approach,vel,accel)
+        keyenceStart()
+        ros.Move(n,0.01,0.01)
+        # ros.Move(n[::-1],0.01,0.01)
+        keyenceStop()
+
+    except Exception as e:
+        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+
+    ros.Move(ros.yolo_array.poses[detection],0.03,0.03)
+    pinSwitch(pin=0,state=False)
+    return True
+
+def routine(detection=0):
+    try:
+
+        maxx, maxy, maxz, minx, miny, minz = yoloCrop(detection)
+
+        ros.Move(ros.yolo_array.poses[detection])
+
+        time.sleep(3.0)
+
+        startReconstruction(maxx=maxx,maxy=maxy,maxz=maxz,minx=minx,miny=miny,minz=minz)
+
+        pause = 2.0
+        accel = 0.1
+        vel = 0.1
+
+        centerLine(detection)
+
+        for i in range(len(ros.center_array.poses)):
+            ros.Move(ros.center_array.poses[i],vel,accel)
+            time.sleep(pause)
+
+        ros.Move(ros.yolo_array.poses[detection],vel,accel)
+        time.sleep(pause)
+        ros.Move("over_table")
+
+        stopReconstruction()
+
+        paramdb.mesh_filter_input_filepath = paramdb.mesh_filepath
+        paramdb.vert_filter = True
+
+        meshFilter()
+
+        redo = 1
+
+        while redo:
+            cont = keyScan(vel,accel,detection)
+
+            if not cont:
+                return
+
+            paramdb.eddy_input_file = paramdb.output_filepath+paramdb.output_filename
+            paramdb.eddy_snake = bool(input("Snake raster? (1=yes/0=no): "))
+            # paramdb.eddy_direction = (-1,0,0)
+
+            global n
+            n = noetherEddy(direction=[-1,0,0])
+            decision = int(input("Does this look right? (1=yes/0=no): "))
+            if not decision:
+                n = noetherEddy(direction=[1,0,0])
+                question = int(input("Does this look better? (1=yes/0=no): "))
+                if not question:
+                    redo = int(input("Redo? (1=yes/0=no): "))
+                    if not redo:
+                        return
+                else:
+                    redo = 0
+            else:
+                redo = 0
+
+        #meshFilter(input=paramdb.output_filepath + paramdb.output_filename, delete_loose_parts=False)
+
+        paramdb.x3d_input_filepath = paramdb.output_filepath+paramdb.output_filename
+        paramdb.x3d_flip_normals = False
+
+        x3d = x3dConvert()
+
+        ros.specimenMesh(specimen_mesh=paramdb.x3d_output_filepath,x=x3d.position[0],y=x3d.position[1],z=x3d.position[2])
+        print(f"{Colors.GREEN}Specimen pose channel: {ros.specimen_pose_channel}{Colors.RESET}")
+
+        time.sleep(3)
+        probeProjectChan(specimenNum=ros.counter)
+
+        time.sleep(3)
+        mapScan()
+
+        time.sleep(3)
+
+        approach = [0]*2
+        approach[0] = copy.deepcopy(n[0])
+        approach[0].position.z += 0.1
+        approach[0].orientation = Quaternion(w=1.0, x=0.0, y=0.0, z=0.0)
+        approach[1] = copy.deepcopy(n[0])
+        approach[1].position.z += 0.05
+
+        accel = 0.05
+        vel = 0.05
+
+        global liftoff_points
+        liftoff_points = {
+            'force_z': [],
+            'complex_real': [],
+            'complex_imag': [],
+            'n': [],
+            'x': [],
+            'y': [],
+            'z': [],}
+
+        try:
+            ros.Move(ros.yolo_array.poses[detection],vel,accel)
+            ros.Move(approach[0],vel,accel)
+            ros.Move(approach[1],vel,accel)
+            ros.Move(n[0],0.05,0.01)
+            null_uni = int(input("Null Uniwest? (yes=1/n=0): "))
+            if not null_uni:
+                print("Quitting")
+                ros.Move(approach[1],vel,accel)
+                ros.Move(approach[0],vel,accel)
+                ros.Move(ros.yolo_array.poses[detection],vel,accel)
+                return
+            mapScan()
+            liftoff_points['force_z'].append(float(ros.force_msg.wrench.force.z))
+            liftoff_points['complex_real'].append(float(complexdata.real))
+            liftoff_points['complex_imag'].append(float(complexdata.imag))
+            liftoff_points['n'].append(0)
+            liftoff_points['x'].append(float(n[0].position.x))
+            liftoff_points['y'].append(float(n[0].position.y))
+            liftoff_points['z'].append(float(n[0].position.z))
+            with IncrementalBar("Scanning...", max=len(n)-1, suffix='%(index)d/%(max)d [Elapsed: %(elapsed_td)s -- Remaining: %(eta_td)s -- Avg: %(avg).2f s]') as bar:
+                for i in range(1,len(n)):
+                    ros.Move(n[i],0.05,0.01)
+                    mapScan()
+                    liftoff_points['force_z'].append(float(ros.force_msg.wrench.force.z))
+                    liftoff_points['complex_real'].append(float(complexdata.real))
+                    liftoff_points['complex_imag'].append(float(complexdata.imag))
+                    liftoff_points['n'].append(int(i))
+                    liftoff_points['x'].append(float(n[i].position.x))
+                    liftoff_points['y'].append(float(n[i].position.y))
+                    liftoff_points['z'].append(float(n[i].position.z))
+                    bar.next()
+
+            with open('liftofff_points.pkl', 'wb') as f:
+                pickle.dump(liftoff_points, f)
+        except Exception as e:
+            print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+        #for i in range(len(n)):
+        #    n[i].position.z += 0.01
+        #approach = n[0]
+        #approach.position.z += 0.05
+        #pinSwitch(pin=0,state=True)
+        # mid = len(n)//2
+        #ros.Move(approach,0.05,0.05)
+        # ros.Move(n[mid],0.05,0.01)
+        # uni.null()
+
+        # for e in range(3):
+        #     for i in range(1,len(n)):
+        #         ros.Move(n[i],0.05,0.01)
+        #         mapScan()
+        #     for i in range(len(n)-1,0,-1):
+        #         ros.Move(n[i],0.05,0.01)
+        #         mapScan()
+
+    except Exception as e:
+
+        print(f"Error: {e}")
+
+    finally:
+
+        ros.Move("over_table")
+        # yoloEnable(True)
+
+def start():
 
     try:
 
@@ -186,12 +478,26 @@ def moveAround():
         
         ros.Move("over_table")
 
+        ros.yolo_array.poses = []
+
+        global detections
+
+        detections = ros.tracked_detection.detections
+
         yoloEnable(False)
 
-        for i in range(len(ros.tracked_detection.detections)):
+        for i in range(len(detections)):
             center(i)
 
-        ros.Move(ros.pose_array)
+        next = 1
+
+        while next:
+    
+            det = int(input(f"Select detection 1-{len(detections)}: ")) - 1
+            corners(det)
+            routine(det)
+
+            next = int(input("Keep going? (1=yes/0=no): "))
 
     except Exception as e:
 
@@ -200,8 +506,11 @@ def moveAround():
     finally:
 
         pinSwitch(pin=0,state=False)
+        pinSwitch(pin=1,state=False)
 
         ros.Move("over_table")
+
+        yoloEnable(True)
 
 def yoloEnable(enable):
 
@@ -210,16 +519,16 @@ def yoloEnable(enable):
     else:
         print(f"{Colors.CYAN}Disabling YOLO!")
 
-    return yolo_enable_client.sendRequest('SetBool',{'enable':enable})
+    return yolo_enable_client.sendRequest('SetBool',{'data':enable})
 
 def azureConvert(pixel_x, pixel_y):
 
     depth_value = ros.depth_image[int(pixel_y),
                             int(pixel_x)]/1000
     
-    print(f"depth_value: {depth_value}")
-    print(f"pixel_x: {pixel_x}")
-    print(f"pixel_y: {pixel_y}")
+    # print(f"depth_value: {depth_value}")
+    # print(f"pixel_x: {pixel_x}")
+    # print(f"pixel_y: {pixel_y}")
     
     if depth_value != 0.0:
                   
@@ -227,8 +536,8 @@ def azureConvert(pixel_x, pixel_y):
         y = (pixel_y - Azure.cy) * depth_value / Azure.fy
         z = depth_value
 
-        print(f"x: {x}\ny: {y}\nz: {z}\n")
-        return x, y, z
+        # print(f"x: {x}\ny: {y}\nz: {z}\n")
+        return [x, y, z]
     
     else:
 
@@ -241,8 +550,8 @@ def yoloCrop(detection = 0):
 
     # azure_scale = azure_client.sendRequest('AzureFovScaler', { 'distance': depth_value})
 
-    pixel_x = ros.tracked_detection.detections[detection].bbox.center.position.x
-    pixel_y = ros.tracked_detection.detections[detection].bbox.center.position.y
+    pixel_x = detections[detection].bbox.center.position.x
+    pixel_y = detections[detection].bbox.center.position.y
 
     detection_coordinates = azureConvert(pixel_x, pixel_y)
     
@@ -265,7 +574,7 @@ def yoloCrop(detection = 0):
     pose.position.z = point_probe.point.z
     # pose.position.z = ros.t.transform.translation.z
     
-    ros.addPose(pose)
+    # ros.addPose(pose)
 
     # input("You ready?")
     # ros.Move(pose)
@@ -276,11 +585,11 @@ def yoloCrop(detection = 0):
     # 
     #     detection = 0
 
-    pixel_x = ros.detected.detections[detection].bbox.center.position.x
-    pixel_y = ros.detected.detections[detection].bbox.center.position.y
+    pixel_x = detections[detection].bbox.center.position.x
+    pixel_y = detections[detection].bbox.center.position.y
 
-    bbox_x = ros.detected.detections[detection].bbox.size.x/2
-    bbox_y = ros.detected.detections[detection].bbox.size.y/2
+    bbox_x = detections[detection].bbox.size.x/2
+    bbox_y = detections[detection].bbox.size.y/2
 
     # Point 1 Upper Left
     bbox_coordinates[0][0] = pixel_x - bbox_x
@@ -298,12 +607,9 @@ def yoloCrop(detection = 0):
     bbox_coordinates[3][0] = pixel_x + bbox_x
     bbox_coordinates[3][1] = pixel_y + bbox_y
 
-    print(f"{bbox_coordinates}")
-
     points = [[PointStamped()]*2 for _ in range(4)]
 
     for i in range(len(bbox_coordinates)):
-        print(f"i: {i}")
         azure_coordinates[i]=azureConvert(bbox_coordinates[i][0], bbox_coordinates[i][1])
         point = PointStamped()
         if azure_coordinates[i] is not None:
@@ -313,9 +619,6 @@ def yoloCrop(detection = 0):
             point.header.frame_id = "azure_rgb"
             points[i][0] = point
             points[i][1] = do_transform_point(points[i][0], ros.azure_t)
-
-    
-    print(f"{azure_coordinates}")
 
     options = []
 
@@ -332,11 +635,11 @@ def yoloCrop(detection = 0):
         maxy = points[2][1].point.y
         miny = points[1][1].point.y
         if points[1][1].point.z > points[2][1].point.z:
-            maxz = points[1][1].point.z + 0.05
-            minz = points[2][1].point.z - 0.05
+            maxz = points[1][1].point.z + 0.1
+            minz = points[2][1].point.z - 0.1
         elif points[1][1].point.z < points[2][1].point.z:
-            maxz = points[2][1].point.z + 0.05
-            minz = points[1][1].point.z - 0.05
+            maxz = points[2][1].point.z + 0.1
+            minz = points[1][1].point.z - 0.1
 
     elif (0 in options) and (3 in options) :
         print(f"Points 1 and 4 chosen")
@@ -345,11 +648,11 @@ def yoloCrop(detection = 0):
         maxy = points[3][1].point.y
         miny = points[0][1].point.y
         if points[0][1].point.z > points[3][1].point.z:
-            maxz = points[0][1].point.z + 0.05
-            minz = points[3][1].point.z - 0.05
+            maxz = points[0][1].point.z + 0.1
+            minz = points[3][1].point.z - 0.1
         elif points[0][1].point.z < points[3][1].point.z:
-            maxz = points[3][1].point.z + 0.05
-            minz = points[0][1].point.z - 0.05
+            maxz = points[3][1].point.z + 0.1
+            minz = points[0][1].point.z - 0.1
     
     elif not (((1 in options) and (2 in options)) or ((0 in options) and (3 in options))):
 
@@ -373,8 +676,8 @@ def yoloCrop(detection = 0):
                 ydis = ratio*bbox_y
                 miny = maxy - ydis
 
-            maxz = points[options[1]][1].point.z + 0.05
-            minz = points[options[1]][1].point.z - 0.05
+            maxz = points[options[1]][1].point.z + 0.1
+            minz = points[options[1]][1].point.z - 0.1
 
             
         else:
@@ -386,8 +689,8 @@ def yoloCrop(detection = 0):
             ratio = ydis/bbox_y
             xdis = ratio*bbox_x
             minx = maxx - xdis
-            maxz = points[options[1]][1].point.z + 0.05
-            minz = points[options[1]][1].point.z - 0.05
+            maxz = points[options[1]][1].point.z + 0.1
+            minz = points[options[1]][1].point.z - 0.1
     else:
 
         # return "we tried (y)"
@@ -401,9 +704,7 @@ def yoloCrop(detection = 0):
     print(f"maxz = {maxz}")
     print(f"minz = {minz}")
 
-    # return maxx, minx, maxy, miny, maxz, minz
-
-    startReconstruction(maxx=maxx,maxy=maxy,maxz=maxz,minx=minx,miny=miny,minz=minz)
+    return maxx, maxy, maxz, minx, miny, minz
             
 def startReconstruction(maxx=0.0,maxy=0.0,maxz=0.0,minx=0.0,miny=0.0,minz=0.0):
 
@@ -439,30 +740,55 @@ def stopReconstruction():
     normal_filter = NormalFilterParams(normal_direction=normal_direction, angle=paramdb.angle.magnitude)
     normal_filters = [normal_filter]
 
-    print(f"{Colors.GREEN}Stoping Reconstruction")
+    print(f"{Colors.GREEN}Stopping Reconstruction")
         
     return stop_reconstruction.sendRequest('StopReconstruction',
                                    {'archive_directory':paramdb.archive_directory,
                                     'mesh_filepath':paramdb.mesh_filepath,
                                     'normal_filters':normal_filters})
 
-def noether(input=paramdb.input_file, set_o=paramdb.set_orientation, line_spacing=paramdb.line_spacing.magnitude, point_spacing=paramdb.point_spacing.magnitude, z_offset=paramdb.z_offset.magnitude):
+def noetherEddy(direction=paramdb.eddy_direction):
 
-    print(f"{Colors.BLUE}Noether TPP")
+    print(f"{Colors.MAGENTA}Eddy Current Noether TPP")
     
-    q = transforms3d.euler.euler2quat(paramdb.orientation.magnitude[0],paramdb.orientation.magnitude[1],paramdb.orientation.magnitude[2])
+    q = transforms3d.euler.euler2quat(paramdb.eddy_orientation.magnitude[0],paramdb.eddy_orientation.magnitude[1],paramdb.eddy_orientation.magnitude[2])
 
     quat = Quaternion(w=q[0],x=q[1],y=q[2],z=q[3])
 
     return noether_client.sendRequest('TariNoether', 
-                                     {'mesh_filename': input,
-                                      'line_spacing': line_spacing,
-                                      'point_spacing': point_spacing,
-                                      'z_offset': z_offset,
-                                      'distance_threshold': paramdb.distance_threshold.magnitude,
-                                      'plane_proj': paramdb.plane_proj,
-                                      'max_planes': paramdb.max_planes.magnitude,
-                                      'set_orientation': set_o,
+                                     {'mesh_filename': paramdb.eddy_input_file,
+                                      'line_spacing': paramdb.eddy_line_spacing.magnitude,
+                                      'point_spacing': paramdb.eddy_point_spacing.magnitude,
+                                      'z_offset': paramdb.eddy_z_offset.magnitude,
+                                      'distance_threshold': paramdb.eddy_distance_threshold.magnitude,
+                                      'plane_proj': paramdb.eddy_plane_proj,
+                                      'max_planes': paramdb.eddy_max_planes.magnitude,
+                                      'set_orientation': paramdb.eddy_set_orientation,
+                                      'snake' : paramdb.eddy_snake,
+                                      'origin': paramdb.eddy_origin,
+                                      'direction': direction,
+                                      'orientation': quat}).noether_pose_array.poses
+
+def noetherKeyence():
+
+    print(f"{Colors.BLUE}Keyence Noether TPP")
+    
+    q = transforms3d.euler.euler2quat(paramdb.keyence_orientation.magnitude[0],paramdb.keyence_orientation.magnitude[1],paramdb.keyence_orientation.magnitude[2])
+
+    quat = Quaternion(w=q[0],x=q[1],y=q[2],z=q[3])
+
+    return noether_client.sendRequest('TariNoether', 
+                                     {'mesh_filename': paramdb.mesh_filter_output_filepath,
+                                      'line_spacing': paramdb.keyence_line_spacing.magnitude,
+                                      'point_spacing': paramdb.keyence_point_spacing.magnitude,
+                                      'z_offset': paramdb.keyence_z_offset.magnitude,
+                                      'distance_threshold': paramdb.keyence_distance_threshold.magnitude,
+                                      'plane_proj': paramdb.keyence_plane_proj,
+                                      'max_planes': paramdb.keyence_max_planes.magnitude,
+                                      'set_orientation': paramdb.keyence_set_orientation,
+                                      'snake' : paramdb.keyence_snake,
+                                      'origin': paramdb.keyence_origin,
+                                      'direction': paramdb.keyence_direction,
                                       'orientation': quat}).noether_pose_array.poses
 
 def noetherDownsample(percentage):
@@ -531,18 +857,19 @@ def noetherDownsample(percentage):
     
     return j
 
-def meshFilter(input=paramdb.mesh_filter_input_filepath):
+def meshFilter():
 
     print(f"{Colors.MAGENTA}Mesh Filter")
 
     return mesh_filter_client.sendRequest('TariMeshFilter', 
-                                     {'input_filepath': input,
+                                     {'input_filepath': paramdb.mesh_filter_input_filepath,
                                       'output_filepath': paramdb.mesh_filter_output_filepath,
                                       'color': paramdb.color.magnitude,
                                       'threshold': paramdb.threshold.magnitude,
                                       'cutoff': paramdb.cutoff.magnitude,
                                       'color_filter': paramdb.color_filter,
-                                      'vert_filter': paramdb.vert_filter}).success
+                                      'vert_filter': paramdb.vert_filter,
+                                      'delete_loose_parts': paramdb.delete_loose_parts}).success
 
 def segment():
 
@@ -580,6 +907,7 @@ def keyenceStop():
                             {'mean_k': paramdb.mean_k.magnitude,
                              'dev_thresh': paramdb.dev_thresh.magnitude,
                              'leaf_size': paramdb.leaf_size.magnitude,
+                             'mini_leaf_size': paramdb.mini_leaf_size.magnitude,
                              'output_filepath': paramdb.output_filepath,
                              'output_filename': paramdb.output_filename,
                              'search_radius': paramdb.search_radius.magnitude,
@@ -589,16 +917,23 @@ def keyenceStop():
                              'k_search': paramdb.k_search.magnitude,
                              'min': paramdb.min.magnitude,
                              'max': paramdb.max.magnitude,
-                             'perform_outlier_filtering': paramdb.perform_outlier_filtering}).success
+                             'perform_outlier_filtering': paramdb.perform_outlier_filtering,
+                             'cluster_tolerance': paramdb.cluster_tolerance.magnitude,
+                             'max_cluster_size': paramdb.max_cluster_size.magnitude,
+                             'min_cluster_size': paramdb.min_cluster_size.magnitude,
+                             'depth': paramdb.poisson_depth.magnitude,
+                             'solver_divide': paramdb.solver_divide.magnitude,
+                             'iso_divide': paramdb.iso_divide.magnitude,
+                             'point_weight': paramdb.point_weight.magnitude,}).success
 
-def x3dConvert(input=paramdb.x3d_input_filepath, flip=paramdb.x3d_flip_normals):
+def x3dConvert():
 
     print(f"{Colors.BLUE}X3d Converter")
 
     return x3d_converter_client.sendRequest('X3dConverter',
-                                     {'input_filepath': input,
+                                     {'input_filepath': paramdb.x3d_input_filepath,
                                       'output_filepath': paramdb.x3d_output_filepath,
-                                      'flip': flip})
+                                      'flip': paramdb.x3d_flip_normals})
 
 def curvedGeometry():
     q = Quaternion(w=0.7012773070207925, x=0.008745344456110877, y=0.008990798433617032, z=0.7127782426193544)
@@ -702,7 +1037,7 @@ def probeProjectChan(specimenNum=1):
                 probe_tip_data_channel = ros.specimen_data_channel[specimenIndex],
                 min_dist = -0.2, # starting position for ray tracer, relative to probe tip position, in meters
                 max_dist = 0.3, # ending position for ray tracer, relative to probe tip position, in meters
-                radius = 0.01, # spot size, in nominal parameterization scale, in meters
+                radius = 10.0, # spot size, in nominal parameterization scale, in meters
                 horizontal_pixels = 1282, # horizontal total pixel width in parameterization space
                 vertical_pixels = 1280, # vertical total pixel width in parameterization space
                 projection_channel = "/graphics/projection_" + str(specimenNum),
@@ -713,13 +1048,14 @@ def probeProjectChan(specimenNum=1):
         
     except Exception as e:
 
-        print(e)
+        print(f"{Colors.RED}Problem projecting probe tip data for specimen {specimenNum}\n{e}{Colors.RESET}")
+
     
     finally:
 
         transact.end_transaction()
 
-def mapScan(specimenNum=1):
+def mapScan(specimenNum=ros.counter):
 
     if ros.counter == 0: return print(f"{Colors.RED}No specimens available{Colors.RESET}")
     elif specimenNum > ros.counter: return print(f"{Colors.RED}Specimen number {specimenNum} out of range")
@@ -747,6 +1083,13 @@ def mapScan(specimenNum=1):
         specimen_data_ref.assign_complexfloat64([],data)
         specimen_data_ref.rec.mark_data_ready()
 
+        pp_data_copy = pp_data.copy()
+        pp_data_copy[0][1][0] = 0
+        pp_data_copy[0][1][3] = 0
+        #pp_data_copy[0][1][2] = pp_data_copy[0][1][3]
+        #z = pp_data_copy[0][0][1]
+        #pp_data_copy[0][0][1] = pp_data_copy[0][0][2]
+        #pp_data_copy[0][0][2] = z
         specimen_pose_ref = snde.create_pose_channel_ndarray_ref(recdb, specimen_pose_channel_copy, recdb.raw(), snde.recdb_path_join(ros.specimen_model_tree[0], "meshed_copy"))
         specimen_pose_ref.allocate_storage([1])
         specimen_pose_ref.data()[:] = sp_data
@@ -756,7 +1099,7 @@ def mapScan(specimenNum=1):
         eoat_pose_ref = snde.create_pose_channel_ndarray_ref(recdb, probe_pose_channel_copy, recdb.raw(), snde.recdb_path_join(ros.eoat_model_tree, "meshed_copy"))
         eoat_pose_ref.allocate_storage([1])
         # eoat_pose_rec = snde.pose_channel_recording.from_ndarray_recording(eoat_pose_ref.rec)
-        eoat_pose_ref.data()[:] = pp_data
+        eoat_pose_ref.data()[:] = pp_data_copy
         eoat_pose_ref.rec.mark_metadata_done()
         eoat_pose_ref.rec.mark_data_ready()
 
@@ -982,12 +1325,12 @@ def calScan(liftoff=0,flip=False):
         keyenceStart()
 
         ros.Move(pa.poses[1],0.01,0.01)
-        keyenceStop()
+        keyenceStop(mean_k=35,dev_thresh=2.0,perform_outlier_filtering=False)
 
 
     finally:
 
-        ros.Move('over_cal_plate',0.05,0.05)
+        ros.Move('over_table',0.05,0.1)
         pinSwitch(pin=0,state=False)
 
     x3d = x3dConvert(input=paramdb.output_filepath+paramdb.output_filename,flip=flip)
@@ -1007,10 +1350,10 @@ def calScan(liftoff=0,flip=False):
 
     try:
 
-        n = noether(input=paramdb.output_filepath+paramdb.output_filename,set_o=True,line_spacing=0.001,point_spacing= 0.001,z_offset=0.0)
+        n = noether(input=paramdb.output_filepath+paramdb.output_filename,set_o=True,line_spacing=0.0001,point_spacing= 0.0001,z_offset=0.0)
 
-        # for i in range(len(n)):
-        #     n[i].position.z += liftoff
+        for i in range(len(n)):
+            n[i].position.z += liftoff
 
 
         approach = n[0]
@@ -1020,19 +1363,24 @@ def calScan(liftoff=0,flip=False):
         ros.Move(approach,0.05,0.05)
         # ros.Move(n[mid],0.05,0.01)
         # uni.null()
-         
+        
         for i in range(1,len(n)):
             ros.Move(n[i],0.05,0.01)
             mapScan()
+
+        # for i in range(len(n)-1,0,-1):
+        #     ros.Move(n[i],0.05,0.01)
+        #     mapScan()
 
     except Exception as e:
         print(f"Error: {e}")
     
     finally:
-        ros.Move('over_cal_plate')
+        # ros.Move(n[-1],0.05,0.01)
+        ros.Move('over_table')
         pinSwitch(pin=0,state=False)
 
-def keyScan(passes=1, x_pos=0.82,y_pos=-0.475,width=0.03,length=0.04,vel=0.04,acc=0.04):
+def keyScanDemo(passes=1, x_pos=0.82,y_pos=-0.475,width=0.03,length=0.04,vel=0.04,acc=0.04):
 
     slice=9
     pinSwitch(pin=0,state=True)
@@ -1487,10 +1835,25 @@ def capture3Ddata(specimenIndex=1):
     ch2data = np.mean(rec.data())
     rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
     ch1data = np.mean(rec.data())
+    global complexdata
     complexdata = ch1data + 1j*ch2data
     # print(f"Complex data = {complexdata}{Colors.RESET}")
     pp_data = recdb.latest_defined_globalrev().get_ndarray_ref('/probe_pose').data()
     sp_data = recdb.latest_defined_globalrev().get_ndarray_ref('/specimen_'+str(specimenIndex)+'_pose').data()
+
+    if not 'trackeddata' in globals():
+        global trackeddata
+        trackeddata = {}
+        trackeddata['complexdata'] = []
+        trackeddata['pp_data'] = []
+        trackeddata['sp_data'] = []
+
+    
+    trackeddata['complexdata'].append(complexdata)
+    trackeddata['pp_data'].append(pp_data)
+    trackeddata['sp_data'].append(sp_data)
+    
+
     # print(f"{Colors.CYAN}Probe pose data = {pp_data}")
     # print(f"{Colors.MAGENTA}Specimen pose data = {sp_data}{Colors.RESET}")
 
