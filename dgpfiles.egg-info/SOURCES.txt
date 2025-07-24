@@ -1,0 +1,10 @@
+LICENSE
+setup.py
+dgpfiles/x3dConverter.py
+dgpfiles.egg-info/PKG-INFO
+dgpfiles.egg-info/SOURCES.txt
+dgpfiles.egg-info/dependency_links.txt
+dgpfiles.egg-info/not-zip-safe
+dgpfiles.egg-info/top_level.txt
+dgpfiles/utils/__init__.py
+dgpfiles/utils/azure.dpi
