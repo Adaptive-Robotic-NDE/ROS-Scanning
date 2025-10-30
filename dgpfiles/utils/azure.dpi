@@ -1,15 +1,15 @@
-class Azure:
-    cx = 1026.55
-    cy = 773.586
-    fx = 973.347
-    fy = 973.203
+global cx, cy, fx, fy
+global x, y, z
 
-def azureConvert(pixel_x, pixel_y, depth):
+cx = 1026.55
+cy = 773.586
+fx = 973.347
+fy = 973.203
 
-                  
-    x = (pixel_x - Azure.cx) * depth / Azure.fx
-    y = (pixel_y - Azure.cy) * depth / Azure.fy
-    z = depth
+pixel_x = 0
+pixel_y = 0
+depth = 0
 
-
-    return [x, y, z]
+x = (pixel_x - cx) * depth / fx
+y = (pixel_y - cy) * depth / fy
+z = depth

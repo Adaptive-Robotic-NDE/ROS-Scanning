@@ -3,7 +3,7 @@ from setuptools import setup
 
 package_data = {
     "dgpfiles": [
-        "*.dpi", # .dpi files for dataguzzler-python
+        "/utils/*.dpi", # .dpi files for dataguzzler-python
     ]
 }
 
