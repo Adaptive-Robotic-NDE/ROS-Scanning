@@ -16,6 +16,7 @@ import os
 import numpy as np
 import dgpfiles
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from launch_ros.substitutions import FindPackageShare
 from industrial_reconstruction_msgs.msg import NormalFilterParams, RGBDImageParams, TSDFVolumeParams
 from launch.substitutions import PathJoinSubstitution
@@ -83,16 +84,19 @@ include(dgpfiles, "utils/azure.dpi")
 rclpy.init()
 positioner_channel = []
 
+tari_ur_launch_pkg = get_package_share_directory('tari_ur_launch')
+eddie_current_probe_mesh = os.path.join(tari_ur_launch_pkg, 'meshes', 'ecProbe.x3d')
+
 global ros
-ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh='/home/labuser/ecProbe.x3d') #'/home/labuser/tari_ws/Probe_uv.x3d')
+ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh=eddie_current_probe_mesh)
 
 include(rosm, "services.dpi")
 include(rosm, "parameters/parameters.dpi")
 
-# daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
+daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
 
-# daq.SampleRate = 10*ur.kHz
-# daq.SampsPerChan = 100
+daq.SampleRate = 10*ur.kHz
+daq.SampsPerChan = 100
 
 raster = False
 orient_dtype = [('offset', '<f4', (4,)), ('quat', '<f4', (4,))]
@@ -635,8 +639,8 @@ def newKeyScan(vel,accel,detection=0):
                 selected_point_x = ros.click_msg.point.x
                 selected_point_y = ros.click_msg.point.y
             else:
-                selected_point_x = 0.8706851005554199
-                selected_point_y = -0.24676552414894104
+                selected_point_x = 0.824
+                selected_point_y = -0.246
                 picking_point = False
             print(f"Point for cropping\nX: {selected_point_x}\nY: {selected_point_y}\n")
             picking_point = not bool(int(input("Does this look right? (1=yes/0=no): ")))
@@ -874,9 +878,9 @@ def routine(detection=0, avg_depth=0):
             ros.Move('over_table')
             return
         mapScan()
-        eddy_points['force_x'].append(float(ros.force_msg.wrench.force.x))
-        eddy_points['force_y'].append(float(ros.force_msg.wrench.force.y))
-        eddy_points['force_z'].append(float(ros.force_msg.wrench.force.z))
+        eddy_points['force_x'].append(float(ros.sync_force_msg.wrench.force.x))
+        eddy_points['force_y'].append(float(ros.sync_force_msg.wrench.force.y))
+        eddy_points['force_z'].append(float(ros.sync_force_msg.wrench.force.z))
         eddy_points['complex_real'].append(float(complexdata.real))
         eddy_points['complex_imag'].append(float(complexdata.imag))
         eddy_points['n'].append(0)
@@ -892,9 +896,9 @@ def routine(detection=0, avg_depth=0):
             for i in range(1,len(n)):
                 ros.Move(n[i],0.05,0.01)
                 mapScan()
-                eddy_points['force_x'].append(float(ros.force_msg.wrench.force.x))
-                eddy_points['force_y'].append(float(ros.force_msg.wrench.force.y))
-                eddy_points['force_z'].append(float(ros.force_msg.wrench.force.z))
+                eddy_points['force_x'].append(float(ros.sync_force_msg.wrench.force.x))
+                eddy_points['force_y'].append(float(ros.sync_force_msg.wrench.force.y))
+                eddy_points['force_z'].append(float(ros.sync_force_msg.wrench.force.z))
                 eddy_points['complex_real'].append(float(complexdata.real))
                 eddy_points['complex_imag'].append(float(complexdata.imag))
                 eddy_points['n'].append(int(i))
@@ -1209,12 +1213,18 @@ def normalize(vect):
        return vect
     return vect / norm
 
-def calculateRegistration():
+def calculateRegistration(detection_id):
 
     print(f"{Colors.YELLOW}Calculating Registration")
 
-    pixel_x = ros.tags.detections[0].centre.x
-    pixel_y = ros.tags.detections[0].centre.y
+    for detection in ros.tags.detections:
+        if detection.id == detection_id:
+            selected_detection = detection
+
+    azure_transform = ros.azure_t
+
+    pixel_x = selected_detection.centre.x
+    pixel_y = selected_detection.centre.y
 
     depth = depthCheck(pixel_x, pixel_y)
 
@@ -1226,42 +1236,48 @@ def calculateRegistration():
     transformed_detection.point.z = tag_coordinates[2]
     transformed_detection.header.frame_id = "azure_rgb"
 
-    tag_center = do_transform_point(transformed_detection, ros.azure_t)
+    tag_center = do_transform_point(transformed_detection, azure_transform)
+    position = [tag_center.point.x, tag_center.point.y,tag_center.point.z]
+
+    print(f"Position: {Colors.RESET}", position)
 
     corners = []
 
-    for corner in ros.tags.detections[0].corners:
+    for corner in selected_detection.corners:
          pixel_x = corner.x
          pixel_y = corner.y
+         print(f"Pixel X: {pixel_x}, Pixel Y: {pixel_y}")
          depth = depthCheck(pixel_x, pixel_y)
+         print(depth)
          corner_coordinate = azureConvert(pixel_x, pixel_y, depth)
          transformed_coordinate = PointStamped()
          transformed_coordinate.point.x = corner_coordinate[0]
          transformed_coordinate.point.y = corner_coordinate[1]
          transformed_coordinate.point.z = corner_coordinate[2]
+         print(corner_coordinate[2])
          transformed_coordinate.header.frame_id = "azure_rgb"
-         transformed_corner = do_transform_point(transformed_coordinate, ros.azure_t)
+         transformed_corner = do_transform_point(transformed_coordinate, azure_transform)
          transformed_corner_coords = [transformed_corner.point.x, transformed_corner.point.y, transformed_corner.point.z]
          corners.append(transformed_corner_coords)
 
-    translation_vector = np.array(tag_center)
+    translation_vector = np.array(position)
 
     v_edge1 = np.array(corners[1]) - np.array(corners[0])
 
     v_edge2 = np.array(corners[3]) - np.array(corners[0])
 
-    z_axis = normalize(np.cross(v_edge1, v_edge2))
-
     x_axis = normalize(v_edge1)
+
+    y_axis = normalize(v_edge2)
+
+    z_axis = normalize(np.cross(v_edge1, v_edge2))
 
     y_axis = normalize(np.cross(z_axis, x_axis))
 
-    x_axis = normalize(np.cross(y_axis, z_axis))
-
     transformation_matrix = np.array([
-        [x_axis[0], y_axis[0], z_axis[0], translation_vector[0]],
-        [x_axis[1], y_axis[1], z_axis[1], translation_vector[1]],
-        [x_axis[2], y_axis[2], z_axis[2], translation_vector[2]],
+        [y_axis[0], -x_axis[0], z_axis[0], translation_vector[0]],
+        [y_axis[1], -x_axis[1], z_axis[1], translation_vector[1]],
+        [y_axis[2], -x_axis[2], z_axis[2], translation_vector[2]],
         [0.0,       0.0,       0.0,       1.0]
     ])
 
@@ -1269,19 +1285,99 @@ def calculateRegistration():
 
     return matrix_flat
 
+#def calculateRegistration(detection_id):
+#
+#    print(f"{Colors.YELLOW}Calculating Registration")
+#
+#    selected_detections = []
+#
+#    for detection in ros.tags.detections:
+#        if detection.id == detection_id:
+#            selected_detections.append(detection)
+#
+#    azure_transform = ros.azure_t
+#
+#    measured_points = []
+#
+#    for detection in selected_detections:
+#        for corner in detection.corners:
+#             pixel_x = corner.x
+#             pixel_y = corner.y
+#             depth = depthCheck(pixel_x, pixel_y)
+#             corner_coordinate = azureConvert(pixel_x, pixel_y, depth)
+#             transformed_coordinate = PointStamped()
+#             transformed_coordinate.point.x = corner_coordinate[0]
+#             transformed_coordinate.point.y = corner_coordinate[1]
+#             transformed_coordinate.point.z = corner_coordinate[2]
+#             transformed_coordinate.header.frame_id = "azure_rgb"
+#             transformed_corner = do_transform_point(transformed_coordinate, azure_transform)
+#             transformed_corner_coords = [transformed_corner.point.x, transformed_corner.point.y, transformed_corner.point.z]
+#             measured_points.append(transformed_corner_coords)
+#
+#
+#    # 1. Find the centroid (average position) of each point set
+#    model_centroid = np.mean(model_points, axis=0)
+#    measured_centroid = np.mean(measured_points, axis=0)
+#
+#    # 2. Center both point sets (subtract the centroid)
+#    model_centered = model_points - model_centroid
+#    measured_centered = measured_points - measured_centroid
+#
+#    # 3. Compute the Covariance Matrix H
+#    H = model_centered.T @ measured_centered
+#
+#    # 4. Use SVD (Singular Value Decomposition) to find the rotation
+#    U, S, Vt = np.linalg.svd(H)
+#
+#    # 5. Calculate the optimal rotation matrix (R)
+#    R_matrix = Vt.T @ U.T
+#
+#    # --- Special reflection case (important!) ---
+#    # If the determinant is -1, it's a reflection, not a rotation.
+#    if np.linalg.det(R_matrix) < 0:
+#       Vt[2,:] *= -1
+#       R_matrix = Vt.T @ U.T
+#
+#    # 6. Calculate the optimal translation vector (t)
+#    #    t = measured_centroid - R * model_centroid
+#    t_vector = measured_centroid - (R_matrix @ model_centroid)
+#
+#    # 7. Build your final 4x4 Transformation Matrix
+#    #    This is the pose of your box in the world (T_world_box)
+#    transformation_matrix = np.eye(4)
+#    transformation_matrix[0:3, 0:3] = R_matrix
+#    transformation_matrix[0:3, 3] = t_vector
+#
+#    # THIS 'transformation_matrix' IS YOUR NEW, STABLE RESULT
+#    # It replaces your old matrix calculation entirely.
+#    matrix_flat = transformation_matrix.flatten().tolist()
 
-
-def registerMesh():
+def registerMesh(id,matrix=None,location=(0.0,0.0,0.0)):
 
     print(f"{Colors.YELLOW}Registering Mesh")
 
-    matrix = calculateRegistration()
+    matrix = calculateRegistration(id)
+
+    if id == 6:
+        print("Performing Calibration Plate Registration")
+        full_mesh_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/calPlate.dae'
+        full_mesh_output_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/calPlate.ply'
+        sample_mesh_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/calPlateSample.dae'
+        sample_mesh_output_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/calPlateSample.ply'
+
+    elif id == 7:
+        print("Performing Cylinder Registration")
+        full_mesh_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/FullFiducialCylinder.dae'
+        full_mesh_output_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/FullFiducialCylinder.ply'
+        sample_mesh_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/SampleFiducialCylinder.dae'
+        sample_mesh_output_filepath = '/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/SampleFiducialCylinder.ply'
 
     return cad_register.sendRequest('AprilRegister',
-                                   {'full_mesh_filepath':'/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/FullFiducialCylinder.dae',
-                                    'full_mesh_output_filepath':'/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/FullFiducialCylinder.ply',
-                                    'sample_mesh_filepath':'/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/SampleFiducialCylinder.dae',
-                                    'sample_mesh_output_filepath':'/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/SampleFiducialCylinder.ply',
+                                   {'full_mesh_filepath':full_mesh_filepath,
+                                    'full_mesh_output_filepath':full_mesh_output_filepath,
+                                    'sample_mesh_filepath':sample_mesh_filepath,
+                                    'sample_mesh_output_filepath':sample_mesh_output_filepath,
+                                    'location':location,
                                     'matrix':matrix,})
 
 def startReconstruction(maxx=0.0,maxy=0.0,maxz=0.0,minx=0.0,miny=0.0,minz=0.0):
