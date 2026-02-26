@@ -347,10 +347,8 @@ def demo():
         noether_result = noether_client.sendRequest('TariNoether', 
                                                                             {'mesh_filename': paramdb.input_file,
                                                                              'line_spacing': paramdb.line_spacing.magnitude,
-                                                                             'point_spacing': paramdb.point_spacing.magnitude,
                                                                              'z_offset': paramdb.z_offset.magnitude,
-                                                                             'distance_threshold': paramdb.distance_threshold.magnitude,
-                                                                             'max_planes': paramdb.max_planes.magnitude})
+                                                                             'distance_threshold': paramdb.distance_threshold.magnitude})
 
         while not noether_result.success:
             print("Creating Tool Path Plan...")
@@ -361,7 +359,6 @@ def demo():
         if noether_result.success : NoetherScan(noether_result.noether_pose_array,
                                                  1,
                                                  len(noether_result.noether_pose_array.poses),
-                                                 paramdb.point_spacing.magnitude,
                                                  paramdb.line_spacing.magnitude)
 
         ros.Move("over_curved_geometry",0.2,0.2)
@@ -733,11 +730,9 @@ def routine(detection=0, avg_depth=0):
         reso = 0 # int(input("Higher resolution? (1=yes/0=no): "))
         if reso:
             paramdb.eddy_line_spacing = 0.0001
-            paramdb.eddy_point_spacing = 0.0001
 
         else:
            paramdb.eddy_line_spacing = 0.0003
-           paramdb.eddy_point_spacing = 0.0003
 
         global n
 
@@ -846,7 +841,6 @@ def routine(detection=0, avg_depth=0):
     timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
 
     eddy_line_spacing = paramdb.eddy_line_spacing.to(ureg.millimeter)
-    eddy_point_spacing = paramdb.eddy_point_spacing.to(ureg.millimeter)
 
 
     global eddy_points
@@ -861,8 +855,7 @@ def routine(detection=0, avg_depth=0):
         'y': [],
         'z': [],
         'elapsed_time': 0.0,
-        'line_spacing': str(eddy_line_spacing),
-        'point_spacing': str(eddy_point_spacing)}
+        'line_spacing': str(eddy_line_spacing)}
 
     try:
         ros.Move(ros.yolo_array.poses[detection],vel,accel)
@@ -1434,11 +1427,8 @@ def noetherEddy(fixed=True, direction=paramdb.eddy_direction, origin=paramdb.edd
         fixed_axis = fixedAxisNoether(
             mesh_filename=paramdb.eddy_input_file,
             line_spacing=paramdb.eddy_line_spacing.magnitude,
-            point_spacing=paramdb.eddy_point_spacing.magnitude,
             z_offset=paramdb.eddy_z_offset.magnitude,
             distance_threshold=paramdb.eddy_distance_threshold.magnitude,
-            plane_proj=paramdb.eddy_plane_proj,
-            max_planes=paramdb.eddy_max_planes.magnitude,
             set_orientation=paramdb.eddy_set_orientation,
             snake=paramdb.eddy_snake,
             fine=True,
@@ -1455,11 +1445,8 @@ def noetherEddy(fixed=True, direction=paramdb.eddy_direction, origin=paramdb.edd
         principal_axis = principalAxisNoether(
             mesh_filename=paramdb.eddy_input_file,
             line_spacing=paramdb.eddy_line_spacing.magnitude,
-            point_spacing=paramdb.eddy_point_spacing.magnitude,
             z_offset=paramdb.eddy_z_offset.magnitude,
             distance_threshold=paramdb.eddy_distance_threshold.magnitude,
-            plane_proj=paramdb.eddy_plane_proj,
-            max_planes=paramdb.eddy_max_planes.magnitude,
             set_orientation=paramdb.eddy_set_orientation,
             snake=paramdb.eddy_snake,
             fine=True,
@@ -1482,11 +1469,8 @@ def noetherKeyence():
     return fixedAxisNoether(
         mesh_filename=paramdb.mesh_filter_output_filepath,
         line_spacing=paramdb.keyence_line_spacing.magnitude,
-        point_spacing=paramdb.keyence_point_spacing.magnitude,
         z_offset=round(ros.keyence_t.transform.translation.z,5),
         distance_threshold=paramdb.keyence_distance_threshold.magnitude,
-        plane_proj=paramdb.keyence_plane_proj,
-        max_planes=paramdb.keyence_max_planes.magnitude,
         set_orientation=paramdb.keyence_set_orientation,
         snake=paramdb.keyence_snake,
         fine=False,
@@ -1499,11 +1483,8 @@ def noetherKeyence():
 def fixedAxisNoether(
         mesh_filename,
         line_spacing,
-        point_spacing,
         z_offset,
         distance_threshold,
-        plane_proj,
-        max_planes,
         set_orientation,
         snake,
         fine,
@@ -1518,11 +1499,8 @@ def fixedAxisNoether(
     return fixed_axis_noether_client.sendRequest('FixedAxisNoetherPlanner',
                                       {'mesh_filename': mesh_filename,
                                        'line_spacing': line_spacing,
-                                       'point_spacing': point_spacing,
                                        'z_offset': z_offset,
                                        'distance_threshold': distance_threshold,
-                                       'plane_proj': plane_proj,
-                                       'max_planes': max_planes,
                                        'set_orientation': set_orientation,
                                        'snake' : snake,
                                        'fine' : fine,
@@ -1534,7 +1512,6 @@ def fixedAxisNoether(
 def principalAxisNoether(
         mesh_filename,
         line_spacing,
-        point_spacing,
         z_offset,
         distance_threshold,
         plane_proj,
@@ -1553,11 +1530,8 @@ def principalAxisNoether(
     return principal_axis_noether_client.sendRequest('PrincipalAxisNoetherPlanner',
                                       {'mesh_filename': mesh_filename,
                                        'line_spacing': line_spacing,
-                                       'point_spacing': point_spacing,
                                        'z_offset': z_offset,
                                        'distance_threshold': distance_threshold,
-                                       'plane_proj': plane_proj,
-                                       'max_planes': max_planes,
                                        'set_orientation': set_orientation,
                                        'snake' : snake,
                                        'fine' : fine,
@@ -2149,7 +2123,6 @@ def runscan():
         noether_result = noether_client.sendRequest('TariNoether', 
                                                                             {'mesh_filename': output_filename.name,
                                                                              'line_spacing': paramdb.line_spacing.magnitude,
-                                                                             'point_spacing': paramdb.point_spacing.magnitude,
                                                                              'z_offset': paramdb.z_offset.magnitude})
 
         while not noether_result.success:
@@ -2161,7 +2134,6 @@ def runscan():
         if noether_result.success : NoetherScan(noether_result.noether_pose_array,
                                                  1,
                                                  len(noether_result.noether_pose_array.poses),
-                                                 paramdb.point_spacing.magnitude,
                                                  paramdb.line_spacing.magnitude)
             
         ros.Move("over_cal_plate",0.2,0.2)
@@ -2270,7 +2242,7 @@ def calScan(liftoff=0,flip=False):
 
     try:
 
-        n = noether(input=paramdb.output_filepath+paramdb.output_filename,set_o=True,line_spacing=0.0001,point_spacing= 0.0001,z_offset=0.0)
+        n = noether(input=paramdb.output_filepath+paramdb.output_filename,set_o=True,line_spacing=0.0001,z_offset=0.0)
 
         for i in range(len(n)):
             n[i].position.z += liftoff
@@ -2347,7 +2319,7 @@ def keyScanDemo(passes=1, x_pos=0.82,y_pos=-0.475,width=0.03,length=0.04,vel=0.0
         ros.Move('over_cal_plate')
         pinSwitch(pin=0,state=False)
 
-def NoetherScan(pose_array, n, m, point_spacing, line_spacing):
+def NoetherScan(pose_array, n, m, line_spacing):
 
 
     tout = TransformStamped()
