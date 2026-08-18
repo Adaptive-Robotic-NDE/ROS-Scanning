@@ -1,0 +1,12 @@
+# colcon build products. `build/lib/` and `dgpfiles.egg-info/` predate this file
+# and stay tracked; these are the paths a plain `colcon build` adds on top.
+/build/.built_by
+/build/COLCON_IGNORE
+/build/dgpfiles/
+/install/
+/log/
+
+# Python bytecode. Some .pyc under dgpfiles/ predates this file and stays
+# tracked; nothing new should be added.
+__pycache__/
+*.pyc
