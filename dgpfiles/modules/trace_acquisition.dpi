@@ -1,0 +1,447 @@
+# Trace-list acquisition: A-scans indexed by trigger, with a pose each.
+#
+# The rectangular accumulator that Scan2DPlaneRaster uses writes the k-th
+# arriving A-scan into slot k of an (m, n, nsamples) volume computed from a grid
+# it has to know in advance. That is fine for a plane and impossible for a
+# surface-following toolpath, whose lines are ragged, whose regions may be
+# disconnected, and whose length is whatever the mesh made it. It is also
+# brittle: one extra or missing trace shifts every later point in the volume,
+# which is the failure mode that has bitten this config twice already.
+#
+# So: acquire into a flat (K, nsamples) trace list, and record the probe pose
+# with every trace. Geometry then lives in the pose array rather than in the
+# array indices, and presentation -- rectangular C-scan, projection onto a
+# parameterized surface, anything else -- becomes a separate, re-runnable step.
+# A stray trace lands at the pose it was actually taken at, or nowhere. It
+# cannot displace its neighbours.
+#
+# K is still known before the scan starts: the toolpath is planned and the pitch
+# is fixed, so K = ScanPath.trace_count(pitch). That is what lets the same
+# nd_accumulate_once machinery be used with a plain sequential map.
+
+import itertools
+import numpy as np
+import spatialnde2 as snde
+
+# A .dpi is compiled as a function body, so anything the including config
+# needs to see has to be declared global before it is assigned.
+global POSE_FIELDS
+global TraceAccumulator
+global NUMPY_TO_SNDE_RTN
+global snde_typenum_for
+
+
+POSE_FIELDS = 7   # qw, qx, qy, qz, x, y, z
+
+# A digitizer's sample type is its own business: the GaGe CompuScope reports raw
+# counts (int8/int16) or converted volts (float64) depending on how it is
+# configured, and that can change between runs. Staging in a fixed type would
+# cast every trace and fix the accumulated volume to a type the card never sent.
+# nd_accumulate_once and cscan_gate are both templated over the integer and the
+# floating types, so the native type carries all the way to the c-scan.
+NUMPY_TO_SNDE_RTN = {
+    np.dtype(np.int8):    snde.SNDE_RTN_INT8,
+    np.dtype(np.uint8):   snde.SNDE_RTN_UINT8,
+    np.dtype(np.int16):   snde.SNDE_RTN_INT16,
+    np.dtype(np.uint16):  snde.SNDE_RTN_UINT16,
+    np.dtype(np.int32):   snde.SNDE_RTN_INT32,
+    np.dtype(np.uint32):  snde.SNDE_RTN_UINT32,
+    np.dtype(np.int64):   snde.SNDE_RTN_INT64,
+    np.dtype(np.uint64):  snde.SNDE_RTN_UINT64,
+    np.dtype(np.float32): snde.SNDE_RTN_FLOAT32,
+    np.dtype(np.float64): snde.SNDE_RTN_FLOAT64,
+}
+
+
+def snde_typenum_for(arr, default=snde.SNDE_RTN_FLOAT32):
+    """snde type number matching a numpy array's dtype."""
+    return NUMPY_TO_SNDE_RTN.get(np.dtype(arr.dtype), default)
+
+
+class TraceAccumulator(object):
+    """Channels and math functions for one trace-list acquisition.
+
+    Channels created (paths are prefixed):
+      <prefix>/current_ascan   staging: the A-scan just acquired      (nsamples,)
+      <prefix>/current_pose    staging: where it was acquired         (7,)
+      <prefix>/traces          accumulated trace list                 (K, nsamples)
+      <prefix>/trace_poses     accumulated poses, same trace order    (K, 7)
+
+    The two accumulators are driven from separate staging channels but advance
+    together, one step per stage_trace() call, so trace_poses[k] is the pose of
+    traces[k] by construction rather than by correlation.
+    """
+
+    def __init__(self, recdb, num_traces, num_samples, prefix="/ut",
+                 storage_manager=None, sample_period=None, time_offset=0.0,
+                 ascan_typenum=None,
+                 ascan_path=None, ascan_chan=None):
+        """ascan_path/ascan_chan reuse a staging channel that already exists.
+
+        Worth doing: several accumulators can read the same staging channel with
+        different maps, so a plane scan can fill its rectangular quick-look
+        volume and the geometry-free trace list from a single staged A-scan
+        rather than writing the same data twice.
+        """
+        self.recdb = recdb
+        self.K = int(num_traces)
+        self.N = int(num_samples)
+        self.prefix = prefix.rstrip("/")
+        self.storage_manager = storage_manager
+        # Seconds per sample and the time of sample 0, taken from the digitizer
+        # rather than from a nominal rate. cscan_gate reads these off the trace
+        # list to turn a gate in seconds into sample indices, and falls back to
+        # scale=1.0 when they are absent -- at which point the gate silently
+        # becomes a sample index. None means "the A-scan had no time axis", and
+        # is stamped as 1.0 s/sample so at least the units are honest.
+        self.sample_period = sample_period
+        self.time_offset = time_offset
+        # Type the traces are stored in. None means "whatever the first staged
+        # trace turns out to be".
+        self.ascan_typenum = ascan_typenum
+
+        self.own_ascan_channel = (ascan_chan is None)
+        self.ascan_path = ascan_path if ascan_path else (self.prefix + "/current_ascan")
+        self.pose_path = self.prefix + "/current_pose"
+        self.traces_path = self.prefix + "/traces"
+        self.poses_path = self.prefix + "/trace_poses"
+
+        self.staged = 0
+        self.ascan_chan = ascan_chan
+        self._accum_traces = None
+        self._accum_poses = None
+
+        with self.recdb.start_transaction() as trans:
+            if self.own_ascan_channel:
+                self.ascan_chan = trans.define_channel(self.ascan_path, "main")
+                seed_type = (self.ascan_typenum if self.ascan_typenum is not None
+                             else snde.SNDE_RTN_FLOAT32)
+                ref = snde.create_ndarray_ref(trans, self.ascan_chan, seed_type)
+                ref.allocate_storage([self.N], False)
+                ref.data[:] = 0
+                ref.rec.mark_data_and_metadata_ready()
+
+            self.pose_chan = trans.define_channel(self.pose_path, "main")
+            pref = snde.create_ndarray_ref(trans, self.pose_chan, snde.SNDE_RTN_FLOAT32)
+            pref.allocate_storage([POSE_FIELDS], False)
+            pref.data[:] = np.zeros(POSE_FIELDS, dtype=np.float32)
+            pref.rec.mark_data_and_metadata_ready()
+
+    # -- metadata ---------------------------------------------------------
+
+    def trace_metadata(self):
+        """Axis 0 is the trace index -- deliberately not a spatial axis.
+
+        Where a trace was taken is in trace_poses, not in an axis scale. That is
+        the whole point: an arbitrary toolpath has no rectangular coordinates to
+        put here, and pretending otherwise is how a c-scan ends up transposed or
+        mislocated.
+        """
+        md = snde.constructible_metadata()
+        md.AddMetaDatum(snde.metadatum("ande_array-axis0_coord", "Trace Index"))
+        md.AddMetaDatum(snde.metadatum_dblunits("ande_array-axis0_scale", 1.0, "unitless"))
+        md.AddMetaDatum(snde.metadatum_dblunits("ande_array-axis0_offset", 0.0, "unitless"))
+        md.AddMetaDatum(snde.metadatum("ande_array-axis1_coord", "Time"))
+        md.AddMetaDatum(snde.metadatum_dblunits(
+            "ande_array-axis1_scale",
+            self.sample_period if self.sample_period else 1.0, "s"))
+        md.AddMetaDatum(snde.metadatum_dblunits("ande_array-axis1_offset", self.time_offset, "s"))
+        md.AddMetaDatum(snde.metadatum("ande_array-ampl_coord", "Amplitude"))
+        md.AddMetaDatum(snde.metadatum("ande_array-ampl_units", "V"))
+        return md
+
+    def pose_metadata(self):
+        md = snde.constructible_metadata()
+        md.AddMetaDatum(snde.metadatum("ande_array-axis0_coord", "Trace Index"))
+        md.AddMetaDatum(snde.metadatum("ande_array-axis1_coord", "qw qx qy qz x y z"))
+        md.AddMetaDatum(snde.metadatum("ande_array-ampl_coord", "Pose"))
+        return md
+
+    # -- setup ------------------------------------------------------------
+
+    def setup(self):
+        """Instantiate the accumulators.
+
+        Call this only after the first real trace has been staged.
+        nd_accumulate_once consumes whatever is on the staging channel at the
+        moment it is instantiated as trace 0, so setting it up any earlier puts
+        the startup placeholder in slot 0 and shifts every real trace one along,
+        dropping the last off the end.
+        """
+        trans = self.recdb.start_transaction()
+
+        # A plain sequential map: trace k goes to slot k. No grid, no
+        # ravel_multi_index, nothing that has to agree with a scan shape.
+        trace_map = [int(k*self.N) for k in range(self.K)]
+        pose_map = [int(k*POSE_FIELDS) for k in range(self.K)]
+
+        self._accum_traces = snde.nd_accumulate_once.instantiate(
+            [snde.math_parameter_recording(self.ascan_path),
+             snde.math_parameter_indexvec_const([self.K, self.N]),
+             snde.math_parameter_indexvec_const(trace_map),
+             snde.math_parameter_sndeindex_const(int(self.K)),
+             snde.math_parameter_bool_const(False),
+             snde.math_parameter_bool_const(False),
+             snde.math_parameter_bool_const(False),
+             snde.math_parameter_metadata_const(self.trace_metadata())],
+            [snde.shared_string(self.traces_path)],
+            "/", False, False, False,
+            snde.math_definition("trace list accumulator"), [], None)
+
+        self._accum_poses = snde.nd_accumulate_once.instantiate(
+            [snde.math_parameter_recording(self.pose_path),
+             snde.math_parameter_indexvec_const([self.K, POSE_FIELDS]),
+             snde.math_parameter_indexvec_const(pose_map),
+             snde.math_parameter_sndeindex_const(int(self.K)),
+             snde.math_parameter_bool_const(False),
+             snde.math_parameter_bool_const(False),
+             snde.math_parameter_bool_const(False),
+             snde.math_parameter_metadata_const(self.pose_metadata())],
+            [snde.shared_string(self.poses_path)],
+            "/", False, False, False,
+            snde.math_definition("trace pose accumulator"), [], None)
+
+        if self.storage_manager is not None:
+            trans.add_math_function_storage_manager(self._accum_traces, False, self.storage_manager)
+        else:
+            trans.add_math_function(self._accum_traces, False)
+        # Poses are tiny; keep them in memory even when traces are file-backed.
+        trans.add_math_function(self._accum_poses, False)
+
+        trans.end_transaction().globalrev_wait().wait_complete()
+        self.staged = 1   # setup() consumed the staged trace as trace 0
+
+    def teardown(self):
+        """Remove the accumulators AND release the channels this instance owns.
+
+        Deleting the math functions is not enough. A channel is held by the
+        reserved_channel that defined it, and defining it again from a fresh
+        instance while the old reservation is still current fails the whole
+        transaction:
+
+            realize_transaction: provided reserved_channel for /ut/current_pose
+            by main is not current (current owner is main)
+
+        which surfaces as a second scan in the session dying inside
+        TraceAccumulator's constructor -- nowhere near the scan that actually
+        still owns the channel. release_channel() hands it back, so the next
+        instance can take it.
+        """
+        if (self._accum_traces is None and self._accum_poses is None
+                and self.pose_chan is None):
+            return
+        trans = self.recdb.start_transaction()
+        if self._accum_poses is not None:
+            trans.delete_math_function([self.poses_path], self._accum_poses)
+            self._accum_poses = None
+        if self._accum_traces is not None:
+            trans.delete_math_function([self.traces_path], self._accum_traces)
+            self._accum_traces = None
+        if self.pose_chan is not None:
+            trans.release_channel(self.pose_chan)
+            self.pose_chan = None
+        if self.own_ascan_channel and self.ascan_chan is not None:
+            trans.release_channel(self.ascan_chan)
+            self.ascan_chan = None
+        trans.end_transaction().globalrev_wait().wait_complete()
+        self.staged = 0
+
+    # -- acquisition ------------------------------------------------------
+
+    def stage_pose_only_in_transaction(self, transact, pose7):
+        """Add the pose half to a transaction someone else is already building.
+
+        Used when the caller stages the A-scan itself -- a plane scan writing
+        into both its rectangular volume and the trace list from one staged
+        A-scan. Both accumulators must advance in the same transaction or the
+        trace and pose lists desynchronise permanently.
+        """
+        pref = snde.create_ndarray_ref(transact, self.pose_chan, snde.SNDE_RTN_FLOAT32)
+        pref.rec.mark_metadata_done()
+        pref.allocate_storage([POSE_FIELDS], True)
+        pref.data[:] = np.asarray(pose7, dtype=np.float32)
+        pref.rec.mark_data_ready()
+
+        # Same bookkeeping as stage_trace(): this staged a trace, even though the
+        # A-scan half of it came from the caller. Without this, staged stays at the
+        # value setup() left it and every consumer that indexes the trace list with
+        # staged-1 -- the live projection in UTPlaneScan.dgp does -- reads trace 0
+        # forever. That is invisible until a scan runs long enough to look at the
+        # result, which is why it survived: the projecting scan used to die at row 12.
+        if self._accum_traces is not None:
+            self.staged += 1
+
+    def stage_trace(self, ascan, pose7, metadata=None, wait=True):
+        """Publish one (A-scan, pose) pair.
+
+        Both staging channels are written in a single transaction so the
+        accumulators advance in lockstep; splitting them would let a failure
+        between the two desynchronise the trace and pose lists permanently.
+        """
+        transact = self.recdb.start_transaction()
+
+        # The type the trace actually arrived in, not a fixed one -- see
+        # snde_typenum_for() above.
+        ref = snde.create_ndarray_ref(transact, self.ascan_chan,
+                                      snde_typenum_for(np.asarray(ascan)))
+        if metadata:
+            ref.rec.metadata = metadata
+        ref.rec.mark_metadata_done()
+        ref.allocate_storage([len(ascan)], True)
+        ref.data[:] = ascan
+        ref.rec.mark_data_ready()
+
+        pref = snde.create_ndarray_ref(transact, self.pose_chan, snde.SNDE_RTN_FLOAT32)
+        pref.rec.mark_metadata_done()
+        pref.allocate_storage([POSE_FIELDS], True)
+        pref.data[:] = np.asarray(pose7, dtype=np.float32)
+        pref.rec.mark_data_ready()
+
+        gr = transact.end_transaction()
+        if wait:
+            gr.globalrev_wait().wait_complete()
+        if self._accum_traces is not None:
+            self.staged += 1
+        return gr
+
+
+global pose7_from_transform
+def pose7_from_transform(t):
+    """(qw,qx,qy,qz,x,y,z) from a geometry_msgs TransformStamped."""
+    r = t.transform.rotation
+    p = t.transform.translation
+    return np.array([r.w, r.x, r.y, r.z, p.x, p.y, p.z], dtype=np.float32)
+
+
+global pose7_from_parts
+def pose7_from_parts(xyz, quat_xyzw):
+    return np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2],
+                     xyz[0], xyz[1], xyz[2]], dtype=np.float32)
+
+
+global setup_gated_cscan
+def setup_gated_cscan(recdb, traces_path, prefix, gates):
+    """Wire a chain of cscan_gate functions onto a trace list or volume.
+
+    `gates` is a list of dicts, applied in order, each of which may reference an
+    earlier gate's time-of-flight output:
+
+        [{"name": "fw",  "mode": snde.CSCAN_MODE_THRESHOLD_POS,
+          "start": 5e-6, "end": 9e-6, "threshold": 0.3},
+         {"name": "def", "mode": snde.CSCAN_MODE_MAXABS,
+          "start": 1.0e-6, "end": 5.0e-6, "track": "fw"}]
+
+    With "track" set, start/end are offsets from the referenced gate's time of
+    flight rather than absolute times -- a tracking gate. That is what keeps a
+    gate on the region of interest when standoff varies, which is the normal
+    case as soon as the surface is not flat.
+
+    Each gate produces <prefix>/<name>_ampl and <prefix>/<name>_tof. Every gate
+    parameter is its own channel, so any of them can be retuned live without
+    redefining the math.
+    """
+    prefix = prefix.rstrip("/")
+    made = {}
+
+    trans = recdb.start_transaction()
+
+    # "No reference" is a zero length array rather than a missing channel, so
+    # the dependency graph stays explicit and the same math function serves both
+    # fixed and tracking gates.
+    noref_path = prefix + "/no_reference"
+    # NOT wrapped in try/except. define_channel() does not raise when the channel
+    # already exists -- it hands back a reserved_channel that is no longer the
+    # current owner, and the transaction fails at end_transaction() with
+    # "provided reserved_channel ... is not current", nowhere near here. Every
+    # channel this function takes has to be handed back by
+    # teardown_gated_cscan() before it is defined again.
+    noref_chan = trans.define_channel(noref_path, "main")
+    nref = snde.create_ndarray_ref(trans, noref_chan, snde.SNDE_RTN_FLOAT64)
+    nref.allocate_storage([0], False)
+    nref.rec.mark_data_and_metadata_ready()
+
+    for g in gates:
+        name = g["name"]
+        base = "%s/%s" % (prefix, name)
+        params = {}
+        chans = {}
+        for key, default in (("start", 0.0), ("end", 0.0), ("threshold", 0.0)):
+            path = "%s_%s" % (base, key)
+            chan = trans.define_channel(path, "main")
+            ref = snde.create_ndarray_ref(trans, chan, snde.SNDE_RTN_FLOAT64)
+            ref.allocate_storage([1], False)
+            ref.data[0] = float(g.get(key, default))
+            ref.rec.mark_data_and_metadata_ready()
+            params[key] = path
+            chans[key] = chan
+
+        ref_path = noref_path
+        if g.get("track"):
+            ref_path = "%s/%s_tof" % (prefix, g["track"])
+
+        fcn = snde.cscan_gate.instantiate(
+            [snde.math_parameter_recording(traces_path),
+             snde.math_parameter_recording(params["start"]),
+             snde.math_parameter_recording(params["end"]),
+             snde.math_parameter_sndeindex_const(int(g["mode"])),
+             snde.math_parameter_recording(params["threshold"]),
+             snde.math_parameter_recording(ref_path)],
+            [snde.shared_string(base + "_ampl"), snde.shared_string(base + "_tof")],
+            "/", False, False, False,
+            snde.math_definition("cscan gate %s" % name), [], None)
+        trans.add_math_function(fcn, False)
+        made[name] = {"function": fcn, "ampl": base + "_ampl", "tof": base + "_tof",
+                      "params": params, "chans": chans, "recdb": recdb,
+                      "noref_chan": noref_chan, "noref_path": noref_path}
+        # Only the first gate carries the shared no_reference channel, so
+        # teardown releases it exactly once however many gates there are.
+        noref_chan = None
+
+    trans.end_transaction().globalrev_wait().wait_complete()
+    return made
+
+
+global teardown_gated_cscan
+def teardown_gated_cscan(recdb, gates):
+    """Remove a gate chain and hand back every channel it took.
+
+    Deleting the math functions is only half of it. Each gate's start/end/
+    threshold is its own channel -- which is what makes a gate retunable live --
+    and those channels stay reserved by the caller that defined them. A second
+    scan in the same session then fails inside setup_gated_cscan with
+
+        realize_transaction: provided reserved_channel for /ut/gate/cscan_end
+        by main is not current (current owner is main)
+
+    which says nothing about the scan that still owns it. Pass the dict
+    setup_gated_cscan returned.
+    """
+    if not gates:
+        return
+    trans = recdb.start_transaction()
+    for name in reversed(list(gates.keys())):
+        g = gates[name]
+        trans.delete_math_function([g["ampl"], g["tof"]], g["function"])
+        for chan in g.get("chans", {}).values():
+            trans.release_channel(chan)
+        if g.get("noref_chan") is not None:
+            trans.release_channel(g["noref_chan"])
+    trans.end_transaction().globalrev_wait().wait_complete()
+
+
+global set_gate_parameter
+def set_gate_parameter(gate, key, value):
+    """Retune one bound of a gate returned by setup_gated_cscan, live.
+
+    Every gate parameter is its own channel precisely so this needs no math
+    redefinition -- the gate recomputes on the next globalrev. Note a gate
+    change invalidates the whole image, so this costs a full reduction; that is
+    expected and is why the gate controls debounce.
+    """
+    chan = gate["chans"][key]
+    recdb = gate["recdb"]
+    with recdb.start_transaction() as trans:
+        ref = snde.create_ndarray_ref(trans, chan, snde.SNDE_RTN_FLOAT64)
+        ref.allocate_storage([1], False)
+        ref.data[0] = float(value)
+        ref.rec.mark_data_and_metadata_ready()

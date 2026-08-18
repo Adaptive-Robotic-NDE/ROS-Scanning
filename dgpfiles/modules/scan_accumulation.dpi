@@ -1,0 +1,357 @@
+# ==============================================================================
+# THE ACCUMULATORS AND THE PROJECTOR
+# ==============================================================================
+# One staged A-scan feeds two representations, deliberately:
+#
+#   * the rectangular (m, n, nsamples) volume -- the quick look.  Needs no mesh
+#     and no registration, which is the whole reason the plane scan exists, and
+#     is meaningless for a surface-following toolpath.
+#   * a flat (K, nsamples) trace list with a pose per trace -- the durable
+#     record.  Carries no geometry assumptions, so it survives a Noether path,
+#     and it is what makes presentation a separate re-runnable step.
+#
+# Do not "simplify" this back to one representation without reading the
+# reasoning in trace_acquisition.dpi.
+#
+# Identical for every scan type, which is why it is here rather than in a
+# config.  Reads the CSCAN_GATES / RECORD_TRACE_LIST / PROJECTION_* settings and
+# the /current_ascan staging channel from the including config.
+
+global ndaccumulator
+ndaccumulator = None
+
+global cscanfunction
+cscanfunction = None
+
+global trace_accum
+trace_accum = None
+
+global cscan_gates
+cscan_gates = None
+
+global projector
+projector = None
+
+global capturedata
+def capturedata(timeout=5.0):
+    """Take the next A-scan the digitizer produces and stage it for accumulation.
+
+    Waits for a recording on ASCAN_CHANNEL_PATH strictly newer than the one we
+    consumed last time, so a stationary digitizer's stale buffer is never
+    accumulated twice.
+
+    A plain bounded poll, deliberately. A globalrev monitor looks tidier but is
+    wrong here: the digitizer free-runs far faster than the scan consumes
+    points, so the monitor falls behind and the database holds every globalrev
+    in between on its behalf. Poll interval is kept well above the digitizer
+    period so this does not spin.
+    """
+    deadline = time.monotonic() + timeout
+
+    rec = None
+    while time.monotonic() < deadline:
+        try:
+            candidate = recdb.latest_globalrev().get_ndarray_ref(ASCAN_CHANNEL_PATH)
+            revision = candidate.rec.info.revision
+        except Exception:
+            time.sleep(0.01)
+            continue
+        if capturedata.last_revision is None or revision > capturedata.last_revision:
+            capturedata.last_revision = revision
+            rec = candidate
+            break
+        time.sleep(0.01)
+
+    if rec is None:
+        print("capturedata: no new A-scan on %s within %.1f s" % (ASCAN_CHANNEL_PATH, timeout))
+        return False
+
+    ascan_data = np.array(rec.data, copy=True)
+    metadata = rec.rec.metadata
+
+    # Where the probe actually is, not where it was commanded to be. The arm is
+    # stationary here, so this is exact.
+    pose7 = None
+    snap = live_pose.snapshot()
+    if snap is not None:
+        pose7 = pose7_from_parts(snap[0], snap[1])
+
+    _stage_ascan(ascan_data, metadata, pose7)
+    return True
+
+capturedata.last_revision = None
+
+global setup_accumulation
+def setup_accumulation(m, n, chanmetadata, num_traces=None, plane_grid=None):
+    """(Re)define the volume accumulator and everything derived from it.
+
+    Two representations, from one staged A-scan:
+
+      * the rectangular (m, n, nsamples) volume -- the quick-look, needs no mesh
+        and no registration, which is why this plane scan exists at all;
+      * a flat (K, nsamples) trace list with a pose per trace -- the durable
+        record, which carries no geometry assumptions and is therefore the one
+        that survives a surface-following toolpath.
+
+    Both accumulators read /current_ascan, so recording the second costs one
+    extra small array per trace rather than a second acquisition.
+    """
+    global ndaccumulator, cscanfunction, trace_accum, cscan_gates, projector
+
+    # Before the transaction below, because teardown_gated_cscan opens its own
+    # and only one may be open at a time. It releases the gate's parameter
+    # channels as well as deleting its functions: each gate bound is a channel of
+    # its own -- which is what makes a gate retunable live -- and one left
+    # reserved by the previous scan makes the next setup_gated_cscan fail at
+    # end_transaction() with a message naming neither scan.
+    if cscan_gates is not None:
+        teardown_gated_cscan(recdb, cscan_gates)
+        cscan_gates = None
+
+    transact = recdb.start_transaction()
+    # A second scan in the same session has to remove the first one's functions
+    # and the channels they own, or /ut_scan_volume and /ut_cscan are already
+    # taken and the new volume cannot be the right shape. The c-scan goes first
+    # because it reads the volume.
+    #
+    # transact.delete_math_function(), not recdb.delete_math_function(): the
+    # recdb one opens a transaction of its own, and we are inside one. It also
+    # takes (channel paths, function) -- every result channel of the function
+    # has to be listed, or it throws.
+    if cscanfunction is not None:
+        transact.delete_math_function(["/ut_cscan", "/ut_cscan_tof"], cscanfunction)
+        cscanfunction = None
+    if ndaccumulator is not None:
+        transact.delete_math_function(["/ut_scan_volume"], ndaccumulator)
+        ndaccumulator = None
+
+    # The volume is (m, n, num_points): u along axis0, v along axis1, time along
+    # axis2. That order is not cosmetic -- spatialnde2's renderer maps axis0 to
+    # screen X and axis1 to screen Y (openscenegraph_rendercache.cpp reads
+    # ande_array-axis0_* for X and takes dimlen[0] as the X length), so building
+    # the volume as (n, m, ...) while _volume_metadata calls axis0 "X Axis" draws
+    # the c-scan transposed and positioned at the scan's x coordinates along its
+    # y axis.
+    #
+    # Points still arrive row by row (v outer, u inner), so the map is a scatter:
+    # the k-th recording goes to column k%m, row k//m. nd_accumulate_once
+    # unravels assignmap[k] against accum_dimlen itself, so the destinations do
+    # not have to be in increasing order.
+    # Record length from the digitizer, not from a constant -- by the time this
+    # runs the first real A-scan has been staged, so the card has told us.
+    nsamp = ascan_geometry(timeout=30.0)["num_points"]
+
+    accummap = [int(np.ravel_multi_index((i, j, 0), (m, n, nsamp)))
+                for j, i in itertools.product(np.arange(n), np.arange(m))]
+
+    ndaccumulator = snde.nd_accumulate_once.instantiate([ snde.math_parameter_recording("/current_ascan"),
+                                                          snde.math_parameter_indexvec_const([m, n, nsamp]),
+                                                          snde.math_parameter_indexvec_const(accummap),
+                                                          snde.math_parameter_sndeindex_const(int(m*n)),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_bool_const(False),
+                                                          snde.math_parameter_metadata_const(chanmetadata)],
+                                                        [ snde.shared_string("/ut_scan_volume") ],
+                                                        "/",
+                                                        False,
+                                                        False,
+                                                        False,
+                                                        snde.math_definition("nd accumulator volume definition"),
+                                                        [],
+                                                        None)
+    if scan_storage_manager is not None:
+        transact.add_math_function_storage_manager(ndaccumulator, False, scan_storage_manager)
+    else:
+        transact.add_math_function(ndaccumulator, False)
+
+    # The quick-look c-scan over the rectangular volume. This was compute_cscan,
+    # which was exactly this gate with the mode and the reference fixed; it has
+    # been removed in favour of the general one rather than maintaining two
+    # implementations of the same reduction. MODE_MAX between two absolute times
+    # reproduces it exactly (verified: maximum absolute difference 0.0).
+    #
+    # It reads /cscan_start and /cscan_end, the same channels the Qt panel
+    # drives, so the panel retunes this gate live exactly as before.
+    #
+    # Two outputs now, not one: every cscan_gate emits an amplitude AND a time
+    # of flight, so that a gate can serve as the reference for another. The
+    # volume's time-of-flight output is not used by the quick look, but it has
+    # to be named and it has to be deleted alongside the amplitude.
+    cscanfunction = snde.cscan_gate.instantiate(
+        [snde.math_parameter_recording("/ut_scan_volume"),
+         snde.math_parameter_recording("/cscan_start"),
+         snde.math_parameter_recording("/cscan_end"),
+         snde.math_parameter_sndeindex_const(int(snde.CSCAN_MODE_MAX)),
+         snde.math_parameter_recording("/cscan_threshold"),
+         snde.math_parameter_recording("/cscan_no_reference")],
+        [snde.shared_string("/ut_cscan"), snde.shared_string("/ut_cscan_tof")],
+        "/", False, False, False,
+        snde.math_definition("quick-look c-scan over the volume"), [], None)
+    transact.add_math_function(cscanfunction, False)
+
+    transact.end_transaction().globalrev_wait().wait_complete()
+
+    # --- the geometry-free side -------------------------------------------
+    # trace_accum was created by _prepare_trace_accum() before the first A-scan
+    # was staged, so its staging channels already hold that first (A-scan, pose)
+    # pair. Instantiating now consumes both as index 0 together.
+    if trace_accum is not None:
+        trace_accum.setup()
+
+        # The gate chain runs on the trace list, not on the rectangular volume:
+        # it is the representation that exists for every kind of scan. Output is
+        # (K,) -- one gated value per trace, which is exactly what the projector
+        # consumes.
+        cscan_gates = setup_gated_cscan(recdb, trace_accum.traces_path, "/ut/gate",
+                                        CSCAN_GATES)
+        print("  gate chain: %s"
+              % ", ".join("%s(%s)%s" % (g["name"],
+                                        snde.CSCAN_MODE_NAMES.get(g["mode"], g["mode"]),
+                                        " tracking %s" % g["track"] if g.get("track") else "")
+                          for g in CSCAN_GATES))
+
+    if projection_enabled() and plane_grid is not None:
+        _setup_projection(plane_grid)
+
+global _prepare_trace_accum
+def _prepare_trace_accum(num_traces):
+    """Create the trace/pose staging channels before the first A-scan is staged.
+
+    Split from setup_accumulation deliberately. nd_accumulate_once consumes
+    whatever is on its input channel at the moment it is instantiated as entry
+    zero, so the pose channel has to exist -- and hold the real first pose --
+    before setup() runs. Creating the accumulator lazily instead put a zeros
+    placeholder at pose 0 and offset the pose list from the trace list by one.
+    """
+    global trace_accum
+    if trace_accum is not None:
+        trace_accum.teardown()
+        trace_accum = None
+    if not RECORD_TRACE_LIST:
+        return None
+    # Length, type and time axis come from the digitizer, not from this file --
+    # on hardware the card owns all three and can be reconfigured between runs.
+    geom = ascan_geometry(timeout=30.0)
+    print(describe_ascan(geom))
+    trace_accum = TraceAccumulator(recdb, int(num_traces), geom["num_points"],
+                                   prefix="/ut",
+                                   storage_manager=scan_storage_manager,
+                                   sample_period=geom["dt"],
+                                   time_offset=geom["t0"],
+                                   ascan_typenum=geom["typenum"],
+                                   ascan_path="/current_ascan",
+                                   ascan_chan=staging_chan)
+    return trace_accum
+
+global _setup_projection
+def _setup_projection(plane_grid):
+    """Synthesise a parameterized surface for the scan area and project onto it.
+
+    No mesh reconstruction and no registration: a plane is exactly two triangles,
+    the UV map is trivial, and the patch is generated in world coordinates from
+    the scan's own corners -- so it is registered by construction. That keeps the
+    mesh-free workflow mesh-free while still producing the representation that
+    generalises to a real surface.
+    """
+    global projector
+    uu, vv, ww = plane_grid
+    radius, pixels = projection_settings(scan_plan)
+    x3d_dir = SCAN_STORAGE_DIR if scan_storage_manager is not None else "/tmp"
+    x3d_path = os.path.join(x3d_dir, "scan_plane_uv.x3d")
+    plane_x3d_from_scanpath(x3d_path, uu, vv, ww, margin=radius*2)
+    if projector is not None and getattr(projector, "x3d_path", None) == x3d_path:
+        # Same surface file, so empty the picture and reuse the loaded geometry.
+        # A second SurfaceProjector on this prefix cannot be built: the channels
+        # x3d_load_geometry defines under the model tree are not ours to release.
+        # See SurfaceProjector.restart().
+        #
+        # The radius and the pixel count are constructor arguments of the
+        # projection MATH FUNCTION, and restart() re-instantiates it -- so a
+        # scan whose step size changed gets the new spot size on the reused
+        # surface, which is exactly what "derive the projection from the step"
+        # requires.
+        projector.radius = radius
+        projector.horizontal_pixels = pixels
+        projector.vertical_pixels = pixels
+        projector.restart()
+        print("  projection surface reused (image cleared): %s" % x3d_path)
+        return
+    if projector is not None:
+        projector.teardown()
+        projector = None
+    print("  projection surface: %s" % x3d_path)
+    projector = SurfaceProjector(recdb, x3d_path, prefix="/ut/proj",
+                                 radius=radius,
+                                 horizontal_pixels=pixels,
+                                 vertical_pixels=pixels,
+                                 create_textured_part=PROJECTION_TEXTURED_PART)
+
+global projection_settings
+def projection_settings(plan=None):
+    """(spot radius, parameterization pixels) to build the projector with.
+
+    Pass the plan when one governs -- a scan setting up its surface has just
+    built one from the settings that are about to be used, and its numbers
+    carry the warnings that were printed with them. Pass nothing to derive from
+    the settings as they stand right now, which is what the panel needs: after
+    a scan, the last plan describes the step size that scan used, not the one
+    the operator has since dialled in.
+
+    Either way there is exactly one place the number comes from, so the x3d
+    margin, the projector and the panel cannot disagree about it.
+    """
+    if plan is not None:
+        return plan["spot_radius_m"], int(plan["projection_pixels"])
+    radius = (PROJECTION_SPOT_RADIUS if PROJECTION_SPOT_RADIUS is not None
+              else auto_spot_radius(SCAN_STEP_SIZE, SCAN_LIMITS))
+    pixels = (PROJECTION_PIXELS if PROJECTION_PIXELS is not None
+              else auto_projection_pixels(radius, 0.30, SCAN_LIMITS))
+    return radius, int(pixels)
+
+global _stage_ascan
+def _stage_ascan(ascan_data, metadata, pose7=None):
+    """Publish one A-scan, and the pose it was taken at.
+
+    Both go in one transaction. The volume accumulator, the trace accumulator
+    and the pose accumulator all advance on this single step, which is what
+    guarantees trace_poses[k] belongs to traces[k] rather than merely correlating
+    with it.
+    """
+    transact = recdb.start_transaction()
+    # Stage in whatever type the card produced. The CompuScope reports raw
+    # counts (int8/int16) or volts (float64) depending on configuration, and
+    # forcing float32 here would quietly cast every trace -- and, worse, fix the
+    # accumulated volume's type to something the card never sent.
+    # nd_accumulate_once and cscan_gate are both templated over the integer and
+    # floating types, so the native type carries all the way through.
+    staging_rec = snde.create_ndarray_ref(transact, staging_chan,
+                                          snde_typenum_for(ascan_data))
+    if metadata:
+        staging_rec.rec.metadata = metadata
+    staging_rec.rec.mark_metadata_done()
+    staging_rec.allocate_storage(ascan_data.shape, True)
+    staging_rec.data[:] = ascan_data
+    staging_rec.rec.mark_data_ready()
+
+    if trace_accum is not None and pose7 is not None:
+        trace_accum.stage_pose_only_in_transaction(transact, pose7)
+
+    transact.end_transaction().globalrev_wait().wait_complete()
+
+    # Project the gated value at the pose it was taken at. Done after the
+    # transaction because the gate is a math function -- its answer for this
+    # trace does not exist until the globalrev completes.
+    #
+    # Only in "live" mode: this is the second serialised globalrev wait, and it
+    # is what halves the sustainable trace rate. "deferred" records the trace and
+    # replays the whole list through the projector afterwards at 62 traces/s
+    # instead of 5.5, for an identical image.
+    if projection_is_live() and projector is not None and pose7 is not None and cscan_gates:
+        try:
+            k = trace_accum.staged - 1 if trace_accum is not None else 0
+            ampl = recdb.latest.ref[cscan_gates["cscan"]["ampl"]].data
+            if 0 <= k < len(ampl):
+                projector.project(pose7, float(ampl[k]))
+        except Exception as e:
+            print("projection: %s" % (e,))

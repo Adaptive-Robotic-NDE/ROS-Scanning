@@ -1,0 +1,69 @@
+import spatialnde2 as snde
+import numpy as np
+
+global setup_sim_ut_channels
+def setup_sim_ut_channels(recdb):
+    ascan_chan = recdb.define_channel('/sim_ut_ascan', "main")
+    cscan_scalar_chan = recdb.define_channel('/cscan_scalar', "main")
+    probe_pose_copy_chan = recdb.define_channel('/probe_pose_copy', "main")
+    return ascan_chan, cscan_scalar_chan, probe_pose_copy_chan
+
+global mock_capture_ultrasound
+def mock_capture_ultrasound(recdb, ros, ascan_chan, cscan_scalar_chan, probe_pose_copy_chan, ut_num_points=10000):
+    # Simulate a 10,000 point A-scan
+    ascan = np.zeros(ut_num_points, dtype=np.float32)
+    ascan += np.random.normal(0, 0.02, ut_num_points)
+    
+    # Simulate Front Wall at index 1000, Defect at 4000, Backwall at 8000
+    ascan[1000:1020] += np.hanning(20) * 0.8
+    
+    has_defect = np.random.rand() > 0.8
+    if has_defect:
+        ascan[4000:4020] += np.hanning(20) * 0.4
+        ascan[8000:8020] += np.hanning(20) * 0.05
+        peak_amp = 0.4
+    else:
+        ascan[8000:8020] += np.hanning(20) * 0.16
+        peak_amp = 0.0 # No defect in gate
+    
+    # Get the latest probe pose
+    g = recdb.latest_defined_globalrev()
+    pp_data = g.get_ndarray_ref('/probe_pose').data.copy()
+    if np.isnan(pp_data['offset'][0][3]) or pp_data['offset'][0][3] != 1.0:
+        pp_data['quat'][0][0] = 1.0
+        pp_data['quat'][0][1] = 0.0
+        pp_data['quat'][0][2] = 0.0
+        pp_data['quat'][0][3] = 0.0
+        pp_data['offset'][0][0] = 0.97258
+        pp_data['offset'][0][1] = -0.32009
+        pp_data['offset'][0][2] = 0.983
+        pp_data['offset'][0][3] = 1.0
+
+    
+    transact = recdb.start_transaction()
+    try:
+        # A-scan
+        ascan_ref = snde.create_ndarray_ref(transact, ascan_chan, snde.SNDE_RTN_FLOAT32)
+        ascan_ref.allocate_storage([ut_num_points])
+        ascan_ref.data[:] = ascan
+        ascan_ref.rec.mark_metadata_done()
+        ascan_ref.rec.mark_data_ready()
+        
+        # C-scan scalar (Live gated feature extraction)
+        cscan_ref = snde.create_ndarray_ref(transact, cscan_scalar_chan, snde.SNDE_RTN_FLOAT32)
+        cscan_ref.allocate_storage([1])
+        cscan_ref.data[0] = peak_amp
+        cscan_ref.rec.mark_metadata_done()
+        cscan_ref.rec.mark_data_ready()
+        
+        # Synchronized Probe Pose Copy
+        eoat_pose_ref = snde.create_pose_channel_ndarray_ref(
+            transact,
+            probe_pose_copy_chan,
+            snde.recdb_path_join(ros.eoat_model_tree, "meshed_copy"))
+        eoat_pose_ref.allocate_storage([1])
+        eoat_pose_ref.data[:] = pp_data
+        eoat_pose_ref.rec.mark_metadata_done()
+        eoat_pose_ref.rec.mark_data_ready()
+    finally:
+        transact.end_transaction()

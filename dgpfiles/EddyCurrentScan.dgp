@@ -1,0 +1,83 @@
+from dataguzzler_python import dgpy
+import spatialnde2 as snde
+import sys
+import time
+import os
+import numpy as np
+import rclpy
+from ament_index_python.packages import get_package_share_directory
+
+import dgpython_rosmotion as rosm
+import dgpython_nidaqmx as daqmx
+from dgpython_uniwest import UniWest, ureg, Q_
+
+print(sys.executable, sys.version)
+
+# 1. Base Setup
+include(dgpy, "dgpy_startup.dpi")
+include(dgpy, "Qt.dpi", prefer_pyqt=False) 
+include(dgpy, "matplotlib.dpi")
+include(dgpy, "pint.dpi")
+include(snde, "recdb.dpi", enable_opencl=True)
+include(snde, "recdb_gui.dpi")
+
+rclpy.init()
+
+# 2. Hardware Instantiation
+tari_ur_launch_pkg = get_package_share_directory('tari_ur_launch')
+eddie_current_probe_mesh = os.path.join(tari_ur_launch_pkg, 'meshes', 'ecProbe.x3d')
+
+ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh=eddie_current_probe_mesh)
+include(rosm, "services.dpi")
+include(rosm, "parameters/parameters.dpi")
+
+daq = daqmx.ai_voltage('daq', recdb, ['PXI1Slot2/ai0', 'PXI1Slot2/ai1'])
+daq.SampleRate = 10*ureg.kHz
+daq.SampsPerChan = 100
+
+# uni =  UniWest('UniWest',comPort=33,baudRate=9600)
+
+# 3. Include Core Logic Modules
+include(dgpy, "modules/direct_mesh.dpi")
+include(dgpy, "modules/vision_pipeline.dpi")
+include(dgpy, "modules/toolpath.dpi")
+include(dgpy, "modules/ec_acquisition.dpi")
+include(dgpy, "modules/scan_projection.dpi")
+include(dgpy, "modules/scan_orchestrator.dpi")
+
+# Initialize managers
+projection_manager = ScanProjectionManager(recdb, ros)
+avgrealchan, avgimagchan, scanrealchan, scanimagchan = setup_ec_channels(recdb)
+
+# 4. Define Execution Wrap Function
+def run_eddy_scan(mesh_path="/home/labuser/iron_tari/src/tari-ros-staging/tari_ur_launch/meshes/calPlate.x3d", line_spacing=0.0003):
+    if not os.path.exists(mesh_path):
+        print(f"Error: Mesh file {mesh_path} does not exist.")
+        return
+
+    # Clear / Reuse existing state safely
+    specimen_tree, specimen_pose = load_mesh_to_scene(recdb, ros, mesh_path)
+    
+    # We use fixed axis here for simplicity, passing the service client
+    toolpath_poses = generate_fixed_axis_toolpath(fixed_axis_noether_client, mesh_path, line_spacing=line_spacing)
+    
+    if not toolpath_poses or not toolpath_poses.poses:
+        print("Failed to generate valid toolpath.")
+        return
+
+    num_poses = len(toolpath_poses.poses)
+    n = int(np.ceil(np.sqrt(num_poses)))
+    m = int(np.ceil(num_poses / n))
+    
+    projection_manager.setup_scalar_accumulator(scanrealchan, "/ndaccum_real", n, m)
+    projection_manager.setup_projection(specimen_tree, specimen_pose, scanrealchan, projection_channel="/graphics/ec_projection", projection_specimen_channel="/graphics/ec_specimen")
+
+    # Define the lambda for triggering data capture and pushing it
+    def capture_callback():
+        complexdata, pp_data, sp_data = capture_ec_data(recdb, ros)
+        push_ec_data_to_recdb(recdb, ros, complexdata, pp_data, sp_data)
+
+    # Run the scan using point-by-point
+    run_point_by_point_scan(ros, projection_manager, toolpath_poses, capture_callback)
+
+print("Setup complete. You can now execute `run_eddy_scan()` to start the hardware scan.")

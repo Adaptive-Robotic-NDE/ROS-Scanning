@@ -1,0 +1,97 @@
+import spatialnde2 as snde
+import numpy as np
+import time
+
+global ScanProjectionManager
+class ScanProjectionManager:
+    """
+    Manages the creation and cleanup of SpatialNDE2 accumulators and projections 
+    to ensure idempotency when running scans multiple times.
+    """
+    def __init__(self, recdb, ros):
+        self.recdb = recdb
+        self.ros = ros
+        self.ndaccumulators = {}
+        self.projections = {}
+
+    def setup_scalar_accumulator(self, input_channel, output_channel, n, m):
+        """Sets up a 2D accumulator for mapping a scalar value across a scan grid."""
+        transact = self.recdb.start_transaction()
+        try:
+            if output_channel in self.ndaccumulators:
+                self.recdb.delete_math_function(self.ndaccumulators[output_channel])
+            
+            chanmetadata = snde.constructible_metadata()
+            chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis0_coord", "X Axis"))
+            chanmetadata.AddMetaDatum(snde.metadatum("ande_array-axis1_coord", "Y Axis"))
+            chanmetadata.AddMetaDatum(snde.metadatum("ande_array-ampl_coord", "Amplitude"))
+            
+            accummap = np.arange(n * m, dtype=np.int64).tolist()
+            
+            accum = snde.nd_accumulate_once.instantiate([
+                snde.math_parameter_recording(input_channel),
+                snde.math_parameter_indexvec_const([n, m]),
+                snde.math_parameter_indexvec_const(accummap),
+                snde.math_parameter_sndeindex_const(int(m * n)),
+                snde.math_parameter_bool_const(False),
+                snde.math_parameter_bool_const(False),
+                snde.math_parameter_bool_const(False),
+                snde.math_parameter_metadata_const(chanmetadata)
+            ], [snde.shared_string(output_channel)], "/", False, False, False,
+            snde.math_definition("nd accumulator definition"), [], None)
+            
+            transact.add_math_function(accum, False)
+            self.ndaccumulators[output_channel] = accum
+            
+        finally:
+            transact.end_transaction()
+
+    def setup_projection(self, specimen_model_tree, specimen_pose_channel, data_channel, 
+                         projection_channel="/graphics/projection", 
+                         projection_specimen_channel="/graphics/projection_specimen",
+                         probe_pose_channel="/probe_pose_copy"):
+        """Sets up 3D texture projection onto a CAD model based on an input data channel."""
+        print(f"Projecting {data_channel} onto CAD model at {projection_channel}...")
+        transact = self.recdb.start_transaction()
+        try:
+            if projection_channel in self.projections:
+                self.recdb.delete_math_function(self.projections[projection_channel])
+                
+            projection = snde.project_point_onto_parameterization.instantiate([
+                snde.math_parameter_recording(snde.recdb_path_join(specimen_model_tree, "meshed")),
+                snde.math_parameter_recording(snde.recdb_path_join(specimen_model_tree, "uv")),
+                snde.math_parameter_recording(snde.recdb_path_join(specimen_model_tree, "trinormals")),
+                snde.math_parameter_recording(snde.recdb_path_join(specimen_model_tree, "boxes3d")),
+                snde.math_parameter_recording(snde.recdb_path_join(specimen_model_tree, "projinfo")),
+                snde.math_parameter_recording(snde.recdb_path_join(specimen_model_tree, "inplanemat")),
+                snde.math_parameter_recording(specimen_pose_channel.name() if hasattr(specimen_pose_channel, 'name') else specimen_pose_channel),
+                snde.math_parameter_recording(probe_pose_channel),
+                snde.math_parameter_recording(data_channel.name() if hasattr(data_channel, 'name') else data_channel),
+                snde.math_parameter_double_const(-0.1),
+                snde.math_parameter_double_const(0.1),
+                snde.math_parameter_double_const(0.01),
+                snde.math_parameter_unsigned_const(512),
+                snde.math_parameter_unsigned_const(512),
+                snde.math_parameter_bool_const(False)
+            ], [snde.shared_string(projection_channel)], "/", True, False, False,
+            snde.math_definition("projection"), [], None)
+            
+            transact.add_math_function(projection, False)
+            self.projections[projection_channel] = projection
+            
+            projection_specimen_chan = transact.define_channel(projection_specimen_channel, "main")
+            snde.create_textured_part_recording(transact, projection_specimen_chan,
+                snde.recdb_path_join(specimen_model_tree, "meshed"),
+                snde.shared_string(snde.recdb_path_join(specimen_model_tree, "uv")),
+                [(0, snde.image_reference(projection_channel, 0, 1, []))]
+            ).mark_data_and_metadata_ready()
+        finally:
+            transact.end_transaction()
+
+    def clear_accumulators(self):
+        """Asynchronously clears all managed accumulators."""
+        for name, accum in self.ndaccumulators.items():
+            print(f"Clearing accumulator {name}...")
+            self.recdb.send_math_message(accum, "clear", None)
+        # Required flush delay from AGENTS.md
+        time.sleep(0.2)

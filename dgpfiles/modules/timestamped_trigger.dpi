@@ -1,0 +1,374 @@
+# Correlating a free-running digitizer with a position trigger, by timestamp.
+#
+# This is the shape the real hardware needs, and it is deliberately NOT the
+# shape sim_ascan_source.dpi's "position" mode has.
+#
+# In that mode the simulator IS the trigger: it watches the probe and
+# synthesises an A-scan at the crossing, so the data and the position are the
+# same event by construction. A real card cannot work that way. It free-runs at
+# its own PRF -- 1 kHz or faster -- publishing every shot onto its channel, and
+# something else has to decide which of those shots is the trace at this
+# position. The obvious implementations are both wrong:
+#
+#   * "take the latest recording at the crossing" is biased, not noisy. It is
+#     systematically old by the acquisition-to-globalrev latency, and on a
+#     serpentine that bias reverses direction every pass -- so it shows up as a
+#     zipper between adjacent rows rather than a harmless global offset.
+#
+#   * "buffer the A-scans and search by timestamp" holds a second of 16000-point
+#     records in memory to find one of them, and has to be told when to stop.
+#
+# spatialnde2 already has the right mechanism and it needs neither. Under
+# timed_transaction_manager, transactions commit in measurement-timestamp ORDER
+# rather than in the order their threads finished. So if the position source
+# opens its own transaction stamped at the crossing time, every A-scan stamped
+# before that crossing is already committed when it lands -- and the globalrev
+# that pose transaction produces carries, on the digitizer's channel, exactly
+# the A-scan that was current at the crossing. No buffer, no search, no bias.
+#
+# Verified against a free-running 1 kHz source of 16000-point records and an
+# independent position source: 100.0% of poses saw exactly the A-scan whose
+# timestamp was the latest at or before them, with zero late transactions down
+# to a 2 ms ordering window.
+#
+# What changes when the trigger box arrives: the box's own clock becomes the
+# measurement_clock (measurement_clock is a SWIG director, so it can be
+# subclassed in Python), and the crossing timestamp comes from the box instead
+# of from watching TF. Everything below is unchanged. That is the point of
+# building it this way rather than around "latest recording".
+
+import threading
+import time
+
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+
+import numpy as np
+import spatialnde2 as snde
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global TimestampedTriggerSource
+
+
+class TimestampedTriggerSource(object):
+    """Position trigger for a free-running digitizer, correlated by timestamp.
+
+    Presents the same interface run_triggered_path_scan() already uses --
+    arm(sink, emit_on_arm) / disarm() / travelled_m / synthesize() / metadata()
+    -- so the acquisition does not change at all. What changes is where the
+    A-scan comes from: instead of being synthesised at the crossing, it is read
+    out of the globalrev the crossing's own pose transaction produced.
+
+    Three threads, and the split matters:
+
+      watcher     polls the probe, detects pitch crossings, and publishes ONE
+                  timestamped pose transaction per crossing. It never waits for
+                  anything -- under the timed manager end_transaction() returns
+                  immediately, because committing is the manager's job. A
+                  trigger loop that blocks stops watching the probe, which is
+                  the failure that made a 0.30 m pass produce one trace instead
+                  of 59.
+      correlator  waits for each pose's globalrev, reads the A-scan out of it,
+                  and calls the sink. One worker, so order is preserved and
+                  trigger k is still trace k.
+      (the caller's stager)  does the database staging, as before.
+    """
+
+    trigger_mode = "timestamped"
+
+    def __init__(self, recdb, clock, ascan_path, position_fn, trigger_pitch_m,
+                 pose_path="/ut/trigger_pose", poll_hz=200.0, queue_depth=4096):
+        self.recdb = recdb
+        self.clock = clock
+        self.ascan_path = ascan_path
+        self.position_fn = position_fn
+        self.trigger_pitch_m = float(trigger_pitch_m)
+        self.pose_path = pose_path
+        self.poll_period = 1.0/poll_hz
+
+        self.travelled_m = 0.0
+        self.triggers = 0
+        self.armed_triggers = 0
+        self.armed_s_m = 0.0
+        self.errors = 0
+        self.last_error = None
+        self.correlation_waits = 0
+        self.max_correlation_wait = 0.0
+        # Crossings whose timestamp was interpolated within a poll interval
+        # rather than taken at the moment the poll noticed them, and the worst
+        # number of crossings that shared one poll. See _watch_loop.
+        self.interpolated_timestamps = 0
+        self.max_crossings_per_poll = 0
+        self.uninterpolated_timestamps = 0
+        self._interp_warned = False
+
+        self._sink = None
+        self._armed = False
+        self._emit_on_arm = True
+        self._reset_phase = False
+        self._quit = False
+        self._last_metadata = None
+
+        trans = recdb.start_transaction(clock.get_current_time())
+        self.pose_chan = trans.define_channel(self.pose_path, "main")
+        ref = snde.create_ndarray_ref(trans, self.pose_chan, snde.SNDE_RTN_FLOAT64)
+        ref.allocate_storage([3], False)
+        ref.data[:] = 0.0
+        ref.rec.mark_data_and_metadata_ready()
+        trans.end_transaction().globalrev_wait().wait_complete()
+
+        self._pending = queue.Queue(queue_depth)
+        self._correlator = threading.Thread(target=self._correlator_loop)
+        self._correlator.daemon = True
+        self._correlator.start()
+        self._watcher = threading.Thread(target=self._watch_loop)
+        self._watcher.daemon = True
+        self._watcher.start()
+
+    # -- the interface run_triggered_path_scan() expects --------------------
+
+    def arm(self, sink, emit_on_arm=True):
+        self._sink = sink
+        self.armed_triggers = 0
+        self.armed_s_m = 0.0
+        self._emit_on_arm = bool(emit_on_arm)
+        self._reset_phase = True
+        self._armed = True
+
+    def disarm(self):
+        self._armed = False
+        # Drain what is already in flight before the caller moves on, or the
+        # last traces of a pass would be delivered during the next one.
+        self._pending.join()
+        self._sink = None
+        return self.armed_triggers
+
+    def synthesize(self, pos=None):
+        """The A-scan currently on the digitizer's channel.
+
+        Used for the trace staged at a pass start, where the probe is stationary
+        and 'the latest one' is the right answer -- there is no crossing to
+        correlate with. Named synthesize() only because that is what the
+        simulator called it and what the acquisition asks for.
+        """
+        ascan, metadata = self._read_latest()
+        self._last_metadata = metadata
+        return ascan
+
+    def metadata(self):
+        return self._last_metadata
+
+    def stop(self):
+        self._quit = True
+        self._pending.put(None)
+
+    def trigger_report(self):
+        expected = self.travelled_m/self.trigger_pitch_m if self.trigger_pitch_m else 0.0
+        return {"mode": "timestamped",
+                "pitch_m": self.trigger_pitch_m,
+                "triggers": self.triggers,
+                "travelled_m": self.travelled_m,
+                "expected_triggers": expected,
+                "error_triggers": self.triggers - 1 - expected,
+                "correlation_waits": self.correlation_waits,
+                "max_correlation_wait_s": self.max_correlation_wait,
+                "interpolated_timestamps": self.interpolated_timestamps,
+                "uninterpolated_timestamps": self.uninterpolated_timestamps,
+                "max_crossings_per_poll": self.max_crossings_per_poll,
+                "errors": self.errors,
+                "last_error": repr(self.last_error) if self.last_error else None}
+
+    # -- internals ---------------------------------------------------------
+
+    def _read_latest(self):
+        ref = self.recdb.latest.ref[self.ascan_path]
+        return np.array(ref.data, copy=True), ref.rec.metadata
+
+    def _publish_pose(self, timestamp, pos):
+        """One timestamped transaction carrying where the probe was.
+
+        Returns the ended transaction WITHOUT waiting for its globalrev. Under
+        the timed manager end_transaction() only marks it ended; the manager
+        commits it in timestamp order once the ordering window has passed. So
+        this costs nothing on the watching thread, which is the whole reason the
+        wait happens on the correlator instead.
+        """
+        trans = self.recdb.start_transaction(timestamp)
+        ref = snde.create_ndarray_ref(trans, self.pose_chan, snde.SNDE_RTN_FLOAT64)
+        ref.allocate_storage([3], True)
+        ref.data[0] = float(pos[0])
+        ref.data[1] = float(pos[1])
+        ref.data[2] = float(pos[2]) if len(pos) > 2 else 0.0
+        ref.rec.mark_data_and_metadata_ready()
+        return trans.end_transaction()
+
+    def _correlator_loop(self):
+        from dataguzzler_python import context
+        context.InitFreeThread()
+        while True:
+            item = self._pending.get()
+            if item is None:
+                self._pending.task_done()
+                break
+            ended, pos, s_m, index, sink = item
+            try:
+                t0 = time.monotonic()
+                # THIS is the correlation. The globalrev this pose produced
+                # contains every A-scan stamped at or before the crossing and
+                # none stamped after it, because the manager committed them in
+                # timestamp order -- so reading the digitizer's channel out of
+                # it gives the shot that was current at the crossing.
+                gr = ended.globalrev()
+                waited = time.monotonic() - t0
+                self.correlation_waits += 1
+                if waited > self.max_correlation_wait:
+                    self.max_correlation_wait = waited
+                ref = gr.get_ndarray_ref(self.ascan_path)
+                ascan = np.array(ref.data, copy=True)
+                self._last_metadata = ref.rec.metadata
+                if sink is not None:
+                    sink(ascan, pos, s_m, index)
+            except Exception as e:
+                self.errors += 1
+                self.last_error = e
+            finally:
+                self._pending.task_done()
+
+    def _interpolate_time(self, t0, t1, frac):
+        """The clock time a fraction `frac` of the way from t0 to t1.
+
+        The timestamp is the correlation -- it is the whole reason this class
+        exists -- so taking it at the moment the POLL noticed a crossing rather
+        than at the crossing itself throws away exactly the accuracy the
+        mechanism was built for. The position is already interpolated along the
+        step; this does the same to the time, so the two describe the same event.
+
+        It matters when more than one crossing falls inside one poll interval.
+        Stamped at poll time they share a timestamp, so they correlate to the
+        same A-scan and one shot of the digitizer is recorded twice under two
+        different positions. Crossings per poll is velocity/(pitch*poll_hz):
+        one at 50 mm/s and a 5.08 mm step, but TEN at 50 mm/s and a 0.5 mm step
+        -- which is precisely what a technician does when they turn the step
+        size down and nothing tells them to slow down. The velocity scaling in
+        scan_parameters.dpi keeps it near one; this makes it correct anyway.
+
+        Arithmetic in integer nanoseconds via seconds_nanos(), because that is
+        the only representation measurement_time exposes that can be added to.
+        A clock that does not implement time_from_secs_nanos -- a Python
+        director subclass for the trigger box, say -- falls back to the
+        uninterpolated stamp and is counted, not silently accepted.
+        """
+        if frac <= 0.0:
+            return t0
+        if frac >= 1.0:
+            return t1
+        try:
+            dt = t1.difference_seconds(t0)
+            if not dt > 0.0:
+                return t0
+            sn = t0.seconds_nanos()
+            # SWIG renders std::pair as a proxy with .first/.second; a Python
+            # director subclass may return a plain tuple.
+            try:
+                secs, nanos = int(sn.first), int(sn.second)
+            except AttributeError:
+                secs, nanos = int(sn[0]), int(sn[1])
+            nanos += int(round(frac*dt*1e9))
+            secs += nanos//1000000000
+            nanos %= 1000000000
+            out = self.clock.time_from_secs_nanos(int(secs), int(nanos))
+            self.interpolated_timestamps += 1
+            return out
+        except Exception as e:
+            self.uninterpolated_timestamps += 1
+            if not self._interp_warned:
+                self._interp_warned = True
+                print("  timestamped trigger: cannot interpolate crossing times "
+                      "on this clock (%r); crossings sharing a poll will share a "
+                      "timestamp. Keep velocity/(step*%.0f Hz) at or under 1."
+                      % (e, 1.0/self.poll_period))
+            return t1
+
+    def _watch_loop(self):
+        from dataguzzler_python import context
+        context.InitFreeThread()
+
+        last = None
+        last_t = None
+        residual = 0.0
+        MAX_BURST = 128
+
+        while not self._quit:
+            if self._reset_phase:
+                self._reset_phase = False
+                last = None
+                last_t = None
+                residual = 0.0
+
+            pos = self.position_fn()
+            # Immediately, and before anything else touches this thread: this is
+            # the time the position below was observed, and it is the far end of
+            # every interpolation done from it.
+            now_t = self.clock.get_current_time()
+            if pos is None:
+                time.sleep(self.poll_period)
+                continue
+            p = np.asarray(pos, dtype=np.float64)
+
+            if last is None:
+                last = p
+                last_t = now_t
+                self.armed_s_m = 0.0
+                if self._emit_on_arm or not self._armed:
+                    self._fire(p, 0.0, now_t)
+                time.sleep(self.poll_period)
+                continue
+
+            step = p - last
+            d = float(np.linalg.norm(step))
+            if d > 0.0:
+                self.travelled_m += d
+                total = residual + d
+                # int(x + 1e-9), not floor division -- 0.5//0.01 is 49 in binary
+                # floating point, so an exact multiple of the pitch fires one
+                # trigger too few, and one missing trigger shifts every later
+                # trace. Same reasoning as sim_ascan_source.dpi.
+                n = int(total/self.trigger_pitch_m + 1e-9)
+                if n > MAX_BURST:
+                    n = MAX_BURST
+                if n > self.max_crossings_per_poll:
+                    self.max_crossings_per_poll = n
+                for k in range(1, n+1):
+                    along = k*self.trigger_pitch_m - residual
+                    frac = min(along, d)/d
+                    self.armed_s_m += self.trigger_pitch_m
+                    # Position and time interpolated by the SAME fraction of the
+                    # same step, so they describe one event rather than two.
+                    self._fire(last + step*frac, self.armed_s_m,
+                               self._interpolate_time(last_t, now_t, frac))
+                residual = max(0.0, total - n*self.trigger_pitch_m)
+            # Outside the branch, and that matters for the TIME. A poll that saw
+            # no travel still advanced the clock, so leaving last_t behind would
+            # make the next interpolation span a stationary period the probe did
+            # not cross anything in. (last is unchanged by this when d == 0,
+            # since p is then equal to it.)
+            last = p
+            last_t = now_t
+
+            time.sleep(self.poll_period)
+
+    def _fire(self, pos, s_m, timestamp):
+        """One crossing: publish the pose at its own time, hand it to the correlator."""
+        try:
+            ended = self._publish_pose(timestamp, pos)
+            self.triggers += 1
+            if self._armed:
+                index = self.armed_triggers
+                self.armed_triggers += 1
+                self._pending.put((ended, pos, s_m, index, self._sink))
+        except Exception as e:
+            self.errors += 1
+            self.last_error = e

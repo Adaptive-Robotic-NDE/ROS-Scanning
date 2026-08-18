@@ -1,0 +1,279 @@
+# ==============================================================================
+# THE TECHNICIAN-CONTROL DERIVATION LAYER
+# ==============================================================================
+# scan_parameters.dpi holds the pure arithmetic -- ROS-free, host-testable, no
+# recording database. This is its wiring: it reads the config's globals and the
+# live digitizer, hands them to plan_scan(), and keeps the resulting plan.
+
+# The plan the scan currently running was started from. Everything that has to
+# know how fast to move or how big to make the projection reads it, so there is
+# one derivation rather than one per call site.
+global scan_plan
+scan_plan = None
+
+global projection_enabled
+def projection_enabled():
+    return PROJECTION_MODE != "off"
+
+global projection_is_live
+def projection_is_live():
+    """Project each trace as it is staged, rather than replaying afterwards.
+
+    Read from PROJECTION_MODE rather than from the plan, deliberately: the
+    settings panel writes that global, so switching to "deferred" partway
+    through a scan that is falling behind takes effect on the next trace. The
+    plan then no longer describes what happened, which check_scan_outcome()
+    reports as an achieved rate that beat the planned one.
+    """
+    return PROJECTION_MODE == "live"
+
+global raster_velocity
+def raster_velocity():
+    """MoveIt velocity scaling for the sweeps, from the plan when there is one.
+
+    RASTER_VELOCITY is the fallback and nothing more. A scan started through
+    run_*_scan() always has a plan, and the plan's scaling is SCAN_VELOCITY
+    clamped to whatever the staging pipeline can keep up with at the chosen step
+    size, then converted through ROBOT_VELOCITY_CALIBRATION.
+    """
+    if scan_plan is None:
+        return RASTER_VELOCITY
+    return scan_plan["velocity_scaling"]
+
+global trace_pitch
+def trace_pitch():
+    """Distance between traces along a pass.
+
+    The trigger's pitch when there is a trigger, because that is the number that
+    physically produced the traces; SCAN_STEP_SIZE otherwise.
+    """
+    if ascan_source is not None and getattr(ascan_source, "trigger_pitch_m", None):
+        return float(ascan_source.trigger_pitch_m)
+    return float(SCAN_STEP_SIZE)
+
+global plane_grid_size
+def plane_grid_size(size=0.30):
+    """(m, n) for a square plane scan of the given side.
+
+    Derived from the step size and the line spacing, which is what makes them
+    the primary controls: SCAN_M/SCAN_N are the override, not the input. A
+    rectangular scan's column pitch and trigger pitch are necessarily equal
+    (trigger k must be column k), so pinning the grid pins the step.
+    """
+    m = SCAN_M if SCAN_M else int(round(size/SCAN_STEP_SIZE)) + 1
+    n = SCAN_N if SCAN_N else int(round(size/SCAN_LINE_SPACING)) + 1
+    return max(int(m), 2), max(int(n), 1)
+
+global set_trigger_pitch
+def set_trigger_pitch(pitch_m):
+    """Retune the trigger pitch on the live source.
+
+    A plane scan's pitch is its grid pitch, so it is not knowable until the scan
+    corners are, and the source was constructed long before that. Both trigger
+    sources hold the pitch in one attribute and read it every poll, so this takes
+    effect immediately -- but only between passes, never during one, because the
+    arc-length phase of a pass is measured against it.
+    """
+    if ascan_source is None:
+        return None
+    pitch_m = float(pitch_m)
+    if getattr(ascan_source, "trigger_pitch_m", None) != pitch_m:
+        ascan_source.trigger_pitch_m = pitch_m
+    return pitch_m
+
+global build_scan_plan
+def build_scan_plan(path_length_m, passes, step_m=None, velocity_mps=None,
+                    projection_extent_m=None, force=False, geom_timeout=5.0):
+    """The arithmetic for a scan of this shape, without committing to it.
+
+    Separate from plan_current_scan so the settings panel can show what the
+    current numbers would produce without disturbing a scan that is running.
+
+    geom_timeout is how long to wait for the digitizer to say what it produces.
+    A scan can afford to wait for an externally triggered card; the panel, which
+    replans on every keystroke, cannot -- so it passes 0 and takes the
+    configured record length instead.
+    """
+    step_m = trace_pitch() if step_m is None else float(step_m)
+    velocity_mps = SCAN_VELOCITY if velocity_mps is None else float(velocity_mps)
+
+    # Record length and sample type belong to the card, so ask it rather than
+    # this file. Before the first trigger on an externally triggered card there
+    # may be nothing yet; fall back to the configured length so the plan can
+    # still be printed, and say which it used.
+    geom = ascan_geometry(timeout=geom_timeout, require=False)
+    if geom is not None:
+        num_samples = geom["num_points"]
+        sample_bytes = np.dtype(geom["dtype"]).itemsize
+    else:
+        num_samples = ASCAN_NUM_POINTS
+        sample_bytes = np.dtype(ASCAN_SIM_DTYPE).itemsize
+        if geom_timeout > 0.0:
+            print("  (no A-scan yet, so the memory estimate assumes %d samples of %s)"
+                  % (num_samples, np.dtype(ASCAN_SIM_DTYPE)))
+
+    return plan_scan(
+        step_m=step_m,
+        velocity_mps=velocity_mps,
+        path_length_m=path_length_m,
+        passes=passes,
+        num_samples=num_samples,
+        sample_bytes=sample_bytes,
+        trigger_mode=ASCAN_TRIGGER_MODE,
+        projection_mode=PROJECTION_MODE,
+        transaction_latency_s=(TRANSACTION_LATENCY if transmgr is not None else 0.0),
+        digitizer_rate_hz=ASCAN_RATE_HZ,
+        velocity_calibration=ROBOT_VELOCITY_CALIBRATION,
+        spot_radius_m=PROJECTION_SPOT_RADIUS,
+        projection_pixels=PROJECTION_PIXELS,
+        projection_extent_m=projection_extent_m,
+        file_backed=(scan_storage_manager is not None),
+        limits=SCAN_LIMITS,
+        force=force)
+
+global plan_current_scan
+def plan_current_scan(path_length_m, passes, step_m=None, velocity_mps=None,
+                      projection_extent_m=None, force=False):
+    """Work out what the scan about to run costs, print it, and hold onto it.
+
+    Called by every continuous scan before it moves. It is the one place the two
+    technician numbers turn into a velocity scaling, a trace count, a memory
+    figure and a projection resolution -- and the one place a scan is refused.
+
+    force=True runs a scan the limits would otherwise reject, still printing
+    exactly what is wrong with it. That is the escape hatch for a deliberate
+    four-hour scan; it is not the default, because the point of the limits is
+    that such a scan should be a decision.
+    """
+    global scan_plan
+    scan_plan = build_scan_plan(path_length_m, passes, step_m=step_m,
+                                velocity_mps=velocity_mps,
+                                projection_extent_m=projection_extent_m,
+                                force=force)
+    print(format_scan_plan(scan_plan))
+    return scan_plan
+
+global preview_scan_plan
+def preview_scan_plan(size=0.30, force=True):
+    """What the CURRENT settings would produce, for the settings panel.
+
+    Uses the planned mesh toolpath when there is one, and the default square
+    plane scan otherwise, because those are the two things run_*_scan() would
+    actually do. force=True: a preview reports limit violations rather than
+    raising on them -- refusing is the job of the scan, not of the display.
+    """
+    if mesh_scan_path is not None:
+        segs = mesh_scan_path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+        travel = sum(mesh_scan_path.segment_length_m(s) for s in segs)
+        pos = mesh_scan_path.positions
+        return build_scan_plan(path_length_m=travel, passes=len(segs),
+                               step_m=SCAN_STEP_SIZE,
+                               projection_extent_m=float(max(pos[:, 0].ptp(),
+                                                             pos[:, 1].ptp())),
+                               force=force, geom_timeout=0.0)
+    m, n = plane_grid_size(size)
+    step = size/(m-1) if m > 1 else SCAN_STEP_SIZE
+    return build_scan_plan(path_length_m=size*n, passes=n, step_m=step,
+                           projection_extent_m=size, force=force, geom_timeout=0.0)
+
+global report_scan_outcome
+def report_scan_outcome(report):
+    """What the scan actually achieved, against what was planned.
+
+    Printed after every scan, and it is the half that keeps the measured
+    constants in scan_parameters.dpi honest -- a queue that grew, a rate that
+    was not reached or a probe that moved at a different speed than asked all
+    say the plan was built on a number that no longer holds here.
+    """
+    if scan_plan is None:
+        return
+    if transmgr is not None:
+        try:
+            report.setdefault("late_transactions", int(transmgr.late_transactions))
+            report.setdefault("max_lateness_secs", float(transmgr.max_lateness_secs))
+        except Exception:
+            pass
+    for line in check_scan_outcome(scan_plan, report, SCAN_LIMITS):
+        print(line)
+    src = ascan_source
+    if getattr(src, "trigger_mode", None) == "timestamped":
+        tr = src.trigger_report()
+        if tr.get("uninterpolated_timestamps"):
+            print("  %d crossing(s) could not have their timestamp interpolated; "
+                  "any that shared a poll shared an A-scan."
+                  % tr["uninterpolated_timestamps"])
+        if tr.get("max_crossings_per_poll", 0) > 1:
+            print("  up to %d crossings fell inside one %.1f ms poll, all "
+                  "interpolated to their own instant"
+                  % (tr["max_crossings_per_poll"], src.poll_period*1e3))
+
+global project_traces
+def project_traces(first=0, count=None, gate="cscan", quiet=False):
+    """Replay the recorded trace list through the projector.
+
+    This is the deferred half of PROJECTION_MODE, and it is the reason the trace
+    list exists. Every trace carries the pose it was taken at, and the gate runs
+    over the whole list as a math function, so the projected image can be rebuilt
+    from what is already in the database -- no robot, no re-scan.
+
+    Measured on 3600 traces: 58.1 s, 62 traces/s, against 658.6 s of live
+    projection during the scan, and an identical image. The 11x is almost
+    entirely the globalrev wait: wait=False per point with a single wait at the
+    end, which is safe here precisely because nothing else is producing.
+
+    Run it again after changing the spot radius, the gate or the surface.
+    """
+    if projector is None:
+        raise RuntimeError("no projector -- PROJECTION_MODE is 'off', or no scan "
+                           "has set up a surface yet")
+    if trace_accum is None:
+        raise RuntimeError("no trace list to project from -- RECORD_TRACE_LIST "
+                           "is off, or no scan has run yet")
+    if not cscan_gates or gate not in cscan_gates:
+        raise RuntimeError("no gate chain to project; run a scan first")
+
+    poses = np.array(recdb.latest.ref[trace_accum.poses_path].data, copy=True)
+    ampl = np.array(recdb.latest.ref[cscan_gates[gate]["ampl"]].data, copy=True)
+
+    end = min(len(poses), len(ampl))
+    if trace_accum is not None and trace_accum.staged:
+        # The accumulators are allocated for the whole planned scan; only the
+        # traces actually staged are real. Projecting the unwritten tail would
+        # splat zeros at an invalid orientation.
+        end = min(end, trace_accum.staged)
+    if count is not None:
+        end = min(end, first + int(count))
+
+    started = time.monotonic()
+    done = 0
+    skipped = 0
+    gr = None
+    for k in range(first, end):
+        pose7 = poses[k]
+        if not float(np.linalg.norm(pose7[:4])) > 1e-6:
+            skipped += 1          # never staged: a zero quaternion is no pose
+            continue
+        gr = projector.project(pose7, float(ampl[k]), wait=False)
+        done += 1
+    if gr is not None:
+        # One wait, at the end. Each projection is a transaction and the
+        # projector accumulates in mutable storage, so they must all land -- but
+        # they need not land one at a time.
+        gr.globalrev_wait().wait_complete()
+    elapsed = time.monotonic() - started
+    if not quiet:
+        print("  projected %d trace(s) in %.1f s (%.1f traces/s)%s"
+              % (done, elapsed, done/elapsed if elapsed > 0 else 0.0,
+                 ", %d unstaged skipped" % skipped if skipped else ""))
+    return {"projected": done, "skipped": skipped, "elapsed": elapsed}
+
+global finish_projection
+def finish_projection():
+    """Run the deferred projection, if that is the mode."""
+    if PROJECTION_MODE != "deferred" or projector is None:
+        return None
+    if trace_accum is None or not trace_accum.staged:
+        return None
+    print("  deferred projection: replaying %d trace(s) from %s"
+          % (trace_accum.staged, trace_accum.poses_path))
+    return project_traces()

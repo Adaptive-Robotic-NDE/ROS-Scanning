@@ -1,0 +1,351 @@
+# Projecting scan data onto a parameterized surface.
+#
+# The rectangular c-scan is an array indexed by grid position. That only exists
+# for a rectangular grid, and it is fragile even there: a trace out of place
+# shifts everything after it. Projection replaces the index with geometry --
+# spatialnde2 ray-traces from the probe pose onto a parameterized surface and
+# splats the value where it lands. It consumes (pose, value) pairs one at a time
+# and has no concept of a path, a line or a grid, so a serpentine over a mesh,
+# disconnected regions and ragged edges are all the same to it. A stray trace
+# lands where the probe actually was, or misses the surface and contributes
+# nothing. It cannot displace its neighbours.
+#
+# The catch is that projection needs a parameterized surface, and building and
+# registering a mesh is exactly the cost the plane scan exists to avoid. So for
+# a plane we *synthesise* one: the scan defines a rectangle in space, and a
+# rectangle is exactly represented by two triangles with a trivial UV map. No
+# reconstruction, no registration -- the geometry is whatever the scan said it
+# was, which is correct by construction. Everything downstream is then shared
+# with the real-mesh case.
+
+import os
+import numpy as np
+import spatialnde2 as snde
+
+# A .dpi is compiled as a function body, so anything the including config
+# needs to see has to be declared global before it is assigned.
+global ORIENT_DTYPE
+global SurfaceProjector
+
+
+ORIENT_DTYPE = [('quat', '<f4', (4,)), ('offset', '<f4', (4,))]
+
+
+global write_plane_x3d
+def write_plane_x3d(path, origin, u_vec, v_vec):
+    """Write a UV-parameterized rectangular patch as X3D.
+
+    origin/u_vec/v_vec are world-frame numpy 3-vectors: the patch spans
+    origin -> origin+u_vec -> origin+u_vec+v_vec -> origin+v_vec. UV runs 0..1
+    along u and v respectively, so parameterization space is the scan's own
+    (u, v) coordinates -- which makes the projected image directly comparable
+    to the rectangular c-scan.
+
+    Two triangles, because a plane needs no more: projection resolution comes
+    from the parameterization pixel count, not from mesh density.
+    """
+    o = np.asarray(origin, dtype=np.float64)
+    u = np.asarray(u_vec, dtype=np.float64)
+    v = np.asarray(v_vec, dtype=np.float64)
+    verts = [o, o+u, o+u+v, o+v]
+
+    pts = " ".join("%.9g %.9g %.9g" % (p[0], p[1], p[2]) for p in verts)
+    uvs = "0.0 0.0 1.0 0.0 1.0 1.0 0.0 1.0"
+
+    with open(path, "w") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        f.write('<!DOCTYPE X3D PUBLIC "ISO//Web3D//DTD X3D 3.3//EN" '
+                '"http://www.web3d.org/specifications/x3d-3.3.dtd">\n')
+        f.write('<X3D profile="Interchange" version="3.3">\n  <Scene>\n    <Transform>\n')
+        f.write('      <Shape>\n')
+        f.write('        <IndexedFaceSet coordIndex="0 1 2 -1 0 2 3 -1" '
+                'texCoordIndex="0 1 2 -1 0 2 3 -1" solid="false">\n')
+        f.write('          <Coordinate point="%s"/>\n' % pts)
+        f.write('          <TextureCoordinate point="%s"/>\n' % uvs)
+        f.write('        </IndexedFaceSet>\n')
+        f.write('        <Appearance><Material diffuseColor="0.8 0.8 0.8"/></Appearance>\n')
+        f.write('      </Shape>\n    </Transform>\n  </Scene>\n</X3D>\n')
+    return path
+
+
+global plane_x3d_from_scanpath
+def plane_x3d_from_scanpath(path, uu, vv, ww, margin=0.0):
+    """Synthesise the patch that a rectangular plane scan covers.
+
+    Takes the world coordinate grids straight from _plane_grid, so the surface
+    is the scan area by definition and lands in the world frame already
+    registered. margin extends the patch outward on all sides, which is useful
+    because the projection spot has a radius and would otherwise be clipped at
+    the edges of the scan.
+    """
+    o = np.array([uu[0, 0], vv[0, 0], ww[0, 0]], dtype=np.float64)
+    umax = np.array([uu[-1, 0], vv[-1, 0], ww[-1, 0]], dtype=np.float64)
+    vmax = np.array([uu[0, -1], vv[0, -1], ww[0, -1]], dtype=np.float64)
+    u = umax - o
+    v = vmax - o
+
+    if margin > 0.0:
+        un = u/np.linalg.norm(u)
+        vn = v/np.linalg.norm(v)
+        o = o - margin*un - margin*vn
+        u = u + 2*margin*un
+        v = v + 2*margin*vn
+
+    return write_plane_x3d(path, o, u, v), o, u, v
+
+
+class SurfaceProjector(object):
+    """Loads a parameterized surface and projects scalar probe data onto it.
+
+    Deliberately the same object whether the surface came from a mesh
+    reconstruction or was synthesised for a plane scan, because the only thing
+    that differs is where the .x3d came from.
+    """
+
+    def __init__(self, recdb, x3d_path, prefix="/proj",
+                 texture_scaling=None,
+                 min_dist=-0.05, max_dist=0.25, radius=0.003,
+                 horizontal_pixels=512, vertical_pixels=512,
+                 use_surface_normal=False, create_textured_part=True,
+                 offset=(0.0, 0.0, 0.0)):
+        self.recdb = recdb
+        self.offset = tuple(float(v) for v in offset)
+        self.prefix = prefix.rstrip("/")
+        self.model_tree = self.prefix + "/graphics/specimen/"
+        self.specimen_pose_channel = self.prefix + "/specimen_pose"
+        self.probe_pose_channel = self.prefix + "/probe_pose"
+        self.data_channel = self.prefix + "/probe_value"
+        self.projection_channel = self.prefix + "/graphics/projection"
+        self.projection_specimen_channel = self.prefix + "/graphics/projection_specimen"
+
+        self.min_dist = min_dist
+        self.max_dist = max_dist
+        self.radius = radius
+        self.horizontal_pixels = horizontal_pixels
+        self.vertical_pixels = vertical_pixels
+        self.use_surface_normal = use_surface_normal
+        self.create_textured_part = create_textured_part
+
+        self.graphman = snde.graphics_storage_manager(
+            self.prefix + "/graphics/", recdb.lowlevel_alloc,
+            recdb.alignment_requirements, recdb.lockmgr, 1e-8, 2000000000)
+
+        trans = recdb.start_transaction()
+        self.graphics_chan = trans.define_channel(self.prefix + "/graphics/", "main",
+                                                  False, self.graphman)
+
+        # project_onto_parameterization_processing_tags is what builds the
+        # boxes3d / projinfo / inplanemat arrays the projector needs; without
+        # them the ray tracer has nothing to intersect against.
+        self.specimen_recording = snde.x3d_load_geometry(
+            trans, self.graphman, x3d_path, 0, "main", self.model_tree,
+            texture_scaling,
+            ["reindex_vertices", "reindex_tex_vertices"]
+            + snde.project_onto_parameterization_processing_tags)
+
+        self.specimen_pose_chan = trans.define_channel(self.specimen_pose_channel, "main")
+        pose_ref = snde.create_pose_channel_ndarray_ref(
+            trans, self.specimen_pose_chan,
+            snde.recdb_path_join(self.model_tree, "meshed"))
+        pose_ref.allocate_storage([1])
+        # Identity rotation, and whatever translation placed the mesh. The
+        # synthesised plane patch is already in world coordinates, so there is
+        # nothing to register and the offset stays zero -- this is the slot a
+        # real registration transform goes in, and it is load-bearing as soon as
+        # a mesh authored somewhere else is placed in the cell: the SAME offset
+        # has to move the toolpath and the projection surface, or the traces land
+        # on the wrong part of the image and nothing says so.
+        pose_ref.data[0] = np.array(((1.0, 0.0, 0.0, 0.0),
+                                     (self.offset[0], self.offset[1], self.offset[2], 1.0)),
+                                    dtype=ORIENT_DTYPE)
+        pose_ref.rec.mark_data_and_metadata_ready()
+
+        self.probe_pose_chan = trans.define_channel(self.probe_pose_channel, "main")
+        self.data_chan = trans.define_channel(self.data_channel, "main")
+
+        # Seed both so the projection can be created immediately and starts empty
+        # rather than waiting for the first trace.
+        self._probe_pose_in_transaction(trans, snde.snde_invalid_orientation3())
+        self._value_in_transaction(trans, np.nan)
+
+        trans.end_transaction().globalrev_wait().wait_complete()
+
+        self.x3d_path = x3d_path
+        self.projection = None
+        self._instantiate_projection()
+
+        # The textured part is what lets the viewer draw the projection on the
+        # model. It is also a rendering input, so every projection revision can
+        # drag CPU-side normal / vertex_arrays / texvertex_arrays recalculation
+        # along with it -- ruinous when projecting once per trace. Turn it off
+        # during acquisition and add it afterwards if that is the cost; the
+        # projection channel itself is unaffected either way.
+        #
+        # Deliberately after end_transaction: add_textured_part() opens its own,
+        # and only one transaction may be open at a time.
+        if self.create_textured_part:
+            self.add_textured_part()
+
+    def _instantiate_projection(self, trans=None):
+        """(Re)create the projection math function on its own channel.
+
+        Split out so restart() can give a scan a FRESH, EMPTY image without
+        rebuilding the object. The projector accumulates in mutable storage --
+        that is what makes it work one point at a time -- so a second scan onto a
+        reused projector would otherwise draw on top of the first one's picture.
+
+        Pass a transaction to join it rather than open one; restart() does, so
+        that the delete and the re-create land together. See restart().
+        """
+        own = (trans is None)
+        if own:
+            trans = self.recdb.start_transaction()
+        self.projection = snde.project_point_onto_parameterization.instantiate(
+            [snde.math_parameter_recording(snde.recdb_path_join(self.model_tree, "meshed")),
+             snde.math_parameter_recording(snde.recdb_path_join(self.model_tree, "uv")),
+             snde.math_parameter_recording(snde.recdb_path_join(self.model_tree, "trinormals")),
+             snde.math_parameter_recording(snde.recdb_path_join(self.model_tree, "boxes3d")),
+             snde.math_parameter_recording(snde.recdb_path_join(self.model_tree, "projinfo")),
+             snde.math_parameter_recording(snde.recdb_path_join(self.model_tree, "inplanemat")),
+             snde.math_parameter_recording(self.specimen_pose_channel),
+             snde.math_parameter_recording(self.probe_pose_channel),
+             snde.math_parameter_recording(self.data_channel),
+             snde.math_parameter_double_const(self.min_dist),
+             snde.math_parameter_double_const(self.max_dist),
+             snde.math_parameter_double_const(self.radius),
+             snde.math_parameter_unsigned_const(self.horizontal_pixels),
+             snde.math_parameter_unsigned_const(self.vertical_pixels),
+             snde.math_parameter_bool_const(self.use_surface_normal)],
+            [snde.shared_string(self.projection_channel)],
+            "/",
+            True,    # mutable -- REQUIRED. The projector accumulates on top of
+                     # its previous revision in mutable storage, so instantiated
+                     # immutable it publishes only the current splat and every
+                     # earlier point vanishes. That looks like the projection
+                     # "not working" when in fact it is working one point at a
+                     # time.
+            False, False,
+            snde.math_definition("scan projection"), [], None)
+        trans.add_math_function(self.projection, False)
+        if own:
+            trans.end_transaction().globalrev_wait().wait_complete()
+
+    def restart(self):
+        """Empty the projected image, keeping the loaded surface.
+
+        This is how a second scan in one session gets a clean picture. Building a
+        whole new SurfaceProjector cannot do it: x3d_load_geometry defines a
+        subtree of channels under the model tree that this object never holds a
+        handle to, so nothing here can hand them back, and the next construction
+        dies with
+
+            realize_transaction: provided reserved_channel for
+            /ut/proj/graphics/specimen/ by main is not current
+
+        The math function, by contrast, owns its own output channel and gives it
+        back when deleted -- so the picture can be replaced even though the
+        surface underneath it cannot.
+
+        A DIFFERENT surface in the same session is therefore not supported;
+        restart the config for that. Reusing one is the common case by a wide
+        margin, because it is what re-running a scan does.
+
+        ONE transaction for the delete and the re-create, and that is not
+        tidiness. add_textured_part() published a textured_part_recording whose
+        image_reference names the projection channel, and that reference is not
+        rebuilt here. Split across two transactions, every globalrev in between
+        holds a textured part pointing at a channel that does not exist, and the
+        compositor throws
+
+            Exception determining display requirements for
+            .../projection_specimen: get_recording(): channel
+            .../projection not found
+
+        once per frame while globalrev completion backs up behind it. Measured
+        with the split version and a free-running 1 kHz digitizer: 800
+        globalrevisions defined but not complete, and the recording database
+        warning that nothing can be pruned so memory, fds and shm keep growing.
+        The window is only a transaction round trip; at 1 kHz that is enough.
+        """
+        trans = self.recdb.start_transaction()
+        if self.projection is not None:
+            trans.delete_math_function([self.projection_channel], self.projection)
+            self.projection = None
+        self._instantiate_projection(trans)
+        trans.end_transaction().globalrev_wait().wait_complete()
+
+    def teardown(self):
+        """Delete the projection and hand back every channel this took.
+
+        Needed before a second projector can be built in the same session:
+        define_channel() does not complain about a channel someone still owns, it
+        returns a reserved_channel that is no longer current, and the transaction
+        fails at end_transaction() naming a channel rather than the object still
+        holding it. That is a long way from "the second scan crashed".
+
+        The graphics tree goes back too. x3d_load_geometry built a subtree of
+        arrays under it, but those are the loaded recording's channels, not this
+        object's; what has to be handed back is the reservation on the tree
+        itself, or the next projector cannot define it.
+        """
+        trans = self.recdb.start_transaction()
+        if self.projection is not None:
+            trans.delete_math_function([self.projection_channel], self.projection)
+            self.projection = None
+        for attr in ("specimen_pose_chan", "probe_pose_chan", "data_chan",
+                     "graphics_chan"):
+            chan = getattr(self, attr, None)
+            if chan is not None:
+                trans.release_channel(chan)
+                setattr(self, attr, None)
+        trans.end_transaction().globalrev_wait().wait_complete()
+
+    def add_textured_part(self):
+        """Attach the projection to the model so the viewer can draw it."""
+        trans = self.recdb.start_transaction()
+        proj_specimen_chan = trans.define_channel(self.projection_specimen_channel, "main")
+        snde.create_textured_part_recording(
+            trans, proj_specimen_chan,
+            snde.recdb_path_join(self.model_tree, "meshed"),
+            snde.shared_string(snde.recdb_path_join(self.model_tree, "uv")),
+            [(0, snde.image_reference(self.projection_channel, 0, 1, []))]
+        ).mark_data_and_metadata_ready()
+        trans.end_transaction().globalrev_wait().wait_complete()
+        self.create_textured_part = True
+
+    # -- publishing -------------------------------------------------------
+
+    def _probe_pose_in_transaction(self, trans, orientation):
+        ref = snde.create_pose_channel_ndarray_ref(
+            trans, self.probe_pose_chan,
+            snde.recdb_path_join(self.model_tree, "meshed"))
+        ref.allocate_storage([1])
+        rec = snde.pose_channel_recording.from_ndarray_recording(ref.rec)
+        rec.set_untransformed_render_channel(self.specimen_pose_channel)
+        ref.data[0] = orientation
+        ref.rec.mark_metadata_done()
+        ref.rec.mark_data_ready()
+
+    def _value_in_transaction(self, trans, value):
+        ref = snde.create_ndarray_ref(trans, self.data_chan, snde.SNDE_RTN_FLOAT32)
+        ref.rec.mark_metadata_done()
+        ref.allocate_storage([])
+        ref.assign_double([], float(value))
+        ref.rec.mark_data_and_metadata_ready()
+
+    def project(self, pose7, value, wait=True):
+        """Splat one scalar at one probe pose.
+
+        pose7 is (qw,qx,qy,qz,x,y,z) -- the same layout TraceAccumulator stores,
+        so a scan can hand the projector exactly what it recorded.
+        """
+        orientation = np.array(((pose7[0], pose7[1], pose7[2], pose7[3]),
+                                (pose7[4], pose7[5], pose7[6], 1.0)),
+                               dtype=ORIENT_DTYPE)
+        trans = self.recdb.start_transaction()
+        self._probe_pose_in_transaction(trans, orientation)
+        self._value_in_transaction(trans, value)
+        gr = trans.end_transaction()
+        if wait:
+            gr.globalrev_wait().wait_complete()
+        return gr

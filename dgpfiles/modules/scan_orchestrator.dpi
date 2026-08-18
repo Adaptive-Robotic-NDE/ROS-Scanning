@@ -1,0 +1,44 @@
+import time
+
+global run_point_by_point_scan
+def run_point_by_point_scan(ros, projection_manager, pose_array, capture_callback):
+    """
+    Executes a point-by-point scan where the script orchestrates the motion 
+    and explicitly triggers data capture at each point.
+    """
+    if not pose_array or not pose_array.poses:
+        print("No poses to scan.")
+        return
+        
+    num_poses = len(pose_array.poses)
+    print(f"Starting scan of {num_poses} points...")
+    
+    # Move to start position first before clearing accumulators (per AGENTS.md rule)
+    start_pose = pose_array.poses[0]
+    print("Moving to start position...")
+    ros.Move(start_pose, 0.2, 0.2)
+    time.sleep(1.0) # Wait for TF to populate the valid pose
+    
+    if projection_manager:
+        projection_manager.clear_accumulators()
+    
+    for i, pose in enumerate(pose_array.poses):
+        print(f"Scanning point {i+1}/{num_poses}...")
+        res = ros.Move(pose, 0.1, 0.1)
+        if not res.result.success:
+            print("Warning: Move failed, continuing anyway.")
+            
+        capture_callback()
+        time.sleep(0.05) # Rate limiting
+        
+    print("Scan complete.")
+
+global run_continuous_scan
+def run_continuous_scan(ros, pose_array):
+    """
+    Placeholder for continuous scanning.
+    Configures hardware triggering and sends a continuous trajectory.
+    """
+    print("Continuous scanning not fully implemented in simulation yet.")
+    # Implementation depends heavily on specific hardware (e.g., UniWest or NIDAQ + UR script)
+    # Hardware pulses would be coordinated natively between the motion controller and DAQ.

@@ -1,0 +1,185 @@
+# ==============================================================================
+# GET ME A MESH, HOWEVER
+# ==============================================================================
+# The one function the scan actually needs from all of this. There are now four
+# ways a mesh of the specimen can come about -- it is already on disk, it is
+# synthesised, the Azure reconstructed it, the Keyence reconstructed it -- and
+# plan_mesh_path() should not care which.
+#
+# So this is the whole integration point between the reconstruction stage and the
+# scan stage: one function, returning (mesh, x3d). Everything downstream is
+# unchanged.
+#
+# The default, source="auto", resolves to exactly what scenario B did before this
+# module existed: NOETHER_MESH if it is set, the synthesised test plate
+# otherwise. That is deliberate -- the 29-pass / 1740-trace acceptance scan has
+# to keep producing the same numbers, and it does that by taking the same branch
+# it always did.
+
+import os
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global obtain_specimen_mesh
+global reconstruct_specimen
+global specimen_mesh
+global specimen_x3d
+global specimen_source_used
+
+
+# The last mesh obtained, and how. Kept so a scan started from the prompt after a
+# reconstruction does not have to be told where the mesh went.
+specimen_mesh = None
+specimen_x3d = None
+specimen_source_used = None
+
+
+def obtain_specimen_mesh(source=None, region=None, clean=None, cutoff=None,
+                         x3d=None, name="specimen", **kwargs):
+    """A mesh of the part and its parameterized X3D, from whichever route works.
+
+        "auto"     NOETHER_MESH if set, else the test plate   (today's behaviour)
+        "file"     NOETHER_MESH, and fail if it is not set
+        "plate"    make_test_plate(), the regression specimen
+        "azure"    rough reconstruction, Azure Kinect + TSDF
+        "keyence"  high-resolution reconstruction, Keyence profiler
+
+    Returns (mesh_path, x3d_path). The X3D is what the projector loads and the
+    mesh is what Noether plans over; they are different formats of the same
+    surface and both are needed -- pcl cannot read X3D and spatialnde2 cannot
+    read PLY.
+
+    A reconstructed mesh has no UV parameterization, so one is generated with
+    Blender (mesh_to_x3d). The test plate already carries one, which is why that
+    branch skips the step.
+    """
+    global specimen_mesh, specimen_x3d, specimen_source_used
+
+    source = SPECIMEN_SOURCE if source is None else source
+    clean = SPECIMEN_CLEAN_MESH if clean is None else clean
+
+    if source == "auto":
+        source = "file" if NOETHER_MESH else "plate"
+
+    if source == "file":
+        if not NOETHER_MESH:
+            raise ValueError(
+                "SPECIMEN_SOURCE='file' but NOETHER_MESH is None. Set it, or use "
+                "'plate' for the test specimen, or 'azure'/'keyence' to go and "
+                "make a mesh.")
+        mesh = NOETHER_MESH
+        if not os.path.exists(mesh):
+            raise IOError("no such mesh: %s" % (mesh,))
+
+    elif source == "plate":
+        # Writes both formats, and the X3D it writes is already parameterized --
+        # so this branch returns early rather than going near Blender.
+        mesh, plate_x3d = make_test_plate(name=name if name != "specimen"
+                                          else "test_plate")
+        specimen_mesh, specimen_x3d, specimen_source_used = mesh, plate_x3d, source
+        return mesh, plate_x3d
+
+    elif source in ("azure", "keyence"):
+        mesh = reconstruct_specimen(source, region=region, name=name, **kwargs)
+
+    else:
+        raise ValueError(
+            "specimen source must be auto/file/plate/azure/keyence, not %r"
+            % (source,))
+
+    if clean and source in ("azure", "keyence"):
+        # Only reconstructions. A mesh someone put on disk deliberately is not
+        # ours to filter, and the test plate is analytic.
+        #
+        # OFF by default (SPECIMEN_CLEAN_MESH), and this used to pass a
+        # SPECIMEN_SUPPORT_Z world-z plane that has since been deleted -- see the
+        # constant's obituary in UTPlaneScan.dgp. What crops now is the cell's
+        # work volume, applied by the reconstruction itself before there is a
+        # vertex to filter. `cutoff` is here so a caller who knows their own
+        # specimen can still ask for the plane deliberately; with no cutoff the
+        # service falls through to loose-part removal, which keeps only the
+        # biggest connected component and says so.
+        mesh = clean_mesh(mesh, cutoff=cutoff)
+        print("  cleaned: %s" % mesh)
+
+    if x3d is None:
+        x3d = mesh_to_x3d(mesh)
+
+    specimen_mesh, specimen_x3d, specimen_source_used = mesh, x3d, source
+    return mesh, x3d
+
+
+def reconstruct_specimen(source="azure", region=None, name="specimen",
+                         rough_mesh=None, vel=None, acc=None, fly=None,
+                         settle_s=None, source_kwargs=None, **kwargs):
+    """Fly a reconstruction sweep and return the mesh file it produced.
+
+    source="azure"    a dome sweep over `region`, TSDF integrated.
+    source="keyence"  a Noether raster over `rough_mesh` -- which the Azure pass
+                      normally provides, so the honest sequence for a part that
+                      has never been measured is azure first, keyence second.
+
+    Motion goes through `fly`, defaulting to ros.Move along the planned path, so
+    this module keeps no opinion about how the arm is driven.
+
+    `source_kwargs` goes to the ReconstructionSource's CONSTRUCTOR, which is
+    where the parameters that decide what the sensor measures live -- the TSDF
+    voxel size, the depth truncation, the motion gate, the profiler's line
+    spacing. **kwargs goes to the SWEEP instead. Without this the source was
+    built with no arguments and a rough mesh could only be made coarse enough to
+    plan over by driving the classes by hand from the prompt, which is how the
+    2026-08-16 run went and is exactly the "step you cannot press a button for"
+    that the direction section is about.
+    """
+    region = SPECIMEN_REGION if region is None else region
+    vel = MOVE_VELOCITY if vel is None else vel
+    acc = MOVE_ACCEL if acc is None else acc
+    source_kwargs = dict(source_kwargs or {})
+
+    out = os.path.join(_scan_work_dir(), "%s_%s.ply" % (name, source))
+
+    if source == "azure":
+        # A ROUGH mesh is a planning surface, not a measurement, and the voxel
+        # size is what makes it one. At the 0.002 m default a TSDF resolves
+        # every hole and noise bump and Noether then follows all of it -- 8 m
+        # raster "lines" on a 0.35 m part, measured. 0.006 gives 11 sane
+        # segments. Coarse is the requirement here, not a compromise.
+        source_kwargs.setdefault("voxel_length", 0.006)
+        source_kwargs.setdefault("sdf_trunc", 0.024)
+        src = AzureReconstruction(**source_kwargs)
+        sweep_kwargs = dict(kwargs)
+        sweep_kwargs.setdefault("height", SPECIMEN_SWEEP_HEIGHT)
+        sweep_kwargs.setdefault("x", SPECIMEN_SWEEP_STOPS[0])
+        sweep_kwargs.setdefault("y", SPECIMEN_SWEEP_STOPS[1])
+        # No camera tilt by default. The tilt exists to see a part from more
+        # than one direction, which a closed surface needs; for anything the
+        # sweep looks down on it costs coverage instead, because a +/-15 degree
+        # tilt walks the footprint 94 mm at this standoff and pushes the edges
+        # of the part out of a frame that is only 0.46 x 0.34 m to begin with.
+        # Turn it back on for a part with real relief.
+        sweep_kwargs.setdefault("rot", False)
+        # None, so AzureReconstruction.reconstruct() derives the sweep speed
+        # from the measured frame rate. MOVE_VELOCITY is the speed for getting
+        # somewhere, not for measuring on the way.
+        vel = None
+    else:
+        src = keyence_reconstruction_class(KEYENCE_BACKEND)(**source_kwargs)
+        if rough_mesh is None:
+            rough_mesh = specimen_mesh
+        if rough_mesh is None:
+            raise ValueError(
+                "the Keyence sweep is a Noether raster over a rough mesh, and "
+                "there is none yet. Run obtain_specimen_mesh('azure') first, or "
+                "pass rough_mesh=.")
+        sweep_kwargs = dict(kwargs, mesh=rough_mesh)
+        # The fine pass is slow by nature: the profiler needs the surface to
+        # cross its laser line at a rate it can resolve.
+        vel = min(vel, src.velocity)
+        acc = min(acc, src.velocity)
+
+    print("reconstructing the specimen with the %s (%s)"
+          % (source, type(src).__name__))
+    mesh = src.reconstruct(out, region=region, fly=fly, vel=vel, acc=acc,
+                           settle_s=settle_s, **sweep_kwargs)
+    print("  specimen mesh: %s" % mesh)
+    return mesh

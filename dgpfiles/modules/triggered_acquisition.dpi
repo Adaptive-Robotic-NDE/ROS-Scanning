@@ -1,0 +1,288 @@
+# Acquisition driven by a position trigger, along an arbitrary toolpath.
+#
+# This is the replacement for the sample-and-bin approach in Scan2DPlaneRaster's
+# _RowSampler, and the difference is not an optimisation -- it is a different
+# relationship between the data and the geometry.
+#
+# _RowSampler POLLS the recording database for the most recent A-scan while the
+# arm sweeps, then assigns each sample to the nearest grid column. That needs a
+# grid to bin into, it needs the digitizer to over-produce so that every column
+# gets at least one sample, and it silently fabricates any column that did not
+# (filling it from a neighbour). Measured with a position trigger publishing
+# exactly one A-scan per column, polling caught ~48 of 59 and 225 of 720 columns
+# came from a neighbour, with the last twelve columns of every row identical.
+#
+# Here the trigger is the index. The source is armed at the start of a pass, so
+# trigger k of that pass is at arc length k*pitch along it by construction, and
+# every trigger is staged -- none are dropped, none are invented, and nothing has
+# to know about a grid. That is what makes the same code work on a Noether
+# surface-following toolpath, where "column" has no meaning at all.
+#
+# Deliberately ROS-free: the caller passes callables for moving the robot and for
+# staging a trace, so this module can be unit-tested and so the ROS dependency
+# stays in the config where it belongs.
+
+import time
+import threading
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global run_triggered_path_scan
+global TraceStager
+
+
+class TraceStager:
+    """Stages traces on its own thread, fed by the trigger.
+
+    The trigger must not do this work itself. Staging is a recording-database
+    transaction that waits for a globalrev, and with live projection on it costs
+    ~0.18 s per trace -- while the acquisition thread is inside that call it is
+    not watching the probe, so it accumulates no travel and fires no triggers.
+    Measured with the sink staging inline: a 0.30 m pass that should produce 59
+    triggers produced one, because the first trigger's stage() swallowed the
+    whole sweep. The trigger loop has to stay free-running; anything slower than
+    the trigger rate belongs behind a queue.
+
+    Order is preserved because there is exactly one worker: trace k is staged
+    before trace k+1, which is what makes the trigger index the trace index.
+    """
+
+    def __init__(self, stage, maxsize=4096):
+        self._stage = stage
+        self._q = queue.Queue(maxsize)
+        self._quit = False
+        self.staged = 0
+        self.errors = 0
+        self.last_error = None
+        self.max_depth = 0
+        self._thread = threading.Thread(target=self._run)
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _run(self):
+        from dataguzzler_python import context
+        context.InitFreeThread()
+        while True:
+            item = self._q.get()
+            if item is None:
+                break
+            try:
+                self._stage(*item)
+                self.staged += 1
+            except Exception as e:
+                self.errors += 1
+                self.last_error = e
+            finally:
+                self._q.task_done()
+
+    def submit(self, *args):
+        """Called from the trigger. Never blocks for long, never drops."""
+        self._q.put(args)
+        d = self._q.qsize()
+        if d > self.max_depth:
+            self.max_depth = d
+
+    def drain(self, timeout=120.0):
+        """Wait for everything queued so far to be staged."""
+        deadline = time.monotonic() + timeout
+        while not self._q.empty() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self._q.join()
+        return self.staged
+
+    def stop(self):
+        self._q.put(None)
+        self._thread.join(timeout=5.0)
+
+
+def _sweep_result(value):
+    """Normalise what sweep() returned to (ok, fraction).
+
+    A caller that only knows whether the move worked returns a bool; one that
+    can also say how much of the path was covered returns (ok, fraction). The
+    second matters on a surface-following toolpath, where a pass may be
+    deliberately allowed to come up short and the report is the only place that
+    difference is visible.
+    """
+    if isinstance(value, tuple):
+        ok = bool(value[0])
+        frac = float(value[1]) if len(value) > 1 and value[1] is not None else None
+        return ok, frac
+    return bool(value), None
+
+
+def run_triggered_path_scan(scan_path, source, pitch_m,
+                            approach, sweep, stage, pose_at,
+                            setup_after_first=None, segments=None,
+                            progress=None, on_segment_failure="stop"):
+    """Acquire along scan_path, one trace per pitch_m of travel.
+
+    Callables, all supplied by the caller:
+
+      approach(idx, end_idx)   -> bool   move to waypoint idx, the pass start,
+                                         in an arm configuration that can also
+                                         reach end_idx. Which configuration a
+                                         pass is entered in decides how far
+                                         along it the Cartesian sweep gets, so
+                                         this is not the same as "move there"
+      sweep(start, end)        -> bool   one continuous move through [start,end)
+                                         or (bool, fraction) if it knows how
+                                         much of the path was covered
+      stage(ascan, meta, pose) -> None   stage one trace; runs on the source's
+                                         acquisition thread, so it must not call
+                                         into a dgpy module
+      pose_at(seg, s_m, xy)    -> pose7  where a trigger at arc length s_m along
+                                         segment seg actually was
+      setup_after_first()      -> None   instantiate the accumulators; called
+                                         once, after the first trace is staged
+                                         and before any more are
+
+    setup_after_first exists because nd_accumulate_once consumes whatever is on
+    its input channel at instantiation as entry 0. So exactly one trace must be
+    staged before it runs, and none in between -- which is why the pass-start
+    trace is staged here explicitly rather than by the trigger, and why the
+    source is armed with emit_on_arm=False so it does not stage a duplicate.
+
+    on_segment_failure decides what an unreachable pass means, and the two
+    answers are both right for different scans:
+
+      "stop"  the default, and correct for a rectangular raster. There the
+              volume is indexed by grid position, so a missing row does not
+              leave a gap -- it shifts every later row into the wrong place.
+              Better to stop with a count of what is correct.
+      "skip"  correct for a surface-following toolpath. Noether segments are
+              ragged (73 of them, 2 to 278 waypoints, on one real mesh) and some
+              will not plan; the scan is a trace list, every trace carries the
+              pose it was taken at, and a dropped segment costs coverage there
+              and nothing anywhere else. Abandoning 72 good segments because the
+              73rd is awkward is the worse outcome.
+
+    Skipped segments are listed in report["skipped"] either way. They are not an
+    accounting detail: coverage that was planned and not acquired is the one
+    thing a trace list cannot show you by itself.
+    """
+    if segments is None:
+        segments = scan_path.acquiring_segments()
+    if on_segment_failure not in ("stop", "skip"):
+        raise ValueError("on_segment_failure must be 'stop' or 'skip', not %r"
+                         % (on_segment_failure,))
+
+    expected = scan_path.trace_count(pitch_m, segments)
+    report = {"segments": len(segments), "expected_traces": expected,
+              "staged": 0, "per_segment": [], "started": time.monotonic(),
+              "stopped_early": None, "skipped": []}
+
+    stager = TraceStager(stage)
+    first_done = False
+
+    for si, seg in enumerate(segments):
+        start, end = seg
+        seg_len = scan_path.segment_length_m(seg)
+        want = int(np.floor(seg_len/pitch_m)) + 1
+
+        if not approach(start, end-1):
+            why = "could not reach the start of pass %d" % (si+1,)
+            report["skipped"].append({"segment": si, "waypoints": end-start,
+                                      "length_m": seg_len, "reason": "approach failed"})
+            if on_segment_failure == "stop":
+                report["stopped_early"] = why
+                break
+            if progress is not None:
+                progress(si, len(segments),
+                         {"segment": si, "waypoints": end-start, "length_m": seg_len,
+                          "observed_m": 0.0, "expected": want, "triggered": 0,
+                          "staged": 0, "move_ok": False, "skipped": True,
+                          "fraction": 0.0},
+                         time.monotonic()-report["started"])
+            continue
+
+        # Trace 0 of this pass, staged here at the pass start. The source is
+        # armed with emit_on_arm=False so it takes its phase reference from the
+        # same point without staging it twice.
+        #
+        # synthesize() with no argument, deliberately: the arm is parked at the
+        # pass start and stationary, so the source's own position lookup is the
+        # right answer and -- more to the point -- it is the SAME answer the
+        # trigger will use for every later trace in this pass. Handing it a
+        # position derived from the pose would mean two coordinate conventions,
+        # and the simulator's defect map is keyed on scan-relative coordinates
+        # while the pose is world.
+        pose0 = pose_at(seg, 0.0, None)
+        # Staged inline, not through the queue: setup_after_first() must see it
+        # already on the channel, and the arm is stationary so nothing is lost.
+        stage(source.synthesize(), source.metadata(), pose0)
+        report["staged"] += 1
+
+        if not first_done:
+            if setup_after_first is not None:
+                setup_after_first()
+            first_done = True
+
+        triggered_here = [0]
+
+        def sink(ascan, xy, s_m, index, _seg=seg):
+            # Runs on the acquisition thread: compute the pose (cheap) and hand
+            # the trace off. Everything that touches the database happens on the
+            # stager's thread so the trigger keeps watching the probe.
+            stager.submit(ascan, source.metadata(), pose_at(_seg, s_m, xy))
+            triggered_here[0] += 1
+
+        travel0 = source.travelled_m
+        source.arm(sink, emit_on_arm=False)
+        sweep_started = time.monotonic()
+        try:
+            ok, fraction = _sweep_result(sweep(start, end))
+        finally:
+            source.disarm()
+        # How long the pass took, so that observed_m/sweep_s is the probe speed
+        # this cell actually produced for the commanded velocity scaling. That
+        # ratio is the only check there is on the m/s -> scaling calibration,
+        # which is a property of the robot and not of any of this code.
+        sweep_s = time.monotonic() - sweep_started
+        observed = source.travelled_m - travel0
+        # The pass is not over until its traces are in the database: the next
+        # pass stages its own trace 0 and the accumulators must not see them out
+        # of order.
+        stager.drain()
+
+        # observed_m is what the probe was SEEN to travel, from live TF; length_m
+        # is what was commanded. The trigger fires on the former, so a shortfall
+        # here is a shortfall in traces, and it is the difference between "the
+        # trigger is wrong" and "the arm did not go where it was told".
+        report["per_segment"].append({"segment": si, "waypoints": end-start,
+                                      "length_m": seg_len, "observed_m": observed,
+                                      "expected": want,
+                                      "triggered": triggered_here[0],
+                                      "staged": triggered_here[0]+1,
+                                      "move_ok": bool(ok),
+                                      "fraction": fraction,
+                                      "sweep_s": sweep_s,
+                                      "skipped": False})
+        report["staged"] += triggered_here[0]
+        staged_here = [triggered_here[0]+1]
+
+        if progress is not None:
+            progress(si, len(segments), report["per_segment"][-1],
+                     time.monotonic()-report["started"])
+
+        # A pass that produced the wrong number of traces has put every later
+        # trace at the wrong index in the rectangular quick-look. The trace list
+        # itself is still honest -- each trace carries the pose it was taken at --
+        # but the volume is not, so say so rather than letting it look fine.
+        if staged_here[0] != want:
+            report.setdefault("short_passes", []).append(
+                {"segment": si, "expected": want, "staged": staged_here[0]})
+
+    stager.drain()
+    stager.stop()
+    report["stager_staged"] = stager.staged
+    report["stager_errors"] = stager.errors
+    report["stager_last_error"] = repr(stager.last_error) if stager.last_error else None
+    report["stager_max_queue_depth"] = stager.max_depth
+    report["elapsed"] = time.monotonic() - report["started"]
+    return report

@@ -1,0 +1,1789 @@
+# ==============================================================================
+# SCENARIO C: NO MESH YET -- GO AND MAKE ONE
+# ==============================================================================
+# mesh_scan.dpi takes a mesh and scans it. This is the stage in front of that:
+# fly a sensor over the part, accumulate what it sees, and write a mesh file the
+# planner and the projector can use. Feed the result to plan_mesh_path() and the
+# rest of the pipeline does not know the difference.
+#
+# Two producers behind one interface, because the caller only wants a mesh file:
+#
+#   AzureReconstruction        RGB-D TSDF integration (industrial_reconstruction)
+#                              over a dome sweep. Rough, fast, no laser.
+#   KeyenceReconstructionKey   laser profiler -> PCL surface reconstruction
+#                              (tari_key_reconstruction). High resolution, slow.
+#   KeyenceReconstructionPC    laser profiler -> Open3D ball pivoting
+#                              (tari_pc_reconstruction). Same sensor, different
+#                              backend -- see KEYENCE_BACKEND in the config.
+#
+# Both Keyence backends ship. Which one a cell uses is a LOAD-TIME choice, not a
+# runtime argument, because it decides which services have to be running and that
+# has to be visible at bring-up rather than discovered when a scan calls it.
+#
+# The pattern worth noticing: the Keyence raster is itself a Noether toolpath
+# over the rough mesh. So reconstruction is not a different kind of thing from
+# scanning -- it is the same "plan a path over a surface, fly it, accumulate"
+# loop with a different sensor and a different accumulator. That is why the sweep
+# returns a ScanPath and is flown by the same code the UT scan uses.
+#
+# Deliberately free of any UT/eddy-current specifics and of paramdb: every
+# parameter is an argument with a default, so this module can serve
+# UTPlaneScan.dgp, ClientScannerTest.dgp and whatever comes next.
+#
+# Service calls run on their own short-lived node rather than through the dgpy
+# motion module, exactly as noether_path.dpi does: a service call that blocks
+# while holding a module context is the standard way to wedge this stack.
+
+import os
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global ReconstructionSource
+global AzureReconstruction
+global KeyenceReconstructionKey
+global KeyenceReconstructionPC
+global keyence_reconstruction_class
+global clean_mesh
+global mesh_to_x3d
+global call_ros_service
+global set_digital_out
+global dome_sweep_path
+global depth_scale_for
+global depth_topic_facts
+global profile_topic_facts
+global RECON_SERVICES
+
+
+# Every service this module can touch, with the package that provides it. Named
+# here rather than inline so a bring-up report and an error message can agree
+# about what is missing.
+RECON_SERVICES = {
+    "azure_start":   ("start_reconstruction",  "industrial_reconstruction_msgs.srv", "StartReconstruction"),
+    "azure_stop":    ("stop_reconstruction",   "industrial_reconstruction_msgs.srv", "StopReconstruction"),
+    "mesh_filter":   ("tari_mesh_filter",      "tari_interfaces.srv",                "TariMeshFilter"),
+    "key_start":     ("start_key_rec",         "tari_interfaces.srv",                "StartKeyRec"),
+    "key_stop":      ("stop_key_rec",          "tari_interfaces.srv",                "StopKeyRec"),
+    "pc_start":      ("start_recording",       "std_srvs.srv",                       "Trigger"),
+    "pc_stop":       ("stop_and_process",      "tari_interfaces.srv",                "ReconstructMesh"),
+    "set_io":        ("/io_and_status_controller/set_io", "ur_msgs.srv",             "SetIO"),
+}
+
+
+def call_ros_service(key, fields=None, timeout=300.0, wait=15.0):
+    """Call one of RECON_SERVICES and return the response.
+
+    Own node, destroyed on the way out. `fields` are assigned onto the request
+    by name, so a field this build of the .srv does not have raises here with the
+    name in the message rather than being silently dropped -- these interfaces
+    have gained and lost fields more than once.
+    """
+    import importlib
+    import rclpy
+    from rclpy.node import Node
+
+    if key not in RECON_SERVICES:
+        raise KeyError("unknown reconstruction service %r; known: %s"
+                       % (key, ", ".join(sorted(RECON_SERVICES))))
+    service_name, module_name, type_name = RECON_SERVICES[key]
+    srv_type = getattr(importlib.import_module(module_name), type_name)
+
+    node = Node("mesh_reconstruction_client_%s" % key)
+    try:
+        client = node.create_client(srv_type, service_name)
+        if not client.wait_for_service(timeout_sec=wait):
+            raise RuntimeError(
+                "no %s service (%s/%s). It is started by tari_bringup; check\n"
+                "  ros2 run tari_bringup tari_cell_info --cell <cell> --mode <mode>\n"
+                "for whether it was skipped and why."
+                % (service_name, module_name, type_name))
+
+        req = srv_type.Request()
+        for name, value in (fields or {}).items():
+            if not hasattr(req, name):
+                raise AttributeError(
+                    "%s.Request has no field %r; this build has: %s"
+                    % (type_name, name, ", ".join(req.get_fields_and_field_types())))
+            setattr(req, name, value)
+
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+        res = future.result()
+        if res is None:
+            raise RuntimeError("%s did not answer within %.0f s" % (service_name, timeout))
+        return res
+    finally:
+        node.destroy_node()
+
+
+def set_digital_out(pin, state):
+    """Switch a UR digital output -- the laser enable, in practice.
+
+    Unconditional, unlike ClientScannerTest.dgp's pinSwitch(), which reads
+    ros.svd_msg.digital_out_states first and skips the call when the pin already
+    reads the way it wants. That guard needs the controller's status message to
+    be arriving; in simulation it is not, and the read raises rather than the
+    laser simply being switched. Setting a pin to the value it already holds
+    costs nothing.
+    """
+    return call_ros_service("set_io", {"fun": 1, "pin": int(pin),
+                                       "state": 1.0 if state else 0.0},
+                            timeout=15.0, wait=5.0)
+
+
+def depth_topic_facts(topic, timeout=10.0):
+    """Ask a depth topic what it is: (depth_scale, rate_hz, frame_id).
+
+    Three things the reconstruction needs and all three fail SILENTLY when
+    assumed. Every one of them was measured wrong at least once on 2026-08-16.
+
+    DEPTH_SCALE. Open3D's create_from_color_and_depth divides by it, so getting
+    it wrong does not distort the reconstruction -- it EMPTIES it. A real Azure
+    Kinect publishes 16UC1 in millimetres, so 1000; a Gazebo depth camera
+    publishes 32FC1 already in metres, so 1. Passing 1000 for the simulated
+    camera turns a 0.35 m standoff into 0.35 mm, every voxel falls outside the
+    bounding box, and stop_reconstruction reports "The TSDF is empty".
+
+    RATE, because industrial_reconstruction's pose lookup runs a fixed 31 frames
+    behind the camera and both the settle before stop and the TF cache have to
+    be sized from that in seconds.
+
+    FRAME_ID, and this is the one worth the extra subscription. It is the frame
+    the pixels are actually in, which is the frame the integrator has to track;
+    anything else places the surface along the wrong axis at the right distance,
+    so it reconstructs cleanly, lands somewhere else entirely, and the crop box
+    then removes all of it. In this cell the images are stamped
+    `azure_gazebo_depth` while the URDF also offers `azure_depth` and
+    `azure_gazebo_optical` -- and despite the name it is `azure_gazebo_depth`
+    that carries the z-forward optical convention Open3D expects, with the two
+    plausible-looking alternatives rotated 90 degrees off it.
+
+    So this asks the topic rather than assuming, which also means one config
+    serves the simulated and the real camera.
+    """
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import Image
+
+    seen = {}
+    stamps = []
+
+    def _got(m):
+        seen.setdefault("encoding", m.encoding)
+        seen.setdefault("frame_id", m.header.frame_id)
+        stamps.append(time.monotonic())
+
+    node = Node("depth_encoding_probe")
+    try:
+        node.create_subscription(Image, topic, _got, 1)
+        # Listen for a fixed WINDOW rather than for a fixed number of messages.
+        # This topic is violently bursty -- inter-arrival times of 0.008 s and
+        # 2.3 s in the same 10-message sample -- so four messages can all land
+        # inside one burst and read as 5.9 Hz on a stream whose real throughput
+        # is 1.2 Hz. Sizing a sweep from that number flies it five times too
+        # fast and costs most of the coverage, which is exactly the failure
+        # this function exists to prevent. Measured 2026-08-16.
+        window = min(5.0, timeout)
+        started = time.monotonic()
+        deadline = started + timeout
+        while time.monotonic() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.2)
+            if stamps and (time.monotonic() - started) >= window:
+                break
+    finally:
+        node.destroy_node()
+
+    if len(stamps) >= 2:
+        # Throughput over the whole window, not the gaps between the samples
+        # that happened to arrive -- bursts make the latter meaningless.
+        elapsed = max(stamps[-1] - started, 1e-6)
+        seen["rate_hz"] = len(stamps)/elapsed
+
+    encoding = seen.get("encoding")
+    if encoding is None:
+        print("  no message on %s in %.0f s; assuming 16UC1 millimetres"
+              % (topic, timeout))
+        return 1000.0, None, None
+    scale = 1.0 if encoding.startswith("32FC") else 1000.0
+    print("  depth encoding %s on %s -> depth_scale %.0f (%.2f Hz), frame %s"
+          % (encoding, topic, scale, seen.get("rate_hz") or 0.0,
+             seen.get("frame_id") or "(none)"))
+    return scale, seen.get("rate_hz"), seen.get("frame_id")
+
+
+def depth_scale_for(topic, timeout=10.0):
+    """(depth_scale, rate_hz) -- depth_topic_facts() without the frame."""
+    scale, rate, _frame = depth_topic_facts(topic, timeout=timeout)
+    return scale, rate
+
+
+def profile_topic_facts(topic="/profiles", timeout=6.0, window=3.0):
+    """What a PointCloud2 profile topic is delivering: the Keyence's version of
+    depth_topic_facts().
+
+    Returns a dict: frame_id, rate_hz, msgs, points_per_msg, finite_per_msg,
+    empty_msgs.
+
+    Same lesson as the depth camera, in a different disguise: ask the topic
+    rather than writing it down, and measure the rate over a fixed WINDOW rather
+    than over N messages, because a bursty topic read over N messages lies by an
+    order of magnitude.
+
+    The reason this exists is POINTS PER MESSAGE, which the depth version has no
+    equivalent of. A laser profiler publishes at full rate whether or not it can
+    see anything -- the simulated one here runs at ~675 Hz regardless -- and a
+    profile of nothing is a valid, well-formed, EMPTY PointCloud2. So a sweep
+    over a part the sensor cannot see looks identical from outside to a sweep
+    that is working: the topic is alive, the arm flies, TF resolves, the
+    accumulator's callback runs on every message, and 19 minutes later
+    /stop_and_process says "No points were accumulated". That happened on
+    2026-08-16 and cost the whole run. Two independent causes, both of which
+    produce exactly this and nothing else:
+
+      * the surface is outside the sensor's measuring range. The simulated
+        LJ-V7080 is a <ray> with range 0.057-0.103 m from laser_link, i.e. the
+        reference distance +/- 23 mm, and a toolpath that puts it anywhere else
+        returns width=0 forever.
+      * the surface has no COLLISION geometry. A <sensor type="ray"> raycasts
+        against the physics engine, not the renderer, so a visual-only Gazebo
+        model is invisible to it while remaining perfectly visible to the depth
+        camera. See write_specimen_sdf() in sim_specimen.dpi.
+    """
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import PointCloud2
+    import sensor_msgs_py.point_cloud2 as pc2
+
+    facts = {"frame_id": None, "rate_hz": None, "msgs": 0,
+             "points_per_msg": 0.0, "finite_per_msg": 0.0, "empty_msgs": 0}
+    stamps = []
+    points = []
+    finite = []
+
+    def _got(m):
+        stamps.append(time.monotonic())
+        facts["frame_id"] = facts["frame_id"] or m.header.frame_id
+        # Count the points ONCE per message and only unpack a few of them --
+        # this runs at several hundred hertz and the probe must not become the
+        # thing that is slow.
+        n = int(m.width)*int(m.height)
+        points.append(n)
+        if n == 0:
+            facts["empty_msgs"] += 1
+            finite.append(0)
+        elif len(finite) < 20:
+            xyz = np.asarray(pc2.read_points_numpy(
+                m, field_names=("x", "y", "z"), skip_nans=True)).reshape(-1, 3)
+            finite.append(xyz.shape[0])
+
+    node = Node("profile_topic_probe")
+    try:
+        node.create_subscription(PointCloud2, topic, _got, 10)
+        started = time.monotonic()
+        deadline = started + timeout
+        while time.monotonic() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.1)
+            if stamps and (time.monotonic() - started) >= window:
+                break
+    finally:
+        node.destroy_node()
+
+    facts["msgs"] = len(stamps)
+    if stamps:
+        facts["rate_hz"] = len(stamps)/max(stamps[-1] - started, 1e-6)
+        facts["points_per_msg"] = float(np.mean(points))
+        facts["finite_per_msg"] = float(np.mean(finite)) if finite else 0.0
+    return facts
+
+
+def dome_sweep_path(x=5, y=5, length=0.30, width=0.30, origin=(0.75, -0.35),
+                    height=1.35, full_dome=False, rot=True, angle=12,
+                    snake=True, base_quat=None):
+    """A serpentine sweep above a region, as a ScanPath the acquisition can fly.
+
+    This is what the Azure looks down from. `rot` tilts the camera through the
+    sweep so the part is seen from more than one direction, which is what makes
+    TSDF integration produce a closed surface rather than a height field.
+
+    The geometry is ros.domePoseArray()'s, reimplemented here in numpy rather
+    than called. Two reasons, and the first is not a style preference:
+
+      * calling it from an acquisition thread ABORTS THE PROCESS. It publishes
+        the array to RViz on the way out, and the header Time it publishes has
+        been through dgpy's censoring, so rosidl's C converter asserts on the
+        class name and SIGABRTs:
+        `builtin_interfaces__msg__time__convert_from_py: Assertion
+        strncmp("builtin_interfaces.msg._time.Time", ...) == 0 failed`.
+        Measured 2026-08-16. This is the trap in the dgpy-repl-context-traps
+        note, reached from the other direction -- a module method that returns a
+        message is as dangerous as one that takes it.
+      * it is 25 poses of arithmetic with no state, so there is nothing to gain
+        by crossing a module boundary for it.
+
+    ClientScannerTest.dgp calls `ros.reconPoseArray()` for this, which does not
+    exist on the motion module and has not for some time, so reconstruct() there
+    raises AttributeError before it gets far enough to hit the abort.
+
+    base_quat is the orientation the tilts are applied TO, and defaults to the
+    one the arm is holding right now, read from live TF. domePoseArray's own
+    quaternions are a tilt about identity, and identity is not a pose this tool
+    can be in -- the eddy-current cell it was written for mounts the camera
+    differently. Taking the base from TF is the same choice NOETHER_ORIENTATION
+    = "fixed" makes for a scan, and for the same reason: how the sensor is
+    mounted is a property of the cell, not of this file.
+
+    snake reverses alternate rows. domePoseArray emits pure raster order, and
+    flying that means a full-width return move between every row.
+    """
+    x, y = int(x), int(y)
+    if x < 2 or y < 2:
+        raise ValueError("a dome sweep needs at least 2x2 stops, not %dx%d" % (x, y))
+
+    if base_quat is None:
+        # live_pose, not ros.t: the context-free holder the TF thread pushes
+        # into, so reading it never enters the motion module's context and is
+        # safe from an acquisition thread. Same reason
+        # probe_position_relative_to_scan() uses it.
+        snap = live_pose.snapshot()
+        if snap is None:
+            raise RuntimeError("no TF for probe_end yet; cannot take the sweep's "
+                               "base orientation. Pass base_quat=.")
+        base_quat = snap[1]
+    base_quat = tuple(float(v) for v in base_quat)
+
+    x_unit, y_unit = length/x, width/y
+    tilt = (np.pi/angle) if angle else 0.0
+
+    positions, quats = [], []
+    for e in range(y):
+        cols = range(x) if (not snake or e % 2 == 0) else range(x - 1, -1, -1)
+        for i in cols:
+            positions.append((origin[0] + x_unit*i, origin[1] + y_unit*e, height))
+            if not rot or tilt == 0.0:
+                quats.append(base_quat)
+                continue
+            # domePoseArray's tilt: sweep the camera through +/-tilt across the
+            # region so the part is seen from more than one direction.
+            pitch = -tilt*np.sin((e - (y - 1)/2.0)*np.pi/(y - 1))
+            if full_dome:
+                roll = tilt*np.sin((i - (x - 1)/2.0)*np.pi/(x - 1))
+            else:
+                roll = tilt*np.sin((i - (x - 1))*np.pi/((x - 1)*2))
+            quats.append(quat_mul(base_quat, _euler_xyz_quat(pitch, roll, 0.0)))
+
+    positions = np.array(positions, dtype=np.float64)
+    quats = np.array(quats, dtype=np.float64)
+    # One segment per row, which is what makes each row a separate continuous
+    # move rather than one trajectory through every reversal.
+    segments = [i*x for i in range(y)]
+    return ScanPath(positions, quats, segments,
+                    source="dome sweep (%dx%d over %.2f x %.2f m)"
+                           % (x, y, length, width))
+
+
+class ReconstructionSource(object):
+    """Something that turns a robot sweep into a mesh file.
+
+    Three calls, in order:
+
+        plan_sweep(region)  -> ScanPath      where to fly. No motion.
+        start()             -> None          begin capture
+        stop(output_path)   -> str           end capture, return the mesh written
+
+    The caller flies the path between start() and stop(); this class does not
+    move the robot, for the same reason triggered_acquisition.dpi does not --
+    the thing that owns the motion should own it for every kind of scan.
+    """
+
+    #: what a config must have running for this source to work
+    requires = ()
+
+    def plan_sweep(self, region=None, **kwargs):
+        raise NotImplementedError
+
+    def start(self):
+        raise NotImplementedError
+
+    def stop(self, output_path):
+        raise NotImplementedError
+
+    #: Frame pairs the accumulator holds between the camera and the pose lookup.
+    #: 0 unless the backend says otherwise; AzureReconstruction overrides it.
+    warmup_frames = 0
+
+    #: A configuration every pose of a sweep can be planned from, used only to
+    #: retry a refused approach -- see reconstruct(). The elbow-up UR neutral,
+    #: which is a property of the ARM rather than of this cell, so it is the one
+    #: number here it is reasonable to write down. Set it to None to disable the
+    #: retry, or to a cell's own park pose.
+    home_joints = (-1.5708, -1.5708, 1.5708, -1.5708, -1.5708, 0.0)
+
+    #: Enter every segment in a configuration that can finish it, rather than
+    #: only the first one. See _fly_scanpath().
+    #:
+    #: OFF by default and ON for the Keyence, deliberately. It is what takes a
+    #: surface-following raster from 8 of 14 rows to all of them. But the extra
+    #: joint move between rows happens WHILE CAPTURE IS RUNNING, and for a
+    #: volumetric integrator that transit is folded into the volume, whereas for
+    #: a profiler it is simply profiles of whatever is under the laser on the
+    #: way. The Azure dome sweep also does not have the problem -- its rows are
+    #: not surface-following and they fly -- so it keeps the cheaper behaviour
+    #: until someone has a measurement that says otherwise.
+    approach_each_segment = False
+
+    def _backlog_s(self, rate_hz=None):
+        """Seconds of camera output the accumulator is holding, plus a margin."""
+        if not self.warmup_frames:
+            return 0.0
+        rate = rate_hz or getattr(self, "observed_rate_hz", None) or 2.0
+        return (self.warmup_frames + 4)/float(rate)
+
+    def warmup(self, rate_hz=None):
+        """Seconds to hold still after start() before flying, or 0.
+
+        An accumulator that runs a fixed number of frames behind is not looking
+        at where the arm is now, so the first frames it integrates during a sweep
+        were taken before the sweep began -- including the approach, if the arm
+        was still moving. Holding still until the backlog is of stationary frames
+        makes what it integrates match what it is told the pose was.
+        """
+        return self._backlog_s(rate_hz)
+
+    def sweep_velocity(self, rate_hz=None):
+        """How fast the sweep may be flown without wasting integration slots.
+
+        Two independent limits decide how many frames a sweep can contribute,
+        and they have to be matched or the tighter one silently wins:
+
+            spatial   path_length / translation_distance   (the accumulator's
+                      motion gate -- it integrates one frame per that much
+                      travel, no matter how slowly you fly)
+            temporal  path_length / velocity * frame_rate  (how many frames the
+                      camera even produces while the sweep is happening)
+
+        Setting them equal and solving for velocity gives, with the path length
+        cancelling out entirely:
+
+            velocity = translation_distance * frame_rate
+
+        Fly faster and the camera cannot keep up, so the gate opens on travel
+        for which no frame exists. Fly slower and frames are produced that the
+        gate throws away -- harmless, but it buys nothing and costs sweep time.
+
+        At the 1.2-1.9 Hz this cell's simulated Azure manages and a 0.015 m
+        gate, that is 18-28 mm/s -- roughly a fifth of MOVE_VELOCITY, which is
+        why a sweep flown at the ordinary move speed integrated a fraction of
+        what it could.
+
+        CLAMPED, because this multiplies a measured quantity and the measurement
+        can be wrong by a lot: a 4-sample rate estimate that landed inside one
+        burst on this topic read 79 Hz, and the sweep was duly flown at 1.185
+        m/s -- over in a second, with almost nothing integrated during it. The
+        ceiling is deliberately below MOVE_VELOCITY: no plausible camera makes
+        sweeping at travel speed correct, so a computed velocity above it means
+        the rate is wrong, not that the camera is fast.
+        """
+        rate = rate_hz or getattr(self, "observed_rate_hz", None) or 2.0
+        vel = float(self.translation_distance)*float(rate)
+        clamped = min(max(vel, self.MIN_SWEEP_VELOCITY), self.MAX_SWEEP_VELOCITY)
+        if clamped != vel:
+            print("    sweep velocity %.3f m/s from a %.1f Hz frame rate is "
+                  "implausible; using %.3f m/s" % (vel, rate, clamped))
+        return clamped
+
+    #: Bounds on the derived sweep speed. Above the ceiling the frame-rate
+    #: measurement is not to be believed; below the floor a sweep takes so long
+    #: that something else is wrong.
+    MAX_SWEEP_VELOCITY = 0.05
+    MIN_SWEEP_VELOCITY = 0.005
+
+    def settle(self, rate_hz=None):
+        """Seconds to hold still BEFORE stop(), or 0.
+
+        The mirror image of warmup(), and the one that costs coverage rather than
+        correctness. Whatever the accumulator is still holding when stop arrives
+        is discarded, so a sweep that stops the moment the arm does loses its
+        last `warmup_frames` frames -- 17 s of a 25 s sweep, at the rate this
+        cell's simulated camera manages. Waiting the backlog out is the whole
+        fix; there is nothing to flush it with from outside.
+        """
+        return self._backlog_s(rate_hz)
+
+    def reconstruct(self, output_path, region=None, fly=None, vel=None,
+                    acc=0.05, settle_s=None, min_fraction=0.6, **kwargs):
+        """plan -> approach -> start -> fly -> stop, as one call.
+
+        `fly` takes the ScanPath and moves the arm along it; pass your own to use
+        a different motion path (run_triggered_path_scan, say, when the sweep
+        should also acquire).
+
+        The default flies it the way the UT scan flies a toolpath: FreeMove to
+        the start, then one CartesianMove per segment. NOT ros.Move() --
+        ClientScannerTest.dgp's reconstruct() uses that, and /dgpython (the
+        dgpython_action_server action behind it) accepts no goals in this cell:
+        measured 2026-08-16, every goal times out after 3 attempts even when the
+        target is the arm's own current pose, while execute_raster and
+        execute_pipeline_move both work. See MISSING-DEPENDENCIES.md.
+
+        min_fraction is low by default for the same reason PATH_MIN_FRACTION is:
+        a short sweep pass costs coverage in the reconstruction, and coverage is
+        recoverable by sweeping again. It is not a grid.
+
+        settle_s=None sizes the wait before stop() from the accumulator's own
+        backlog, which is what it should be; pass a number to override it and 0
+        to skip it and lose the tail of the sweep.
+
+        vel=None likewise derives the sweep speed from the camera, via
+        sweep_velocity() -- which is the setting that decides coverage. Passing
+        MOVE_VELOCITY here is what a caller naturally does and is roughly five
+        times too fast for this camera.
+        """
+        path = self.plan_sweep(region=region, **kwargs)
+
+        # The approach happens at the ordinary move speed; only the sweep itself
+        # has to match the camera.
+        approach_vel = vel if vel is not None else 0.05
+        # Get to the first pose BEFORE capture starts, or the integrator folds
+        # the whole approach move -- ceiling, cell wall, arm -- into the volume.
+        #
+        # AND CHECK THAT IT HAPPENED. This used to be a bare call, and a refused
+        # approach is invisible: the sweep then starts from wherever the arm was
+        # parked, the first Cartesian segment quietly drags it across the cell to
+        # the start of row 1 while capture is running, and the result is a
+        # reconstruction that is merely worse rather than obviously broken. It
+        # was refused on every run for weeks -- ros.FreeMove(Pose) was resolving
+        # the pose against 'probe_end' instead of 'world' -- and nothing said so.
+        #
+        # ApproachInConfiguration rather than FreeMove, and for two reasons.
+        # The one that matters for whether it works at all: a free-space pose
+        # goal goes to mtc_hub_node's PipelineHandler, whose OMPL goal sampler
+        # cannot find a valid state for these poses -- "Unable to sample any
+        # valid states for goal tree" -- even though /compute_ik returns a
+        # solution for the same pose and CheckStateValidity says it is
+        # collision-free. The one that matters for the DATA: solving the far end
+        # of the first pass and seeding the start from it enters the pass in a
+        # configuration that can finish it, which is the whole reason
+        # approach_row_start() exists on the UT side.
+        # TRY THE FIRST FEW ROWS, not only the first. The first waypoint of a
+        # Noether raster sits exactly on the edge of the mesh, and the edge of a
+        # RECONSTRUCTED mesh is wherever the detection stopped -- so it can be
+        # off the part, at an awkward reach, in a spot the OMPL goal sampler
+        # refuses ("Unable to sample any valid states for goal tree"). Measured
+        # 2026-08-17: waypoint 0 at y = -0.015 was 14 mm beyond the real plate
+        # and unreachable, and the whole 18-minute sweep was abandoned for it.
+        # A row is worth a row, not a run: start at the first one the arm can
+        # enter and say which were given up.
+        skipped_rows = 0
+        for skipped_rows in range(min(4, len(path.segments))):
+            first, last = path.segments[skipped_rows]
+            approach = ros.ApproachInConfiguration(
+                _pose_from_scanpath(path, first),
+                _pose_from_scanpath(path, last-1))
+            if approach is not None:
+                break
+            print("    row %d of the sweep will not be entered from here"
+                  % (skipped_rows + 1,))
+        if approach is not None and skipped_rows:
+            print("    starting at row %d; the first %d could not be entered "
+                  "and their surface will be missing from the reconstruction"
+                  % (skipped_rows + 1, skipped_rows))
+            start_i = path.segments[skipped_rows][0]
+            path = ScanPath(path.positions[start_i:], path.quats[start_i:],
+                            [s - start_i for s, _e in path.segments[skipped_rows:]],
+                            source=path.source)
+        first, last = path.segments[0]
+        if approach is None and self.home_joints:
+            # RETRY FROM A KNOWN CONFIGURATION, which is what makes the SECOND
+            # sweep of a session work. A sweep ends at the far end of its last
+            # row, and the IK branch it finishes in can be one no pose goal can
+            # be planned out of: measured 2026-08-16, an arm left at wrist_3 =
+            # -277 degrees refused every pose goal from there -- the first pose
+            # of the next sweep, the same pose lifted 100 mm, even a 150 mm
+            # straight-up retract -- while a plain joint-space move to home was
+            # accepted immediately, and from home the identical approach
+            # succeeded and came back on the SHORT wrist branch (-2.00 rad
+            # rather than the +4.28 that is the same orientation one turn
+            # away). The start state chooses the branch.
+            print("    no approach from here; going home and trying again")
+            ros.MoveJoints(list(self.home_joints), secs=8.0, plan=True)
+            approach = ros.ApproachInConfiguration(
+                _pose_from_scanpath(path, first),
+                _pose_from_scanpath(path, last-1))
+        if approach is None:
+            approach = ros.FreeMove(_pose_from_scanpath(path, 0),
+                                    vel=approach_vel, acc=acc)
+            approach = (approach
+                        if bool(getattr(getattr(approach, "result", None),
+                                        "success", False)) else None)
+        if approach is None:
+            raise RuntimeError(
+                "the arm would not go to the first pose of the sweep (%s), so "
+                "there is nothing to start capture for. mtc_hub_node's log says "
+                "why; mesh_path_feasibility() distinguishes 'unreachable' from "
+                "'in collision' without moving anything."
+                % (np.array2string(path.positions[0], precision=3),))
+        self.start()
+        # start() measures the frame rate, so sweep_velocity() is only
+        # meaningful after it.
+        if vel is None:
+            vel = self.sweep_velocity()
+            print("    sweeping at %.3f m/s (%.3f m gate x %.2f Hz)"
+                  % (vel, self.translation_distance,
+                     getattr(self, "observed_rate_hz", None) or 2.0))
+        if fly is None:
+            fly = lambda p: _fly_scanpath(p, vel, acc, min_fraction,
+                                          approach=self.approach_each_segment)
+        try:
+            warm = self.warmup()
+            if warm:
+                print("    holding still %.0f s while the accumulator warms up"
+                      % (warm,))
+                time.sleep(warm)
+            fly(path)
+            # The integrator runs behind the camera and is asynchronous besides:
+            # frames from the last row are still queued when the move returns,
+            # and stopping immediately discards every one of them.
+            wait = self.settle() if settle_s is None else settle_s
+            if wait:
+                print("    holding still %.0f s so the tail of the sweep is not "
+                      "discarded" % (wait,))
+                time.sleep(wait)
+        finally:
+            mesh = self.stop(output_path)
+        return mesh
+
+
+def _fly_scanpath(path, vel, acc, min_fraction, approach=True):
+    """One continuous CartesianMove per segment, reporting what each achieved.
+
+    RasterScan.Result's two fields answer two different questions and the
+    combination that reads like a contradiction is the informative one:
+    `fraction` is how much of the requested path the PLANNER covered, reported
+    whatever happens, and `success` is whether MoveIt then EXECUTED it. So
+    "FAILED at 100%" is not a mixed signal and not a misread result -- it means
+    planning was complete and execution was refused, and the reason for that is
+    in mtc_node's own log as "Execution failed with code <n>" (99999 is MoveIt's
+    generic FAILURE). Checked against tari_cpp_mtc/src/task_handlers.cpp,
+    2026-08-16.
+
+    EVERY ROW GETS AN APPROACH, which this used to leave out. The arm was simply
+    dragged from the end of one row to the start of the next by the Cartesian
+    move itself, in whatever configuration the previous row left it, and the
+    planner then could not follow the new row: measured on the first working
+    Keyence sweep, 6 of 14 rows reported "planner reached 0-21%, below
+    min_fraction 60%" and coverage of the part fell from ~99% to 27-78% across
+    those bands. That is exactly the fault approach_row_start() exists for on
+    the UT side -- solve the FAR end of the row first, seed the near end from
+    it, and enter in a configuration that demonstrably reaches both. It costs
+    one joint move per row and it is the difference between a reconstruction
+    with holes in it and one without.
+    """
+    outcomes = []
+    for k, (start, end) in enumerate(path.segments):
+        poses = [_pose_from_scanpath(path, i) for i in range(start, end)]
+        if len(poses) < 2:
+            continue
+        if approach and ros.ApproachInConfiguration(poses[0], poses[-1]) is None:
+            # Not fatal: the row may still fly from wherever the arm is, and a
+            # short row costs coverage rather than correctness -- the profiles
+            # carry their own poses. Say so, because it predicts the gap.
+            print("    sweep row %d/%d: no row-spanning configuration; "
+                  "entering it as-is" % (k + 1, len(path.segments)))
+        res = ros.CartesianMove(poses, vel=vel, acc=acc,
+                                min_fraction=min_fraction)
+        frac = float(getattr(getattr(res, "result", None), "fraction", 0.0) or 0.0)
+        ok = bool(getattr(getattr(res, "result", None), "success", False))
+        outcomes.append((k, ok, frac))
+        if ok:
+            note = "flew %.0f%% of the row" % (frac*100.0,)
+        elif frac >= 0.999:
+            note = "planned in full, EXECUTION refused -- see mtc_node's log"
+        else:
+            note = "planner reached %.0f%%, below min_fraction %.0f%%" % (
+                frac*100.0, min_fraction*100.0)
+        print("    sweep row %d/%d: %s" % (k + 1, len(path.segments), note))
+    short = [k for k, ok, _f in outcomes if not ok]
+    if short:
+        print("    %d of %d rows did not fly; the reconstruction will have gaps "
+              "there" % (len(short), len(outcomes)))
+    return outcomes
+
+
+def _euler_xyz_quat(ax, ay, az):
+    """(x,y,z,w) from an sxyz Euler triple -- transforms3d.euler.euler2quat.
+
+    Written out rather than imported so this module has no dependency beyond
+    numpy for what is three multiplications.
+    """
+    ca, sa = np.cos(ax/2.0), np.sin(ax/2.0)
+    cb, sb = np.cos(ay/2.0), np.sin(ay/2.0)
+    cc, sc = np.cos(az/2.0), np.sin(az/2.0)
+    return (sa*cb*cc - ca*sb*sc,
+            ca*sb*cc + sa*cb*sc,
+            ca*cb*sc - sa*sb*cc,
+            ca*cb*cc + sa*sb*sc)
+
+
+def _flat_tool_quat(path, up=(0.0, 0.0, 1.0)):
+    """One orientation for a whole raster: tool z along `up`, tool x along travel.
+
+    The orientation a LINE sensor wants over a flat part. Tool z vertical means
+    no normal-following and so no noise from a rough mesh's estimated normals;
+    tool x along the direction of travel puts the laser line -- which lies along
+    tool y, measured -- across the pass, which is the only way a raster sweeps
+    area rather than retracing one strip.
+
+    The direction is taken from the longest segments, weighted by length, and
+    with the sign folded out: a serpentine raster travels alternately +d and -d,
+    and a line has no direction anyway, so d and -d must contribute to the same
+    average rather than cancelling.
+    """
+    segs = [(a, b) for a, b in path.segments if b - a >= 2]
+    if not segs:
+        return (0.0, 0.0, 0.0, 1.0)
+    acc = np.zeros(3)
+    for a, b in segs:
+        d = path.positions[b-1] - path.positions[a]
+        n = np.linalg.norm(d)
+        if n < 1e-9:
+            continue
+        d = d/n
+        # Fold the sign: -d is the same line as +d.
+        if d[0] < 0 or (abs(d[0]) < 1e-12 and d[1] < 0):
+            d = -d
+        acc += n*d
+    z = np.asarray(up, dtype=np.float64)
+    z = z/np.linalg.norm(z)
+    x = acc - float(np.dot(acc, z))*z
+    if np.linalg.norm(x) < 1e-9:
+        x = np.array([1.0, 0.0, 0.0]) - float(z[0])*z
+    x = x/np.linalg.norm(x)
+    y = np.cross(z, x)
+    return tuple(matrix_to_quat(np.column_stack([x, y, z])))
+
+
+def _offset_path_in_tool_frame(path, offset):
+    """A copy of `path` with every position moved by `offset` IN ITS OWN FRAME.
+
+    The difference from scanpath_from_noether(offset=) is the frame, and it is
+    not a detail. That argument translates the path in WORLD coordinates, which
+    is right for its purpose -- placing a mesh that was authored about its own
+    origin into a cell -- and wrong for a sensor bolted to the wrist. A sensor
+    offset is fixed in the TOOL frame and turns with it, so on any path whose
+    orientation varies a world translation puts the sensor somewhere different
+    at every pose.
+
+    Orientations are untouched: this moves where the tool is, not where it looks.
+    """
+    off = np.asarray(offset, dtype=np.float64).reshape(3)
+    pos = np.array(path.positions, dtype=np.float64, copy=True)
+    for i in range(pos.shape[0]):
+        pos[i] += quat_to_matrix(path.quats[i]).dot(off)
+    out = ScanPath(pos, np.array(path.quats, copy=True),
+                   list(path.segment_starts),
+                   source=path.source + " +tool offset")
+    # Carried across because plan_mesh_path() and the sweep report read them.
+    out.noether_flipped = getattr(path, "noether_flipped", 0)
+    out.worst_roll_step_deg = getattr(path, "worst_roll_step_deg", 0.0)
+    return out
+
+
+def _crop_path_to_work_volume(path, what="sweep", min_points=4):
+    """Drop waypoints that fall outside the cell's work volume.
+
+    THE BOX IS ALSO A TOOLPATH BOUND, and until 2026-08-17 nothing applied it as
+    one. A reconstruction contains the bench as well as the part -- the crop
+    keeps everything inside the cell, which is the right rule and includes the
+    surface the part rests on -- and Noether then plans a raster over all of it.
+    Measured on the first end-to-end run: row 1 of a 17-row Keyence raster ended
+    at z 0.907, which is 23 mm BELOW the work volume's floor and inside the
+    table. Every such pose is unreachable, so `ApproachInConfiguration` returned
+    None for every row it tried (its IK on the row's FAR end failed, silently,
+    while the row's start solved fine) and an 18-minute sweep was abandoned
+    before it started.
+
+    A waypoint below the floor is not a measurement to attempt; it is the sensor
+    being driven into the bench. Dropping it costs the part of the mesh that was
+    never the part, and it keeps the rows that were.
+
+    Segments are split rather than truncated: a row that leaves the box and comes
+    back becomes two rows, and runs shorter than `min_points` are dropped
+    entirely because a two-waypoint pass measures nothing worth the transit.
+    """
+    volume = work_volume()
+    if volume is None:
+        return path
+    inside = in_work_volume(path.positions)
+    if inside.all():
+        return path
+
+    positions, quats, starts = [], [], []
+    for seg_start, seg_end in path.segments:
+        run = []
+        for i in list(range(seg_start, seg_end)) + [None]:
+            if i is not None and inside[i]:
+                run.append(i)
+                continue
+            if len(run) >= min_points:
+                starts.append(len(positions))
+                positions.extend(path.positions[j] for j in run)
+                quats.extend(path.quats[j] for j in run)
+            run = []
+    dropped = int((~inside).sum())
+    if not positions:
+        raise RuntimeError(
+            "every waypoint of the %s is outside the cell's work volume, so "
+            "there is nothing to fly. The mesh is probably somewhere else "
+            "entirely -- plan_mesh_path() prints how much of it is inside."
+            % (what,))
+    print("    %d of %d waypoints are outside the work volume and were dropped; "
+          "%d passes remain of %d" % (dropped, len(path), len(starts),
+                                      len(path.segments)))
+    return ScanPath(positions, quats, starts, source=path.source)
+
+
+def _pose_from_scanpath(path, i):
+    """geometry_msgs Pose for waypoint i of a ScanPath."""
+    from geometry_msgs.msg import Pose, Quaternion
+    p = Pose()
+    p.position.x, p.position.y, p.position.z = [float(v) for v in path.positions[i]]
+    q = path.quats[i]
+    p.orientation = Quaternion(x=float(q[0]), y=float(q[1]),
+                               z=float(q[2]), w=float(q[3]))
+    return p
+
+
+class AzureReconstruction(ReconstructionSource):
+    """Rough mesh from the Azure Kinect, by TSDF integration.
+
+    industrial_reconstruction subscribes to the colour, depth and camera_info
+    topics itself -- it is told which ones at launch, not here -- and integrates
+    a new frame whenever the tracked frame has moved far enough. So the only
+    things this class controls are the volume, the motion thresholds, and when
+    integration is running.
+
+    Three parameters decide whether this works at all, and all three fail
+    silently -- the failure is always either "The TSDF is empty" or a mesh that
+    crops away to nothing, whichever one is wrong.
+
+    The TRACKING FRAME is the frame the depth pixels are in, and getting it wrong
+    is the subtlest of the three: the surface is built at the right DISTANCE
+    along the wrong AXIS, so the reconstruction succeeds, looks healthy, lands a
+    metre from the part, and the bounding box then removes every vertex of it.
+    Left at None it is read from the depth topic's own header, which is the only
+    authority that is right in both simulation and on hardware. This cell offers
+    three plausible names -- `azure_depth`, `azure_gazebo_optical` and
+    `azure_gazebo_depth` -- and only the last is the z-forward optical frame the
+    images are stamped with; the other two are rotated 90 degrees off it.
+    Measured 2026-08-16 against the plate: tracking `azure_depth` put the
+    reconstruction at x 1.39..1.78, z 1.37..1.95 for a plate at x 0.75..1.05,
+    z 1.00..1.03.
+
+    The BOUNDING BOX crops the finished mesh. The default (all zeros) means NO
+    box, which keeps the whole room including the table and the arm. Pass a
+    region.
+
+    DEPTH_TRUNC decides what is integrated in the first place: Open3D discards
+    depths beyond it. It has to be smaller than the distance to the background,
+    or the background becomes a surface. The simulated Azure clips at 2.88 m and
+    returns exactly 2.88 for "nothing", so the default of 3.0 that this class
+    shipped with integrated a 2.88 m phantom wall across every frame; the mesh
+    was then almost entirely that wall, and cropping to the box left ZERO
+    vertices -- at which point industrial_reconstruction dies in meshToRos
+    rather than reporting an empty result. 1.0 m comfortably brackets a part
+    seen from a 0.30-0.40 m standoff and excludes the room. Measured 2026-08-16.
+
+    TRANSLATION_DISTANCE is what decides COVERAGE, and it is not obvious that it
+    does. industrial_reconstruction integrates a frame only once the tracked
+    frame has moved this far, so the number of frames that can EVER be
+    integrated is `sweep path length / translation_distance` -- a spatial cap,
+    untouched by how slowly the sweep is flown. At the 0.05 m it shipped with,
+    a 1.44 m sweep could integrate at most 29 frames however long it took, and
+    the plate came back 36.8% covered. At 0.015 m the same sweep covered 99.6%.
+    See sweep_velocity() for the other half of that: the cap only helps if the
+    camera actually delivers the frames.
+    """
+
+    requires = ("industrial_reconstruction",)
+
+    # industrial_reconstruction's cameraCallback appends every synchronised pair
+    # to self.sensor_data and only popleft()s once frame_count > 30 -- after
+    # which it is one append and one popleft per callback, forever. So this is
+    # not a warm-up that ends: it is a permanent 31-frame DELAY LINE between the
+    # camera and the pose lookup, and two things follow from it.
+    #
+    # The pose looked up is 31/rate seconds stale, so tf2's default 10 s buffer
+    # cannot answer at the 1.3-1.9 Hz this cell's simulated camera manages and
+    # every lookup fails "extrapolation into the past" -- silently, into the
+    # node's log, while the sweep looks perfect. Fixed on the node side with a
+    # tf_cache_time parameter (a LOCAL PATCH to industrial_reconstruction).
+    #
+    # And the last 31 frames are still in the deque when stop arrives, so the
+    # tail of the sweep is discarded. That is what settle() below covers.
+    #
+    # Measured 2026-08-16.
+    warmup_frames = 31
+
+    def __init__(self, tracking_frame=None, relative_frame="world",
+                 # 0.015/0.02 rather than the 0.05/0.05 this shipped with: see
+                 # TRANSLATION_DISTANCE in the class docstring. 36.8% -> 99.6%
+                 # coverage of the test plate, measured 2026-08-16.
+                 translation_distance=0.015, rotational_distance=0.02, live=True,
+                 voxel_length=0.002, sdf_trunc=0.008,
+                 depth_scale=None, depth_trunc=1.0,
+                 # The topic industrial_reconstruction is SUBSCRIBED to, which in
+                 # simulation is the 16UC1 republication of the Gazebo camera --
+                 # see tari_bringup/depth_to_16uc1.py. The depth scale, the frame
+                 # and the frame rate are all measured off it, so it has to be
+                 # the same stream the synchroniser sees, not the raw camera.
+                 depth_topic="/azure/depth/image_raw_16uc1",
+                 convert_rgb_to_intensity=False,
+                 min_num_faces=100, normal_angle=None,
+                 archive_directory="", tf_offset=None):
+        self.tracking_frame = tracking_frame
+        self.relative_frame = relative_frame
+        self.translation_distance = translation_distance
+        self.rotational_distance = rotational_distance
+        self.live = live
+        self.voxel_length = voxel_length
+        self.sdf_trunc = sdf_trunc
+        self.depth_scale = depth_scale
+        self.depth_trunc = depth_trunc
+        self.depth_topic = depth_topic
+        self.convert_rgb_to_intensity = convert_rgb_to_intensity
+        self.min_num_faces = min_num_faces
+        self.normal_angle = normal_angle
+        self.archive_directory = archive_directory
+        self.box = None
+        self.tf_offset = tf_offset
+        # Set by start(), which asks the depth topic what frame it stamps.
+        # camera_offset() may be called before that, from plan_sweep().
+        self.resolved_tracking_frame = None
+        self.observed_rate_hz = None
+
+    def camera_offset(self):
+        """probe_end -> the camera's optical frame, from live TF.
+
+        The mount offset, read rather than written down, for the same reason
+        the Keyence's is: it is a property of how this cell's tooling is built
+        and it changes when the tooling does. Returns zeros when TF cannot
+        answer, because an un-offset sweep still reconstructs -- it just
+        reconstructs 47 mm from where it was asked to.
+
+        The frame is the one the depth images are stamped with, resolved at
+        start(); before the first start() it falls back to asking the topic.
+        """
+        if self.tf_offset is not None:
+            return tuple(self.tf_offset)
+        frame = (self.resolved_tracking_frame or self.tracking_frame
+                 or depth_topic_facts(self.depth_topic)[2])
+        if not frame:
+            return (0.0, 0.0, 0.0)
+        try:
+            import rclpy
+            t = ros._tf_buffer.lookup_transform("probe_end", frame,
+                                                rclpy.time.Time())
+        except Exception as e:
+            print("  no probe_end -> %s transform (%s); sweeping without the "
+                  "camera offset" % (frame, e))
+            return (0.0, 0.0, 0.0)
+        return (t.transform.translation.x, t.transform.translation.y,
+                t.transform.translation.z)
+
+    def plan_sweep(self, region=None, pad=None, box_z=None, **kwargs):
+        """Dome sweep above `region`, and remember the box to integrate inside.
+
+        region is (xmin, ymin, xmax, ymax) in world metres, or None to use the
+        kwargs of dome_sweep_path directly.
+
+        BY DEFAULT THE BOX IS THE CELL'S WORK VOLUME (work_cell.dpi), because
+        "what is inside this cell" is declared once in the cell manifest and is
+        not a per-sweep decision. `pad` and `box_z` below are the override, kept
+        for a caller that genuinely wants a different box for one sweep and for
+        cells that have not declared a work volume yet; passing either brings
+        back the old region-derived behaviour in full.
+
+        `pad` widens the box beyond the region in x and y. Its old default was
+        generous on purpose, because that box was there to keep the room out
+        rather than to trim the part, and `region` is where the CAMERA
+        flies rather than where the part is -- a camera tilted through a dome
+        sweep sees a footprint offset from the position it is at, so a box drawn
+        tightly around the flight path cuts the edges off the thing being
+        measured. At 0.05 the plate came back clipped flat against three sides.
+
+        BUT A REGION FROM yolo_region() IS DIFFERENT: it bounds the PART, to a
+        few millimetres, and then 0.15 m of pad is 0.15 m of table. Pass a small
+        pad when the region came from a detection. Measured 2026-08-16 on the
+        cal plate: a 0.31 x 0.15 m part in a 0.61 x 0.45 m box came back 30 k
+        vertices of plate and 107 k of table.
+
+        `box_z` is (zmin, zmax) for the same box and defaults to
+        (0.0, height - 0.10) -- the floor, because the part's height is exactly
+        what is not known yet, up to just below the camera so the arm's own
+        tooling does not integrate. Give it a floor when something DOES know:
+        yolo_region()'s `surface_z` is the top of the part, measured, so
+        `surface_z - thickness` bounds the support out.
+
+        Do not reach for clean_mesh()'s z cutoff to do this job instead. It is a
+        plane, and the support here is an optical breadboard that reconstructs
+        across 19 mm of z -- 0.9156 to 0.9500, measured -- so on a part only
+        19.6 mm thick there is no plane that keeps the part and drops the table.
+        The crop box is applied to the TSDF, before any of that noise becomes
+        vertices.
+        """
+        # THE BOX IS THE CELL'S WORK VOLUME, not something derived from the
+        # region. `region` says where to FLY; the work volume says what is
+        # inside the cell, and those are different questions that were being
+        # answered with one number. Everything the old pad/box_z arithmetic was
+        # for -- keeping the room out, keeping the arm out, keeping the bench
+        # out -- is what the work volume already means, and it is declared once
+        # in the cell manifest instead of guessed per run. See work_cell.dpi.
+        #
+        # pad and box_z remain as explicit overrides for a caller that really
+        # does want a different box for one sweep, and for cells that have not
+        # declared a work volume yet.
+        if pad is None and box_z is None:
+            _frame, lo, hi = require_work_volume("a reconstruction sweep")
+            self.box = (tuple(lo), tuple(hi))
+        if region is not None:
+            xmin, ymin, xmax, ymax = [float(v) for v in region]
+            kwargs.setdefault("origin", (xmin, ymin))
+            kwargs.setdefault("length", xmax - xmin)
+            kwargs.setdefault("width", ymax - ymin)
+            if self.box is None:
+                pad = 0.15 if pad is None else float(pad)
+                zlo, zhi = ((0.0, kwargs.get("height", 1.35) - 0.10)
+                            if box_z is None
+                            else (float(box_z[0]), float(box_z[1])))
+                self.box = ((xmin - pad, ymin - pad, zlo),
+                            (xmax + pad, ymax + pad, zhi))
+        path = dome_sweep_path(**kwargs)
+        # The sweep is a path for PROBE_END, and the camera is not at probe_end.
+        # Moving each pose back along the probe_end -> camera vector centres the
+        # CAMERA over the region instead of the tool, which is what the caller
+        # meant. Exactly the correction the Keyence needs for its own sensor,
+        # and it was missing here: measured 2026-08-16 on the cal plate, the
+        # reconstruction's midpoint landed at x 0.929 for a part centred on
+        # 0.883, a +46 mm shift against a +47 mm mount offset, and the first
+        # 70 mm of the part was never seen at all in three consecutive runs.
+        dx, dy, dz = self.camera_offset()
+        if (dx, dy, dz) != (0.0, 0.0, 0.0):
+            path = _offset_path_in_tool_frame(path, (-dx, -dy, -dz))
+            print("    camera offset applied in the tool frame: "
+                  "(%+.4f, %+.4f, %+.4f) m" % (-dx, -dy, -dz))
+        print("  reconstruction sweep: %s" % path.describe())
+        if self.box is not None:
+            print("    integrating inside x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f"
+                  % (self.box[0][0], self.box[1][0], self.box[0][1],
+                     self.box[1][1], self.box[0][2], self.box[1][2]))
+        else:
+            print("    WARNING: no bounding box -- the whole scene will be "
+                  "integrated, table and arm included. Pass region=.")
+        return path
+
+    def start(self):
+        from geometry_msgs.msg import Vector3
+        from industrial_reconstruction_msgs.msg import (RGBDImageParams,
+                                                        TSDFVolumeParams)
+        lo = self.box[0] if self.box else (0.0, 0.0, 0.0)
+        hi = self.box[1] if self.box else (0.0, 0.0, 0.0)
+        tsdf = TSDFVolumeParams(
+            voxel_length=float(self.voxel_length),
+            sdf_trunc=float(self.sdf_trunc),
+            min_box_values=Vector3(x=float(lo[0]), y=float(lo[1]), z=float(lo[2])),
+            max_box_values=Vector3(x=float(hi[0]), y=float(hi[1]), z=float(hi[2])))
+        scale, rate, frame = depth_topic_facts(self.depth_topic)
+        if self.depth_scale is not None:
+            scale = self.depth_scale
+        # Remembered so warmup()/settle() can size their waits from the rate this
+        # camera is actually managing rather than from its nominal update_rate.
+        self.observed_rate_hz = rate
+        # The frame the pixels are in, unless the caller insisted. Asked rather
+        # than assumed: see the class docstring for what tracking the wrong one
+        # looks like, which is a healthy reconstruction of empty space.
+        tracking = self.tracking_frame or frame
+        if not tracking:
+            raise RuntimeError(
+                "no tracking frame: %s published nothing to read a frame_id "
+                "from, and none was given. Check the topic is publishing, or "
+                "pass tracking_frame=." % (self.depth_topic,))
+        self.resolved_tracking_frame = tracking
+        rgbd = RGBDImageParams(depth_scale=float(scale),
+                               depth_trunc=float(self.depth_trunc),
+                               convert_rgb_to_intensity=bool(self.convert_rgb_to_intensity))
+        res = call_ros_service("azure_start", {
+            "tracking_frame": tracking,
+            "relative_frame": self.relative_frame,
+            "translation_distance": float(self.translation_distance),
+            "rotational_distance": float(self.rotational_distance),
+            "live": bool(self.live),
+            "tsdf_params": tsdf,
+            "rgbd_params": rgbd})
+        if not res.success:
+            raise RuntimeError("start_reconstruction refused to start")
+        print("  reconstruction started (tracking %s relative to %s)"
+              % (tracking, self.relative_frame))
+        return res
+
+    def stop(self, output_path):
+        from industrial_reconstruction_msgs.msg import NormalFilterParams
+        from geometry_msgs.msg import Vector3
+
+        filters = []
+        if self.normal_angle is not None and self.normal_angle < 180.0:
+            # Keep only triangles whose normal is within normal_angle of +z. The
+            # sweep only ever sees the part from above, so downward faces are
+            # integration noise.
+            #
+            # OFF by default, because industrial_reconstruction does not survive
+            # this filter removing everything: stopReconstructionCallback goes on
+            # to meshToRos(cropped_mesh), which does vertices[:, 2].min() and
+            # raises "zero-size array to reduction operation minimum" -- and that
+            # is an unhandled exception in a service callback, so the NODE DIES
+            # and the next start_reconstruction has nothing to talk to. Seen
+            # 2026-08-16 with angle=90. Turn it on when there is a part with
+            # enough top surface to survive it, and expect to relaunch the node
+            # if you get it wrong.
+            filters.append(NormalFilterParams(
+                normal_direction=Vector3(x=0.0, y=0.0, z=1.0),
+                angle=float(self.normal_angle)))
+
+        output_path = os.path.abspath(output_path)
+        _ensure_dir(output_path)
+        res = call_ros_service("azure_stop", {
+            "archive_directory": self.archive_directory,
+            "mesh_filepath": output_path,
+            "min_num_faces": int(self.min_num_faces),
+            "normal_filters": filters})
+        if not res.success:
+            raise RuntimeError("stop_reconstruction failed: %s"
+                               % (getattr(res, "message", "") or "no message",))
+        if not os.path.exists(output_path):
+            raise RuntimeError(
+                "stop_reconstruction reported success but wrote no %s. The usual "
+                "cause is that no frames were integrated: check that the depth "
+                "and colour topics are publishing and that the part is inside "
+                "the bounding box." % (output_path,))
+        print("  reconstruction stopped: %s (%.1f kB)"
+              % (output_path, os.path.getsize(output_path)/1024.0))
+        return output_path
+
+
+class _KeyenceReconstruction(ReconstructionSource):
+    """What the two Keyence backends have in common.
+
+    Both drive the same sensor over the same kind of path and differ only in
+    which service accumulates the profiles. The laser enable and the sensor's own
+    TF offset belong to the sensor, so they live here.
+    """
+
+    #: UR digital output wired to the laser enable
+    LASER_PIN = 1
+
+    #: PointCloud2 topic the profiler publishes on, real or simulated.
+    PROFILE_TOPIC = "/profiles"
+
+    #: A surface-following raster is exactly the case this is for.
+    approach_each_segment = True
+
+    def __init__(self, laser_pin=None, tf_offset=None, line_spacing=0.02,
+                 z_offset=0.0, velocity=0.01, profile_topic=None,
+                 check_profiles=True):
+        self.laser_pin = self.LASER_PIN if laser_pin is None else laser_pin
+        self.tf_offset = tf_offset
+        # 0.02 m from the sensor's own fan, not from taste: the simulated
+        # LJ-V7080 spans +/-0.246 rad, so at the 0.085 m reference distance one
+        # profile is 2*0.085*tan(0.246) = 43 mm wide (measured: 47 mm of finite
+        # points at a 94 mm range). Twenty millimetres is a bit over 50% overlap.
+        # It buys nothing to go far below that -- across-track resolution is set
+        # by the 56 samples in one profile, 0.8 mm, not by how often the passes
+        # repeat -- and 5 mm turns a 10-minute sweep into 35.
+        self.line_spacing = line_spacing
+        # ZERO, and this is the whole standoff question. See plan_sweep().
+        self.z_offset = z_offset
+        self.velocity = velocity
+        self.profile_topic = profile_topic or self.PROFILE_TOPIC
+        self.check_profiles = check_profiles
+
+    def keyence_offset(self):
+        """probe_end -> Keyence optical frame, from live TF.
+
+        Read rather than written down: it is a property of how the sensor is
+        mounted in this cell and it changes when the tooling does.
+
+        It comes off `ros.keyence_t`, which the motion module polls for exactly
+        this pair of frames. This used to call `ros.lookupTransform(...)`, which
+        IS NOT A METHOD of that module -- so every call raised AttributeError,
+        was caught by the except below, printed one line about there being no
+        Keyence TF, and returned a ZERO offset. The sweep then flew with the
+        sensor 116 mm out of position and no error anywhere. A fallback that
+        cannot tell "this cell has no Keyence" from "I called the wrong method"
+        is worth less than the failure it hides, so a missing transform now
+        raises unless tf_offset was given explicitly.
+        """
+        if self.tf_offset is not None:
+            return tuple(self.tf_offset)
+        t = getattr(ros, "keyence_t", None)
+        if t is None:
+            raise RuntimeError(
+                "no probe_end -> lj_v7080_optical_frame transform (ros.keyence_t "
+                "is None). Either this cell has no Keyence mounted, or TF is not "
+                "up yet. Pass tf_offset=(dx, dy, dz) to fly it anyway.")
+        return (t.transform.translation.x, t.transform.translation.y,
+                t.transform.translation.z)
+
+    def plan_sweep(self, region=None, mesh=None, **kwargs):
+        """A Noether raster over the ROUGH mesh, offset by the sensor's own TF.
+
+        This is the step that makes reconstruction and scanning the same shape of
+        problem: the fine sweep is planned exactly the way a UT toolpath is, over
+        the mesh the Azure produced.
+
+        WHERE THE STANDOFF COMES FROM, because getting it wrong produces a sweep
+        that flies perfectly and measures nothing.
+
+        A profiler is not a probe with a standoff you pick; it has ONE working
+        distance and a narrow window either side of it. The URDF already says
+        where that is: `lj_v7080_optical_frame` sits at the reference distance
+        along the sensor's axis (ref_dist_a = 85 mm), so putting THAT frame on
+        the surface is the entire requirement. The simulated sensor's range,
+        0.057-0.103 m from laser_link, is exactly that point +/- 23 mm.
+
+        So the toolpath is planned ON the surface -- z_offset 0, not the -0.10
+        this used to default to -- and then every pose is moved back along the
+        probe_end -> optical-frame vector, which puts the optical frame where the
+        toolpath said and probe_end 39 mm above it.
+
+        And the offset is applied IN THE TOOL FRAME, per pose. It used to go
+        through scanpath_from_noether(offset=), which translates the whole path
+        in WORLD coordinates -- right for placing a mesh in a cell, which is what
+        that argument is for, and wrong for a sensor bolted to the wrist, whose
+        offset turns with the tool. On a surface-following path over the bowed
+        test plate the poses tilt up to 17 degrees, so a world-frame offset walks
+        the sensor 22 mm across the surface and 3 mm along its own axis.
+
+        The roll defaults to "path" rather than "fixed" for the same class of
+        reason: the laser line lies along probe_end's y axis (measured -- the
+        fan spreads in laser_link y, which is probe_end y), so a raster only
+        sweeps area if the tool's x runs along the direction of travel. A UT
+        transducer is rotationally symmetric and does not care; a line profiler
+        is the case regularize_tool_roll's "path" mode exists for. It keeps the
+        sign continuous at the serpentine turns, so this costs no wrist travel.
+        """
+        if mesh is None:
+            raise ValueError(
+                "the Keyence sweep is a Noether raster over the rough mesh; "
+                "pass mesh=<the Azure reconstruction>. There is nothing to "
+                "follow without it.")
+        res = plan_noether_toolpath(mesh,
+                                    line_spacing=kwargs.pop("line_spacing",
+                                                            self.line_spacing),
+                                    z_offset=kwargs.pop("z_offset", self.z_offset),
+                                    # NOT a serpentine, and this is measured
+                                    # rather than a preference. A serpentine
+                                    # reverses alternate rows, and on this arm
+                                    # the return rows cannot be ENTERED: the
+                                    # configuration that reaches a row's far end
+                                    # cannot also reach its start, so
+                                    # ApproachInConfiguration returns None and
+                                    # the row flies 0%. Checked with IK alone,
+                                    # no motion, on one rough mesh: 9 of 16 rows
+                                    # spannable with snake, 16 of 16 without.
+                                    # Flown: 7 of 14 against 14 of 15, coverage
+                                    # 72.4% -> 77.3%, same 0.03 mm RMS, and the
+                                    # wall-clock was comparable because the
+                                    # extra transit happens at move speed while
+                                    # a row crawls at the profiler's 10 mm/s.
+                                    # The one row that still fails is the mesh
+                                    # edge. Pass snake=True to compare again.
+                                    snake=kwargs.pop("snake", False),
+                                    estimate_normals=kwargs.pop("estimate_normals",
+                                                                True))
+        if not res.success:
+            raise RuntimeError("noether planning failed for %s" % (mesh,))
+        orient = kwargs.pop("orient", "surface")
+        fixed_quat = kwargs.pop("fixed_quat", None)
+        roll = kwargs.pop("roll", "path")
+        if orient == "fixed" and fixed_quat is None:
+            # WHEN TO REACH FOR orient="fixed". "surface" points the tool along
+            # the mesh's normals, and on a ROUGH mesh those are estimated from a
+            # noisy TSDF -- around a hole or a step they point sideways. Planned
+            # over the Azure reconstruction of the cal plate the tool tilt
+            # reached 84 degrees from vertical on a plate that is flat, the roll
+            # stepped a full 180 degrees between adjacent waypoints, and because
+            # the sensor offset is applied in the TOOL frame those orientation
+            # spikes became POSITION spikes: the same raster came out 10.5 m
+            # long instead of 2.5 m. A profiler at a fixed working distance over
+            # a mild surface does not need to follow normals at all -- its
+            # +/-23 mm window absorbs the relief. Follow the surface for a part
+            # with real curvature; hold fixed for a flat one measured roughly.
+            #
+            # AND THE FIXED ORIENTATION IS DERIVED FROM THE PATH, not taken from
+            # wherever the arm is pointing. A profiler measures a LINE, and that
+            # line has to lie across the direction of travel or each pass sweeps
+            # a strip of zero width. Holding the arm's current pose put the line
+            # along world y over a raster whose lines also ran along y, and the
+            # sweep came back with 12% of the plate covered -- every row flew
+            # 100%, the laser saw 56 points on every one of 2293 profiles, and
+            # the result was still nearly empty. Nothing announces this: it is
+            # the one failure that looks like a complete success at every step.
+            fixed_quat = _flat_tool_quat(scanpath_from_noether(
+                res, orient="fixed", fixed_quat=(0.0, 0.0, 0.0, 1.0)))
+        path = scanpath_from_noether(res, orient=orient, fixed_quat=fixed_quat,
+                                     roll=roll)
+        dx, dy, dz = self.keyence_offset()
+        path = _offset_path_in_tool_frame(path, (-dx, -dy, -dz))
+        path = _crop_path_to_work_volume(path, "keyence sweep")
+        print("  keyence sweep: %s" % path.describe())
+        print("    sensor offset applied in the tool frame: "
+              "(%+.4f, %+.4f, %+.4f) m" % (-dx, -dy, -dz))
+        # Kept so start()'s pre-flight check can step into the first pass. See
+        # profile_facts().
+        self.sweep_path = path
+        return path
+
+    #: How far into the first pass the pre-flight check may step to get off the
+    #: mesh boundary, in waypoints.
+    PRIME_WAYPOINTS = 10
+
+    def profile_facts(self):
+        """What the profiler is delivering right now, and refuse a blind sweep.
+
+        Called from start(), which happens after the arm has reached the first
+        pose of the sweep -- so the sensor is looking at the part, and a profile
+        of zero points means the whole sweep will be zero points. Nineteen
+        minutes of flying, a stop that answers "No points were accumulated", and
+        nothing in between that says why: a three-second check beforehand is
+        worth it.
+
+        WITH ONE CORRECTION, learned the hard way. The first waypoint of a
+        Noether raster sits exactly ON the edge of the mesh, and the laser line
+        is a line: at waypoint 0 of the test plate it lies exactly along the
+        y = -0.05 boundary and returns ZERO points, while 25 mm further into
+        the same pass it returns 44 of 56. So an empty reading at the start pose
+        is not evidence of anything, and a guard that refused there would refuse
+        every sweep that was about to work. It steps into the pass and asks
+        again before it believes it. _fly_scanpath() starts from the beginning
+        of the segment regardless, so nothing is skipped by this.
+        """
+        facts = profile_topic_facts(self.profile_topic)
+        if not facts["msgs"]:
+            raise RuntimeError(
+                "nothing publishing on %s. The real sensor needs "
+                "keyence_driver_node; the simulated one is a Gazebo ray sensor "
+                "and needs the cell up." % (self.profile_topic,))
+        print("    %s: %.0f Hz, %.0f points per profile (%d of %d empty), frame %s"
+              % (self.profile_topic, facts["rate_hz"] or 0.0,
+                 facts["points_per_msg"], facts["empty_msgs"], facts["msgs"],
+                 facts["frame_id"]))
+
+        path = getattr(self, "sweep_path", None)
+        if facts["points_per_msg"] <= 0.0 and path is not None and len(path) > 1:
+            i = min(self.PRIME_WAYPOINTS, len(path) - 1)
+            print("    nothing at the start pose, which is ON the edge of the "
+                  "mesh; stepping %d waypoints into the pass and asking again" % (i,))
+            ros.CartesianMove([_pose_from_scanpath(path, 0),
+                               _pose_from_scanpath(path, i)],
+                              vel=0.02, acc=0.02, min_fraction=0.5)
+            facts = profile_topic_facts(self.profile_topic)
+            print("    %s: %.0f points per profile there"
+                  % (self.profile_topic, facts["points_per_msg"]))
+
+        if facts["points_per_msg"] <= 0.0:
+            raise RuntimeError(
+                "%s is publishing %.0f Hz of EMPTY profiles from the first pose "
+                "of the sweep, so the sweep would accumulate nothing. The sensor "
+                "sees a surface only within its measuring range -- 0.057-0.103 m "
+                "from laser_link in simulation, the reference distance +/-23 mm "
+                "-- and, in Gazebo, only a surface with COLLISION geometry: a "
+                "<sensor type=\"ray\"> raycasts against physics, not against the "
+                "renderer, so a visual-only model is invisible to it while the "
+                "depth camera sees it perfectly. Check the standoff first, then "
+                "check the specimen has a <collision>."
+                % (self.profile_topic, facts["rate_hz"] or 0.0))
+        return facts
+
+    def _laser(self, on):
+        try:
+            set_digital_out(self.laser_pin, on)
+            print("  laser %s (pin %d)" % ("on" if on else "off", self.laser_pin))
+        except Exception as e:
+            # In simulation there is no UR IO controller and there is no laser
+            # to switch; the simulated profiler publishes regardless. A missing
+            # set_io must not abort a reconstruction that would otherwise work.
+            print("  could not switch the laser (%s) -- continuing" % (e,))
+
+
+class KeyenceReconstructionKey(_KeyenceReconstruction):
+    """Keyence via tari_key_reconstruction: start_key_rec / stop_key_rec.
+
+    The older of the two backends. Its stop() carries the whole PCL greedy
+    triangulation parameter set, which is why there are so many arguments -- they
+    are the surface reconstruction, not the capture.
+    """
+
+    requires = ("tari_key_reconstruction",)
+
+    def __init__(self, distance=0.001, passthrough=(0.0, 1.0),
+                 outlier_filtering=True, mean_k=50, dev_thresh=1.0,
+                 mini_leaf_size=0.0005, leaf_size=0.002, depth=8,
+                 solver_divide=8, iso_divide=8, point_weight=4.0,
+                 k_search=20, radius_search=0.01, cluster_tolerance=0.02,
+                 min_cluster_size=100, max_cluster_size=1000000,
+                 search_radius=0.025, set_mu=2.5, max_nearest=100,
+                 max_surface_angle=45.0, min_angle=10.0, max_angle=120.0,
+                 normal_consistency=False, **kwargs):
+        super().__init__(**kwargs)
+        self.distance = distance
+        self.passthrough = passthrough
+        self.params = dict(
+            perform_outlier_filtering=outlier_filtering, mean_k=mean_k,
+            dev_thresh=dev_thresh, mini_leaf_size=mini_leaf_size,
+            leaf_size=leaf_size, depth=depth, solver_divide=solver_divide,
+            iso_divide=iso_divide, point_weight=point_weight, k_search=k_search,
+            radius_search=radius_search, cluster_tolerance=cluster_tolerance,
+            min_cluster_size=min_cluster_size, max_cluster_size=max_cluster_size,
+            search_radius=search_radius, set_mu=set_mu, max_nearest=max_nearest,
+            max_surface_angle=max_surface_angle, min_angle=min_angle,
+            max_angle=max_angle, normal_consistency=normal_consistency)
+
+    def start(self):
+        self._laser(True)
+        if self.check_profiles:
+            self.profile_facts()
+        res = call_ros_service("key_start", {"distance": float(self.distance)})
+        if not res.success:
+            raise RuntimeError("start_key_rec refused to start")
+        print("  keyence capture started (tari_key_reconstruction)")
+        return res
+
+    def stop(self, output_path):
+        self._laser(False)
+        output_path = os.path.abspath(output_path)
+        _ensure_dir(output_path)
+        fields = {"output_filepath": os.path.dirname(output_path) + os.sep,
+                  "output_filename": os.path.basename(output_path),
+                  "min": float(self.passthrough[0]),
+                  "max": float(self.passthrough[1])}
+        fields.update({k: _srv_number(v) for k, v in self.params.items()})
+        res = call_ros_service("key_stop", fields)
+        if not res.success:
+            raise RuntimeError("stop_key_rec failed")
+        return _check_written(output_path, "stop_key_rec")
+
+
+class KeyenceReconstructionPC(_KeyenceReconstruction):
+    """Keyence via tari_pc_reconstruction: /start_recording -> /stop_and_process.
+
+    The newer backend. Open3D ball pivoting rather than PCL, and it returns the
+    files it wrote in the response, so the mesh path does not have to be guessed
+    from the directory and base name it was given.
+    """
+
+    requires = ("tari_pc_reconstruction",)
+
+    #: /stop_and_process runs ball pivoting, hole filling, 25 Taubin smoothing
+    #: iterations, TWO depth-9 Poisson reconstructions and two decimations, all
+    #: inside one service callback on a single-threaded node. Minutes, not
+    #: seconds, and the 300 s default would give up part way through a run that
+    #: is going to succeed.
+    STOP_TIMEOUT = 1800.0
+
+    def __init__(self, merge=True, merge_distance_m=0.001, crop=None,
+                 coarse_voxel_divisor=2.0, dbscan_eps_multiplier=0.0,
+                 dbscan_min_points=10, sor_filter=True, sor_nb_neighbors=20,
+                 sor_std_ratio=2.0, uniform_downsampling=False,
+                 target_downsample_points=500000,
+                 ball_pivot_radii=(0.002, 0.004, 0.008),
+                 triangle_num=0, **kwargs):
+        # TWO defaults here are changed from the server's nominal ones, and both
+        # of the originals are unusable rather than merely suboptimal. Neither
+        # had ever been run.
+        #
+        # dbscan_eps_multiplier = 0, which means DO NOT CLUSTER AT ALL, and this
+        # is the interesting one. The server's rule was "keep the largest
+        # connected cluster", which is a guess at which points are the part; the
+        # crop box is the thing that actually knows, because it is the cell's
+        # measured work volume. Measured on the calibration plate, which has
+        # holes through it and so does not sample as one component: a raster
+        # that captured 96.2% of the plate left this step at 55%, and 21% once
+        # the mesh was smoothed. The acquisition was never the problem.
+        #
+        # 0 relies on a LOCAL PATCH to tari_pc_reconstruction that made the
+        # clustering opt-in and moved the crop ahead of it. Against an unpatched
+        # server this asks for eps = 0, every point is DBSCAN noise, and the
+        # service fails with "DBSCAN did not find any clusters" -- loudly, which
+        # is the right way round for a mismatch to show up. Pass 0.02 to get the
+        # old behaviour: eps is then 1% of the part's longest dimension, 3 mm
+        # here, a few times the 1 mm spacing the merge voxel leaves. Anything
+        # near the server's nominal 2.0 makes eps the WHOLE part -- every point a
+        # neighbour of every other, an O(n^2) radius search over ~10^5 points,
+        # which is a hang with a progress bar.
+        #
+        # ball_pivot_radii. Empty means Open3D pivots a ball of no radii at all
+        # and returns an empty mesh, and the node then reports success anyway
+        # because a later meshing method succeeded. 2/4/8 mm brackets the same
+        # 1 mm point spacing.
+        super().__init__(**kwargs)
+        self.merge = merge
+        self.merge_distance_m = merge_distance_m
+        self.crop = crop
+        self.params = dict(
+            coarse_voxel_divisor=coarse_voxel_divisor,
+            dbscan_eps_multiplier=dbscan_eps_multiplier,
+            dbscan_min_points=dbscan_min_points,
+            perform_sor_filter=sor_filter, sor_nb_neighbors=sor_nb_neighbors,
+            sor_std_ratio=sor_std_ratio,
+            perform_uniform_downsampling=uniform_downsampling,
+            target_downsample_points=target_downsample_points,
+            triangle_num=triangle_num)
+        self.ball_pivot_radii = list(ball_pivot_radii)
+
+    def start(self):
+        self._laser(True)
+        if self.check_profiles:
+            self.profile_facts()
+        res = call_ros_service("pc_start", {})
+        if not res.success:
+            raise RuntimeError("/start_recording refused: %s"
+                               % (getattr(res, "message", ""),))
+        print("  keyence capture started (tari_pc_reconstruction)")
+        return res
+
+    def stop(self, output_path):
+        self._laser(False)
+        output_path = os.path.abspath(output_path)
+        _ensure_dir(output_path)
+        base = os.path.splitext(os.path.basename(output_path))[0]
+        # CROP TO THE CELL'S WORK VOLUME unless told otherwise. This used to
+        # crop to nothing at all -- `crop=None` meant perform_cropping=False --
+        # so every profile the laser caught on the way to the part, and every
+        # reflection off the bench beside it, went into the cloud DBSCAN then
+        # had to make sense of. The box is declared once in the cell manifest
+        # and is the same one the Azure integrates inside, which is the point:
+        # two sensors measuring the same cell should not disagree about where
+        # it is. Pass crop=(lo, hi) for a different box, or crop=False for none.
+        crop = self.crop
+        if crop is None:
+            _frame, wlo, whi = require_work_volume("a keyence sweep")
+            crop = (wlo, whi)
+        if not crop and not self.params["dbscan_eps_multiplier"]:
+            # With the clustering off the box is the ONLY thing rejecting
+            # anything, so this combination accumulates the room.
+            print("  WARNING: no crop box and no cluster filtering -- every "
+                  "point the laser returned will be meshed, including whatever "
+                  "it caught on the way to the part.")
+        fields = {"output_directory": os.path.dirname(output_path),
+                  "base_filename": base,
+                  "perform_merge": bool(self.merge),
+                  "merge_distance_m": float(self.merge_distance_m),
+                  "perform_cropping": bool(crop),
+                  "ball_pivot_radii": [float(r) for r in self.ball_pivot_radii]}
+        lo, hi = crop if crop else ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        fields.update({"crop_min_x": float(lo[0]), "crop_max_x": float(hi[0]),
+                       "crop_min_y": float(lo[1]), "crop_max_y": float(hi[1]),
+                       "crop_min_z": float(lo[2]), "crop_max_z": float(hi[2])})
+        fields.update({k: _srv_number(v) for k, v in self.params.items()})
+        print("  processing the profiles into a mesh; this takes minutes")
+        res = call_ros_service("pc_stop", fields, timeout=self.STOP_TIMEOUT)
+        if not res.success:
+            raise RuntimeError("/stop_and_process failed: %s"
+                               % (getattr(res, "message", "") or "no message",))
+        # It tells us what it wrote, so prefer that over the path we asked for --
+        # it writes into a TIMESTAMPED subdirectory of the one it was given, so
+        # the path we asked for does not exist afterwards and cannot be guessed.
+        #
+        # PICK BY NAME, not "the first .ply". Ten files come back and six of them
+        # are POINT CLOUDS: _raw, _merged, _cluster, _cropped, _sor_filtered and
+        # _final_points are the processing stages, and _raw is first in the list.
+        # Returning that gives every caller downstream a .ply with no faces --
+        # Noether refuses it, tari_mesh_filter has nothing to filter, and the
+        # projector has no surface. Only the last four entries are meshes.
+        saved = list(getattr(res, "saved_files", None) or [])
+        for suffix in ("_ball_pivot_smoothed", "_poisson", "_ball_pivot",
+                       "_qudric_decimation"):
+            for written in saved:
+                if os.path.splitext(os.path.basename(written))[0].endswith(suffix):
+                    # AND IT HAS TO BE FINITE. Measured 2026-08-16 on the cal
+                    # plate: with the whole cloud kept rather than one DBSCAN
+                    # cluster, ball pivoting leaves isolated slivers and the 25
+                    # Taubin smoothing iterations turn 158 of 29 166 vertices
+                    # into NaN. The same run's Poisson mesh has none, and the
+                    # old one-cluster mesh had none because it had a third of
+                    # the data. A NaN vertex is not survivable downstream --
+                    # Noether plans over it, Blender parameterizes it, and
+                    # x3d_load_geometry aborts the whole process on meshes it
+                    # dislikes -- so fall through to the next method and say
+                    # which one and why, rather than returning it.
+                    if not _mesh_is_finite(written):
+                        continue
+                    print("  keyence mesh: %s" % written)
+                    self.saved_files = saved
+                    return written
+        raise RuntimeError(
+            "/stop_and_process reported success but wrote no mesh, only "
+            "point clouds: %s. Every meshing method failed; the node logs which "
+            "and why." % (", ".join(os.path.basename(s) for s in saved) or "nothing",))
+
+
+def _mesh_is_finite(path, what="mesh"):
+    """True if every vertex of `path` is finite, with a printed reason if not.
+
+    Deliberately soft: it reads the file with mesh_scan.dpi's dependency-free
+    _mesh_vertices() and, if that is not available or the file will not parse,
+    says so and answers True rather than rejecting a mesh it could not check.
+    A check that turns into a refusal on its own failure is worse than no check.
+    """
+    try:
+        verts = _mesh_vertices(path)
+    except NameError:
+        return True                    # mesh_scan.dpi not included
+    except Exception as e:
+        print("  (could not check %s for non-finite vertices: %s)"
+              % (os.path.basename(path), e))
+        return True
+    bad = int((~np.isfinite(verts).all(axis=1)).sum())
+    if bad:
+        print("  skipping %s: %d of %d vertices are not finite"
+              % (os.path.basename(path), bad, len(verts)))
+        return False
+    return True
+
+
+def keyence_reconstruction_class(backend):
+    """The Keyence backend named by a config's KEYENCE_BACKEND.
+
+    A load-time choice: which backend a cell uses decides which services must be
+    running, and that belongs at bring-up rather than at the moment a scan calls
+    it. Raising here, while the config is being read, is the point.
+    """
+    classes = {"key": KeyenceReconstructionKey, "pc": KeyenceReconstructionPC}
+    if backend not in classes:
+        raise ValueError(
+            "KEYENCE_BACKEND must be 'key' (tari_key_reconstruction) or 'pc' "
+            "(tari_pc_reconstruction, Open3D), not %r" % (backend,))
+    return classes[backend]
+
+
+def clean_mesh(input_path, output_path=None, color=(0.0, 0.55, 0.44),
+               threshold=0.15, cutoff=None, color_filter=False, vert_filter=None,
+               delete_loose_parts=True):
+    """Filter a reconstructed mesh with tari_mesh_filter.
+
+    The colour filter is the specialised one from ClientScannerTest.dgp rather
+    than a general one: (0.0, 0.55, 0.44) at 0.15 is the green tape the
+    eddy-current specimens are marked with. It is OFF here, because a specimen
+    with no tape on it would be deleted entirely.
+
+    TWO THINGS ABOUT THIS SERVICE, both of which made it a silent no-op here.
+
+    The three filters are NOT independent. The server is
+    `if color_filter: ... elif vert_filter: ... elif delete_loose_parts: ...`,
+    so asking for two gets you the first and no warning about the second. This
+    function used to default `vert_filter=True` AND `delete_loose_parts=True`,
+    which meant loose-part removal never ran even once.
+
+    `cutoff` is a plane in WORLD z, not a height above the part or the table --
+    the server does `[v for v in bm.verts if v.co.z < request.cutoff]`. It
+    defaulted to 0.0, and in this cell the robot base, the table and the
+    specimen all sit around z = 0.92-1.06, so nothing was ever below the plane
+    and the filter removed exactly nothing on every call. Measured 2026-08-16:
+    266 686 vertices in, 266 686 out, identical bounds. A cutoff written for a
+    cell whose table is near the world origin is a no-op in a cell whose table
+    is a metre up.
+
+    So `cutoff=None` now means "do not run the vertex filter", which lets
+    `delete_loose_parts` actually run. Pass a world z to use it -- for this cell
+    the table reconstructs at z 0.938-0.956 and the specimen sits at 0.998
+    upward, so anything in 0.96-0.99 separates them. That number is a property
+    of the SPECIMEN and not of the cell, which is why it is an argument here and
+    is no longer a config constant: 0.98 is right for the bowed test plate and
+    deletes the calibration plate, whose top is at 0.948, in its entirety.
+
+    AND NOTHING HERE IS THE DEFAULT PATH ANY MORE. The cell's work volume is
+    what crops a reconstruction (work_cell.dpi), applied to the TSDF or to the
+    profile cloud before there is a vertex to filter, and SPECIMEN_CLEAN_MESH is
+    off. Each of these three filters is a "keep the one thing I recognise" rule
+    -- the tape, the plane, the biggest piece -- and each of them deletes a
+    legitimate specimen without saying so.
+    """
+    if vert_filter is None:
+        vert_filter = cutoff is not None
+    if vert_filter and delete_loose_parts:
+        print("  note: tari_mesh_filter runs ONE filter per call and the vertex "
+              "filter wins; loose-part removal will not run this time.")
+    elif delete_loose_parts and not color_filter:
+        # The mesh-level twin of the reconstruction server's largest-cluster
+        # rule, and wrong in the same way: the server separates by LOOSE parts
+        # and keeps the object with the most vertices. A part with holes through
+        # it is several loose parts, and a bench cropped to the work volume has
+        # more of it than the part does.
+        print("  note: loose-part removal keeps only the BIGGEST connected "
+              "component. A holey part is several components, and a table is "
+              "bigger than a part -- check what comes back.")
+    input_path = os.path.abspath(input_path)
+    if output_path is None:
+        stem, ext = os.path.splitext(input_path)
+        output_path = stem + "_filtered" + ext
+    output_path = os.path.abspath(output_path)
+    _ensure_dir(output_path)
+
+    res = call_ros_service("mesh_filter", {
+        "input_filepath": input_path,
+        "output_filepath": output_path,
+        "color": [float(c) for c in color],
+        "threshold": float(threshold),
+        "cutoff": float(cutoff if cutoff is not None else 0.0),
+        "color_filter": bool(color_filter),
+        "vert_filter": bool(vert_filter),
+        "delete_loose_parts": bool(delete_loose_parts)})
+    if not res.success:
+        raise RuntimeError("tari_mesh_filter failed on %s" % (input_path,))
+    return _check_written(output_path, "tari_mesh_filter")
+
+
+def mesh_to_x3d(mesh_path, x3d_path=None, method=None):
+    """Parameterize a mesh so the projector can splat onto it.
+
+    noether_path.mesh_uv_x3d() -- the local Blender path -- and deliberately NOT
+    the ROS x3d_converter service, decided 2026-08-15: the service has known
+    problems and the UT path already depends on Blender's UV parameterization
+    behaving the way the noether-mesh-scanning skill documents. x3d_converter is
+    still started by tari_bringup because other workflows call it; this one does
+    not.
+
+    A projection surface without a UV map is the single most common reason a scan
+    produces a trace list and an empty image.
+    """
+    if x3d_path is None:
+        x3d_path = os.path.splitext(os.path.abspath(mesh_path))[0] + "_uv.x3d"
+    _ensure_dir(x3d_path)
+    print("  parameterizing %s -> %s" % (os.path.basename(mesh_path), x3d_path))
+    mesh_uv_x3d(mesh_path, x3d_path,
+                method=NOETHER_UV_METHOD if method is None else method)
+    return _check_written(x3d_path, "mesh_uv_x3d")
+
+
+def _ensure_dir(path):
+    d = os.path.dirname(os.path.abspath(path))
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+
+
+def _check_written(path, who):
+    if not os.path.exists(path):
+        raise RuntimeError("%s reported success but wrote no %s" % (who, path))
+    if os.path.getsize(path) == 0:
+        raise RuntimeError("%s wrote an empty %s" % (who, path))
+    return path
+
+
+def _srv_number(v):
+    """bool stays bool; everything else keeps its int/float-ness.
+
+    rosidl is strict: assigning a Python float to an int32 field raises, and
+    these two .srv files mix int32 and float32 freely.
+    """
+    return v

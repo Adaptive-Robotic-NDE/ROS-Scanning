@@ -1,0 +1,101 @@
+import time
+import os
+import transforms3d
+import math
+import statistics
+import copy
+import numpy as np
+from geometry_msgs.msg import PointStamped, Pose, PoseArray, Quaternion, Vector3
+from industrial_reconstruction_msgs.msg import NormalFilterParams, RGBDImageParams, TSDFVolumeParams
+from tf2_geometry_msgs import do_transform_point
+from scipy.spatial.transform import Rotation
+
+class Azure:
+    cx = 1026.55
+    cy = 773.586
+    fx = 973.347
+    fy = 973.203
+
+def depthCheck(ros, pixel_x, pixel_y):
+    depth_value = ros.depth_image[int(pixel_y), int(pixel_x)]/1000
+    if depth_value != 0.0:
+        return depth_value
+    else:
+        return 0.0
+
+def azureConvert(pixel_x, pixel_y, depth):
+    x = (pixel_x - Azure.cx) * depth / Azure.fx
+    y = (pixel_y - Azure.cy) * depth / Azure.fy
+    z = depth
+    return [x, y, z]
+
+def normalize(vect):
+    norm = np.linalg.norm(vect)
+    if norm == 0:
+       return vect
+    return vect / norm
+
+def calculateRegistration(ros, detection_id):
+    print("Calculating Registration")
+    selected_detection = None
+    for detection in ros.tags.detections:
+        if detection.id == detection_id:
+            selected_detection = detection
+            break
+
+    if not selected_detection:
+        return None
+
+    azure_transform = ros.azure_t
+    pixel_x = selected_detection.centre.x
+    pixel_y = selected_detection.centre.y
+    depth = depthCheck(ros, pixel_x, pixel_y)
+    tag_coordinates = azureConvert(pixel_x, pixel_y, depth)
+
+    transformed_detection = PointStamped()
+    transformed_detection.point.x = tag_coordinates[0]
+    transformed_detection.point.y = tag_coordinates[1]
+    transformed_detection.point.z = tag_coordinates[2]
+    transformed_detection.header.frame_id = "azure_rgb"
+
+    tag_center = do_transform_point(transformed_detection, azure_transform)
+    position = [tag_center.point.x, tag_center.point.y, tag_center.point.z]
+
+    corners = []
+    for corner in selected_detection.corners:
+         cx = corner.x
+         cy = corner.y
+         cdepth = depthCheck(ros, cx, cy)
+         corner_coordinate = azureConvert(cx, cy, cdepth)
+         tc = PointStamped()
+         tc.point.x = corner_coordinate[0]
+         tc.point.y = corner_coordinate[1]
+         tc.point.z = corner_coordinate[2]
+         tc.header.frame_id = "azure_rgb"
+         transformed_corner = do_transform_point(tc, azure_transform)
+         corners.append([transformed_corner.point.x, transformed_corner.point.y, transformed_corner.point.z])
+
+    translation_vector = np.array(position)
+    v_edge1 = np.array(corners[1]) - np.array(corners[0])
+    v_edge2 = np.array(corners[3]) - np.array(corners[0])
+    
+    x_axis = normalize(v_edge1)
+    y_axis = normalize(v_edge2)
+    z_axis = normalize(np.cross(v_edge1, v_edge2))
+    y_axis = normalize(np.cross(z_axis, x_axis))
+
+    transformation_matrix = np.array([
+        [y_axis[0], -x_axis[0], z_axis[0], translation_vector[0]],
+        [y_axis[1], -x_axis[1], z_axis[1], translation_vector[1]],
+        [y_axis[2], -x_axis[2], z_axis[2], translation_vector[2]],
+        [0.0,       0.0,       0.0,       1.0]
+    ])
+    
+    return transformation_matrix.flatten().tolist()
+
+def yoloEnable(yolo_enable_client, enable):
+    if enable:
+        print("Enabling YOLO!")
+    else:
+        print("Disabling YOLO!")
+    return yolo_enable_client.sendRequest('SetBool',{'data':enable})

@@ -1,0 +1,86 @@
+import spatialnde2 as snde
+import numpy as np
+
+def setup_ec_channels(recdb):
+    avgrealchan = recdb.define_channel('/avgreal', "main")
+    avgimagchan = recdb.define_channel('/avgimag', "main")
+    scanrealchan = recdb.define_channel('/scanreal', "main")
+    scanimagchan = recdb.define_channel('/scanimag', "main")
+    
+    probe_pose_channel_copy = recdb.define_channel('/probe_pose_copy', "main")
+    probe_tip_data_channel_copy = recdb.define_channel('/specimen_data_copy', "main")
+    
+    return avgrealchan, avgimagchan, scanrealchan, scanimagchan
+
+def capture_ec_data(recdb, ros):
+    """
+    Captures eddy current data using NIDAQ and records it alongside the current 
+    probe and specimen poses.
+    """
+    monitor = recdb.start_monitoring_globalrevs()
+    g = monitor.wait_next(recdb)
+    monitor.close(recdb)
+    
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai1')
+    ch2data = np.mean(rec.data)
+    rec = g.get_ndarray_ref('/PXI1Slot2/ai0')
+    ch1data = np.mean(rec.data)
+    
+    complexdata = ch1data + 1j*ch2data
+    
+    # Capture poses
+    pp_data = recdb.latest_defined_globalrev().get_ndarray_ref('/probe_pose').data
+    sp_data = recdb.latest_defined_globalrev().get_ndarray_ref('/specimen_pose').data
+
+    return complexdata, pp_data, sp_data
+
+def push_ec_data_to_recdb(recdb, ros, complexdata, pp_data, sp_data):
+    """
+    Pushes the captured eddy current data and poses into the spatialnde2 recording database.
+    """
+    try:
+        transact = recdb.start_transaction()
+        
+        # Specimen Data
+        specimen_data_ref = snde.create_ndarray_ref(transact, ros.specimen_data_chan, snde.SNDE_RTN_COMPLEXFLOAT32)
+        metadata = snde.constructible_metadata()
+        metadata.AddMetaDatum(snde.metadatum("snde_render_goal", "SNDE_SRG_PHASEPLANE"))
+        metadata.AddMetaDatum(snde.metadatum("snde_phase_plane_historical_fade", True))
+        metadata.AddMetaDatum(snde.metadatum("nde_array-ampl_coord", "Impedance"))
+        metadata.AddMetaDatum(snde.metadatum("nde_array-ampl_units", "Volts"))
+        specimen_data_ref.rec.metadata = metadata
+        specimen_data_ref.rec.mark_metadata_done()
+        specimen_data_ref.allocate_storage([])
+        specimen_data_ref.assign_complexfloat64([], complexdata)
+        specimen_data_ref.rec.mark_data_ready()
+
+        # Specimen Pose Copy
+        sp_data_copy = sp_data.copy()
+        specimen_pose_ref = snde.create_pose_channel_ndarray_ref(
+            transact,
+            '/specimen_pose_copy',
+            snde.recdb_path_join(ros.specimen_model_tree, "meshed_copy"))
+        
+        if len(specimen_pose_ref.data) == 0:
+            specimen_pose_ref.allocate_storage([1])
+        specimen_pose_ref.data[:] = sp_data_copy
+        specimen_pose_ref.rec.mark_metadata_done()
+        specimen_pose_ref.rec.mark_data_ready()
+
+        # Probe Pose Copy
+        pp_data_copy = pp_data.copy()
+        eoat_pose_ref = snde.create_pose_channel_ndarray_ref(
+            transact,
+            '/probe_pose_copy',
+            snde.recdb_path_join(ros.eoat_model_tree, "meshed_copy"))
+            
+        if len(eoat_pose_ref.data) == 0:
+            eoat_pose_ref.allocate_storage([1])
+        eoat_pose_ref.data[:] = pp_data_copy
+        eoat_pose_ref.rec.mark_metadata_done()
+        eoat_pose_ref.rec.mark_data_ready()
+
+    except Exception as e:
+        print(f"Error pushing EC data to recdb: {e}")
+    finally:
+        transact.end_transaction()

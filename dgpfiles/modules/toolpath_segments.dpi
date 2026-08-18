@@ -1,0 +1,243 @@
+# Toolpath structure: waypoints, segment boundaries, and arc length.
+#
+# A scan is not a grid. Noether plans ToolPaths -> ToolPath -> ToolPathSegment ->
+# waypoints over a mesh, and applies a snake modifier so the raster lines run
+# alternately; what arrives at the robot is one flat PoseArray. Acquisition has
+# to know two things that a flat array does not carry: where along the path it
+# is (so a position trigger can fire every `pitch` millimetres) and which parts
+# of the path are scanning passes rather than link moves between them.
+#
+# ScanPath carries both. Segment boundaries come from the planner when it
+# reports them -- tari_interfaces' Noether services now return
+# segment_start_indices -- and are inferred from the geometry when it does not,
+# which is what makes this work for a PoseArray from any source.
+#
+# A rectangular plane scan is the degenerate case: one segment per row, boundaries
+# known exactly, no mesh involved. That path stays available deliberately, because
+# it is how you get data without paying for reconstruction and registration.
+
+import numpy as np
+from geometry_msgs.msg import PoseArray, Pose
+
+# A .dpi is compiled as a function body, so anything the including config
+# needs to see has to be declared global before it is assigned.
+global ScanPath
+global infer_segment_starts
+global scanpath_from_pose_array
+global scanpath_from_plane_grid
+
+
+
+class ScanPath(object):
+    """Ordered 6-DOF waypoints, divided into segments, with arc length.
+
+    positions      (n,3) float64, metres
+    quats          (n,4) float64, (x,y,z,w)
+    segment_starts sorted list of waypoint indices where a segment begins
+    s_m            (n,) cumulative arc length along the path, metres, monotonic
+                   over the WHOLE path -- not reset per segment, because that is
+                   what the trigger box's s means.
+    """
+
+    def __init__(self, positions, quats, segment_starts=None, source="unknown"):
+        self.positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+        self.quats = np.asarray(quats, dtype=np.float64).reshape(-1, 4)
+        self.source = source
+
+        n = self.positions.shape[0]
+        if self.quats.shape[0] != n:
+            raise ValueError("positions and quats disagree: %d vs %d" % (n, self.quats.shape[0]))
+
+        step = np.zeros(n)
+        if n > 1:
+            step[1:] = np.linalg.norm(np.diff(self.positions, axis=0), axis=1)
+        self.s_m = np.cumsum(step)
+
+        if segment_starts is None or len(segment_starts) == 0:
+            self.segment_starts = infer_segment_starts(self.positions)
+            self.segments_inferred = True
+        else:
+            starts = sorted(set(int(i) for i in segment_starts if 0 <= int(i) < n))
+            if not starts or starts[0] != 0:
+                starts = [0] + starts
+            self.segment_starts = starts
+            self.segments_inferred = False
+
+    def __len__(self):
+        return self.positions.shape[0]
+
+    @property
+    def segments(self):
+        """List of (start, end) half-open waypoint ranges."""
+        n = len(self)
+        bounds = list(self.segment_starts) + [n]
+        return [(bounds[i], bounds[i+1]) for i in range(len(bounds)-1) if bounds[i+1] > bounds[i]]
+
+    def segment_length_m(self, seg):
+        start, end = seg
+        if end - start < 2:
+            return 0.0
+        return float(self.s_m[end-1] - self.s_m[start])
+
+    def total_length_m(self):
+        return float(self.s_m[-1]) if len(self) else 0.0
+
+    def acquiring_segments(self, min_length_m=0.0, min_points=2):
+        """Segments long enough to be scanning passes rather than link moves.
+
+        A link move between two raster lines is short -- one line spacing -- and
+        often only two waypoints. Filtering on length is crude but it is the
+        only signal available when the boundaries were inferred; when the
+        planner supplied them, prefer to keep them all and let the caller decide.
+        """
+        out = []
+        for seg in self.segments:
+            if seg[1]-seg[0] < min_points:
+                continue
+            if self.segment_length_m(seg) < min_length_m:
+                continue
+            out.append(seg)
+        return out
+
+    def trace_count(self, pitch_m, segments=None):
+        """How many triggers a position-triggered acquisition will produce.
+
+        Known before the scan starts, which is what lets the accumulator be
+        allocated up front even for a path whose shape is arbitrary.
+        """
+        if segments is None:
+            segments = self.acquiring_segments()
+        total = 0
+        for seg in segments:
+            L = self.segment_length_m(seg)
+            # The +1e-9 matches the trigger in sim_ascan_source.dpi, and for the
+            # same reason: a pass whose length is an exact multiple of the pitch
+            # computes as a hair under it in binary floating point, so plain
+            # floor() predicts one trace too few. A 60-column row at a 0.30/59
+            # pitch is exactly that case -- it predicted 719 traces for a 720
+            # trace scan, and the accumulator would have been one slot short.
+            total += int(L/pitch_m + 1e-9) + 1
+        return total
+
+    def describe(self):
+        segs = self.segments
+        acq = self.acquiring_segments()
+        return ("ScanPath(%s): %d waypoints, %.3f m, %d segments (%s)%s, %d look like scanning passes"
+                % (self.source, len(self), self.total_length_m(), len(segs),
+                   "inferred" if self.segments_inferred else "from planner",
+                   "", len(acq)))
+
+
+def infer_segment_starts(positions, turn_cos=0.5, jump_factor=5.0):
+    """Find segment boundaries in a flat waypoint list, from geometry alone.
+
+    The thing to find is the *link step* -- the move that carries the probe from
+    the end of one raster line to the start of the next. A new segment then
+    begins at that step's endpoint.
+
+    A link step is one whose direction differs from **both** its neighbours.
+    That double-sided test is what makes this work, and the obvious single-sided
+    version does not: a serpentine raster with a lateral link turns through 90
+    degrees twice, not 180 degrees once, so "differs from the previous step"
+    fires on the link *and* on the first scanning step of the next line, and
+    chops one waypoint off the front of every row. The link differs from what
+    came before and from what comes after; the first scanning step of a line
+    differs from the link but agrees with the rest of its own line.
+
+    A step much longer than typical is also treated as a link, which catches
+    disconnected regions and retract/approach moves that happen to stay
+    collinear.
+
+    Defaults are conservative: a missed boundary costs a few mislabelled traces
+    at a line end, a spurious one chops a good line in half. turn_cos = 0.5 is a
+    60 degree turn.
+
+    jump_factor was 2.5 until it was measured against a real planner path, where
+    it was far too tight. Noether places waypoints where raster planes cross mesh
+    edges, so step length inherits the mesh's triangle size and varies by 4.5x
+    WITHIN a single raster line -- the long-step test then fires constantly in
+    the middle of perfectly good lines. Against the 5644-pose, 73-segment
+    surface-following path from curved_scan.ply, with the planner's own
+    segment_start_indices as ground truth:
+
+        jump_factor 2.5 -> 251 inferred, 63 real,  188 spurious
+        jump_factor 5.0 ->  60 inferred, 57 real,    3 spurious
+
+    Note what stays true at any threshold: recall tops out around 78%, because
+    16 of the 72 link steps on that path are SHORTER than the longest step
+    inside a line and 6 of them have zero length (coincident waypoints where one
+    segment ends and the next begins). No purely geometric rule can recover
+    those. That is the argument for the planner reporting its own boundaries --
+    use segment_start_indices whenever the service provides them, and treat this
+    function as the fallback it is.
+    """
+    positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+    n = positions.shape[0]
+    if n < 3:
+        return [0]
+
+    steps = np.diff(positions, axis=0)                 # steps[i]: waypoint i -> i+1
+    lengths = np.linalg.norm(steps, axis=1)
+    nz = lengths > 0
+    typical = np.median(lengths[nz]) if np.any(nz) else 0.0
+
+    unit = np.zeros_like(steps)
+    unit[nz] = steps[nz]/lengths[nz][:, None]
+
+    def differs(a, b):
+        if a < 0 or b < 0 or a >= len(steps) or b >= len(steps):
+            return False
+        if lengths[a] <= 0 or lengths[b] <= 0:
+            return False
+        return float(np.dot(unit[a], unit[b])) < turn_cos
+
+    starts = [0]
+    for i in range(len(steps)):
+        is_link = differs(i, i-1) and differs(i, i+1)
+        if not is_link and typical > 0 and lengths[i] > jump_factor*typical:
+            is_link = True
+        if is_link:
+            boundary = i+1                 # the new segment begins where the link lands
+            if boundary < n and boundary not in starts:
+                starts.append(boundary)
+    return sorted(starts)
+
+
+def scanpath_from_pose_array(pose_array, segment_start_indices=None):
+    """Build a ScanPath from a geometry_msgs/PoseArray.
+
+    Pass the service response's segment_start_indices when you have them. An
+    empty or missing list means the planner did not report structure and the
+    boundaries get inferred -- which is exactly the situation with any toolpath
+    that reaches you as a bare PoseArray.
+    """
+    poses = pose_array.poses if isinstance(pose_array, PoseArray) else pose_array
+    pos = np.array([[p.position.x, p.position.y, p.position.z] for p in poses], dtype=np.float64)
+    quat = np.array([[p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]
+                     for p in poses], dtype=np.float64)
+    src = "PoseArray" if segment_start_indices else "PoseArray (no structure)"
+    return ScanPath(pos, quat, segment_start_indices, source=src)
+
+
+def scanpath_from_plane_grid(uu, vv, ww, rotation, serpentine=True):
+    """Build a ScanPath for the rectangular plane scan.
+
+    uu/vv/ww are the (m,n) world coordinate grids from _plane_grid; rotation is
+    the geometry_msgs Quaternion held constant over the scan. One segment per
+    row, boundaries exact -- no mesh, no registration, no inference. This is the
+    quick-look path and it produces the same ScanPath type as a Noether toolpath,
+    so everything downstream is shared.
+    """
+    m = uu.shape[0]
+    n = uu.shape[1]
+    pos = []
+    starts = []
+    for j in range(n):
+        starts.append(len(pos))
+        cols = range(m) if (not serpentine or j % 2 == 0) else range(m-1, -1, -1)
+        for i in cols:
+            pos.append((float(uu[i, j]), float(vv[i, j]), float(ww[i, j])))
+    pos = np.array(pos, dtype=np.float64)
+    q = np.tile(np.array([[rotation.x, rotation.y, rotation.z, rotation.w]], dtype=np.float64),
+                (pos.shape[0], 1))
+    return ScanPath(pos, q, starts, source="plane grid %dx%d" % (m, n))

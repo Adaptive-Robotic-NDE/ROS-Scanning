@@ -1,0 +1,572 @@
+# Scenario B: an existing mesh of the specimen goes in, a toolpath comes out.
+#
+# The plane scan builds its own raster from three taught points and needs none of
+# this. Everything here exists for the other case -- a mesh already describes the
+# surface, and the scan should follow it rather than a rectangle.
+#
+# Four pieces, each of which can be used on its own:
+#
+#   plan_noether_toolpath()  call principal_axis_noether_srv on a mesh file
+#   scanpath_from_noether()  turn its PoseArray into a ScanPath, with the tool
+#                            orientation made consistent and the specimen placed
+#   mesh_uv_x3d()            parameterize an arbitrary mesh so it can be
+#                            projected onto -- projection needs a UV map and a
+#                            PLY has none
+#   write_plate_ply()        synthesise a plate mesh, so the whole path can be
+#                            exercised without depending on a particular
+#                            specimen being present and positioned
+#
+# Deliberately kept out of the config: none of it is specific to UT, and the
+# service call needs its own ROS node rather than the dgpy motion module's.
+
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global plan_noether_toolpath
+global scanpath_from_noether
+global mesh_uv_x3d
+global write_plate_ply
+global quat_to_matrix
+global matrix_to_quat
+global orient_tool_away_from_surface
+global regularize_tool_roll
+global NOETHER_SERVICE
+
+
+NOETHER_SERVICE = "principal_axis_noether"
+
+
+global quat_mul
+def quat_mul(a, b):
+    """Quaternion product, both (x, y, z, w)."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw*bx + ax*bw + ay*bz - az*by,
+            aw*by - ax*bz + ay*bw + az*bx,
+            aw*bz + ax*by - ay*bx + az*bw,
+            aw*bw - ax*bx - ay*by - az*bz)
+
+
+def quat_to_matrix(q):
+    """Rotation matrix from an (x, y, z, w) quaternion. Columns are the axes."""
+    x, y, z, w = q
+    n = np.sqrt(x*x + y*y + z*z + w*w)
+    if n == 0.0:
+        return np.eye(3)
+    x, y, z, w = x/n, y/n, z/n, w/n
+    return np.array([
+        [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
+        [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
+        [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]], dtype=np.float64)
+
+
+def matrix_to_quat(R):
+    """(x, y, z, w) from a rotation matrix, via the largest-diagonal branch."""
+    R = np.asarray(R, dtype=np.float64)
+    tr = R[0, 0] + R[1, 1] + R[2, 2]
+    if tr > 0.0:
+        s = np.sqrt(tr + 1.0)*2.0
+        w = 0.25*s
+        x = (R[2, 1] - R[1, 2])/s
+        y = (R[0, 2] - R[2, 0])/s
+        z = (R[1, 0] - R[0, 1])/s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])*2.0
+        w = (R[2, 1] - R[1, 2])/s
+        x = 0.25*s
+        y = (R[0, 1] + R[1, 0])/s
+        z = (R[0, 2] + R[2, 0])/s
+    elif R[1, 1] > R[2, 2]:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])*2.0
+        w = (R[0, 2] - R[2, 0])/s
+        x = (R[0, 1] + R[1, 0])/s
+        y = 0.25*s
+        z = (R[1, 2] + R[2, 1])/s
+    else:
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])*2.0
+        w = (R[1, 0] - R[0, 1])/s
+        x = (R[0, 2] + R[2, 0])/s
+        y = (R[1, 2] + R[2, 1])/s
+        z = 0.25*s
+    q = np.array([x, y, z, w], dtype=np.float64)
+    return q/np.linalg.norm(q)
+
+
+def regularize_tool_roll(positions, quats, segments=None, mode="fixed",
+                         reference=(1.0, 0.0, 0.0)):
+    """Choose the roll about the tool axis rather than inheriting the planner's.
+
+    THIS IS NOT COSMETIC. Noether builds each pose with z along the surface
+    normal and x along the raster direction, and on some lines it emits x and y
+    SWAPPED for a run of waypoints -- a commanded roll of exactly 90 degrees,
+    then exactly 90 back, several times within one straight 0.30 m pass whose
+    surface normal never changes. The arm executes it faithfully: measured on
+    one such pass, wrist_3 travelled 557 degrees to accomplish a move that needed
+    20, in a sawtooth of three full out-and-back cycles. Nine of 29 passes on the
+    test plate did it; the other twenty had exactly 0.0 degrees of within-pass
+    orientation variation. That is where the 4x trajectory-state counts and the
+    70-second passes came from.
+
+    orient_tool_away_from_surface() cannot catch this. It corrects the SIGN of
+    the tool z axis; a 90 degree roll about z leaves z untouched.
+
+    The fix is to stop inheriting the roll at all, because for this measurement
+    it carries no information: a UT transducer is rotationally symmetric about
+    its own axis, so the roll is free for us to choose. Choosing it well is worth
+    real time and real wrist travel.
+
+      "fixed"    (default) roll from a fixed world reference. The tool z still
+                 follows the surface; the roll then changes only as much as the
+                 normal forces it to, which is the least wrist motion available
+                 and has no discontinuities anywhere -- including at the
+                 serpentine turns, where a travel-aligned frame would flip 180.
+      "path"     x along the direction of travel, computed from the positions
+                 rather than trusted from the planner. This is what Noether
+                 intends; use it when the tool is NOT symmetric and its
+                 orientation relative to the scan direction matters.
+      "planner"  keep whatever came back. The old behaviour, kept so the fault
+                 above can be reproduced.
+
+    Returns (quats, max_roll_change_deg) so the caller can report what it did.
+    """
+    positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+    quats = np.asarray(quats, dtype=np.float64).reshape(-1, 4)
+    if mode == "planner":
+        return quats.copy(), 0.0
+    if mode not in ("fixed", "path"):
+        raise ValueError("mode must be 'fixed', 'path' or 'planner', not %r" % (mode,))
+
+    n = quats.shape[0]
+    ref = np.asarray(reference, dtype=np.float64)
+    ref = ref/np.linalg.norm(ref)
+
+    # Tangents, per segment so a segment boundary never contributes a direction.
+    tangent = np.zeros((n, 3))
+    if mode == "path":
+        bounds = list(segments) if segments else [(0, n)]
+        for a, b in bounds:
+            if b - a < 2:
+                continue
+            d = np.zeros((b-a, 3))
+            d[:-1] = np.diff(positions[a:b], axis=0)
+            d[-1] = d[-2]
+            tangent[a:b] = d
+
+    out = np.empty_like(quats)
+    prev_x = None
+    for i in range(n):
+        z = quat_to_matrix(quats[i])[:, 2]
+        nz = np.linalg.norm(z)
+        if nz == 0.0:
+            out[i] = quats[i]
+            continue
+        z = z/nz
+
+        if mode == "path":
+            cand = tangent[i]
+            if np.linalg.norm(cand) < 1e-12:
+                cand = prev_x if prev_x is not None else ref
+        else:
+            cand = ref
+            # A reference parallel to the tool axis leaves the roll undefined.
+            # Only happens on a near-vertical surface with the default +x.
+            if abs(float(np.dot(cand, z))) > 0.99:
+                cand = np.array([0.0, 0.0, 1.0]) if abs(z[2]) < 0.9 \
+                    else np.array([0.0, 1.0, 0.0])
+
+        x = cand - float(np.dot(cand, z))*z
+        nx = np.linalg.norm(x)
+        if nx < 1e-9:
+            out[i] = quats[i]
+            continue
+        x = x/nx
+        # Keep the sign continuous, so a tangent that reverses at a serpentine
+        # turn does not hand back a 180 degree roll.
+        if prev_x is not None and float(np.dot(x, prev_x)) < 0.0 and mode == "fixed":
+            x = -x
+        y = np.cross(z, x)
+        out[i] = matrix_to_quat(np.column_stack([x, y, z]))
+        prev_x = x
+
+    # Report the worst roll change between neighbours, which is the number the
+    # arm pays for.
+    worst = 0.0
+    for i in range(1, n):
+        Ra = quat_to_matrix(out[i-1])
+        Rb = quat_to_matrix(out[i])
+        c = (np.trace(Ra.T @ Rb) - 1.0)/2.0
+        worst = max(worst, float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0)))))
+    return out, worst
+
+
+def orient_tool_away_from_surface(quats, up=(0.0, 0.0, 1.0)):
+    """Make every tool z axis point away from the specimen, not into it.
+
+    Two independent things want this, and they want the same thing:
+
+      * the projector. raytrace_sensor_evaluate_zdist puts the sensor at the
+        origin of its own frame looking in the MINUS z direction, so a probe
+        above a part has its frame z pointing UP. Verified by splatting the same
+        points with each cardinal orientation against a real parameterized mesh:
+        z up hits from above and misses from below, z down does the reverse.
+      * the arm. probe_end is mounted the same way round, which is why the plane
+        scan can hand the projector the robot's own pose unmodified.
+
+    Noether emits tool z along the surface normal, which is the right convention
+    -- but the normals it gets from NormalEstimationPCLMeshModifier are not
+    consistently oriented. On curved_scan.ply 47% of the poses came out pointing
+    the other way, and a probe told to approach half the part from underneath is
+    not a scan.
+
+    The flip is 180 degrees about the tool's own x axis, which reverses z while
+    leaving x -- the direction of travel along the raster line -- alone.
+
+    `up` is the direction "away from the specimen" points on average. The default
+    is world +z, correct for a part lying on a table.
+    """
+    up = np.asarray(up, dtype=np.float64)
+    out = np.array(quats, dtype=np.float64).reshape(-1, 4).copy()
+    flipped = 0
+    for i in range(out.shape[0]):
+        R = quat_to_matrix(out[i])
+        if float(np.dot(R[:, 2], up)) < 0.0:
+            out[i] = quat_mul(tuple(out[i]), (1.0, 0.0, 0.0, 0.0))
+            flipped += 1
+    return out, flipped
+
+
+def plan_noether_toolpath(mesh_filename, line_spacing=0.01, z_offset=0.0,
+                          snake=True, rotation_offset=0.0, origin=(0, 0, 0),
+                          distance_threshold=0.0, estimate_normals=True,
+                          timeout=300.0, service=None):
+    """Ask principal_axis_noether_srv for a raster toolpath over a mesh.
+
+    Returns the service response, which carries `success`, `noether_pose_array`
+    and `segment_start_indices`. Use those indices -- they are the planner's own
+    raster-line boundaries, and inferring them from geometry tops out around 78%
+    recall on a real path because some link steps are shorter than the longest
+    step inside a line and some have zero length.
+
+    Runs on its own short-lived node rather than through the dgpy motion module.
+    A service call that blocks while holding a module context is the standard way
+    to wedge this stack, and none of this needs the module's state.
+
+    Things that will otherwise cost you an afternoon:
+
+      * The mesh is read in WORLD coordinates. The server emits vertex positions
+        as poses directly, so a mesh authored about its own origin plans a
+        toolpath in the floor.
+      * z_offset is SUBTRACTED from every pose. Negative lifts the path above the
+        surface, which is what standoff wants; positive drives the probe into
+        the part.
+      * estimate_normals must be on for any mesh without vertex normals --
+        PlaneSlicerRasterPlanner refuses one outright ("does not have vertex
+        normals"). It maps to the request's `depth_reconstruction` field, which
+        is misleadingly named: it is the normals switch.
+      * The request has an `orientation` field. The server ignores it. Fix the
+        orientation on this side -- see orient_tool_away_from_surface().
+    """
+    import rclpy
+    from rclpy.node import Node
+    from tari_interfaces.srv import PrincipalAxisNoetherPlanner
+
+    if not os.path.exists(mesh_filename):
+        raise IOError("no such mesh: %s" % (mesh_filename,))
+
+    node = Node("noether_toolpath_client")
+    try:
+        client = node.create_client(PrincipalAxisNoetherPlanner,
+                                    service or NOETHER_SERVICE)
+        if not client.wait_for_service(timeout_sec=15.0):
+            raise RuntimeError(
+                "no %s service. Start it with:\n"
+                "  ros2 run tari_noether_srv principal_axis_noether_srv"
+                % (service or NOETHER_SERVICE,))
+
+        req = PrincipalAxisNoetherPlanner.Request()
+        req.mesh_filename = mesh_filename
+        req.line_spacing = float(line_spacing)
+        req.rotation_offset = float(rotation_offset)
+        req.origin = [int(v) for v in origin]
+        req.z_offset = float(z_offset)
+        req.distance_threshold = float(distance_threshold)
+        req.depth_reconstruction = bool(estimate_normals)
+        req.snake = bool(snake)
+        req.orientation.w = 1.0
+
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+        res = future.result()
+        if res is None:
+            raise RuntimeError("noether planner did not answer within %.0f s" % timeout)
+        return res
+    finally:
+        node.destroy_node()
+
+
+def scanpath_from_noether(response, offset=(0.0, 0.0, 0.0), orient="surface",
+                          fixed_quat=None, up=(0.0, 0.0, 1.0), roll="fixed"):
+    """ScanPath from a Noether response, ready to hand to the acquisition.
+
+    offset translates the whole path, which is how a mesh gets placed in the
+    cell without re-authoring it. It has to be applied to the projection surface
+    too or the traces land on the wrong part of the image -- SurfaceProjector
+    takes the same offset for exactly that reason.
+
+    orient:
+      "surface"  keep Noether's per-pose orientation, made consistent by
+                 orient_tool_away_from_surface(). Follows the part.
+      "fixed"    one orientation for the whole path, from fixed_quat (x,y,z,w).
+                 Right when the surface is mild and the probe is a fixed
+                 standoff transducer, and the only option that works at all if
+                 the estimated normals swing further than the wrist can follow.
+    """
+    poses = response.noether_pose_array.poses
+    if not poses:
+        raise ValueError("noether returned an empty pose array")
+
+    pos = np.array([[p.position.x, p.position.y, p.position.z] for p in poses],
+                   dtype=np.float64)
+    pos = pos + np.asarray(offset, dtype=np.float64).reshape(1, 3)
+    quats = np.array([[p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]
+                      for p in poses], dtype=np.float64)
+
+    starts = [int(i) for i in response.segment_start_indices]
+
+    if orient == "fixed":
+        if fixed_quat is None:
+            raise ValueError("orient='fixed' needs fixed_quat as (x, y, z, w)")
+        quats = np.tile(np.asarray(fixed_quat, dtype=np.float64).reshape(1, 4),
+                        (pos.shape[0], 1))
+        flipped = 0
+        worst_roll = 0.0
+    elif orient == "surface":
+        quats, flipped = orient_tool_away_from_surface(quats, up=up)
+        # Then re-derive the roll about the tool axis. The sign correction above
+        # cannot see a 90 degree roll, and Noether emits those in runs, mid-pass,
+        # on a surface whose normal is not changing. See regularize_tool_roll().
+        bounds = list(starts) + [pos.shape[0]]
+        segs = [(bounds[i], bounds[i+1]) for i in range(len(bounds)-1)
+                if bounds[i+1] > bounds[i]]
+        quats, worst_roll = regularize_tool_roll(pos, quats, segments=segs, mode=roll)
+    else:
+        raise ValueError("orient must be 'surface' or 'fixed', not %r" % (orient,))
+
+    path = ScanPath(pos, quats, starts, source="noether (%d poses)" % len(poses))
+    path.noether_flipped = flipped
+    path.worst_roll_step_deg = worst_roll
+    return path
+
+
+def mesh_uv_x3d(mesh_filename, x3d_filename, method="planar", timeout=900.0,
+                blender_python=None):
+    """UV-parameterize a mesh and write it as X3D for the projector.
+
+    project_point_onto_parameterization needs a parameterization, and a PLY or
+    STL has none. For the plane scan the surface is synthesised with a trivial
+    two-triangle UV map; for a real mesh something has to compute one.
+
+    This reuses the Blender workflow already in the tree (dgpfiles/x3dConverter.py,
+    which drives the eddy-current process): import, clean, consistent normals,
+    triangulate, unwrap. Two things had to change to make the result loadable:
+
+      * Blender's own X3D exporter rounds texture coordinates to FOUR decimal
+        places. spatialnde2 reindexes texture vertices by exact coordinate, so on
+        an 18780-vertex mesh that quantization welded eight distinct UV vertices
+        together, producing seven zero-area UV triangles and seven UV edges
+        shared by more than two triangles -- and x3d_load_geometry refuses the
+        mesh ("Edge involving original uv vertices ... is shared by more than two
+        triangles"). So Blender does the unwrap and the helper script writes the
+        X3D itself, at full precision.
+      * The exporter also converts to the X3D Y-up convention and emits a
+        Transform to match. The mesh is already in world coordinates and has to
+        stay there, because the projector is registered to probe poses by
+        construction.
+
+    method:
+      "planar"       UV is the surface's footprint on its own principal plane.
+                     One island, no seams, bijective for anything plate-like,
+                     and it makes the projected image directly comparable to a
+                     rectangular c-scan -- the same property the synthesised
+                     plane patch has. Wrong for a part that folds back on itself.
+      "angle_based"  seams from sharp edges, angle-based unwrap: the existing
+                     x3dConverter.py recipe. General, but the UV layout has no
+                     simple relationship to the part.
+
+    Blender runs as a SUBPROCESS deliberately. bpy is a singleton that installs
+    its own signal handlers and never really unloads; importing it into a
+    long-running dgpy session is not worth the risk when a subprocess costs a few
+    seconds.
+    """
+    if not os.path.exists(mesh_filename):
+        raise IOError("no such mesh: %s" % (mesh_filename,))
+    helper = os.path.join(os.path.dirname(os.path.abspath(_noether_module_file())),
+                          "mesh_uv_blender.py")
+    if not os.path.exists(helper):
+        raise IOError("missing helper script %s" % (helper,))
+
+    cmd = [blender_python or sys.executable, helper, "--",
+           mesh_filename, x3d_filename, method]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          timeout=timeout)
+    out = proc.stdout.decode("utf-8", "replace")
+    summary = [l for l in out.splitlines() if l.startswith("MESHUV")]
+    if proc.returncode != 0 or not os.path.exists(x3d_filename):
+        raise RuntimeError("UV parameterization failed (exit %d):\n%s"
+                           % (proc.returncode, out[-4000:]))
+    for line in summary:
+        print("  %s" % line)
+    return x3d_filename
+
+
+global _noether_module_file
+def _noether_module_file():
+    """Where this .dpi lives, so the Blender helper beside it can be found.
+
+    A .dpi has no __file__ -- it is compiled as a function body -- so the config
+    records the module directory when it includes this file.
+    """
+    return os.path.join(SCAN_MODULE_DIR, "noether_path.dpi")
+
+
+def write_plate_ply(path, origin, u_vec, v_vec, nu=41, nv=41, bow=0.0,
+                    also_x3d=None):
+    """Write a plate as a triangulated PLY with vertex normals.
+
+    This exists to make the mesh path testable. The specimen mesh that happens to
+    be in this tree is a real scanned surface whose normals swing to near
+    horizontal, and whose position the arm cannot work around -- so a scan that
+    depends on it cannot distinguish "the mesh workflow is broken" from "that
+    part is not reachable from here". A plate written over ground the arm is
+    known to cover separates the two.
+
+    origin/u_vec/v_vec are world-frame 3-vectors: the plate spans
+    origin -> origin+u_vec -> origin+u_vec+v_vec -> origin+v_vec.
+
+    bow raises the middle of the plate by that many metres along the surface
+    normal, as a half-cosine in u. bow=0 gives a flat plate whose Noether
+    toolpath should reproduce a plain raster; a few centimetres gives a genuinely
+    curved surface with the normals still pointing usefully upward.
+
+    Vertex normals are written, so the planner does not need to estimate them --
+    which also means the toolpath orientation is exact rather than whatever a
+    radius-0.01 PCL normal estimate produced.
+    """
+    o = np.asarray(origin, dtype=np.float64)
+    u = np.asarray(u_vec, dtype=np.float64)
+    v = np.asarray(v_vec, dtype=np.float64)
+    n = np.cross(u, v)
+    n = n/np.linalg.norm(n)
+
+    us = np.linspace(0.0, 1.0, nu)
+    vs = np.linspace(0.0, 1.0, nv)
+    uu, vv = np.meshgrid(us, vs, indexing="ij")
+    height = bow*np.sin(np.pi*uu) if bow else np.zeros_like(uu)
+    pts = (o.reshape(1, 1, 3)
+           + uu[..., None]*u.reshape(1, 1, 3)
+           + vv[..., None]*v.reshape(1, 1, 3)
+           + height[..., None]*n.reshape(1, 1, 3))
+
+    # Analytic normals: the surface is o + s*u + t*v + bow*sin(pi*s)*n, so
+    # d/ds and d/dt are exact and the cross product is the true normal. Estimated
+    # normals are the single largest source of nonsense in a Noether toolpath, so
+    # where they can be computed they should be.
+    du = u.reshape(1, 1, 3) + (bow*np.pi*np.cos(np.pi*uu))[..., None]*n.reshape(1, 1, 3)
+    dv = np.tile(v.reshape(1, 1, 3), (nu, nv, 1))
+    nrm = np.cross(du, dv)
+    nrm = nrm/np.linalg.norm(nrm, axis=2, keepdims=True)
+    if float(np.dot(nrm.reshape(-1, 3).mean(axis=0), n)) < 0.0:
+        nrm = -nrm
+
+    verts = pts.reshape(-1, 3)
+    norms = nrm.reshape(-1, 3)
+
+    def vid(i, j):
+        return i*nv + j
+
+    tris = []
+    for i in range(nu-1):
+        for j in range(nv-1):
+            a, b, c, d = vid(i, j), vid(i+1, j), vid(i+1, j+1), vid(i, j+1)
+            tris.append((a, b, c))
+            tris.append((a, c, d))
+    tris = np.array(tris, dtype=np.int64)
+
+    # Wind every triangle so its face normal agrees with the surface normal.
+    # The x3d loader sorts the triangle fan around each vertex and asserts when
+    # it cannot, and inconsistent winding is one way to get there.
+    p0, p1, p2 = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+    fn = np.cross(p1-p0, p2-p0)
+    wrong = (fn*norms[tris[:, 0]]).sum(axis=1) < 0.0
+    tris[wrong] = tris[wrong][:, [0, 2, 1]]
+
+    with open(path, "w") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write("comment plate written by noether_path.dpi\n")
+        f.write("element vertex %d\n" % verts.shape[0])
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property float nx\nproperty float ny\nproperty float nz\n")
+        f.write("element face %d\n" % tris.shape[0])
+        f.write("property list uchar int vertex_indices\n")
+        f.write("end_header\n")
+        for p, q in zip(verts, norms):
+            f.write("%.9g %.9g %.9g %.9g %.9g %.9g\n"
+                    % (p[0], p[1], p[2], q[0], q[1], q[2]))
+        for t in tris:
+            f.write("3 %d %d %d\n" % (t[0], t[1], t[2]))
+
+    if also_x3d is not None:
+        # Noether loads meshes with pcl::io::loadPolygonFile -- PLY, OBJ, STL,
+        # VTK, and NOT X3D. spatialnde2's projector reads X3D and not PLY. The
+        # same surface therefore has to exist in both formats, and writing them
+        # from one array is the only way they stay the same surface.
+        _write_x3d_grid(also_x3d, pts, nu, nv)
+
+    return path, verts, tris
+
+
+global _write_x3d_grid
+def _write_x3d_grid(path, pts, nu, nv):
+    """X3D for a plate grid, with UV running 0..1 along u and v.
+
+    The parameterization is the plate's own (u, v), so the projected image is
+    directly comparable to a rectangular c-scan over the same area -- and it
+    needs no Blender, because a grid already has a parameterization.
+    """
+    verts = pts.reshape(-1, 3)
+    us = np.linspace(0.0, 1.0, nu)
+    vs = np.linspace(0.0, 1.0, nv)
+    uu, vv = np.meshgrid(us, vs, indexing="ij")
+    uvs = np.stack([uu.reshape(-1), vv.reshape(-1)], axis=1)
+
+    idx = []
+    for i in range(nu-1):
+        for j in range(nv-1):
+            a, b, c, d = i*nv+j, (i+1)*nv+j, (i+1)*nv+j+1, i*nv+j+1
+            idx.append((a, b, c))
+            idx.append((a, c, d))
+
+    coordidx = " ".join("%d %d %d -1" % t for t in idx)
+    with open(path, "w") as f:
+        f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        f.write('<!DOCTYPE X3D PUBLIC "ISO//Web3D//DTD X3D 3.3//EN" '
+                '"http://www.web3d.org/specifications/x3d-3.3.dtd">\n')
+        f.write('<X3D profile="Interchange" version="3.3">\n  <Scene>\n    <Transform>\n')
+        f.write('      <Shape>\n')
+        f.write('        <IndexedFaceSet solid="false" coordIndex="%s" texCoordIndex="%s">\n'
+                % (coordidx, coordidx))
+        f.write('          <Coordinate point="%s"/>\n'
+                % " ".join("%.9g %.9g %.9g" % (p[0], p[1], p[2]) for p in verts))
+        f.write('          <TextureCoordinate point="%s"/>\n'
+                % " ".join("%.9g %.9g" % (t[0], t[1]) for t in uvs))
+        f.write('        </IndexedFaceSet>\n')
+        f.write('        <Appearance><Material diffuseColor="0.8 0.8 0.8"/></Appearance>\n')
+        f.write('      </Shape>\n    </Transform>\n  </Scene>\n</X3D>\n')
+    return path

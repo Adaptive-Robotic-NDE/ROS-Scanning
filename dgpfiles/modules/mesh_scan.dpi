@@ -1,0 +1,538 @@
+# ==============================================================================
+# SCENARIO B: EXISTING MESH IN, SCAN OUT
+# ==============================================================================
+# The plane scan defines its own geometry from three taught points. This does the
+# other thing: a mesh already describes the surface, Noether plans a toolpath over
+# it, and the scan follows that. Everything downstream is shared -- the same
+# triggered acquisition, the same trace list, the same projector -- because the
+# acquisition takes a ScanPath and knows nothing about where it came from.
+#
+# What is NOT shared is the rectangular volume. There is no grid here, so there
+# is no quick-look c-scan and no `assignmap`; the trace list and the projection
+# are the whole output. That is deliberate and is the reason the trace list
+# exists.
+
+global mesh_scan_path
+mesh_scan_path = None
+global mesh_scan_x3d
+mesh_scan_x3d = None
+
+global _scan_work_dir
+def _scan_work_dir():
+    return SCAN_STORAGE_DIR if scan_storage_manager is not None else "/tmp"
+
+global make_test_plate
+def make_test_plate(size=None, height=None, bow=None, divisions=None,
+                    origin=None, name="test_plate"):
+    """Write a bowed plate over the flat scan's ground, as PLY and X3D.
+
+    This is the regression specimen for the mesh path, and it is here for the
+    same reason ASCAN_SIM_DTYPE exists: to exercise a path end to end without
+    depending on hardware -- or in this case on a particular part being present,
+    positioned and reachable. A scan of the real specimen mesh cannot tell you
+    whether the mesh workflow works, because that mesh does not plan in this cell
+    at all (see CURVED_SPECIMEN_MESH).
+
+    Both formats, from one array. Noether loads meshes with
+    pcl::io::loadPolygonFile -- PLY, OBJ, STL, VTK, and NOT X3D -- while
+    spatialnde2's projector reads X3D and not PLY. Writing them separately is how
+    they stop being the same surface.
+    """
+    size = TEST_PLATE_SIZE if size is None else size
+    height = TEST_PLATE_HEIGHT if height is None else height
+    bow = TEST_PLATE_BOW if bow is None else bow
+    divisions = TEST_PLATE_DIVISIONS if divisions is None else divisions
+    origin = SCAN_ORIGIN if origin is None else origin
+
+    o = np.array([origin[0], origin[1], height], dtype=np.float64)
+    u = np.array([size, 0.0, 0.0])
+    v = np.array([0.0, size, 0.0])
+
+    ply = os.path.join(_scan_work_dir(), name + ".ply")
+    x3d = os.path.join(_scan_work_dir(), name + ".x3d")
+    write_plate_ply(ply, o, u, v, nu=divisions, nv=divisions, bow=bow, also_x3d=x3d)
+    print("  test plate: %.2f x %.2f m at z=%.3f, bow %.0f mm, %dx%d"
+          % (size, size, height, bow*1e3, divisions, divisions))
+    print("    mesh for the planner: %s" % ply)
+    print("    surface for the projector: %s" % x3d)
+    return ply, x3d
+
+global plan_mesh_path
+def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
+                   offset=None, orient=None, uv_method=None, x3d=None,
+                   estimate_normals=None, roll=None, source=None,
+                   specimen_kwargs=None):
+    """Plan a toolpath over a mesh and prepare its projection surface.
+
+    Returns (ScanPath, x3d path). Both are also left in the globals
+    mesh_scan_path / mesh_scan_x3d, so a scan started afterwards from the prompt
+    does not have to replan -- planning a real mesh takes tens of seconds and the
+    result does not change.
+
+    Passing mesh=None asks obtain_specimen_mesh() for one, which is where the
+    four ways of getting a mesh -- on disk, synthesised, Azure, Keyence -- come
+    together. With SPECIMEN_SOURCE at its default "auto" that resolves to
+    NOETHER_MESH if it is set and the synthesised test plate otherwise, which is
+    exactly what this function did before the reconstruction stage existed.
+
+    source= forces one route for this call, e.g. plan_mesh_path(source="azure")
+    to go and measure the part first.
+    """
+    global mesh_scan_path, mesh_scan_x3d
+
+    line_spacing = NOETHER_LINE_SPACING if line_spacing is None else line_spacing
+    z_offset = NOETHER_Z_OFFSET if z_offset is None else z_offset
+    snake = NOETHER_SNAKE if snake is None else snake
+    offset = NOETHER_MESH_OFFSET if offset is None else offset
+    orient = NOETHER_ORIENTATION if orient is None else orient
+    uv_method = NOETHER_UV_METHOD if uv_method is None else uv_method
+    roll = NOETHER_TOOL_ROLL if roll is None else roll
+
+    if mesh is None:
+        mesh, obtained_x3d = obtain_specimen_mesh(source=source,
+                                                  **(specimen_kwargs or {}))
+        if x3d is None:
+            x3d = obtained_x3d
+        # A synthesised plate is written with analytic vertex normals, so the
+        # planner does not have to estimate them -- and an estimated normal is
+        # the single largest source of nonsense in a Noether toolpath. A
+        # reconstruction has only estimated normals to begin with, so it needs
+        # the planner's.
+        if estimate_normals is None and specimen_source_used == "plate":
+            estimate_normals = False
+    if estimate_normals is None:
+        estimate_normals = True
+
+    # Is this mesh even in the cell? A mesh authored about its own origin plans
+    # a toolpath in the floor, and a reconstruction that tracked the wrong frame
+    # lands a metre away and reconstructs cleanly while it does it -- both have
+    # happened here, and both cost an afternoon because the first sign of them
+    # was an unreachable toolpath rather than anything about the mesh. The work
+    # volume is what "in the cell" means, so it can be checked in one line
+    # before the planner is asked for anything.
+    _check_mesh_in_work_volume(mesh)
+
+    print("planning %s (line spacing %.1f mm, z offset %+.3f m)"
+          % (mesh, line_spacing*1e3, z_offset))
+    res = plan_noether_toolpath(mesh, line_spacing=line_spacing, z_offset=z_offset,
+                                snake=snake, estimate_normals=estimate_normals)
+    if not res.success:
+        raise RuntimeError("noether planning failed for %s -- check the service log "
+                           "(a mesh with no vertex normals needs estimate_normals=True)"
+                           % (mesh,))
+
+    fixed_quat = None
+    if orient == "fixed":
+        # The orientation the arm is actually holding. Taken from live TF rather
+        # than written down, because it is a property of how the probe is mounted
+        # in this cell and it changes when the tooling does.
+        t = ros.t
+        if t is None:
+            raise RuntimeError("no TF for probe_end; cannot take the fixed orientation")
+        r = t.transform.rotation
+        fixed_quat = (float(r.x), float(r.y), float(r.z), float(r.w))
+
+    path = scanpath_from_noether(res, offset=offset, orient=orient,
+                                 fixed_quat=fixed_quat, roll=roll)
+    print("  %s" % path.describe())
+    if orient == "surface":
+        print("  orientation: %d of %d poses flipped so the probe faces the part"
+              % (path.noether_flipped, len(path)))
+        # The number that matters for wrist travel. Anything near 90 means the
+        # planner's roll is being followed and the arm will stop and spin
+        # mid-pass; see NOETHER_TOOL_ROLL.
+        print("  tool roll: %s, worst orientation step between waypoints %.2f deg"
+              % (roll, path.worst_roll_step_deg))
+        _spans = [max((_quat_angle(path.quats[a], path.quats[i])
+                       for i in range(a, b)), default=0.0)
+                  for a, b in path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)]
+        _bad = [i for i, v in enumerate(_spans) if v > 5.0]
+        if _bad:
+            print("  WARNING: %d pass(es) vary in orientation by up to %.1f deg along "
+                  "their own length (%s). The arm will stop and rotate mid-pass."
+                  % (len(_bad), max(_spans), ", ".join(str(i) for i in _bad[:8])))
+        else:
+            print("  every pass holds its orientation to within %.2f deg along its "
+                  "own length" % (max(_spans) if _spans else 0.0,))
+
+    if x3d is None:
+        x3d = os.path.join(_scan_work_dir(),
+                           os.path.splitext(os.path.basename(mesh))[0] + "_uv.x3d")
+        print("  parameterizing %s -> %s" % (os.path.basename(mesh), x3d))
+        mesh_uv_x3d(mesh, x3d, method=uv_method)
+
+    acq = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    print("  %d of %d segments are scanning passes (>= %.0f mm); %.3f m of travel, "
+          "%d traces at a %.2f mm pitch"
+          % (len(acq), len(path.segments), PATH_MIN_SEGMENT_M*1e3,
+             sum(path.segment_length_m(s) for s in acq),
+             path.trace_count(_mesh_pitch(), acq), _mesh_pitch()*1e3))
+
+    mesh_scan_path = path
+    mesh_scan_x3d = x3d
+    return path, x3d
+
+global _check_mesh_in_work_volume
+def _check_mesh_in_work_volume(mesh, warn_fraction=0.5):
+    """Say how much of a mesh lies inside the cell, before planning over it.
+
+    A warning rather than a refusal, and deliberately: a legitimate mesh can
+    overhang the box a little, and the reconstructions this is most useful for
+    are exactly the ones somebody is still debugging. What it must not do is
+    stay quiet when a mesh is somewhere else entirely.
+    """
+    volume = work_volume()
+    if volume is None:
+        return None
+    try:
+        verts = _mesh_vertices(mesh)
+    except Exception as e:
+        print("  (could not read %s to check it against the work volume: %s)"
+              % (os.path.basename(mesh), e))
+        return None
+    if not len(verts):
+        return None
+    inside = in_work_volume(verts)
+    frac = float(inside.mean())
+    lo = verts.min(axis=0)
+    hi = verts.max(axis=0)
+    if frac < warn_fraction:
+        _f, wlo, whi = volume
+        print("  WARNING: only %.0f%% of %s is inside the cell's work volume."
+              % (frac*100.0, os.path.basename(mesh)))
+        print("    mesh spans   x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f"
+              % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+        print("    work volume  x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f"
+              % (wlo[0], whi[0], wlo[1], whi[1], wlo[2], whi[2]))
+        print("    A mesh authored about its own origin, or reconstructed while "
+              "tracking the wrong frame, looks exactly like this.")
+    else:
+        print("  %.0f%% of the mesh is inside the cell's work volume" % (frac*100.0,))
+    return frac
+
+
+global _mesh_vertices
+def _mesh_vertices(path):
+    """(n,3) vertex positions from a binary or ascii PLY, or an STL.
+
+    Deliberately small and dependency-free: this runs to CHECK a mesh, and a
+    check that needs open3d to be importable is a check that gets skipped.
+    """
+    import re
+    import struct
+
+    low = path.lower()
+    if low.endswith(".stl"):
+        with open(path, "rb") as f:
+            head = f.read(80)
+            if head[:5].lower() == b"solid" and b"facet" in f.read(512):
+                f.seek(0)
+                vals = [float(v) for line in f
+                        for v in (line.split()[1:4]
+                                  if line.strip().lower().startswith(b"vertex")
+                                  else [])]
+                return np.asarray(vals, dtype=np.float64).reshape(-1, 3)
+            f.seek(80)
+            n = struct.unpack("<I", f.read(4))[0]
+            data = np.frombuffer(f.read(n*50), count=n,
+                                 dtype=np.dtype([("n", "<3f4"), ("v", "<9f4"),
+                                                 ("a", "<u2")]))
+            return data["v"].reshape(-1, 3).astype(np.float64)
+
+    with open(path, "rb") as f:
+        hdr = b""
+        while b"end_header" not in hdr:
+            line = f.readline()
+            if not line:
+                raise IOError("no PLY header in %s" % path)
+            hdr += line
+        txt = hdr.decode("ascii", "replace")
+        n = int(re.search(r"element vertex (\d+)", txt).group(1))
+        section = txt.split("element vertex")[1].split("element")[0]
+        props = re.findall(r"property (\w+) (\w+)", section)
+        if "format ascii" in txt:
+            vals = []
+            for _ in range(n):
+                vals.append([float(v) for v in f.readline().split()[:3]])
+            return np.asarray(vals, dtype=np.float64)
+        types = {"float": "<f4", "float32": "<f4", "double": "<f8",
+                 "uchar": "u1", "int": "<i4", "uint": "<u4",
+                 "short": "<i2", "ushort": "<u2"}
+        dt = [(name, types[t]) for t, name in props]
+        arr = np.frombuffer(f.read(np.dtype(dt).itemsize*n), dtype=dt, count=n)
+        return np.stack([arr["x"], arr["y"], arr["z"]], axis=1).astype(np.float64)
+
+
+global _quat_angle
+def _quat_angle(qa, qb):
+    """Angle between two (x,y,z,w) orientations, degrees."""
+    Ra = quat_to_matrix(qa)
+    Rb = quat_to_matrix(qb)
+    c = (np.trace(Ra.T @ Rb) - 1.0)/2.0
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+global _mesh_pitch
+def _mesh_pitch():
+    """Trace pitch along a pass. Kept as the old name; see trace_pitch()."""
+    return trace_pitch()
+
+global mesh_path_feasibility
+def mesh_path_feasibility(path=None, sample=15, lifts=(0.0,), verbose=True):
+    """Can the arm actually enter and finish these passes? Ask before scanning.
+
+    Reproduces exactly what approach_row_start() does -- solve IK at the pass END
+    with collision checking, seed the START from that solution, and check both --
+    because that, and not "is this pose reachable", is what decides whether a pass
+    completes. Every pose on the real specimen mesh is individually reachable and
+    almost none of the passes are enterable, so the cheap test is the misleading
+    one.
+
+    Costs a couple of IK calls per sampled segment and moves nothing.
+    """
+    path = mesh_scan_path if path is None else path
+    if path is None:
+        raise RuntimeError("no toolpath planned yet -- call plan_mesh_path() first")
+
+    segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    lengths = [path.segment_length_m(s) for s in segs]
+    order = list(np.argsort(lengths)[::-1][:sample])
+    report = []
+    for lift in lifts:
+        ok_end = 0
+        ok_both = 0
+        for si in order:
+            start, end = segs[si]
+            p_end = path.positions[end-1] + np.array([0.0, 0.0, lift])
+            p_start = path.positions[start] + np.array([0.0, 0.0, lift])
+            q_end = ros.SolveIK(_pose_stamped(p_end, path.quats[end-1]))
+            if q_end is None:
+                continue
+            ok_end += 1
+            q_start = ros.SolveIK(_pose_stamped(p_start, path.quats[start]), seed=q_end)
+            if q_start is not None:
+                ok_both += 1
+        report.append({"lift_m": lift, "sampled": len(order),
+                       "valid_end": ok_end, "valid_both": ok_both})
+        if verbose:
+            print("  lift %+.3f m: %d/%d passes have a usable end configuration, "
+                  "%d/%d usable at both ends"
+                  % (lift, ok_end, len(order), ok_both, len(order)))
+    return report
+
+global _pose_msg
+def _pose_msg(xyz, quat_xyzw):
+    """A bare geometry_msgs/Pose, for filling a PoseArray."""
+    p = Pose()
+    p.position.x = float(xyz[0])
+    p.position.y = float(xyz[1])
+    p.position.z = float(xyz[2])
+    p.orientation.x = float(quat_xyzw[0])
+    p.orientation.y = float(quat_xyzw[1])
+    p.orientation.z = float(quat_xyzw[2])
+    p.orientation.w = float(quat_xyzw[3])
+    return p
+
+global _pose_stamped
+def _pose_stamped(xyz, quat_xyzw, frame="world"):
+    """The same pose, stamped -- which for IK is not optional.
+
+    SolveIK() falls back to the module's from_frame_rel when handed a bare Pose,
+    and this module was constructed as motion('ros', recdb, 'probe_end', 'world')
+    -- so an unstamped pose is interpreted in the PROBE's own frame. Every
+    solution then comes back empty and it reads exactly like an unreachable
+    toolpath: 0 of 10 passes solvable over ground the flat scan raster covers
+    every day. The plane path never hit it because scan_corners() builds its
+    poses from live TF, which arrives stamped 'world' already.
+    """
+    ps = PoseStamped()
+    ps.header.frame_id = frame
+    ps.pose = _pose_msg(xyz, quat_xyzw)
+    return ps
+
+global Scan2DMeshPath
+def Scan2DMeshPath(path=None, x3d=None, max_passes=None, force=False):
+    """Acquire along a planned toolpath. No grid, no rectangular volume.
+
+    The differences from Scan2DPlaneTriggered are exactly the ones the geometry
+    forces, and no others:
+
+      * no volume and no /ut_cscan, because there is no grid to index. The trace
+        list plus the projection is the output.
+      * every pose on the path carries its own orientation, so the probe follows
+        the surface rather than holding one attitude.
+      * a pass that will not plan is DROPPED and reported rather than aborting
+        the scan. Noether segments are ragged and some of them will not plan;
+        with a trace list a dropped pass costs coverage there and nothing
+        anywhere else, which is not true of a grid.
+    """
+    global scan_origin, mesh_scan_path, mesh_scan_x3d
+
+    path = mesh_scan_path if path is None else path
+    x3d = mesh_scan_x3d if x3d is None else x3d
+    if path is None:
+        raise RuntimeError("no toolpath planned yet -- call plan_mesh_path() first")
+    if getattr(ascan_source, "trigger_mode", "timer") not in ("position", "timestamped"):
+        raise RuntimeError("Scan2DMeshPath needs ASCAN_TRIGGER_MODE = 'position' or "
+                           "'timestamped'. There is no grid here to bin a free-running "
+                           "digitizer into, so the trigger IS the trace index.")
+
+    segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    if max_passes is not None:
+        segs = segs[:max_passes]
+    # No grid here, so nothing constrains the pitch except the operator: the
+    # step size is the step size.
+    pitch = set_trigger_pitch(SCAN_STEP_SIZE)
+
+    # The simulator's defect map is keyed on position relative to the scan
+    # origin, so give it the toolpath's own footprint corner.
+    scan_origin = (float(path.positions[:, 0].min()), float(path.positions[:, 1].min()))
+    origin_xy = scan_origin
+
+    _show_cscan_panel()
+    travel = sum(path.segment_length_m(s) for s in segs)
+    print("Mesh path scan: %d passes, %.3f m of travel, %d traces expected at %.2f mm"
+          % (len(segs), travel, path.trace_count(pitch, segs), pitch*1e3))
+
+    # The projection extent is the surface's own footprint, not a pass length:
+    # the parameterization spans the whole part, so that is what the pixel count
+    # has to resolve the spot against.
+    extent = float(max(path.positions[:, 0].ptp(), path.positions[:, 1].ptp()))
+    plan = plan_current_scan(path_length_m=travel, passes=len(segs),
+                             step_m=pitch, projection_extent_m=extent,
+                             force=force)
+
+    _prepare_trace_accum(path.trace_count(pitch, segs))
+
+    positions = np.array(path.positions, dtype=np.float64)
+    quats = np.array(path.quats, dtype=np.float64)
+
+    def _approach(idx, end_idx):
+        # Same reasoning as approach_row_start(): solve the far end first and
+        # seed the start from it, so the pass is entered in a configuration that
+        # can also finish it. Here it goes through MoveIt, so the move is
+        # collision checked rather than merely commanded.
+        start_pose = _pose_stamped(positions[idx], quats[idx])
+        end_pose = _pose_stamped(positions[end_idx], quats[end_idx])
+        q = ros.ApproachInConfiguration(start_pose, end_pose)
+        if q is not None:
+            return True
+        print("    no row-spanning configuration for this pass")
+        return False
+
+    def _sweep(start, end):
+        poses = PoseArray()
+        poses.header.frame_id = "world"
+        for k in range(start, end):
+            poses.poses.append(_pose_msg(positions[k], quats[k]))
+        r = ros.CartesianMove(poses, vel=raster_velocity(), acc=RASTER_ACCEL,
+                              min_fraction=PATH_MIN_FRACTION)
+        return _move_outcome(r)
+
+    def _pose_at(seg, s_m, xy):
+        start, end = seg
+        s0 = path.s_m[start]
+        idx = int(np.searchsorted(path.s_m[start:end], s0 + s_m) + start)
+        idx = min(max(idx, start), end-1)
+        pos = positions[idx]
+        x, y = float(pos[0]), float(pos[1])
+        if xy is not None:
+            # The trigger's xy is measured and interpolated to the exact
+            # crossing, so it beats the commanded value. z and the orientation
+            # still come from the path -- the surface is what says how high the
+            # probe was and which way it was pointing.
+            x = float(xy[0]) + origin_xy[0]
+            y = float(xy[1]) + origin_xy[1]
+        return pose7_from_parts((x, y, float(pos[2])), tuple(quats[idx]))
+
+    def _setup():
+        global cscan_gates, ndaccumulator, cscanfunction
+        # An earlier scan in this session left a gate chain, and possibly a plane
+        # scan's volume accumulator reading /current_ascan with a c-scan reading
+        # the volume. Nothing here feeds that volume a grid, so every trace this
+        # scan stages would land in it at an index that means nothing.
+        #
+        # The gates go first and in their own transaction: teardown_gated_cscan
+        # opens one, and it has to RELEASE the gate parameter channels, not just
+        # delete the functions, or setup_gated_cscan below cannot define them
+        # again.
+        if cscan_gates is not None:
+            teardown_gated_cscan(recdb, cscan_gates)
+            cscan_gates = None
+
+        transact = recdb.start_transaction()
+        if cscanfunction is not None:
+            transact.delete_math_function(["/ut_cscan", "/ut_cscan_tof"], cscanfunction)
+            cscanfunction = None
+        if ndaccumulator is not None:
+            transact.delete_math_function(["/ut_scan_volume"], ndaccumulator)
+            ndaccumulator = None
+        transact.end_transaction().globalrev_wait().wait_complete()
+
+        if trace_accum is not None:
+            trace_accum.setup()
+            cscan_gates = setup_gated_cscan(recdb, trace_accum.traces_path, "/ut/gate",
+                                            CSCAN_GATES)
+        if projection_enabled() and x3d is not None:
+            global projector
+            radius, pixels = projection_settings(scan_plan)
+            if projector is not None and getattr(projector, "x3d_path", None) == x3d:
+                # Same surface: empty the picture and reuse it. Rebuilding is not
+                # an option -- the channels x3d_load_geometry defines under the
+                # model tree cannot be handed back from Python, so a second
+                # SurfaceProjector on the same prefix fails. See restart().
+                # restart() re-instantiates the math function, so a changed spot
+                # radius or pixel count does take effect on the reused surface.
+                projector.radius = radius
+                projector.horizontal_pixels = pixels
+                projector.vertical_pixels = pixels
+                projector.restart()
+                print("  projection surface reused (image cleared): %s" % x3d)
+            else:
+                if projector is not None:
+                    projector.teardown()
+                    projector = None
+                projector = SurfaceProjector(recdb, x3d, prefix="/ut/proj",
+                                             radius=radius,
+                                             horizontal_pixels=pixels,
+                                             vertical_pixels=pixels,
+                                             create_textured_part=PROJECTION_TEXTURED_PART,
+                                             offset=NOETHER_MESH_OFFSET)
+                print("  projection surface: %s" % x3d)
+
+    def _progress(si, nseg, seg_report, elapsed):
+        if seg_report.get("skipped"):
+            print("  pass %d/%d: SKIPPED, %.3f m of coverage lost, %.1f s elapsed"
+                  % (si+1, nseg, seg_report["length_m"], elapsed))
+            return
+        L = seg_report["length_m"]
+        frac = seg_report.get("fraction")
+        print("  pass %d/%d: %d traces (expected %d), commanded %.3f m / observed "
+              "%.3f m (%.0f%%)%s, %.1f s elapsed"
+              % (si+1, nseg, seg_report["staged"], seg_report["expected"], L,
+                 seg_report["observed_m"],
+                 100.0*seg_report["observed_m"]/L if L else 0.0,
+                 "" if frac is None else ", planner %.0f%%" % (100.0*frac),
+                 elapsed))
+
+    try:
+        report = run_triggered_path_scan(path, ascan_source, pitch,
+                                         _approach, _sweep, _stage_ascan, _pose_at,
+                                         setup_after_first=_setup, segments=segs,
+                                         progress=_progress,
+                                         on_segment_failure="skip")
+    finally:
+        ascan_source.disarm()
+        ros.WaitUnPauseAcquisition()
+
+    print("Mesh path scan complete: %d traces (%d expected), %.1f s, %.3f s/trace."
+          % (report["staged"], report["expected_traces"], report["elapsed"],
+             report["elapsed"]/max(report["staged"], 1)))
+    if report.get("skipped"):
+        lost = sum(s["length_m"] for s in report["skipped"])
+        print("  %d pass(es) dropped, %.3f m of planned coverage not acquired. "
+              "The traces that were taken are still correct -- each carries its "
+              "own pose -- but that ground was not scanned."
+              % (len(report["skipped"]), lost))
+    report_scan_outcome(report)
+    finish_projection()
+    return report
