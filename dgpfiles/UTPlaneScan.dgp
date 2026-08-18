@@ -220,7 +220,26 @@ MAX_TRACE_RATE_HZ = {"live": 10.0, "deferred": 22.0, "off": 22.0}
 #                               between runs or mid-session. Everything that
 #                               needs them asks the data (see ascan_geometry()).
 #
-# Switching between the two is this one line.
+# Switching between the two is this one line. ASCAN_CHANNEL_PATH follows it
+# automatically, and nothing downstream is aware of which one is loaded.
+#
+# WHAT ASCAN_TRIGGER_MODE MEANS DIFFERS BETWEEN THE TWO, and it is the only
+# thing that does:
+#
+#            simulated                        hardware
+#   timer    free-run at ASCAN_RATE_HZ        the card free-runs; the scan
+#            and let the scan sample it       samples it. run_default_scan /
+#                                             run_raster_scan.
+#   position synthesise a trace AT each       NOT AVAILABLE from software -- on
+#            crossing (models a trigger       hardware the trigger box fires the
+#            box without the hardware)        card by wire. Raises, rather than
+#                                             quietly sampling instead.
+#   timestamped  free-run and correlate       identical, and this is the
+#            by measurement timestamp         arrangement a real digitizer is
+#                                             actually driven in.
+#
+# So "timestamped" is the mode that means the same thing on both sides, which
+# is why it is the one to develop a triggered scan against.
 
 ASCAN_SOURCE = "simulated"
 
@@ -946,7 +965,43 @@ elif ASCAN_SOURCE == "hardware":
     from dgpython_gage_compuscope import gc
 
     CS = CompuScope("CS", recdb, 0, 0, 0, 0, Mode="SINGLE")
-    ascan_source = None   # no simulated source object; the card is the source
+    # The card free-runs and knows nothing about the scan, so there is no
+    # "source object" to arm the way the simulator provides one. What the
+    # triggered acquisition needs instead is a correlator, and that is not
+    # simulator-specific: TimestampedTriggerSource reads each trace out of the
+    # globalrev its own trigger's pose transaction produced, whatever put it
+    # there. Building it here is what makes run_triggered_scan() work on
+    # hardware -- without it ascan_source stays None, Scan2DPlaneTriggered
+    # refuses, and the card silently gets only the two sampling paths.
+    ascan_source = None
+    if ASCAN_TRIGGER_MODE == "timestamped":
+        if transmgr is None:
+            raise RuntimeError("ASCAN_TRIGGER_MODE='timestamped' needs "
+                               "RECDB_TRANSACTION_MANAGER='timed' -- the correlation "
+                               "IS the timestamp ordering, and the ordered manager "
+                               "does not provide it.")
+        ascan_source = TimestampedTriggerSource(
+            recdb, transaction_clock, ASCAN_CHANNEL_PATH,
+            probe_position_relative_to_scan,
+            SCAN_STEP_SIZE if ASCAN_TRIGGER_PITCH is None else ASCAN_TRIGGER_PITCH,
+            pose_path="/ut/trigger_pose")
+        print("  A-scan trigger: timestamped correlation against the card's own "
+              "free-running output on %s" % (ASCAN_CHANNEL_PATH,))
+    elif ASCAN_TRIGGER_MODE == "position":
+        # "position" means something different here than it does for the
+        # simulator. There, the source synthesises a trace AT the crossing; a
+        # real card cannot be made to do that from software, so a position
+        # trigger on hardware is a WIRE -- the trigger box fires the card
+        # directly (see scan-trigger-box/). Nothing in this config drives that,
+        # and pretending otherwise would produce a scan that silently samples
+        # instead of triggering, so say so rather than continue.
+        raise RuntimeError(
+            "ASCAN_TRIGGER_MODE='position' with ASCAN_SOURCE='hardware' is not "
+            "something this config can arrange: the card is triggered by the "
+            "trigger box in hardware, not by software. Use 'timestamped' to "
+            "correlate the free-running card against the probe position, or "
+            "'timer' for the sampling paths (run_default_scan / "
+            "run_raster_scan).")
 else:
     raise ValueError("ASCAN_SOURCE must be 'simulated' or 'hardware', not %r" % (ASCAN_SOURCE,))
 
@@ -985,6 +1040,44 @@ include(None, os.path.join(SCAN_MODULE_DIR, "specimen.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "sim_specimen.dpi"))
 
 
+global capture_point
+def capture_point(label=None):
+    """Snapshot the probe pose for one corner of a taught scan area.
+
+    This is the three-point workflow's only input: drive the probe to a corner,
+    call this, repeat three times, hand the three to Scan2DPlaneTriggered. See
+    docs/three-point-plane-scan.md.
+
+    It exists rather than telling people to write `p1 = ros.t` because of what
+    ros.t is before TF arrives: the motion module initialises it to an EMPTY
+    TransformStamped -- frame_id '', stamp 0, position (0,0,0), orientation
+    identity -- and it is never None, so a bare capture cannot tell "the probe
+    is here" from "this process has never heard from TF". Teaching three corners
+    from that is silent: the corners are all identical, the plane is degenerate,
+    and the first sign of trouble is a scan somewhere else entirely. Seen
+    2026-08-18, on a dgpy that had come up against a cell whose DDS discovery
+    had gone stale after nine hours.
+
+    Returns the TransformStamped, which is a snapshot: the TF thread rebinds
+    ros.t on every poll rather than mutating it, so captures stay distinct while
+    the arm keeps moving.
+    """
+    t = ros.t
+    if t is None or not t.header.frame_id or not t.child_frame_id:
+        raise RuntimeError(
+            "no probe pose yet: ros.t is still the empty transform this module "
+            "starts with, so nothing has been heard from TF. The cell is not "
+            "running, or this process cannot see it -- check that the bring-up "
+            "is up and that `ros2 topic echo /tf` shows traffic. Capturing now "
+            "would teach a corner at the origin.")
+    xyz = (t.transform.translation.x, t.transform.translation.y,
+           t.transform.translation.z)
+    print("  captured %s: x %.4f  y %.4f  z %.4f  (%s -> %s)"
+          % (label or "point", xyz[0], xyz[1], xyz[2],
+             t.header.frame_id, t.child_frame_id))
+    return t
+
+
 global scan_corners
 def scan_corners(size=0.30, height=1.0, origin=None):
     """Three TransformStamped corners for a square scan area.
@@ -997,12 +1090,15 @@ def scan_corners(size=0.30, height=1.0, origin=None):
     """
     p1 = ros.t
     waited = 0.0
-    while p1 is None and waited < 30.0:
+    # An EMPTY transform counts as "no TF yet", not as a pose. ros.t is never
+    # None -- the module initialises it to a blank TransformStamped -- so
+    # waiting on None alone returns instantly with a corner at the origin.
+    while (p1 is None or not p1.header.frame_id) and waited < 30.0:
         print("waiting for TF ...")
         time.sleep(1.0)
         waited += 1.0
         p1 = ros.t
-    if p1 is None:
+    if p1 is None or not p1.header.frame_id:
         raise RuntimeError("no TF for probe_end after %.0f s; is the simulation running?" % waited)
 
     p1 = copy.deepcopy(p1)
