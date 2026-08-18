@@ -4,12 +4,253 @@ Teach a scan area by driving the probe to three points and capturing the pose at
 each. No mesh, no reconstruction, no registration — which is the whole reason
 this path exists and why it is the one to reach for on a new part or a new cell.
 
-Verified end to end in simulation on 2026-08-17, by the procedure below rather
-than by a convenience wrapper: three points captured from `ros.t` at three
-manually reached poses, then `Scan2DPlaneTriggered` — 183 of 183 traces staged,
-every pass `move_ok` at `fraction 1.0`, 0 stager errors, 0 late transactions.
+**Part 1 is a runbook**: copy, paste, scan. Part 2 explains what the three
+points mean and the traps behind them; read it before teaching a part you care
+about.
 
-## What the three points mean
+Verified end to end in simulation on 2026-08-18 by exactly the runbook below:
+183 of 183 traces staged, every pass `move_ok` at `fraction 1.0`, 0 stager
+errors, 0 late transactions.
+
+---
+
+# Part 1 — Runbook
+
+## 0. What you need running
+
+Two terminals. The first runs the robot cell (ROS 2), the second runs
+dataguzzler-python. In simulation both are inside the `ros2-workstation`
+container; on hardware they are wherever the robot's ROS installation lives.
+
+**In simulation**, get a shell in the container first — from the workspace root
+on the host:
+
+```bash
+./ros2_docker.sh shell
+```
+
+Every command below assumes ROS is sourced in whichever shell you use:
+
+```bash
+source /opt/ros/iron/setup.bash
+source ~/ros_ws/install/setup.bash
+```
+
+## 1. Terminal 1 — start the cell
+
+One command brings up the robot, MoveIt, RViz, both motion action servers and
+the shared services. In simulation it also starts Gazebo:
+
+```bash
+ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=sim
+```
+
+On hardware, the same command with the mode changed:
+
+```bash
+ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=hardware
+```
+
+Wait for the summary line `N started, 0 skipped`. Anything unavailable is
+skipped **by name with a reason** rather than taking the bring-up down with it,
+so read that list — a skipped motion server means nothing will move later.
+
+To see what a cell would start without starting it:
+
+```bash
+ros2 run tari_bringup tari_cell_info --cell ex-ur10e-1 --mode sim
+```
+
+The plane scan needs only the robot and the motion servers, so if the machine is
+busy you can leave the service layer out:
+
+```bash
+ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=sim services:=false
+```
+
+In simulation, check the arm is actually there before going further:
+
+```bash
+ros2 topic echo /tf --once
+```
+
+## 2. Terminal 2 — start dataguzzler-python
+
+```bash
+cd ~/software_ws/ROS-Scanning/dgpfiles      # in the container
+dataguzzler-python UTPlaneScan.dgp
+```
+
+That is the whole command — the configuration takes no arguments. It opens the
+SpatialNDE2 viewer, prints a summary of the current settings, and leaves you at
+a `dgpy>` prompt. Everything from here on is typed at that prompt.
+
+If you want the scan to talk to the **real digitizer** instead of the built-in
+simulator, edit one line near the top of `UTPlaneScan.dgp` before starting it:
+
+```python
+ASCAN_SOURCE = "hardware"        # "simulated" is the default
+```
+
+`ASCAN_CHANNEL_PATH` follows automatically (`/CS_CH1` for the GaGe CompuScope,
+`/ut_ascan` for the simulator) and nothing downstream is aware of which one is
+loaded. See "Real digitizer" below for the one thing that does differ.
+
+Expect the banner to end with:
+
+```
+  A-scan source: simulated
+  step size 5.00 mm, line spacing 10.00 mm, velocity 50.0 mm/s, projection live
+```
+
+## 3. Set the scan up (optional, but do it once)
+
+Open the technician panel and see what the current settings would cost, without
+moving anything:
+
+```python
+show_scan_panel()
+preview_scan_plan()
+```
+
+Step size, line spacing and velocity are the controls; everything else — trace
+rate, scan time, memory, projection resolution — is derived from them and the
+plan will clamp or refuse rather than let you exceed the measured limits.
+
+## 4. Teach the three corners
+
+Drive the probe to each corner however you normally do — pendant, servoing, or
+`ros.MoveJoints(...)` from this prompt — and capture at each one:
+
+```python
+p1 = capture_point("origin")     # corner 1: origin, AND the scan orientation
+p2 = capture_point("u axis")     # corner 2: far end of the first scan axis
+p3 = capture_point("v extent")   # corner 3: the other axis
+```
+
+Each call prints where it captured, and refuses if this process has never heard
+from TF rather than quietly handing you a corner at the origin:
+
+```
+  captured origin: x 0.7496  y -0.3502  z 1.0991  (world -> probe_end)
+```
+
+**Square the probe up before capturing `p1`.** Its orientation is the one held
+for the entire scan; the other two contribute position only.
+
+## 5. Choose the grid and scan
+
+```python
+m, n = plane_grid_size(0.30)                    # square area, side in metres
+res = Scan2DPlaneTriggered(p1, p2, p3, m, n)
+```
+
+`m` is the number of points along a row, `n` the number of rows, both derived
+from the step size and line spacing you set in step 3. For a **rectangle**,
+derive them from the two taught lengths instead:
+
+```python
+import numpy as np
+def taught_length(a, b):
+    pa = np.array([a.transform.translation.x, a.transform.translation.y, a.transform.translation.z])
+    pb = np.array([b.transform.translation.x, b.transform.translation.y, b.transform.translation.z])
+    return float(np.linalg.norm(pb - pa))
+
+m = int(round(taught_length(p1, p2) / SCAN_STEP_SIZE)) + 1
+n = int(round(taught_length(p1, p3) / SCAN_LINE_SPACING)) + 1
+res = Scan2DPlaneTriggered(p1, p2, p3, m, n)
+```
+
+**Try a couple of rows first** on anything new — same call, same geometry, stops
+early:
+
+```python
+res = Scan2DPlaneTriggered(p1, p2, p3, m, n, max_rows=3)
+```
+
+## 6. Check what you got
+
+```python
+res['staged'], res['expected_traces']      # traces in the database vs planned
+res['stager_errors'], res['late_transactions']    # both should be 0
+[s['fraction'] for s in res['per_segment']]       # 1.0 on every pass
+res['skipped']                                    # rows that did not run
+```
+
+A healthy short run:
+
+```
+segments 3, expected_traces 183, staged 183, stager_errors 0,
+late_transactions 0, elapsed 31.9 s
+```
+
+The data is in the recording database: `/ut_scan_volume` is `(m, n, nsamples)`,
+`/ut_cscan` the gated image, `/ut/traces` the flat trace list with a pose per
+trace. Retune the gate live from the panel — it reads `/cscan_start` and
+`/cscan_end` as channels, so the c-scan recomputes without rescanning:
+
+```python
+project_traces()        # rebuild the projected image from the trace list
+```
+
+## 7. The whole thing, condensed
+
+```bash
+# terminal 1
+source /opt/ros/iron/setup.bash && source ~/ros_ws/install/setup.bash
+ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=sim
+```
+
+```bash
+# terminal 2
+source /opt/ros/iron/setup.bash && source ~/ros_ws/install/setup.bash
+cd ~/software_ws/ROS-Scanning/dgpfiles && dataguzzler-python UTPlaneScan.dgp
+```
+
+```python
+# at the dgpy> prompt, driving the probe to each corner in between
+preview_scan_plan()
+p1 = capture_point("origin")
+p2 = capture_point("u axis")
+p3 = capture_point("v extent")
+m, n = plane_grid_size(0.30)
+res = Scan2DPlaneTriggered(p1, p2, p3, m, n, max_rows=3)   # drop max_rows for the full scan
+res['staged'], res['expected_traces'], res['stager_errors']
+```
+
+## Real digitizer
+
+`ASCAN_SOURCE = "hardware"` loads the GaGe CompuScope. Record length, sample
+rate and sample type are **not** set in this config — they are whatever the card
+is configured for, they can change between runs, and everything that needs them
+asks the data.
+
+`ASCAN_TRIGGER_MODE` is the one setting that means something different on
+hardware:
+
+| mode | simulated | hardware |
+|---|---|---|
+| `"timer"` | free-runs at `ASCAN_RATE_HZ`, the scan samples it | the card free-runs, the scan samples it — `run_default_scan()` / `run_raster_scan()` |
+| `"position"` | synthesises a trace at each crossing, modelling a trigger box | **refuses**: on hardware the trigger box fires the card by wire and this config cannot arrange it |
+| `"timestamped"` | free-runs and correlates by measurement timestamp | identical, and this is how a real digitizer is actually driven |
+
+So develop a triggered scan against `"timestamped"`: it is the mode that means
+the same thing on both sides. It requires `RECDB_TRANSACTION_MANAGER = "timed"`,
+which is the default here.
+
+## When it does not work
+
+| symptom | cause |
+|---|---|
+| `capture_point` raises "nothing has been heard from TF" | the cell is not running, or this process cannot see it. Check terminal 1 and `ros2 topic echo /tf`. In simulation after the cell has been up a long time, DDS discovery can go stale for *new* processes — restart the container |
+| `no A-scan on /ut_ascan after 30 s` | with `ASCAN_TRIGGER_MODE="position"` the simulator only emits when the probe MOVES, so the first scan of a session needs the arm to have moved at least one trigger pitch. Jog it, then scan |
+| a pass reports `fraction` well below 1.0 | the arm entered the row in a configuration that cannot follow it. The scan refuses to fill in the rest — see the trap below |
+| everything refuses to plan | the arm may be parked in an invalid state. `ros2 service call /check_state_validity moveit_msgs/srv/GetStateValidity "{group_name: ur_manipulator}"` |
+| nothing moves and nothing is logged | in simulation, restart the container first (`./ros2_docker.sh restart`); a Gazebo that has been up for hours takes the rest of the stack down with it in ways that read as unrelated failures |
+
+---
+
+# Part 2 — What the three points mean
 
 | point | what it fixes |
 |---|---|
@@ -25,81 +266,29 @@ consequences worth knowing before you teach a part:
   and t3 only contributes its perpendicular distance. Teaching a rough third
   corner gives a clean rectangle, not a parallelogram.
 - **The scan plane is the plane through all three points.** If the three are not
-  coplanar with the surface you meant, the scan is flat and the surface is not;
-  that is fine for a quick look and wrong for a gated C-scan (see "when the
-  plane is a lie" below).
-- **Orientation comes from t1 alone** and is held for every point. Whatever
-  attitude the probe is in when you capture t1 is the attitude it scans in, so
-  square the probe up before capturing the first point, not the second.
+  coplanar with the surface you meant, the scan is flat and the surface is not.
+- **Orientation comes from t1 alone** and is held for every point.
 
-## The procedure
-
-Drive the probe to each corner however you normally do — pendant, servoing,
-`ros.MoveJoints`, anything — and capture at each:
-
-```python
-pt1 = ros.t        # origin corner; probe squared up as you want it to scan
-# ... drive to the far end of the first scan axis ...
-pt2 = ros.t        # sets the u direction and length
-# ... drive to the far corner of the other axis ...
-pt3 = ros.t        # sets the v extent
-```
-
-**`ros.t` is a snapshot, not a live handle.** The TF thread rebinds it to a new
-`TransformStamped` on every poll rather than mutating the one you hold
-(`motion.py`, `self.t = self._tf_buffer.lookup_transform(...)`), so the three
-captures stay distinct while the arm keeps moving. Verified: `pt1` still read
-x = 0.7496 after the arm had moved on to x = 1.0499 and `pt2` had been taken. No
-`deepcopy` needed.
-
-Then choose the grid and scan:
-
-```python
-m, n = plane_grid_size(0.30)                  # from the technician settings
-res = Scan2DPlaneTriggered(pt1, pt2, pt3, m, n)
-```
-
-`m` is the number of points ALONG a row (u), `n` is the number of ROWS (v). For
-a rectangle the sizes differ, so derive them from the two lengths rather than
-one:
-
-```python
-import numpy as np
-def _len(a, b):
-    pa = np.array([a.transform.translation.x, a.transform.translation.y, a.transform.translation.z])
-    pb = np.array([b.transform.translation.x, b.transform.translation.y, b.transform.translation.z])
-    return float(np.linalg.norm(pb - pa))
-
-m = int(round(_len(pt1, pt2) / SCAN_STEP_SIZE)) + 1
-n = int(round(_len(pt1, pt3) / SCAN_LINE_SPACING)) + 1
-```
-
-`SCAN_M` / `SCAN_N` in the config override the derivation if you would rather
-pin the grid; `plane_grid_size()` honours them.
-
-## Which of the three to call
+## Which call to use
 
 All three take the same `(t1, t2, t3, m, n)` and build identical geometry.
 
 | call | motion | acquisition | use it when |
 |---|---|---|---|
-| `Scan2DPlane(...)` | stops at every point | one A-scan while stationary | the geometry is in doubt, or the probe needs to settle. Costs a MoveIt plan-and-execute cycle per point — 0.3–0.5 s regardless of step size |
-| `Scan2DPlaneRaster(...)` | one continuous trajectory per row | free-running digitizer, samples binned to the nearest grid column | a quick continuous scan where the digitizer has no position trigger |
-| `Scan2DPlaneTriggered(...)` | one continuous trajectory per row | **one trace per position trigger** | the normal choice. Trigger k IS column k — nothing is binned, nothing is filled from a neighbour, and the pose on a trace is the interpolated trigger crossing rather than whatever TF last published |
+| `Scan2DPlane` | stops at every point | one A-scan while stationary | the geometry is in doubt, or the probe needs to settle. Costs a MoveIt plan-and-execute cycle per point — 0.3–0.5 s regardless of step size |
+| `Scan2DPlaneRaster` | one continuous trajectory per row | free-running digitizer, samples binned to the nearest grid column | a quick continuous scan with no position trigger |
+| `Scan2DPlaneTriggered` | one continuous trajectory per row | **one trace per position trigger** | the normal choice. Trigger k IS column k — nothing is binned, and the pose on a trace is the interpolated trigger crossing rather than whatever TF last published |
 
-`Scan2DPlaneTriggered` requires `ASCAN_TRIGGER_MODE = "position"` (or
-`"timestamped"`) and refuses otherwise. The trigger pitch is set from the grid
-at the start of the scan — trigger k must be column k, so the pitch is not
-yours to choose independently of `m`.
+`Scan2DPlaneTriggered` requires `ASCAN_TRIGGER_MODE = "position"` or
+`"timestamped"` and refuses otherwise. The trigger pitch is set from the grid at
+the start of the scan — trigger k must be column k, so it is not yours to choose
+independently of `m`.
 
-Both continuous forms take `max_rows=` (stop after that many rows) and
-`force=`; the point-to-point form takes `max_points=`. The volume is allocated
-at full size either way, so a short run is a dry run of the real geometry rather
-than a different scan.
+Both continuous forms take `max_rows=` and `force=`; the point-to-point form
+takes `max_points=`. The volume is allocated at full size either way, so a short
+run is a dry run of the real geometry rather than a different scan.
 
 ## Reading the result
-
-The returned dict is the scan's own account of itself. The fields that matter:
 
 | field | meaning |
 |---|---|
@@ -111,53 +300,48 @@ The returned dict is the scan's own account of itself. The fields that matter:
 | `late_transactions`, `max_lateness_secs` | the timestamped-acquisition window — should be 0 |
 | `stager_max_queue_depth` | how close the staging pipeline came to falling behind |
 
-A healthy 3-row run looks like:
-
-    segments 3, expected_traces 183, staged 183, stager_errors 0,
-    late_transactions 0, elapsed 32.8 s
-
-Then `/ut_scan_volume` holds `(m, n, nsamples)` and `/ut_cscan` the gated
-reduction, retunable live from the panel (`show_scan_panel()`) because the gate
-reads `/cscan_start` and `/cscan_end` as channels rather than constants.
-
 ## Traps
+
+**`ros.t` is a snapshot, but an empty one until TF arrives.** The TF thread
+rebinds it on every poll rather than mutating the object you hold, so three
+captures stay distinct while the arm keeps moving — verified: `p1` still read
+x = 0.7496 after the arm had moved to x = 1.0499 and `p2` had been taken, no
+`deepcopy` needed. What it is NOT is None before TF exists: the motion module
+initialises it to a blank `TransformStamped`, so a bare `p1 = ros.t` on a
+process that cannot see the cell yields a corner at the origin, silently. That
+is why `capture_point()` exists and why it checks.
 
 **A pass that runs short is a fabricated C-scan, not a gap.** The volume is
 indexed by grid position, so a row that stops three quarters of the way along
 does not leave a hole — the acquisition fills the rest from a neighbour and the
 image looks complete. That is why `RASTER_MIN_FRACTION` is 1.0 and why the
-Cartesian stage refuses a short path outright instead of logging it. Do not
-lower it for a grid scan; `PATH_MIN_FRACTION` exists for the surface-following
-scans, where a short pass costs coverage rather than correctness.
+Cartesian stage refuses a short path outright. Do not lower it for a grid scan;
+`PATH_MIN_FRACTION` exists for the surface-following scans, where a short pass
+costs coverage rather than correctness.
 
 **Pin the origin for anything you intend to compare.** `scan_corners()` with
 `origin=None` starts from wherever the probe happens to be, which drifts between
-sessions; a scan started from a wandered position can run off the edge of the
-workspace and every point past the limit only logs "Ensure point is reachable".
-Capturing t1 by hand is the pinned version of that, which is the point of this
-workflow.
+sessions. Capturing t1 by hand is the pinned version of that.
 
 **When the plane is a lie.** A flat scan plane over a curved part changes the
 standoff across the scan, so the gate walks off the feature and the C-scan is
-wrong even though every trace is real. That is acceptable for confirming the
-mechanism and for a flat part; for a curved one either follow the surface
-(`run_mesh_scan()`, which needs a mesh) or use a tracking gate — `cscan_gate`
-takes a reference recording precisely so a second gate can sit a fixed distance
-behind a front-wall crossing.
+wrong even though every trace is real. For a curved part either follow the
+surface (`run_mesh_scan()`, which needs a mesh) or use a tracking gate —
+`cscan_gate` takes a reference recording precisely so a second gate can sit a
+fixed distance behind a front-wall crossing.
 
 **Velocity is derived, and the derivation can be wrong.** The continuous forms
-build a scan plan that clamps velocity against the measured trace-rate ceiling.
-If the arm's observed speed disagrees with the commanded one the scan says so
-and names the correction, e.g. *"observed probe speed 8.4 mm/s over 30 passes
-(asked for 50.0) ... ROBOT_VELOCITY_CALIBRATION is wrong here. Replace or add
-the entry (0.0424, 0.0084)"*. Believe it; the calibration is a measured curve,
-not a constant, and it is per cell.
+clamp velocity against the measured trace-rate ceiling. If the arm's observed
+speed disagrees with the commanded one the scan says so and names the
+correction, e.g. *"observed probe speed 8.4 mm/s over 30 passes (asked for
+50.0) … ROBOT_VELOCITY_CALIBRATION is wrong here. Replace or add the entry
+(0.0424, 0.0084)"*. Believe it: the calibration is a measured curve, not a
+constant, and it is per cell.
 
 ## Saving a taught area
 
 The three transforms are ordinary messages. To keep an area across sessions,
-store the nine numbers and the orientation and rebuild them — do not pickle the
-message:
+store the numbers and rebuild them — do not pickle the message:
 
 ```python
 def area_to_dict(t):
