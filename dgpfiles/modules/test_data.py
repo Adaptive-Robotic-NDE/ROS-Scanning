@@ -94,8 +94,24 @@ def root():
     return None
 
 
+#: First bytes of a git-lfs pointer file. A checkout made without the lfs
+#: filters configured contains these instead of the data, and the paths still
+#: exist -- so a fixture has to be checked for content, not just for presence,
+#: or a suite reads a pointer where it expects a mesh.
+_LFS_MAGIC = b"version https://git-lfs.github.com/spec/"
+
+
+def is_pointer(p):
+    """True when p is a git-lfs pointer rather than the file itself."""
+    try:
+        with open(p, "rb") as fh:
+            return fh.read(len(_LFS_MAGIC)) == _LFS_MAGIC
+    except OSError:
+        return False
+
+
 def path(*parts):
-    """A fixture path, or None when the fixture is absent.
+    """A fixture path, or None when the fixture is absent or unfetched.
 
     Returning None rather than raising lets a suite skip one section and still
     run everything that needs no recorded data.
@@ -104,7 +120,9 @@ def path(*parts):
     if base is None:
         return None
     p = os.path.join(base, *parts)
-    return p if os.path.exists(p) else None
+    if not os.path.exists(p) or is_pointer(p):
+        return None
+    return p
 
 
 def why_missing(*parts):
@@ -113,4 +131,8 @@ def why_missing(*parts):
     if base is None:
         return ("no fixture directory: set TARI_TEST_DATA, or check out "
                 "test_data_staging as %s beside this repository" % (DIRNAME,))
+    p = os.path.join(base, *parts)
+    if os.path.exists(p) and is_pointer(p):
+        return ("%s is a git-lfs pointer, not content: run "
+                "`git -C %s lfs pull`" % (os.path.join(*parts), base))
     return "%s is not in %s" % (os.path.join(*parts), base)

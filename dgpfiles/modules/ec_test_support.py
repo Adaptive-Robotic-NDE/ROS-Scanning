@@ -174,7 +174,13 @@ def ensure_ec_functions():
     except ImportError:
         pass
     else:
-        return {"real": True, "how": "installed", "origin": mod.__file__}
+        # sys.modules is process-wide, so a stub installed by an EARLIER test in
+        # this same run imports cleanly here and would be reported as the real
+        # thing. The caller would then take the compiled path and hit the stub's
+        # guard instead of skipping. Ask the module what it is.
+        if not getattr(mod, "is_stub", False):
+            return {"real": True, "how": "installed", "origin": mod.__file__}
+        sys.modules.pop("spatialnde2_ec_functions", None)
 
     source = workspace_source_dir()
     if source is not None:
