@@ -1,0 +1,200 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  pitch_crossings.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Chord-based pitch-crossing detection shared by every position trigger
+#   source.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# Turning observed probe positions into pitch crossings.
+#
+# One implementation, used by both trigger sources -- the simulator's position
+# trigger (sim_ascan_source.dpi) and the real timestamped one
+# (timestamped_trigger.dpi) -- so that a defect in this arithmetic cannot be
+# fixed in one source and left in the other.
+#
+# A crossing is a CHORD, not integrated arc length, and the reason is measured,
+# not aesthetic. Integrating arc length -- every poll, add |p - last| to a
+# running total, and fire whenever the total passes the next multiple of the
+# pitch -- is what a trigger box does with an encoder, and it is wrong for a
+# position that comes from TF. An encoder count is monotonic; a TF pose is not.
+# Every poll's step carries lateral noise and controller wobble, |step| is
+# always positive, and so the running total is biased LONG -- a random walk
+# never shortens a path. On a UR7e cell that bias is about 2%: every pass of a
+# plane scan reports 102% of its commanded length, the trigger fires one extra
+# time per pass, and each surplus trace shifts every later row of the volume
+# one column to the right. The same bias compresses the traces that ARE taken
+# toward the start of the pass by the same 2%.
+#
+# Here progress is the CHORD from the last crossing to the current position.
+# Noise no longer accumulates: a crossing is measured from a fixed reference,
+# and lateral noise enters only at second order. A step backwards shortens the
+# chord and fires nothing, where a running sum counts it as forward travel. On a
+# curved pass the chord underestimates arc by (pitch/R)^2/24 -- nothing at any
+# pitch a scan uses. The one thing given up is arc length across a sharp corner
+# inside a single armed pass, and a scanning pass has no such corners: the
+# corners are the link moves between passes, and the source is disarmed for
+# those.
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global PitchCrossingDetector
+
+
+class PitchCrossingDetector(object):
+    """Feed it positions; get back the pitch crossings they reveal.
+
+    feed(p) returns the crossings this observation revealed, oldest first, as
+    (position, s_m, frac):
+
+      position  where the crossing was, interpolated along the step from the
+                previous observation
+      s_m       progress since reset() at that crossing: k*pitch for the k-th
+      frac      how far through that step it fell, 0..1, for whoever holds the
+                timestamps to interpolate with
+
+    The first observation after reset() is the origin and comes back as
+    (p, 0.0, 1.0) -- not a crossing, but the point everything after it is
+    measured from, and both sources treat it as trigger 0.
+
+    Progress is chord-from-last-crossing (see the header). travelled_m keeps
+    counting across reset(): it is what the probe was seen to progress in
+    total, and a scan reads it before and after a pass. raw_travelled_m is the
+    old arc-sum, kept because the difference between the two is the wobble.
+    """
+
+    def __init__(self, pitch_m, max_burst=128):
+        self.pitch_m = float(pitch_m)
+        # A first observation after a long stall can look like a teleport: the
+        # link move between two rows is a real 0.3 m and would legitimately be
+        # ~60 crossings in one poll. Firing them is correct; an unbounded burst
+        # stalling the poll loop is not, so it is capped and counted.
+        self.max_burst = int(max_burst)
+        self.burst_dropped = 0
+        self.crossings = 0
+        self._total_m = 0.0        # progress folded in by previous resets
+        self._raw_total_m = 0.0
+        self._ref = None
+        self._last = None
+        self.s_m = 0.0             # crossings*pitch since reset
+        self.chord_m = 0.0         # |last - ref|
+        self.raw_m = 0.0           # sum of |step| since reset
+
+    def reset(self):
+        """Start a new phase: the next observation is the origin.
+
+        Progress so far is folded into travelled_m first, so a reset never
+        makes it go backwards.
+        """
+        self._total_m += self.s_m + self.chord_m
+        self._raw_total_m += self.raw_m
+        self._ref = None
+        self._last = None
+        self.s_m = 0.0
+        self.chord_m = 0.0
+        self.raw_m = 0.0
+
+    @property
+    def primed(self):
+        return self._ref is not None
+
+    @property
+    def travelled_m(self):
+        return self._total_m + self.s_m + self.chord_m
+
+    @property
+    def raw_travelled_m(self):
+        return self._raw_total_m + self.raw_m
+
+    def feed(self, p):
+        p = np.asarray(p, dtype=np.float64)
+        if self._ref is None:
+            self._ref = p
+            self._last = p
+            self.chord_m = 0.0
+            return [(p, 0.0, 1.0)]
+
+        step = p - self._last
+        d = float(np.linalg.norm(step))
+        self.raw_m += d
+        chord_prev = self.chord_m
+        chord_now = float(np.linalg.norm(p - self._ref))
+        pitch = self.pitch_m
+
+        out = []
+        # int(x + 1e-9), not floor division: 0.5//0.01 is 49 in binary
+        # floating point, so a probe that lands exactly on a crossing would
+        # otherwise fire one short -- and one missing trigger shifts every
+        # later trace. Same reasoning the two sources always carried.
+        n = int(chord_now/pitch + 1e-9)
+        if n > 0:
+            if n > self.max_burst:
+                self.burst_dropped += n - self.max_burst
+                n = self.max_burst
+            span = chord_now - chord_prev
+            for k in range(1, n+1):
+                # Where along THIS step the chord reached k*pitch. Linear in
+                # the chord, which is exact when the step continues away from
+                # the reference (a straight pass) and first-order otherwise.
+                frac = (k*pitch - chord_prev)/span if span > 0.0 else 1.0
+                frac = min(max(frac, 0.0), 1.0)
+                pos = self._last + step*frac
+                self.s_m += pitch
+                self.crossings += 1
+                out.append((pos, self.s_m, frac))
+            # Measure the next crossing from this one.
+            self._ref = out[-1][0]
+            chord_now = float(np.linalg.norm(p - self._ref))
+
+        self._last = p
+        self.chord_m = chord_now
+        return out

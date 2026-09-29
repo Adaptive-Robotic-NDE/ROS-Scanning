@@ -8,6 +8,13 @@
 # The plan the scan currently running was started from. Everything that has to
 # know how fast to move or how big to make the projection reads it, so there is
 # one derivation rather than one per call site.
+#
+# THIS FILE OWNS scan_plan: plan_current_scan() is the only thing that builds
+# one. plane_scan.dpi's Scan2DPlane() also writes it, and only ever to None --
+# a point-to-point scan has no sweep velocity, so an inherited plan from an
+# earlier continuous scan would describe something it is not doing. That is a
+# second writer of one shared variable, not a second definition, and it is
+# allowlisted in dpi_exports_test.py.
 global scan_plan
 scan_plan = None
 
@@ -40,6 +47,42 @@ def raster_velocity():
         return RASTER_VELOCITY
     return scan_plan["velocity_scaling"]
 
+global motion_scaling
+def motion_scaling(speed_mps):
+    """The MoveIt velocity SCALING that moves the probe at `speed_mps`.
+
+    CartesianMove's vel is a fraction of the robot's joint limits, not a speed,
+    and in this cell the mapping is a curve (ROBOT_VELOCITY_CALIBRATION; see
+    velocity_scaling_for()). Every automated stage that states a speed in m/s
+    -- the Keyence sweep, the Azure sweep, the eddy-current contact moves --
+    converts it here, so "10 mm/s near the part" is 10 mm/s rather than the
+    15.6 mm/s a scaling of 0.01 actually produces.
+
+    A config with no calibration gets the number back unchanged, which is the
+    uncalibrated behaviour.
+    """
+    cal = globals().get("ROBOT_VELOCITY_CALIBRATION")
+    if not cal:
+        return float(speed_mps)
+    return velocity_scaling_for(speed_mps, cal)
+
+global joint_move_kwargs
+def joint_move_kwargs():
+    """{vel, acc} for a MoveIt joint move, from JOINT_MOVE_SCALING, or {}.
+
+    Every automated joint move -- ApproachInConfiguration() into a pass or a
+    row, the home retry, a named pose -- goes at MoveJoints' default scaling of
+    0.1 unless this says otherwise, and a joint move's tip speed is not bounded
+    in Cartesian terms by that scaling. Measured on the tip in simulation at 0.1:
+    132 mm/s going to over_table, 194 in the Azure sweep's row approaches, 245 in
+    the Keyence raster's -- 46 mm above the part -- and 75-80 between
+    eddy-current passes, against an approved limit of 50 mm/s. A config that sets
+    JOINT_MOVE_SCALING slows all of them together; one that does not (UTPlaneScan)
+    keeps 0.1.
+    """
+    s = globals().get("JOINT_MOVE_SCALING")
+    return {"vel": float(s), "acc": float(s)} if s else {}
+
 global trace_pitch
 def trace_pitch():
     """Distance between traces along a pass.
@@ -65,25 +108,39 @@ def plane_grid_size(size=0.30):
     return max(int(m), 2), max(int(n), 1)
 
 global set_trigger_pitch
-def set_trigger_pitch(pitch_m):
-    """Retune the trigger pitch on the live source.
+def set_trigger_pitch(pitch_m, source=None):
+    """Retune the trigger pitch on the live source, and return the pitch.
 
     A plane scan's pitch is its grid pitch, so it is not knowable until the scan
     corners are, and the source was constructed long before that. Both trigger
     sources hold the pitch in one attribute and read it every poll, so this takes
     effect immediately -- but only between passes, never during one, because the
     arc-length phase of a pass is measured against it.
+
+    `source` is WHICH source to retune, and it matters: `ascan_source` is the
+    ULTRASOUND config's global, which ECAutomatedScan.dgp declares and leaves
+    None forever because its source is `ec_source`. Defaulting to it retunes
+    nothing in an eddy-current scan and says nothing about it.
+
+    THE PITCH IS ALWAYS RETURNED, even when there is no source to retune. A
+    missing source is a reason not to retune anything; it is not a reason to
+    answer None to "what is the pitch". Returning None here puts a None into
+    run_surface_path_scan's `pitch`, and the next line divides a segment length
+    by it: "TypeError: unsupported operand type(s) for /: 'float' and 'NoneType'"
+    out of trace_count().
     """
-    if ascan_source is None:
-        return None
+    src = ascan_source if source is None else source
     pitch_m = float(pitch_m)
-    if getattr(ascan_source, "trigger_pitch_m", None) != pitch_m:
-        ascan_source.trigger_pitch_m = pitch_m
+    if src is None:
+        return pitch_m
+    if getattr(src, "trigger_pitch_m", None) != pitch_m:
+        src.trigger_pitch_m = pitch_m
     return pitch_m
 
 global build_scan_plan
 def build_scan_plan(path_length_m, passes, step_m=None, velocity_mps=None,
-                    projection_extent_m=None, force=False, geom_timeout=5.0):
+                    projection_extent_m=None, force=False, geom_timeout=5.0,
+                    num_samples=None, sample_bytes=None):
     """The arithmetic for a scan of this shape, without committing to it.
 
     Separate from plan_current_scan so the settings panel can show what the
@@ -101,16 +158,27 @@ def build_scan_plan(path_length_m, passes, step_m=None, velocity_mps=None,
     # this file. Before the first trigger on an externally triggered card there
     # may be nothing yet; fall back to the configured length so the plan can
     # still be printed, and say which it used.
-    geom = ascan_geometry(timeout=geom_timeout, require=False)
-    if geom is not None:
-        num_samples = geom["num_points"]
-        sample_bytes = np.dtype(geom["dtype"]).itemsize
-    else:
-        num_samples = ASCAN_NUM_POINTS
-        sample_bytes = np.dtype(ASCAN_SIM_DTYPE).itemsize
-        if geom_timeout > 0.0:
-            print("  (no A-scan yet, so the memory estimate assumes %d samples of %s)"
-                  % (num_samples, np.dtype(ASCAN_SIM_DTYPE)))
+    # An instrument that knows its own trace size supplies it and nothing else
+    # is asked. Eddy current does: one complex number per point, always.
+    if num_samples is None or sample_bytes is None:
+        # Otherwise ask the digitizer, because record length and sample type
+        # belong to the card rather than to this file. ascan_geometry lives in
+        # digitizer.dpi, which an instrument with no waveform to digitize does
+        # not include at all -- so the NAME may not exist, not merely return
+        # None. Looking it up rather than calling it directly is what lets this
+        # module serve both.
+        _geom_fn = globals().get("ascan_geometry")
+        geom = _geom_fn(timeout=geom_timeout, require=False) if _geom_fn else None
+        if geom is not None:
+            num_samples = geom["num_points"]
+            sample_bytes = np.dtype(geom["dtype"]).itemsize
+        else:
+            num_samples = globals().get("ASCAN_NUM_POINTS", 1)
+            _dt = globals().get("ASCAN_SIM_DTYPE", np.complex128)
+            sample_bytes = np.dtype(_dt).itemsize
+            if geom_timeout > 0.0 and _geom_fn is not None:
+                print("  (no A-scan yet, so the memory estimate assumes %d samples of %s)"
+                      % (num_samples, np.dtype(_dt)))
 
     return plan_scan(
         step_m=step_m,
@@ -119,10 +187,10 @@ def build_scan_plan(path_length_m, passes, step_m=None, velocity_mps=None,
         passes=passes,
         num_samples=num_samples,
         sample_bytes=sample_bytes,
-        trigger_mode=ASCAN_TRIGGER_MODE,
+        trigger_mode=globals().get("ASCAN_TRIGGER_MODE", "timestamped"),
         projection_mode=PROJECTION_MODE,
         transaction_latency_s=(TRANSACTION_LATENCY if transmgr is not None else 0.0),
-        digitizer_rate_hz=ASCAN_RATE_HZ,
+        digitizer_rate_hz=globals().get("ASCAN_RATE_HZ", None),
         velocity_calibration=ROBOT_VELOCITY_CALIBRATION,
         spot_radius_m=PROJECTION_SPOT_RADIUS,
         projection_pixels=PROJECTION_PIXELS,
@@ -133,7 +201,8 @@ def build_scan_plan(path_length_m, passes, step_m=None, velocity_mps=None,
 
 global plan_current_scan
 def plan_current_scan(path_length_m, passes, step_m=None, velocity_mps=None,
-                      projection_extent_m=None, force=False):
+                      projection_extent_m=None, force=False,
+                      num_samples=None, sample_bytes=None):
     """Work out what the scan about to run costs, print it, and hold onto it.
 
     Called by every continuous scan before it moves. It is the one place the two
@@ -149,7 +218,8 @@ def plan_current_scan(path_length_m, passes, step_m=None, velocity_mps=None,
     scan_plan = build_scan_plan(path_length_m, passes, step_m=step_m,
                                 velocity_mps=velocity_mps,
                                 projection_extent_m=projection_extent_m,
-                                force=force)
+                                force=force, num_samples=num_samples,
+                                sample_bytes=sample_bytes)
     print(format_scan_plan(scan_plan))
     return scan_plan
 
@@ -266,6 +336,144 @@ def project_traces(first=0, count=None, gate="cscan", quiet=False):
               % (done, elapsed, done/elapsed if elapsed > 0 else 0.0,
                  ", %d unstaged skipped" % skipped if skipped else ""))
     return {"projected": done, "skipped": skipped, "elapsed": elapsed}
+
+global motion_profile
+def motion_profile(name="scan"):
+    """Hold every IK-solving node in the named motion profile for a block.
+
+        with motion_profile("scan"):
+            ...
+
+    The profiles are defined once, in tari_ur_description's
+    config/motion_profiles.yaml, and ros.SetMotionProfile() applies one to
+    every node that solves IK -- move_group, mtc_hub_node,
+    dgpython_action_server -- because each holds its own copy of the solver's
+    settings. A cell starts in `transit`: large moves, free to change arm
+    configuration, 0.1 mm is ample.
+
+    A scan wants the opposite, for two reasons. ApproachInConfiguration()
+    solves the far end of a row and seeds the near end from it so the whole row
+    is reachable in one configuration, and a global solver may hand back the
+    other branch and truncate the row. And a point-to-point step of a few
+    hundred microns needs IK to stop within 0.01 mm rather than 0.1, or every
+    step lands short: 0.2 mm steps move 0.106-0.113 mm at the transit setting
+    and 0.188-0.199 mm at the scan one. So a scan takes
+    `scan` for as long as it runs and gives back exactly what was there before,
+    including when it fails.
+
+    Never fatal. Where a node is not up, or runs a solver without these
+    parameters, this says so and lets the scan proceed; the scan may be worse
+    without it, but refusing to scan because a solver knob is missing would be
+    worse still.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _hold():
+        previous = None
+        try:
+            previous = ros.SetMotionProfile(name)
+        except Exception as e:
+            print("  WARNING: could not put the IK solvers in the %r motion "
+                  "profile (%s); continuing with what they have. Rows may "
+                  "truncate, and small steps may land up to 0.1 mm short."
+                  % (name, e))
+        try:
+            yield previous
+        finally:
+            if previous:
+                try:
+                    ros.SetMotionParameters(previous)
+                except Exception as e:
+                    print("  WARNING: could not put the IK solver settings back "
+                          "(%s). Large moves may be refused until they are: "
+                          "ros.SetMotionProfile('transit')." % (e,))
+    return _hold()
+
+global motion_kind
+def motion_kind(kind):
+    """Overlay the IK settings ONE kind of move needs, for a block.
+
+        with motion_kind("cartesian_path"):
+            ros.CartesianMove(poses, ...)
+
+    A profile is the settings for a kind of MOTION -- a scan, a transit. This is
+    the settings for one MOVE inside it, and it exists because the two moves a
+    scan makes want opposite values of `position_threshold` from the same node.
+
+    Both are ros.CartesianMove on mtc_hub_node: plane_scan.dpi steps point to
+    point with one pose per call, and every raster row is a polyline of them. A
+    single small step needs IK to stop within 0.01 mm or it lands short (0.2 mm
+    steps move 0.106-0.113 mm at a 0.1 mm threshold). A 69-waypoint row at
+    0.01 mm truncates at 21.3% and at 0.1 mm completes. Neither value is wrong;
+    they belong to different moves.
+
+    The kinds and their values live with the profiles, in tari_ur_description's
+    config/motion_profiles.yaml under `move_kinds`. An unknown kind, or a cell
+    whose description predates them, is a warning and not a failure: the move
+    still flies, with whatever the profile holds.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _hold():
+        previous = None
+        try:
+            spec = ros.MotionProfiles()
+            kinds = spec.get("move_kinds") or {}
+            if kind not in kinds:
+                raise ValueError(
+                    "no move kind %r in motion_profiles.yaml; defined: %s"
+                    % (kind, ", ".join(sorted(kinds)) or "none"))
+            entry = kinds[kind] or {}
+            common = dict(entry.get("parameters") or {})
+            want = {}
+            for node in spec.get("nodes") or []:
+                values = dict(common)
+                values.update((entry.get("nodes") or {}).get(node) or {})
+                if values:
+                    want[node] = values
+            if want:
+                previous = ros.SetMotionParameters(want)
+        except Exception as e:
+            print("  WARNING: could not apply the %r move-kind settings (%s); "
+                  "the move goes with whatever the profile holds. A "
+                  "multi-waypoint row may truncate, or a small step land short."
+                  % (kind, e))
+        try:
+            yield previous
+        finally:
+            if previous:
+                try:
+                    ros.SetMotionParameters(previous)
+                except Exception as e:
+                    print("  WARNING: could not put the IK settings back after "
+                          "a %r move (%s)" % (kind, e))
+    return _hold()
+
+
+global cartesian_move
+def cartesian_move(poses, kind=None, **kwargs):
+    """ros.CartesianMove with the IK settings this KIND of move needs.
+
+    The kind is taken from the number of waypoints unless a caller names one,
+    because that is the thing that actually decides which settings are right and
+    it is the thing a caller would get wrong: one pose is a step and wants a
+    tight threshold, a polyline is a row and wants a loose one. See
+    motion_kind().
+
+    Everything else is passed straight through, so this is a drop-in for
+    ros.CartesianMove at every call site in a scan.
+    """
+    try:
+        count = len(poses.poses)
+    except AttributeError:
+        count = len(poses)
+    if kind is None:
+        kind = "point_step" if count <= 1 else "cartesian_path"
+    with motion_kind(kind):
+        return ros.CartesianMove(poses, **kwargs)
+
 
 global finish_projection
 def finish_projection():

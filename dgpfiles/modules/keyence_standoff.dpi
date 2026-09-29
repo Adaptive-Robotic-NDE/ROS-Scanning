@@ -1,0 +1,1745 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  keyence_standoff.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Keeps the line profiler inside its measuring window: standoff
+#   reporting, gating and pre-flight checks.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# THE KEYENCE HAS TO BE IN ITS MEASURING WINDOW, AND SOMETHING HAS TO CHECK
+# ==============================================================================
+# The LJ-V7080 measures a surface only from 0.057 to 0.103 m from its head -- the
+# 80 mm reference distance plus or minus 23 mm. Noether plans the Keyence raster
+# OVER A ROUGH MESH, with the optical frame placed on that surface, so an error
+# in the mesh becomes an error in the commanded standoff, one for one.
+#
+# At the bottom of a triangulation profiler's range the return geometry degrades
+# badly and the sensor does NOT fail cleanly: it returns wrong values, which are
+# then meshed, Poisson-reconstructed, decimated and handed to the eddy-current
+# planner as a surface. Every stage downstream reports success.
+#
+# THE FAILURE THE CONSTANTS BELOW ARE SIZED AGAINST. A rough mesh from a
+# miscalibrated depth camera read a flat surface-ground plate 13.6 mm low across
+# the part and about 22 mm low at one end. The raster commanded 80 mm everywhere,
+# so the sensor flew at 66 mm over most of the plate -- inside the window, 9 mm
+# above the near limit, which is why most of it worked -- and at 58-61 mm over
+# the bad end, one to four millimetres from the hard limit. Between 26% and 39%
+# of the plate came back as points scattered over a 16 mm range instead of a flat
+# surface, and nothing in the pipeline noticed at any stage.
+#
+# Recovered from the raw profiles of that raster, per 16 mm band across the
+# plate, the signature is unambiguous:
+#
+#     standoff median   p5..p95 spread   within 5 mm of the limit
+#         64.6 mm           19.2 mm             41.7%
+#         66.3 mm           17.6 mm              0.0%
+#         66.8 mm           17.1 mm              0.0%
+#         66.3 mm           17.0 mm              0.0%
+#         66.2 mm            7.5 mm              0.0%
+#      66.4..68.5 mm    0.20..0.26 mm            0.0%
+#
+# A surface-ground plate is flat to a fraction of a millimetre, so the 0.2 mm
+# rows are the sensor working and the 17-19 mm rows are it failing.
+#
+# ------------------------------------------------------------------------------
+# WHAT THIS FILE CHECKS, IN THREE LAYERS, AND WHY IT TAKES THREE
+# ------------------------------------------------------------------------------
+# No single check catches this. They are listed in the order they run.
+#
+# 1. THE PLAN-TIME GATE -- keyence_standoff_gate(), called from
+#    _KeyenceReconstruction.plan_sweep(). Takes the planned probe_end poses and
+#    a surface, casts the sensor's own optical axis from every waypoint, and
+#    measures how far the first surface is. REFUSES a plan that leaves less than
+#    the margin inside the window.
+#
+#    Against the mesh the raster was planned over this is a CONSISTENCY check
+#    and it should read 80 mm everywhere, because that is what the plan asked
+#    for. It is worth running anyway, because "everywhere" is where it stops
+#    being true: a pose re-oriented by the clearance gate after the sensor
+#    offset was applied, a z_offset that is not zero, a wrong keyence_ref_dist,
+#    a waypoint aimed across a hole so that the ray hits nothing at all, and a
+#    vertical tool over a curved part whose ray grazes a nearer ridge than the
+#    waypoint it was planned for, all show up here and nowhere else.
+#
+#    Given a BETTER surface -- surface=, a truth mesh, a plane from a touch-off,
+#    the Keyence's own mesh from a previous run -- the same call grades the plan
+#    against that instead, and a raster planned over a mesh that is wrong by more
+#    than the margin is refused outright. That is what keyence_standoff_test.py
+#    asserts.
+#
+# 2. THE PRE-FLIGHT GATE -- keyence_range_gate(), called from
+#    _KeyenceReconstruction.profile_facts(), which runs after the arm has
+#    reached the first pose and before a single row is flown. The sensor is
+#    already looking at the part, so it can be asked what it SEES, and that
+#    answer is compared against what the plan COMMANDED at the same waypoint.
+#    The difference is the error in the rough mesh, measured, in seconds,
+#    with no touch-off and no calibration.
+#
+#    On the failure above it reads: commanded 80.0 mm, measured 66.4 mm, so the
+#    rough mesh is 13.6 mm low here. That is over KEYENCE_MESH_BIAS_LIMIT_M and
+#    the sweep is refused before the ten minutes are spent. See that constant for
+#    why 10 mm rather than "is it in the window" -- 66 mm IS in the window, and
+#    a guard that only asks that question passes a raster like that one.
+#
+# 3. THE IN-FLIGHT MONITOR -- KeyenceStandoffMonitor, subscribed to /profiles
+#    for the duration of the sweep and reporting per pass through progress.dpi.
+#    This is the only layer that sees a LOCAL mesh error: a mesh can be 13.6 mm
+#    wrong across a part and 22 mm wrong at one end, and it is the end that
+#    produces garbage. The monitor says so on the pass it happens, with the
+#    fraction of that pass's points inside the margin, rather than in a mesh
+#    somebody looks at the next day.
+#
+# ------------------------------------------------------------------------------
+# NO TOUCH-OFF. Nothing in this file may require one: a contact touch-off is how
+# the cell is CALIBRATED, and it is not part of the automated pipeline. Layer 1
+# uses the planned geometry, layer 2 and layer 3 use the sensor's own returns. A
+# touch-off can be handed in as `surface=` when one exists, and that is all.
+#
+# ------------------------------------------------------------------------------
+# THE GEOMETRY, WRITTEN DOWN ONCE
+# ------------------------------------------------------------------------------
+# Read off tari_ur_description/urdf/lj_v7080_macro.xacro and confirmed by
+# chaining the rendered URDF:
+#
+#   lj_v7080_frame              the head. The measuring window is measured from
+#                               here: 0.057 to 0.103 m.
+#   lj_v7080_optical_frame      at (-0.0022, -0.0005, -keyence_ref_dist) in the
+#                               head's frame, i.e. 80 mm out along the head's
+#                               -z. It is the plane a raw reading of zero means,
+#                               which is why the raster is planned with THIS
+#                               frame on the surface.
+#   probe_end -> optical        a pure Rz(+90 deg) with translation
+#                               (-0.07515, -0.0022, -0.03428) on the ec tooling.
+#                               The optical frame's z axis is probe_end's z
+#                               axis, so the sensor looks along probe_end's -z,
+#                               which is the direction Noether's poses already
+#                               point at the surface.
+#
+# So, with `t` measured along the look direction from the optical frame origin,
+# positive away from the head:
+#
+#     standoff = keyence_ref_dist + t
+#
+# and the profiler's own reported z, which keyence_driver_node packs as
+# (x_across, 0, z) in lj_v7080_optical_frame with POSITIVE z TOWARDS THE HEAD
+# (tari_keyence_sim's z_sign, and the device's convention):
+#
+#     standoff = keyence_ref_dist - z
+#
+# z = +0.023 is the near limit, 0.057 m; z = -0.023 is the far limit, 0.103 m.
+# Both expressions are the same quantity from the two ends of the pipeline,
+# which is exactly what layer 2 subtracts.
+#
+# ------------------------------------------------------------------------------
+# Numpy only. No ROS for anything but the live subscription, no open3d, no
+# service: a guard that needs the cell up is a guard that cannot refuse before
+# the cell is up. Python 3.10 -- the work cell runs ROS natively on Ubuntu
+# 22.04 and has no container to hide a newer interpreter in.
+
+import os
+import math
+import time
+import threading
+
+import numpy as np
+
+# A .dpi is compiled as a FUNCTION BODY sharing one globals() dict with every
+# other .dpi, so a top-level def or assignment binds a LOCAL of the include
+# unless it is declared global first -- invisible to every other module AND to
+# the functions in this one. dpi_exports_test.py refuses the pattern; everything
+# defined below is listed here.
+global KEYENCE_RANGE_M
+global KEYENCE_REF_DIST_M
+global KEYENCE_STANDOFF_MARGIN_M
+global KEYENCE_MESH_BIAS_LIMIT_M
+global KEYENCE_LINE_FLAT_SPREAD_M
+global KEYENCE_STANDOFF_WARN_FRACTION
+global KEYENCE_RAY_SEARCH_M
+global KEYENCE_MONITOR_TOPIC
+global keyence_window
+global keyence_standoff_margin
+global keyence_ref_dist
+global keyence_optical_geometry
+global commanded_standoff
+global keyence_standoff_report
+global describe_standoff_report
+global keyence_standoff_gate
+global check_keyence_standoff
+global keyence_profile_standoff
+global keyence_range_report
+global describe_range_report
+global keyence_range_gate
+global KeyenceStandoffMonitor
+global last_standoff_report
+global last_range_report
+global _standoff_say
+global _surface_geometry
+global _describe_surface
+global _ray_first_hit
+global _tri_grid
+global _fmt_mm
+global _pass_of
+global _worst_side
+global _standoff_of_path
+global out_of_window_shape
+
+
+#: The LJ-V7080's measuring window, metres from the head (lj_v7080_frame /
+#: laser_link). The reference distance plus and minus 23 mm, from the head's
+#: specification; it is also the range the simulated profiler enforces and the
+#: range the old Gazebo gpu_ray was configured with, so simulation and hardware
+#: refuse in the same place.
+KEYENCE_RANGE_M = (0.057, 0.103)
+
+#: Where in that window the optical frame sits -- the plane a raw reading of
+#: zero means, and therefore the standoff the raster commands when it puts that
+#: frame on the surface. It is `keyence_ref_dist` in lj_v7080_macro.xacro, and a
+#: value that disagrees with the URDF's puts every profile low in world by the
+#: difference. A cell that has measured `keyence_ref_dist_cal` should set
+#: KEYENCE_REF_DIST in its config to the same total, so this file and the URDF
+#: agree.
+KEYENCE_REF_DIST_M = 0.080
+
+#: How much of the window a plan must leave unused at EACH end: the guarded
+#: window is 0.062..0.098 m.
+#:
+#: 5 mm, and it is not arbitrary. It is the same number tooling_clearance.dpi
+#: uses for the same reason -- the rough mesh a raster is planned over is a 6 mm
+#: voxel TSDF, so a few millimetres IS the resolution of the surface the plan is
+#: made from, and a plan that sits closer than that to a limit is not inside the
+#: window, it is inside the noise. For scale, a raster measured at 66.4 mm leaves
+#: 4.4 mm of this margin unspent; one at 60.8 mm is 1.2 mm past it.
+#:
+#: Override per cell with KEYENCE_STANDOFF_MARGIN in the config. Raising it is a
+#: statement about how much you distrust the planning surface. LOWERING it is
+#: not a fix for a refusal -- see the refusal text.
+KEYENCE_STANDOFF_MARGIN_M = 0.005
+
+#: How far the surface a raster was planned over may sit from the surface the
+#: sensor actually reports, before the plan stops being worth flying. Metres.
+#:
+#: 10 mm. The window is 46 mm wide; after the margin above, 18 mm of it is usable
+#: either side of the reference distance. A planning surface that is wrong by
+#: more than half of that has spent the budget GLOBALLY, and whatever made it
+#: wrong -- a loose camera mount, a bad calibration -- has no reason to be wrong
+#: by the same amount everywhere: 13.6 mm across a plate and 22 mm at one end is
+#: the measured shape of it, and the end is what came back as garbage. So the
+#: question the pre-flight gate asks is not "is the sensor in its window here",
+#: which at 66 mm is honestly yes, but "is the surface this raster was planned
+#: over good enough that the rest of it will be".
+KEYENCE_MESH_BIAS_LIMIT_M = 0.010
+
+#: How much height the laser line may span before the surface under it counts as
+#: CURVED ACROSS THE LINE rather than flat, metres.
+#:
+#: 3 mm. A flat plate measures 0.3-1.9 mm of p5..p95 spread in simulation and
+#: 0.10 mm on a sprayed flat at the cell, so 3 mm is well clear of a flat surface
+#: and well under what a real curve gives: a 131 x 65 x 67 mm cylinder spans tens
+#: of millimetres across the same 31 mm line.
+#:
+#: What it gates is the INFERENCE, not the measurement -- see the note in
+#: keyence_range_report() where the bias is computed. Over this, "the median
+#: disagrees with the commanded standoff" stops being evidence about the mesh,
+#: because the plan commands a standoff at the MIDDLE of the line and a curved
+#: surface puts that point at one END of the returned range.
+KEYENCE_LINE_FLAT_SPREAD_M = 0.003
+
+#: Fraction of one pass's returns inside the margin that makes the pass worth
+#: shouting about. 2%: in the failure above the worst pass was 41.7% and every
+#: good pass 0.0%, so anything in this range separates them. It is low on purpose
+#: -- a pass with 2% of its points at the limit has a bad patch in it, and a bad
+#: patch is what gets meshed.
+KEYENCE_STANDOFF_WARN_FRACTION = 0.02
+
+#: How far either side of the reference distance the plan-time ray is searched,
+#: metres. Wider than the window so a plan that is badly out can be REPORTED as
+#: badly out rather than as "no surface found", which is a different fault.
+KEYENCE_RAY_SEARCH_M = 0.060
+
+#: Where the profiler publishes. Same default as
+#: _KeyenceReconstruction.PROFILE_TOPIC, read through the source when there is
+#: one so a cell that remaps it only says so once.
+KEYENCE_MONITOR_TOPIC = "/profiles"
+
+#: The last report each layer produced, for a caller who wants the numbers
+#: rather than the printed page.
+last_standoff_report = None
+last_range_report = None
+
+
+def _standoff_say(text):
+    """One line, through progress.dpi when it is loaded and print() otherwise.
+
+    progress_say() reaches the operator from a worker thread, which a bare
+    print() does not -- see the header of progress.dpi. Not every config that
+    can fly a Keyence raster includes it, though, so this must not be the thing
+    that raises when it is missing.
+    """
+    say = globals().get("progress_note")
+    if say is not None:
+        try:
+            say(text)
+            return
+        except Exception:
+            pass
+    print(text, flush=True)
+
+
+def _fmt_mm(v):
+    """A standoff in millimetres, or a word when there is no number."""
+    if v is None:
+        return "none"
+    v = float(v)
+    if not np.isfinite(v):
+        return "nothing in range"
+    return "%.1f mm" % (1e3*v,)
+
+
+def keyence_standoff_margin(margin=None):
+    """How much of the window to leave unused at each end, metres.
+
+    Explicit argument, then the config's KEYENCE_STANDOFF_MARGIN, then this
+    module's KEYENCE_STANDOFF_MARGIN_M. The same three-step resolution every
+    other number here uses, so a cell overrides in one place and every layer
+    picks it up.
+    """
+    if margin is not None:
+        return float(margin)
+    cfg = globals().get("KEYENCE_STANDOFF_MARGIN")
+    if cfg is not None:
+        return float(cfg)
+    return float(KEYENCE_STANDOFF_MARGIN_M)
+
+
+def keyence_ref_dist(ref_dist=None):
+    """The reference distance the optical frame sits at, metres.
+
+    KEYENCE_REF_DIST in the config is `keyence_ref_dist + keyence_ref_dist_cal`
+    from the cell's URDF. They are two settings in two trees and only one of
+    them moves the robot, which is the same shape of trap as the Azure's depth
+    mode -- so a cell that has calibrated one should set the other.
+    """
+    if ref_dist is not None:
+        return float(ref_dist)
+    cfg = globals().get("KEYENCE_REF_DIST")
+    if cfg is not None:
+        return float(cfg)
+    return float(KEYENCE_REF_DIST_M)
+
+
+def keyence_window(margin=None, range_m=None):
+    """(guarded_lo, guarded_hi, hard_lo, hard_hi) in metres.
+
+    The hard window is the sensor's; the guarded one is what a plan has to stay
+    inside. Everything in this file compares against the guarded pair and
+    reports both, because "1 mm inside the specification" and "4 mm inside the
+    guard" are different sentences and the operator needs to be told which.
+    """
+    hard = tuple(float(v) for v in
+                 (range_m if range_m is not None
+                  else globals().get("KEYENCE_RANGE") or KEYENCE_RANGE_M))
+    m = keyence_standoff_margin(margin)
+    lo, hi = hard[0] + m, hard[1] - m
+    if lo >= hi:
+        raise ValueError(
+            "a standoff margin of %.1f mm leaves nothing of the LJ-V7080's "
+            "%.0f..%.0f mm window. The window is %.0f mm wide; the margin is "
+            "per end." % (1e3*m, 1e3*hard[0], 1e3*hard[1],
+                          1e3*(hard[1] - hard[0])))
+    return lo, hi, hard[0], hard[1]
+
+
+# ==============================================================================
+# LAYER 1: WHAT THE PLAN COMMANDS
+# ==============================================================================
+
+def keyence_optical_geometry(tf_offset=None, axis=None, ref_dist=None,
+                             source=None):
+    """(offset, axis, ref_dist): probe_end -> the sensor, from live TF.
+
+    `offset` is probe_end -> lj_v7080_optical_frame in the PROBE_END frame, the
+    same vector _KeyenceReconstruction.keyence_offset() returns and the one
+    plan_sweep() moves every pose back along. `axis` is the unit look direction
+    in the probe_end frame -- from the head towards the surface.
+
+    THE AXIS IS READ, NOT ASSUMED, when TF has it. ros.keyence_t carries the
+    full transform, and the optical frame's -z is the measuring axis (the head
+    sits at +keyence_ref_dist along its +z). On the ec tooling that rotation is
+    a pure Rz(+90 deg), so the axis comes out as probe_end's -z exactly -- which
+    is the default when there is no transform and the reason a cell whose sensor
+    is mounted square can be checked with nothing running. A cell that tilts the
+    head gets the tilt for free; a cell that tilts the head and has no TF gets
+    the default and is told so by keyence_offset()'s own refusal long before
+    this is reached.
+
+    `source` is a _KeyenceReconstruction, if the caller has one: its
+    keyence_offset() is preferred over ros.keyence_t so an explicit tf_offset=
+    passed to the constructor is honoured here too.
+    """
+    ref = keyence_ref_dist(ref_dist)
+    ax = None if axis is None else np.asarray(axis, dtype=np.float64).reshape(3)
+    off = None if tf_offset is None else np.asarray(tf_offset,
+                                                    dtype=np.float64).reshape(3)
+    if off is None and source is not None:
+        off = np.asarray(source.keyence_offset(), dtype=np.float64).reshape(3)
+    t = getattr(globals().get("ros"), "keyence_t", None)
+    if off is None:
+        if t is None:
+            raise RuntimeError(
+                "no probe_end -> lj_v7080_optical_frame transform (ros.keyence_t "
+                "is None), so where the sensor is relative to the poses is "
+                "unknown and the standoff cannot be checked. Pass "
+                "tf_offset=(dx, dy, dz), or check_keyence_standoff(source=) a "
+                "reconstruction that has one.")
+        off = np.array([t.transform.translation.x, t.transform.translation.y,
+                        t.transform.translation.z], dtype=np.float64)
+    if ax is None and t is not None:
+        r = t.transform.rotation
+        q = np.array([r.x, r.y, r.z, r.w], dtype=np.float64)
+        if np.isfinite(q).all() and np.linalg.norm(q) > 1e-9:
+            # -z of the optical frame, expressed in probe_end.
+            ax = -quat_to_matrix(q / np.linalg.norm(q))[:, 2]
+    if ax is None:
+        ax = np.array([0.0, 0.0, -1.0])
+    n = float(np.linalg.norm(ax))
+    if n < 1e-9:
+        raise ValueError("the Keyence optical axis is degenerate: %r" % (ax,))
+    return off, ax / n, ref
+
+
+def _surface_geometry(surface):
+    """Anything the guard accepts as a surface -> ("mesh", v, tris) or
+    ("plane", z, None).
+
+    Accepted, in the order they are tried:
+
+      * a float, or {"plane_z": z}          a horizontal plane at that world z.
+        This is how a contact touch-off is handed in on the rare occasion one
+        exists, and how a test states that the truth is flat at a known height.
+      * a path to a PLY                     read with noether_path.dpi's
+        read_ply_mesh, which is the same reader the planner's own gate uses.
+      * (vertices, triangles)               already in memory.
+      * (vertices, normals, triangles)      read_ply_mesh's own tuple, passed
+                                            straight back in.
+
+    A POINT CLOUD IS REFUSED. A raw Keyence cloud is millions of points and no
+    faces; casting a ray at it finds nothing, and "nothing in range" is the
+    report this guard gives for a sensor aimed at a hole. Confusing the two
+    would turn a wrong filename into a fake refusal, so say which it is.
+    """
+    if surface is None:
+        return None
+    if isinstance(surface, (int, float)) and not isinstance(surface, bool):
+        return ("plane", float(surface), None)
+    if isinstance(surface, dict):
+        if "plane_z" in surface:
+            return ("plane", float(surface["plane_z"]), None)
+        raise ValueError("a surface dict must carry plane_z, not %s"
+                         % (sorted(surface),))
+    if isinstance(surface, str):
+        path = os.path.abspath(surface)
+        if not os.path.exists(path):
+            raise IOError("no surface to check the standoff against: %s" % (path,))
+        # ASKED OF THE HEADER, before the reader is handed the file.
+        # read_ply_mesh() refuses a faceless PLY with "has no vertices or no
+        # faces", which is true and is the wrong sentence here: what the caller
+        # did was point this at one of the SIX point clouds the Keyence chain
+        # writes, and the useful answer names them.
+        nface, nvert = None, None
+        with open(path, "rb") as f:
+            head = f.read(4096).split(b"end_header")[0]
+        for line in head.decode("ascii", "replace").splitlines():
+            w = line.split()
+            if len(w) >= 3 and w[0] == "element" and w[1] == "face":
+                nface = int(w[2])
+            elif len(w) >= 3 and w[0] == "element" and w[1] == "vertex":
+                nvert = int(w[2])
+        if nface in (None, 0):
+            raise ValueError(
+                "%s is a POINT CLOUD -- %s vertices and no faces -- so there is "
+                "no surface for the sensor's axis to intersect. The Keyence "
+                "chain writes six of these (_raw, _merged, _cluster, _cropped, "
+                "_sor_filtered, _final_points); the meshes are _ball_pivot, "
+                "_poisson and _qudric_decimation."
+                % (path, "no" if nvert is None else nvert))
+        v, _n, tris = read_ply_mesh(path)
+        return ("mesh", np.asarray(v, dtype=np.float64),
+                np.asarray(tris, dtype=np.int64))
+    seq = list(surface)
+    if len(seq) == 3 and seq[1] is not None and np.asarray(seq[1]).ndim == 2 \
+            and np.asarray(seq[1]).shape == np.asarray(seq[0]).shape:
+        seq = [seq[0], seq[2]]              # (verts, normals, tris)
+    elif len(seq) == 3:
+        seq = [seq[0], seq[2]]
+    if len(seq) != 2:
+        raise ValueError("a surface is a plane z, a PLY path, (verts, tris) or "
+                         "(verts, normals, tris); got %r" % (surface,))
+    return ("mesh", np.asarray(seq[0], dtype=np.float64),
+            np.asarray(seq[1], dtype=np.int64))
+
+
+def _describe_surface(surface, geom=None):
+    """What the report calls the thing it measured against."""
+    if surface is None:
+        return "nothing"
+    if isinstance(surface, str):
+        return os.path.basename(surface)
+    if geom is not None and geom[0] == "plane":
+        return "a horizontal plane at z %.4f" % (geom[1],)
+    if geom is not None:
+        return "a mesh of %d faces" % (len(geom[2]),)
+    return repr(surface)
+
+
+def _tri_grid(verts, tris, cell):
+    """A uniform xy bucket grid over the triangles: (x0, y0, cell, keys, order,
+    starts).
+
+    Broad phase, and it is what makes this affordable. The narrow phase is
+    Moller-Trumbore, which costs one pass over every candidate triangle per ray;
+    a 30 000-face rough mesh times 4 000 waypoints is 1.2e8 of those, which is
+    minutes and gigabytes of temporaries. The ray only has to be searched over
+    about 120 mm, so its xy footprint covers a handful of cells and the
+    candidate set drops to tens.
+
+    Built with np.repeat and one argsort rather than a dict, because a Python
+    loop over the faces of a Poisson mesh is itself several seconds.
+    """
+    lo = np.minimum(np.minimum(verts[tris[:, 0]], verts[tris[:, 1]]),
+                    verts[tris[:, 2]])
+    hi = np.maximum(np.maximum(verts[tris[:, 0]], verts[tris[:, 1]]),
+                    verts[tris[:, 2]])
+    x0, y0 = float(lo[:, 0].min()), float(lo[:, 1].min())
+    # A CAP ON THE GRID, not on the candidates. The cell above is sized from the
+    # MEDIAN face, and a reconstructed mesh is not uniform: ball pivoting leaves
+    # slivers and Poisson leaves a few faces spanning a hole, so one triangle
+    # can cover the whole grid and the (cell, triangle) list can blow up while
+    # the median says everything is fine. Widening the cell until the list fits
+    # keeps the answer exactly right -- a coarser grid means more candidates per
+    # ray, never a missed one -- where clipping a triangle's span would lose
+    # surface and silently under-report the standoff.
+    for _round in range(12):
+        nx = max(1, int(math.ceil((float(hi[:, 0].max()) - x0)/cell)) + 1)
+        ny = max(1, int(math.ceil((float(hi[:, 1].max()) - y0)/cell)) + 1)
+        ix0 = np.clip(((lo[:, 0] - x0)/cell).astype(np.int64), 0, nx - 1)
+        ix1 = np.clip(((hi[:, 0] - x0)/cell).astype(np.int64), 0, nx - 1)
+        iy0 = np.clip(((lo[:, 1] - y0)/cell).astype(np.int64), 0, ny - 1)
+        iy1 = np.clip(((hi[:, 1] - y0)/cell).astype(np.int64), 0, ny - 1)
+        wx, wy = ix1 - ix0 + 1, iy1 - iy0 + 1
+        counts = wx*wy
+        if int(counts.sum()) <= 8_000_000 and nx*ny <= 4_000_000:
+            break
+        cell *= 2.0
+    tri_idx = np.repeat(np.arange(len(tris), dtype=np.int64), counts)
+    # Position of each entry within its own triangle's (wx, wy) block.
+    within = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(
+        np.concatenate(([0], np.cumsum(counts)[:-1])), counts)
+    wxr = np.repeat(wx, counts)
+    cx = np.repeat(ix0, counts) + (within % wxr)
+    cy = np.repeat(iy0, counts) + (within // wxr)
+    keys = cy*nx + cx
+    order = np.argsort(keys, kind="stable")
+    keys = keys[order]
+    tri_idx = tri_idx[order]
+    # CSR: starts[k] .. starts[k+1] are the entries of cell k.
+    starts = np.searchsorted(keys, np.arange(nx*ny + 1, dtype=np.int64))
+    return (x0, y0, float(cell), nx, ny, tri_idx, starts)
+
+
+def _ray_first_hit(origins, dirs, geom, search=None, progress_what=None):
+    """(n,) signed distance from each origin, along its direction, to the first
+    surface; +inf where the ray finds nothing within +/- `search`.
+
+    NEGATIVE means the surface is between the origin and the head -- nearer than
+    the optical frame, which is the failure mode this file exists for. The
+    returned value is `t`, and the standoff is keyence_ref_dist + t.
+
+    "First" is the SMALLEST t, not the smallest |t|: the sensor sees the nearest
+    surface along its axis starting from the head, and on a curved part with a
+    vertical tool that is not always the waypoint the pose was planned for.
+    """
+    search = float(KEYENCE_RAY_SEARCH_M if search is None else search)
+    origins = np.asarray(origins, dtype=np.float64).reshape(-1, 3)
+    dirs = np.asarray(dirs, dtype=np.float64).reshape(-1, 3)
+    n = origins.shape[0]
+    out = np.full(n, np.inf)
+    if geom is None or n == 0:
+        return out
+
+    if geom[0] == "plane":
+        z = geom[1]
+        dz = dirs[:, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t = np.where(np.abs(dz) > 1e-12, (z - origins[:, 2])/dz, np.inf)
+        return np.where(np.abs(t) <= search, t, np.inf)
+
+    verts, tris = geom[1], geom[2]
+    v0 = verts[tris[:, 0]]
+    e1 = verts[tris[:, 1]] - v0
+    e2 = verts[tris[:, 2]] - v0
+    # THE CELL IS SIZED FOR THE TRIANGLES, NOT FOR THE RAY. Sizing it to 2*search
+    # makes the ray's footprint fit in one cell, which is true and useless: it
+    # also makes the whole mesh one bucket, so every ray is tested against every
+    # face, and cost then grows with mesh size. Sizing the grid to the faces
+    # instead -- about sqrt(n) cells a side, never finer than a face -- holds a
+    # 4600-pose raster to a fraction of a second against both a 31k-face TSDF
+    # mesh and a 199k-face Poisson mesh, so the bigger mesh is not the slower one.
+    #
+    # A near-vertical ray still covers exactly one cell, because its footprint
+    # comes from its own direction below, not from `search`.
+    span = np.linalg.norm(np.maximum(np.abs(e1), np.abs(e2)), axis=1)
+    # max - min written out: ndarray.ptp() was removed in numpy 2 and the host
+    # is on it while the cell is not, so the one spelling that works on both is
+    # the arithmetic.
+    extent = max(float(verts[:, 0].max() - verts[:, 0].min()),
+                 float(verts[:, 1].max() - verts[:, 1].min()), 1e-6)
+    cell = max(float(np.median(span))*2.0, extent/max(math.sqrt(len(tris)), 1.0),
+               1e-4)
+    x0, y0, cell, nx, ny, tri_idx, starts = _tri_grid(verts, tris, cell)
+
+    p0 = origins - search*dirs
+    p1 = origins + search*dirs
+    lox = np.minimum(p0[:, 0], p1[:, 0])
+    hix = np.maximum(p0[:, 0], p1[:, 0])
+    loy = np.minimum(p0[:, 1], p1[:, 1])
+    hiy = np.maximum(p0[:, 1], p1[:, 1])
+    ix0 = np.clip(((lox - x0)/cell).astype(np.int64), 0, nx - 1)
+    ix1 = np.clip(((hix - x0)/cell).astype(np.int64), 0, nx - 1)
+    iy0 = np.clip(((loy - y0)/cell).astype(np.int64), 0, ny - 1)
+    iy1 = np.clip(((hiy - y0)/cell).astype(np.int64), 0, ny - 1)
+
+    prog = globals().get("progress")
+    ctx = (prog(progress_what, total=n, unit="waypoints")
+           if (prog is not None and progress_what) else None)
+    if ctx is not None:
+        ctx.start()
+    try:
+        for i in range(n):
+            cand = []
+            for cy in range(iy0[i], iy1[i] + 1):
+                base = cy*nx
+                a = starts[base + ix0[i]]
+                b = starts[base + ix1[i] + 1]
+                if b > a:
+                    cand.append(tri_idx[a:b])
+            if ctx is not None:
+                ctx.step()
+            if not cand:
+                continue
+            c = cand[0] if len(cand) == 1 else np.concatenate(cand)
+            d = dirs[i]
+            a0, a1, a2 = v0[c], e1[c], e2[c]
+            pv = np.cross(np.broadcast_to(d, a2.shape), a2)
+            det = np.einsum("ij,ij->i", a1, pv)
+            ok = np.abs(det) > 1e-14
+            if not ok.any():
+                continue
+            inv = np.where(ok, 1.0/np.where(ok, det, 1.0), 0.0)
+            tv = origins[i] - a0
+            u = np.einsum("ij,ij->i", tv, pv)*inv
+            qv = np.cross(tv, a1)
+            v = (qv @ d)*inv
+            t = np.einsum("ij,ij->i", a2, qv)*inv
+            ok &= (u >= -1e-9) & (v >= -1e-9) & (u + v <= 1.0 + 1e-9)
+            ok &= np.abs(t) <= search
+            if ok.any():
+                out[i] = float(t[ok].min())
+    finally:
+        if ctx is not None:
+            ctx.finish()
+    return out
+
+
+def _standoff_of_path(path, surface, tf_offset=None, axis=None, ref_dist=None,
+                      source=None, search=None, quiet=True):
+    """(standoff (n,), optical origins (n,3), axis directions (n,3))."""
+    off, ax, ref = keyence_optical_geometry(tf_offset=tf_offset, axis=axis,
+                                            ref_dist=ref_dist, source=source)
+    pos = np.asarray(path.positions, dtype=np.float64).reshape(-1, 3)
+    quats = np.asarray(path.quats, dtype=np.float64).reshape(-1, 4)
+    n = pos.shape[0]
+    optical = np.empty((n, 3))
+    look = np.empty((n, 3))
+    for i in range(n):
+        R = quat_to_matrix(quats[i])
+        optical[i] = pos[i] + R.dot(off)
+        look[i] = R.dot(ax)
+    geom = _surface_geometry(surface)
+    t = _ray_first_hit(optical, look, geom, search=search,
+                       progress_what=None if quiet else
+                       "checking the keyence standoff")
+    return ref + t, optical, look
+
+
+def commanded_standoff(path, surface, **kwargs):
+    """(n,) commanded standoff in metres, +inf where the sensor is aimed at
+    nothing within the search band.
+
+    "Commanded" because it is what the PLAN asks the sensor to measure at: the
+    distance from the head, along the head's own axis, to the first surface the
+    ray meets. Over the mesh the raster was planned over it should be the
+    reference distance everywhere, because plan_sweep() puts the optical frame
+    on that surface and the optical frame is at the reference distance. Where it
+    is not, something has moved the pose since -- or the ray is finding a nearer
+    piece of the part than the waypoint it was planned for.
+    """
+    return _standoff_of_path(path, surface, **kwargs)[0]
+
+
+def _pass_of(path, index):
+    """Which segment of `path` a waypoint index belongs to, 0-based."""
+    for k, (a, b) in enumerate(path.segments):
+        if a <= index < b:
+            return k
+    return -1
+
+
+def _worst_side(value, lo, hi):
+    """"near", "far" or None for where `value` leaves the window."""
+    if not np.isfinite(value):
+        return "missing"
+    if value < lo:
+        return "near"
+    if value > hi:
+        return "far"
+    return None
+
+
+def keyence_standoff_report(path, surface, margin=None, range_m=None,
+                            quiet=True, **kwargs):
+    """What the plan commands, measured against the window. Moves nothing.
+
+    Returns a dict:
+
+      ok              every waypoint inside the guarded window
+      standoff        (n,) metres, +inf where the ray found no surface
+      lo, hi          the guarded window
+      hard_lo, hard_hi  the sensor's own
+      margin          how much of the window is being held back, per end
+      n, n_out, n_missing
+      worst           the standoff furthest outside the guarded window
+      worst_index, worst_xyz, worst_pass, worst_side
+      passes          one dict per segment, in order
+      passes_out      indices of the segments with a waypoint out
+      surface         what it was measured against, for the printed line
+    """
+    lo, hi, hard_lo, hard_hi = keyence_window(margin=margin, range_m=range_m)
+    d, optical, _look = _standoff_of_path(path, surface, quiet=quiet, **kwargs)
+    missing = ~np.isfinite(d)
+    out = (d < lo) | (d > hi) | missing
+    # How far outside, with a miss counted as maximally outside so it sorts to
+    # the top: a waypoint whose sensor is aimed at nothing measures nothing, and
+    # that is not better news than one aimed 2 mm too close.
+    excess = np.where(missing, np.inf,
+                      np.maximum(lo - np.where(missing, lo, d),
+                                 np.where(missing, hi, d) - hi))
+    passes = []
+    for k, (a, b) in enumerate(path.segments):
+        seg = d[a:b]
+        segout = out[a:b]
+        finite = seg[np.isfinite(seg)]
+        passes.append({
+            "index": k, "first": int(a), "last": int(b) - 1, "n": int(b - a),
+            "n_out": int(segout.sum()),
+            "n_missing": int((~np.isfinite(seg)).sum()),
+            "min": float(finite.min()) if len(finite) else float("inf"),
+            "max": float(finite.max()) if len(finite) else float("inf"),
+            "median": float(np.median(finite)) if len(finite) else float("inf"),
+        })
+    worst_i = int(np.argmax(excess)) if len(excess) else -1
+    worst = (float(d[worst_i]) if worst_i >= 0 else float("nan"))
+    geom = _surface_geometry(surface)
+    finite = d[np.isfinite(d)]
+    rep = {
+        "ok": not bool(out.any()),
+        "standoff": d, "optical": optical,
+        "lo": lo, "hi": hi, "hard_lo": hard_lo, "hard_hi": hard_hi,
+        "margin": keyence_standoff_margin(margin),
+        "ref_dist": keyence_ref_dist(kwargs.get("ref_dist")),
+        "n": int(len(d)), "n_out": int(out.sum()),
+        "n_missing": int(missing.sum()),
+        "min": float(finite.min()) if len(finite) else float("inf"),
+        "max": float(finite.max()) if len(finite) else float("inf"),
+        "median": float(np.median(finite)) if len(finite) else float("inf"),
+        "worst": worst, "worst_index": worst_i,
+        "worst_xyz": (optical[worst_i].copy() if worst_i >= 0
+                      else np.zeros(3)),
+        "worst_pass": _pass_of(path, worst_i) if worst_i >= 0 else -1,
+        "worst_side": _worst_side(worst, lo, hi) if worst_i >= 0 else None,
+        "passes": passes,
+        "out": out, "missing": missing,
+        "passes_out": [p["index"] for p in passes if p["n_out"]],
+        "surface": _describe_surface(surface, geom),
+        "n_passes": len(passes),
+    }
+    return rep
+
+
+def describe_standoff_report(rep, what="keyence sweep"):
+    """The report as lines. The refusal and the check print the SAME text.
+
+    Four things, in this order: how bad, where, which end of the window, and
+    what to do about it.
+    """
+    lines = []
+    lines.append(
+        "    commanded standoff over %s: %s..%s (median %s); the LJ-V7080 "
+        "measures from %.0f to %.0f mm and this guard holds %.0f..%.0f "
+        "(%.0f mm margin)"
+        % (rep["surface"], _fmt_mm(rep["min"]), _fmt_mm(rep["max"]),
+           _fmt_mm(rep["median"]), 1e3*rep["hard_lo"], 1e3*rep["hard_hi"],
+           1e3*rep["lo"], 1e3*rep["hi"], 1e3*rep["margin"]))
+    if rep["ok"]:
+        head = min(rep["min"] - rep["lo"], rep["hi"] - rep["max"])
+        lines.append(
+            "    %d waypoints in %d pass(es), all inside the guarded window "
+            "with %.1f mm to spare at the tightest"
+            % (rep["n"], rep["n_passes"], 1e3*head))
+        return lines
+    lines.append(
+        "    %d of %d waypoints are outside it, in %d of %d pass(es): %s"
+        % (rep["n_out"], rep["n"], len(rep["passes_out"]), rep["n_passes"],
+           ", ".join(str(k + 1) for k in rep["passes_out"][:12])
+           + (" ..." if len(rep["passes_out"]) > 12 else "")))
+    if rep["n_missing"]:
+        lines.append(
+            "    %d of them have NO surface within %.0f mm of the reference "
+            "distance at all -- the sensor is aimed past the edge of the "
+            "surface, or across a hole in it, and will measure nothing there"
+            % (rep["n_missing"], 1e3*KEYENCE_RAY_SEARCH_M))
+    x, y, z = rep["worst_xyz"]
+    side = rep["worst_side"]
+    if side == "missing":
+        lines.append(
+            "    worst: pass %d, waypoint %d, sensor at (%.3f, %.3f, %.3f) "
+            "aimed at nothing"
+            % (rep["worst_pass"] + 1, rep["worst_index"], x, y, z))
+    else:
+        limit = rep["lo"] if side == "near" else rep["hi"]
+        hard = rep["hard_lo"] if side == "near" else rep["hard_hi"]
+        lines.append(
+            "    worst: %s at pass %d, waypoint %d, sensor at "
+            "(%.3f, %.3f, %.3f) -- %.1f mm past the %s guard limit of %.0f mm "
+            "and %.1f mm %s the sensor's own %.0f mm %s limit"
+            % (_fmt_mm(rep["worst"]), rep["worst_pass"] + 1, rep["worst_index"],
+               x, y, z, 1e3*abs(rep["worst"] - limit), side, 1e3*limit,
+               1e3*abs(rep["worst"] - hard),
+               "inside" if ((side == "near" and rep["worst"] >= hard)
+                            or (side == "far" and rep["worst"] <= hard))
+               else "OUTSIDE", 1e3*hard, side))
+    lines.append(
+        "    a profiler at the bottom of its range does not fail, it returns "
+        "WRONG VALUES: flown at 58-61 mm over a surface-ground plate, "
+        "26-39% of it came back scattered over 16 mm, and then got meshed.")
+    lines.append(
+        "    WHAT TO DO: the rough mesh this raster was planned over is the "
+        "thing that is most likely wrong, not the sensor. A loose camera mount "
+        "is enough to read a plate 13.6 mm low across the part and 22 mm low at "
+        "one end. Re-seat and re-calibrate the camera and reconstruct the rough "
+        "surface again, or plan this raster over a better surface -- a previous "
+        "Keyence mesh, a CAD model. Do NOT raise KEYENCE_STANDOFF_MARGIN to get "
+        "past this: the margin is what is left of the window, and spending it "
+        "does not move the sensor.")
+    return lines
+
+
+#: How much of a raster may be DROPPED for being out of the measuring window
+#: before the plan is refused outright instead.
+#:
+#: A handful of waypoints at the edge of the rough mesh is geometry, not a
+#: fault: a Noether raster over any mesh with a boundary runs off it at the
+#: ends, and a sensor aimed past the edge measures nothing there. A quarter of
+#: the path out of window is a different statement entirely -- it says the mesh
+#: the raster was planned over is wrong, and no amount of dropping fixes that.
+#:
+#: For scale: a raster over a cylinder in simulation puts 4 of 299 waypoints out
+#: (1.3%), two of them aimed at nothing, against 295 sitting at exactly 80.0 mm;
+#: a raster planned over a mesh 13.6-22 mm low was 26-39% out.
+#:
+#: IT APPLIES TO INTERIOR WAYPOINTS ONLY -- see out_of_window_shape(). A fraction
+#: of the whole path is the wrong denominator for pass-END waypoints, because the
+#: number of pass ends scales with the number of PASSES and not with path length.
+#: Two rasters over the same part, minutes apart, show it:
+#:
+#:   1790 waypoints, 19 passes   2 out (0.11%)  ->  dropped, ran, meshed
+#:     39 waypoints,  3 passes   3 out (7.69%)  ->  REFUSED
+#:
+#: Both are the same geometric fact -- a Noether raster runs off the end of a
+#: bounded mesh and the sensor aimed past that edge measures nothing. The second
+#: is a 24 x 66 mm ROI, which Noether plans as 3 passes of 13 poses, so ONE end
+#: waypoint per pass is 7.7% of the path before anything is wrong. Capping the
+#: whole path at 5% therefore refuses small regions for being small, which is
+#: exactly backwards: a small ROI is what an operator draws when they want one
+#: feature scanned in the hour the plan allows.
+global KEYENCE_STANDOFF_DROP_FRACTION
+KEYENCE_STANDOFF_DROP_FRACTION = 0.05
+
+#: How much of ONE PASS may be trimmed off its ends before the trim stops being
+#: an overrun and becomes evidence about the surface.
+#:
+#: Trim needs its own limit and it cannot be a fraction of the path -- that is
+#: what the note above is about -- but it cannot be unlimited either. A raster
+#: overruns a mesh boundary by about one waypoint spacing, so a pass losing one
+#: or two waypoints off an end is geometry. A pass losing a THIRD of its length
+#: off its ends is not: the surface it was planned over is at the wrong height
+#: near the edges, which is precisely the failure this file guards against -- a
+#: rough mesh 13.6 mm low across a plate and 22 mm low at ONE END puts the error
+#: exactly where a per-path fraction would call it trim.
+#:
+#: Sized against the four cases on record, which is why it is 0.20 and not a
+#: round guess:
+#:
+#:   19 passes of ~94,  2 out       ~1% of a pass                     -> fly
+#:    3 passes of  13,  3 out      7.7% of a pass                     -> fly
+#:   17 passes,        36 out, 4 passes lost WHOLE                    -> refuse
+#:    7 passes of   9, 21 out       33% of a pass (edge overrun)      -> refuse
+#:
+#: A pass that is out from end to end is 100% and fails this by construction,
+#: which is the behaviour wanted: it is not a shortened pass, it is no pass.
+global KEYENCE_STANDOFF_TRIM_PASS_FRACTION
+KEYENCE_STANDOFF_TRIM_PASS_FRACTION = 0.20
+
+
+def out_of_window_shape(path, out):
+    """Split out-of-window waypoints into pass-END TRIM and INTERIOR holes.
+
+    THE TWO ARE DIFFERENT STATEMENTS ABOUT THE PLAN, which is why they are
+    counted separately and held to different rules:
+
+      TRIM      a contiguous run of out-of-window waypoints that TOUCHES the
+                start or the end of a pass. This is the geometry of a finite
+                surface: the raster overruns the mesh boundary, the sensor is
+                aimed past the edge, and shortening the pass is the whole of the
+                fix. It says nothing about whether the mesh is right.
+
+      INTERIOR  out of window with in-window waypoints on BOTH sides. The
+                surface is there and the plan is at the wrong height over it.
+                That is what a wrong rough mesh looks like -- a mesh 13.6 mm low
+                under a raster that came back 26-39% scattered -- and no amount
+                of dropping fixes it.
+
+    A pass that is out of window from end to end is NEITHER of those. There is no
+    in-window waypoint for anything to be "between", so calling it an interior
+    hole is wrong; and there is nothing left of the pass after trimming it, so
+    calling it trim would let a raster that cannot be flown at all be reported as
+    a shortened one. It is counted separately, as a pass lost whole.
+
+    Returns (n_trim, n_interior, n_whole, passes), where `passes` is one dict per
+    segment carrying its own counts -- so the report can name which pass has a
+    hole in the middle rather than only how many waypoints are out.
+    """
+    out = np.asarray(out, dtype=bool).reshape(-1)
+    n_trim = 0
+    n_interior = 0
+    n_whole = 0
+    passes = []
+    for k, (a, b) in enumerate(path.segments):
+        seg = out[a:b]
+        n = len(seg)
+        trim = 0
+        interior = 0
+        whole = False
+        if n and seg.all():
+            whole = True
+            n_whole += 1
+        elif n:
+            lead = 0
+            while lead < n and seg[lead]:
+                lead += 1
+            tail = 0
+            while tail < n and seg[n - 1 - tail]:
+                tail += 1
+            trim = lead + tail
+            interior = int(seg.sum()) - trim
+        n_trim += trim
+        n_interior += interior
+        passes.append({"index": k, "n": n, "n_trim": int(trim),
+                       "n_interior": int(interior), "whole": whole,
+                       # What share of THIS pass is out, which is the quantity
+                       # the trim limit is on. See
+                       # KEYENCE_STANDOFF_TRIM_PASS_FRACTION.
+                       "share": (float(int(seg.sum()))/n) if n else 1.0})
+    return int(n_trim), int(n_interior), int(n_whole), passes
+
+
+def keyence_standoff_gate(path, surface, margin=None, allow=None,
+                          what="keyence sweep", quiet=False, drop=None,
+                          min_points=4, **kwargs):
+    """Measure the plan's standoff, say it, and REFUSE it if it is out.
+
+    REFUSED, NOT PRINTED. A warning emitted while the wrong thing proceeds is a
+    warning nobody acts on: AzureReconstruction._report_standoff() is the
+    precedent, and sweeps flew with its paragraph on screen. The Keyence's
+    version of that failure is worse, because a depth camera in its dead zone at
+    least produces a mesh that looks wrong; a profiler at the bottom of its range
+    produces one that looks right.
+
+    allow=True (or KEYENCE_ALLOW_BAD_STANDOFF in a config) is the deliberate
+    override. It flies it anyway and prints what to expect rather than falling
+    silent, which is the same contract allow_dead_zone has.
+
+    Returns the report. Raises ValueError when the plan is out and not allowed.
+    """
+    global last_standoff_report
+    if surface is None:
+        _standoff_say(
+            "    WARNING: there is no surface to check the %s standoff "
+            "against, so nothing knows whether the sensor will be in its "
+            "measuring window. Pass surface= the mesh the raster was planned "
+            "over." % (what,))
+        return None
+    rep = keyence_standoff_report(path, surface, margin=margin, quiet=quiet,
+                                  **kwargs)
+    last_standoff_report = rep
+    lines = describe_standoff_report(rep, what=what)
+    if rep["ok"]:
+        for line in lines:
+            _standoff_say(line)
+        return rep
+    if allow is None:
+        allow = bool(globals().get("KEYENCE_ALLOW_BAD_STANDOFF", False))
+    for line in lines:
+        _standoff_say(line)
+    if allow:
+        _standoff_say(
+            "    ** FLYING OUT OF THE MEASURING WINDOW ANYWAY "
+            "(KEYENCE_ALLOW_BAD_STANDOFF): expect the %d out-of-window "
+            "waypoints to return scattered values rather than nothing, and "
+            "expect those values to be meshed." % (rep["n_out"],))
+        return rep
+
+    # DROP THE FEW, REFUSE THE MANY -- the same contract the tooling-clearance
+    # gate has had all along, and for the same reason it gives: losing a few
+    # waypoints is a measurement with a hole in it, which is a result. Flying
+    # them is wrong data, which is not.
+    #
+    # Without the third option the pipeline cannot finish unattended on ANY part
+    # whose rough mesh has an edge: a Noether raster runs off the end of any
+    # bounded surface, and the sensor aimed past that edge measures nothing. On a
+    # simulated cylinder that is four waypoints of 299, and refuse-or-fly-
+    # everything throws away all ten passes for them.
+    frac = (KEYENCE_STANDOFF_DROP_FRACTION if drop is None else float(drop))
+    crop = globals().get("_crop_path_by_mask")
+
+    # TRIM IS ALWAYS ALLOWED; ONLY INTERIOR HOLES ARE CAPPED. The fraction used
+    # taken over every out-of-window waypoint refuses a plan for having few
+    # waypoints rather than for being wrong -- see the note on
+    # KEYENCE_STANDOFF_DROP_FRACTION for the two runs that settled it.
+    n_trim, n_interior, n_whole, shape = out_of_window_shape(path, rep["out"])
+    interior_share = (float(n_interior)/rep["n"]) if rep["n"] else 1.0
+    share = (float(rep["n_out"])/rep["n"]) if rep["n"] else 1.0
+    rep = dict(rep)
+    rep.update({"n_trim": n_trim, "n_interior": n_interior,
+                "n_whole_passes_out": n_whole,
+                "interior_share": interior_share, "shape": shape})
+
+    # A pass that loses too much of its own length is not an overrun. Held per
+    # pass, because that is the unit an overrun belongs to.
+    pass_frac = KEYENCE_STANDOFF_TRIM_PASS_FRACTION
+    gutted = [p for p in shape if p["share"] > pass_frac]
+    rep["gutted_passes"] = [p["index"] for p in gutted]
+
+    keep = ~np.asarray(rep["out"], bool)
+    cropped = None
+    if (crop is not None and rep["n_out"] and keep.any()
+            and interior_share <= frac and not gutted):
+        try:
+            cropped = crop(path, keep, what,
+                           min_points, "outside the measuring window")
+        except RuntimeError:
+            # Nothing survived the crop -- every run left was shorter than
+            # min_points. Not a shortened raster: there is no raster. Fall
+            # through to the refusal, which says what was measured and why.
+            cropped = None
+    if cropped is not None:
+        n_miss = int(rep["n_missing"])
+        _standoff_say(
+            "    DROPPED %d of %d waypoints (%.1f%%) for being outside the "
+            "window -- %d of them aimed at nothing, which would have measured "
+            "nothing anyway. %d of %d passes remain."
+            % (rep["n_out"], rep["n"], 100.0*share, n_miss,
+               len(cropped.segments), len(path.segments)))
+        _standoff_say(
+            "    %d of those are pass ENDS (the raster overrunning the edge of "
+            "a bounded mesh, which every raster does -- the pass is shortened) "
+            "and %d are INTERIOR, with surface on both sides. Interior holes "
+            "are what say the planning mesh is at the wrong height, and they "
+            "are what the %.0f%% limit is on: this plan is at %.1f%%."
+            % (n_trim, n_interior, 100.0*frac, 100.0*interior_share))
+        _standoff_say(
+            "    This is a HOLE IN THE MEASUREMENT, not a clean run: those "
+            "waypoints are not measured and the mesh will have gaps there.")
+        rep.update({"ok": True, "dropped": int(rep["n_out"]),
+                    "path": cropped, "passes_after": len(cropped.segments),
+                    "passes_before": len(path.segments)})
+        last_standoff_report = rep
+        return rep
+
+    # WHICH of the three refusals this is. They are different problems and the
+    # operator's next move differs, so do not blur them into one sentence.
+    inner = [p["index"] + 1 for p in shape if p["n_interior"]]
+    if gutted:
+        worst_pass = max(gutted, key=lambda p: p["share"])
+        whole = [p["index"] + 1 for p in gutted if p["whole"]]
+        why = ("\n    %d of %d pass(es) lose more than %.0f%% of their own "
+               "length to the window, worst pass %d at %.0f%% (%d of %d "
+               "waypoints)%s. A raster overruns the edge of a bounded mesh by "
+               "about ONE waypoint, so losing a third of a pass is not an "
+               "overrun -- it is the surface being at the wrong height near "
+               "that edge, which is the failure this gate exists for: a rough "
+               "mesh 13.6 mm low across a plate and 22 mm low at ONE END puts "
+               "the error precisely where a whole-path fraction would have "
+               "called it trim. That is above the %.0f%% this gate will "
+               "drop and fly around. The mesh is the thing to fix, not the "
+               "margin."
+               % (len(gutted), rep["n_passes"], 100.0*pass_frac,
+                  worst_pass["index"] + 1, 100.0*worst_pass["share"],
+                  int(round(worst_pass["share"]*worst_pass["n"])),
+                  worst_pass["n"],
+                  ("" if not whole else
+                   "; %d of them out from end to end (pass(es) %s)"
+                   % (len(whole), ", ".join(str(k) for k in whole[:12])
+                      + (" ..." if len(whole) > 12 else ""))),
+                  100.0*frac))
+    elif interior_share > frac:
+        why = ("\n    %d of them are INTERIOR -- surface on both sides, so the "
+               "plan is at the wrong height over ground that IS there -- which "
+               "is %.1f%% of the raster against the %.0f%% this gate will drop "
+               "and fly around. Pass(es) %s. The mesh is the thing to fix, not "
+               "the margin."
+               % (n_interior, 100.0*interior_share, 100.0*frac,
+                  ", ".join(str(k) for k in inner[:12])
+                  + (" ..." if len(inner) > 12 else "")))
+    elif cropped is None and crop is not None:
+        why = ("\n    NOTHING IS LEFT TO FLY: %d of %d pass(es) are out of the "
+               "window from end to end, and no run of at least %d in-window "
+               "waypoints survives anywhere. This is not a raster with a hole "
+               "in it, it is a raster that cannot be flown -- the surface it "
+               "was planned over is at the wrong height, not merely finite."
+               % (n_whole, rep["n_passes"], min_points))
+    else:
+        why = ("\n    %.1f%% of the raster is out of the window and this gate "
+               "has no path-cropping function available, so it cannot drop the "
+               "few and fly the rest." % (100.0*share,))
+    raise ValueError(
+        "this %s is refused: %d of %d waypoints command a standoff outside "
+        "%.0f..%.0f mm, worst %s at pass %d.\n%s"
+        % (what, rep["n_out"], rep["n"], 1e3*rep["lo"], 1e3*rep["hi"],
+           _fmt_mm(rep["worst"]), rep["worst_pass"] + 1,
+           "\n".join(lines[1:]))
+        + why)
+
+
+def check_keyence_standoff(path=None, surface=None, rough=None, region=None,
+                           margin=None, source=None, **kwargs):
+    """WILL THE KEYENCE RASTER BE IN ITS WINDOW? Nothing moves.
+
+    Run it before the recorder starts. It plans the raster THE SAME WAY THE RUN
+    PLANS IT and prints the same analysis the gate prints, because it is the
+    same call and the same gate -- check_rough_plan() in ECAutomatedScan.dgp is
+    the precedent, and the reason is that a checker which is a second
+    implementation of the thing it checks eventually disagrees with it. IK is
+    randomised and meshes are noisy, so "eventually" is every run: a sweep
+    checker built that way once reported 2 flyable directions where the run
+    itself found 0 of 8 over the same region minutes later.
+
+        check_keyence_standoff()                       plan it and grade it
+        check_keyence_standoff(surface=0.9402)         ...against a touched-off
+                                                       plate top instead
+        check_keyence_standoff(surface="previous.ply") ...against a better mesh
+        check_keyence_standoff(path=already_planned)   grade a path in hand
+
+    The second and third forms are the interesting ones. Grading the plan
+    against the mesh it was PLANNED over can only find inconsistencies inside
+    the plan; grading it against a surface that came from somewhere else finds
+    the mesh itself being wrong, which is the failure that matters.
+
+    Returns the report. It does not raise -- it is a check, so the refusal is
+    printed in full and reported as ok=False rather than thrown at somebody who
+    asked a question.
+    """
+    if path is None:
+        # THE SAME CALL THE RUN MAKES. reconstruct_fine() is
+        # reconstruct_specimen(source="keyence", ...) with one setdefault, and
+        # plan_only=True stops at the plan -- so plan_sweep() runs, and its own
+        # gate runs inside it, over the same mesh with the same orientation and
+        # the same clearance ladder.
+        #
+        # The setdefault is mirrored rather than shared because reconstruct_fine
+        # lives in the config: if a config grows a second one, this drifts, and
+        # the drift shows up as a different orient in the printed line below.
+        if globals().get("KEYENCE_ORIENTATION") is not None:
+            kwargs.setdefault("orient", KEYENCE_ORIENTATION)
+        if rough is None:
+            rough = globals().get("rough_mesh")
+        if rough is None:
+            raise RuntimeError(
+                "the Keyence raster is a Noether toolpath over a rough mesh, "
+                "and there is none. Run reconstruct_rough() first, or pass "
+                "rough= a mesh on disk.")
+        if region is None:
+            region = globals().get("detected_region")
+        try:
+            path = reconstruct_specimen(source="keyence", rough_mesh=rough,
+                                        region=region, name="specimen",
+                                        plan_only=True, **kwargs)
+        except ValueError as e:
+            # plan_sweep()'s own gate refused it. That IS the answer; print it
+            # where a check's output belongs rather than as a traceback.
+            print("  REFUSED by the standoff guard while planning:\n%s" % (e,))
+            return last_standoff_report
+        if surface is None:
+            surface = rough
+    if surface is None:
+        surface = rough if rough is not None else globals().get("rough_mesh")
+    try:
+        return keyence_standoff_gate(path, surface, margin=margin,
+                                     source=source, what="keyence raster",
+                                     quiet=False, **{
+                                         k: v for k, v in kwargs.items()
+                                         if k in ("tf_offset", "axis",
+                                                  "ref_dist", "range_m",
+                                                  "search")})
+    except ValueError as e:
+        print("  REFUSED: %s" % (e,))
+        return last_standoff_report
+
+
+# ==============================================================================
+# LAYER 2 AND 3: WHAT THE SENSOR ACTUALLY RETURNS
+# ==============================================================================
+# The plan-time gate can only be as right as the surface it is handed. This half
+# asks the sensor, which has no opinion about the rough mesh at all.
+
+def keyence_profile_standoff(msg, ref_dist=None):
+    """(m,) standoffs in metres from one /profiles PointCloud2, finite only.
+
+    keyence_driver_node packs each column as (x_across, 0, z) in
+    lj_v7080_optical_frame, where z is the device's own reading and POSITIVE z
+    is TOWARDS THE HEAD -- so the distance from the head is
+
+        standoff = keyence_ref_dist - z
+
+    and the device's +/-23 mm of travel maps onto 0.057..0.103 m the right way
+    round. Out-of-range columns are +inf (REP-117) and are dropped here; a
+    profile of nothing returns an empty array, which is a fact about coverage
+    and not about standoff.
+
+    Reads only z. This runs on every message at the real head's 216 Hz with 800
+    columns each, so it must not be the thing that is slow: the fields are
+    located once from the message's own layout rather than assumed, and nothing
+    is transformed into world -- the standoff IS a sensor-frame quantity, which
+    is exactly why this check needs no TF, no pose and no clock.
+    """
+    ref = keyence_ref_dist(ref_dist)
+    fields = {f.name: (int(f.offset), int(f.datatype)) for f in msg.fields}
+    if "z" not in fields:
+        return np.zeros(0)
+    offset, datatype = fields["z"]
+    dt = {7: "<f4", 8: "<f8"}.get(datatype)
+    if dt is None:
+        return np.zeros(0)
+    step = int(msg.point_step)
+    n = int(msg.width)*int(msg.height)
+    if n <= 0 or step <= 0:
+        return np.zeros(0)
+    buf = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    need = n*step
+    if buf.size < need:
+        n = buf.size//step
+        if n <= 0:
+            return np.zeros(0)
+        need = n*step
+    z = np.frombuffer(buf[:need].tobytes(), dtype=np.dtype({
+        "names": ["z"], "formats": [dt], "offsets": [offset],
+        "itemsize": step}), count=n)["z"].astype(np.float64)
+    z = z[np.isfinite(z)]
+    return ref - z
+
+
+def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
+                         n_profiles=0, n_empty=0, warn_fraction=None):
+    """What the sensor is measuring, against the window and against the plan.
+
+    `standoff` is metres from the head, as keyence_profile_standoff() returns
+    it. `commanded` is what the plan asked for at the same place, if the caller
+    knows -- and the difference between the two is the error in the surface the
+    plan was made from, measured with no touch-off and no calibration.
+
+      bias = commanded - measured
+
+    positive meaning the real surface is NEARER the head than the plan believed.
+    """
+    lo, hi, hard_lo, hard_hi = keyence_window(margin=margin, range_m=range_m)
+    warn = float(KEYENCE_STANDOFF_WARN_FRACTION if warn_fraction is None
+                 else warn_fraction)
+    d = np.asarray(standoff, dtype=np.float64).reshape(-1)
+    d = d[np.isfinite(d)]
+    rep = {"n": int(d.size), "lo": lo, "hi": hi, "hard_lo": hard_lo,
+           "hard_hi": hard_hi, "margin": keyence_standoff_margin(margin),
+           "n_profiles": int(n_profiles), "n_empty": int(n_empty),
+           "warn_fraction": warn, "commanded": None, "bias": None,
+           "bias_limit": float(globals().get("KEYENCE_MESH_BIAS_LIMIT",
+                                             KEYENCE_MESH_BIAS_LIMIT_M))}
+    if d.size == 0:
+        rep.update({"min": float("nan"), "max": float("nan"),
+                    "median": float("nan"), "p5": float("nan"),
+                    "p95": float("nan"), "spread": float("nan"),
+                    "near_fraction": 0.0, "far_fraction": 0.0,
+                    "tight_fraction": 0.0, "out_fraction": 0.0,
+                    "ok": True, "empty": True, "why": []})
+        return rep
+    near = float((d < lo).mean())
+    far = float((d > hi).mean())
+    p5, p95 = float(np.percentile(d, 5)), float(np.percentile(d, 95))
+    rep.update({
+        "min": float(d.min()), "max": float(d.max()),
+        "median": float(np.median(d)), "p5": p5, "p95": p95,
+        "spread": p95 - p5,
+        "near_fraction": near, "far_fraction": far,
+        "tight_fraction": near + far,
+        "out_fraction": float(((d < hard_lo) | (d > hard_hi)).mean()),
+        "empty": False,
+    })
+    # Each reason carries a KIND beside it, so a caller can suppress one it has
+    # already printed without matching on the text -- over a 17-row raster a
+    # uniform mesh error is one fact, not seventeen, and a paragraph repeated
+    # seventeen times is how a real finding becomes noise.
+    why, kinds = [], []
+    if near >= warn:
+        kinds.append("near")
+        why.append("%.1f%% of these points are within %.0f mm of the NEAR "
+                   "limit (%.0f mm), where a triangulation profiler stops "
+                   "returning the surface and starts returning noise"
+                   % (100.0*near, 1e3*rep["margin"], 1e3*hard_lo))
+    if far >= warn:
+        kinds.append("far")
+        why.append("%.1f%% of these points are within %.0f mm of the FAR "
+                   "limit (%.0f mm)" % (100.0*far, 1e3*rep["margin"], 1e3*hard_hi))
+    if commanded is not None and np.isfinite(commanded):
+        bias = float(commanded) - float(np.median(d))
+        rep["commanded"] = float(commanded)
+        rep["bias"] = bias
+        # A MEDIAN IS THE RIGHT SUMMARY ONLY WHERE THE SURFACE IS FLAT ACROSS THE
+        # LINE, and the laser line is 31 mm wide.
+        #
+        # The plan commands a standoff at ONE POINT -- the middle of the line. On
+        # a surface that curves across the line the sensor returns a RANGE, and
+        # the commanded point sits at one end of it, not in the middle: on a
+        # convex crest the middle of the line is the NEAREST return. Comparing the
+        # commanded standoff with the median then reads the sagitta as a mesh
+        # error.
+        #
+        # Measured on a 131 x 65 x 67 mm cylinder: comparing against the median
+        # refuses the sweep with "commanded 80.0, measuring 62.8, so the surface
+        # is 17.2 mm BELOW the real one" while the planning mesh's crest is
+        # accurate to 0.4 mm. The mesh is right and the inference is wrong.
+        #
+        # So when the line spans more than a flat surface would, ask the weaker
+        # question that is still sound: is the commanded standoff somewhere in
+        # what the sensor actually sees? If it is, the plan agrees with the sensor
+        # about where the surface is and the spread is the part's own shape. If it
+        # is not, the disagreement is real and survives the curvature.
+        rep["line_spread"] = float(rep["spread"])
+        flat_line = float(globals().get("KEYENCE_LINE_FLAT_SPREAD_M",
+                                        KEYENCE_LINE_FLAT_SPREAD_M))
+        curved = rep["spread"] > flat_line
+        in_range = (rep["min"] - rep["margin"] <= float(commanded)
+                    <= rep["max"] + rep["margin"])
+        rep["bias_from_curvature"] = bool(curved and in_range)
+        if curved and in_range:
+            rep["bias_note"] = (
+                "the laser line spans %.1f mm of height here (p5..p95), which is "
+                "a CURVED surface across the line rather than a mesh error: the "
+                "commanded %s lies inside the %.1f..%.1f mm the sensor actually "
+                "returns. The %.1f mm 'bias' is the sagitta, and the median is "
+                "not the standoff at the point the plan commanded."
+                % (1e3*rep["spread"], _fmt_mm(commanded), 1e3*rep["min"],
+                   1e3*rep["max"], 1e3*abs(bias)))
+        if abs(bias) > rep["bias_limit"] and not rep["bias_from_curvature"]:
+            # WHICH WAY ROUND, and it is worth being slow about. bias is
+            # commanded minus measured, so a POSITIVE bias means the real
+            # surface is NEARER the head than the plan believed -- for a sensor
+            # looking down, that is a real surface HIGHER than the planning
+            # surface, which is to say a planning surface that reads LOW: a
+            # bias of +13.6 mm is a planning mesh 13.6 mm below the part.
+            kinds.append("bias")
+            why.append(
+                "the plan commanded %s here and the sensor is measuring %s, so "
+                "the surface this raster was planned over is %.1f mm %s the "
+                "real one -- over the %.0f mm this pipeline will trust"
+                % (_fmt_mm(commanded), _fmt_mm(np.median(d)), 1e3*abs(bias),
+                   "BELOW" if bias > 0 else "ABOVE", 1e3*rep["bias_limit"]))
+    rep["why"] = why
+    rep["why_kinds"] = kinds
+    rep["ok"] = not why
+    return rep
+
+
+def describe_range_report(rep, what="this pass", skip=()):
+    """One summary line, plus a line per reason it is not ok.
+
+    `skip` drops reasons by kind ("near", "far", "bias"), which is how the
+    monitor says a uniform mesh error once instead of once per row. The report
+    itself is unchanged -- what is suppressed is the repetition, not the fact.
+    """
+    if rep.get("empty"):
+        return ["    %s: no finite returns at all (%d profile(s), %d empty)"
+                % (what, rep["n_profiles"], rep["n_empty"])]
+    lines = ["    %s: %d points, standoff %.1f..%.1f mm (median %.1f, "
+             "p5..p95 spread %.2f mm) against the %.0f..%.0f mm window"
+             % (what, rep["n"], 1e3*rep["min"], 1e3*rep["max"],
+                1e3*rep["median"], 1e3*rep["spread"],
+                1e3*rep["hard_lo"], 1e3*rep["hard_hi"])]
+    if rep.get("bias_note") and "bias" not in skip:
+        lines.append("    ** %s" % (rep["bias_note"],))
+    if rep.get("bias") is not None:
+        lines[0] += ("; commanded %.1f mm, so the planning surface is %.1f mm "
+                     "%s" % (1e3*rep["commanded"], 1e3*abs(rep["bias"]),
+                             "high" if rep["bias"] < 0 else "low"))
+    kinds = rep.get("why_kinds") or [None]*len(rep.get("why", []))
+    for kind, reason in zip(kinds, rep.get("why", [])):
+        if kind in skip:
+            continue
+        lines.append("    ** %s" % (reason,))
+    return lines
+
+
+def keyence_range_gate(standoff, commanded=None, margin=None, allow=None,
+                       what="the first pose of the keyence sweep", **kwargs):
+    """The pre-flight gate: what the sensor sees, before anything flies.
+
+    Called from _KeyenceReconstruction.profile_facts(), which runs after the arm
+    has reached the sweep's first pose and before a row is flown. Everything it
+    needs is already there -- a profile from the sensor and the standoff the
+    plan commanded at that waypoint -- and the whole check costs the three
+    seconds profile_topic_facts() was already spending.
+
+    REFUSES when the measurement is outside the guarded window, and when it
+    disagrees with the plan by more than KEYENCE_MESH_BIAS_LIMIT_M. The second
+    is the one that catches a raster planned over a mesh at the wrong height,
+    and it has to be the second and not the first because 66 mm IS inside the
+    window: such a run is refusable not because the sensor is out of range at
+    the first pose but because the surface it was planned over is 13.6 mm wrong,
+    and a surface that wrong globally is wrong by more than the remaining 4.4 mm
+    somewhere.
+
+    Ten minutes of flying, and then a mesh that looks like a mesh. Three seconds
+    here.
+    """
+    global last_range_report
+    rep = keyence_range_report(standoff, commanded=commanded, margin=margin,
+                               **kwargs)
+    last_range_report = rep
+    for line in describe_range_report(rep, what=what):
+        _standoff_say(line)
+    if rep["ok"]:
+        return rep
+    if allow is None:
+        allow = bool(globals().get("KEYENCE_ALLOW_BAD_STANDOFF", False))
+    fix = ("Re-seat and re-calibrate the camera and reconstruct the rough "
+           "surface again, or plan this raster over a better surface. The "
+           "sensor is telling you where the part is; the mesh is the thing "
+           "that is wrong.")
+    if allow:
+        _standoff_say("    ** SWEEPING ANYWAY (KEYENCE_ALLOW_BAD_STANDOFF). %s"
+                      % (fix,))
+        return rep
+    raise RuntimeError(
+        "this keyence sweep is refused before it flies: %s\n  %s"
+        % ("; ".join(rep["why"]), fix))
+
+
+class KeyenceStandoffMonitor(object):
+    """Watches /profiles during the sweep and says where in the window it is.
+
+    THE LAYER THAT SEES A LOCAL ERROR. The plan-time gate grades the plan
+    against a surface, and when the only surface available is the wrong one it
+    has nothing to find. The pre-flight gate asks the sensor once, at the first
+    pose. This asks it continuously, so it is the only thing in the pipeline that
+    can say, while it is happening, that the last few passes of a part are being
+    measured at the bottom of the range: 41.7% of the worst pass's points within
+    5 mm of the near limit, against 0.0% on every good pass, and a p5..p95 spread
+    of 19 mm against 0.2 mm.
+
+    It reports through progress.dpi, which is where the rest of a long stage's
+    output goes and which reaches the operator from a worker thread.
+
+    Cheap by construction: one subscription, z only, no transform, no TF lookup,
+    no pose. The whole per-message cost is a strided read of 800 float32 and a
+    handful of comparisons -- measured at well under a millisecond, against the
+    real head's 216 Hz.
+
+    The pure-numpy half (add_standoff / start_pass / end_pass / summary) has no
+    ROS in it at all, which is what lets keyence_standoff_test.py drive the
+    whole thing from a recorded point cloud.
+    """
+
+    #: How many profiles the whole-sweep buffer keeps before it starts thinning.
+    #: The real head runs at 216.8 Hz with 800 columns, so a ten-minute sweep is
+    #: 130 000 profiles and 830 MB of float64 if every one is kept -- and this
+    #: pipeline has been OOM-killed by a multi-gigabyte buffer before (the
+    #: clearance gate). Past the cap every second profile is dropped and the
+    #: stride doubles again at the next one, which keeps the buffer bounded and
+    #: the DISTRIBUTION unbiased: what the summary reports is percentiles and
+    #: fractions, and a uniform subsample preserves both. Per-pass buffers are
+    #: not thinned -- they are freed at end_pass() and a pass is a minute.
+    MAX_KEPT_PROFILES = 4000
+
+    def __init__(self, topic=None, commanded=None, margin=None, ref_dist=None,
+                 warn_fraction=None, path=None):
+        self.topic = topic or globals().get("KEYENCE_MONITOR_TOPIC") \
+            or KEYENCE_MONITOR_TOPIC
+        self.margin = margin
+        self.ref_dist = ref_dist
+        self.warn_fraction = warn_fraction
+        # (n,) commanded standoff per waypoint, so a pass can be compared
+        # against what it was told to do. None is fine -- the window check does
+        # not need it, only the bias does.
+        self.commanded = (None if commanded is None else
+                          np.asarray(commanded, dtype=np.float64).reshape(-1))
+        self.path = path
+        self._lock = threading.RLock()
+        self._pass = None
+        self._all = []
+        self._all_profiles = 0
+        self._all_empty = 0
+        self._stride = 1
+        self._node = None
+        self._thread = None
+        self._stop = None
+        self._bias_said = False
+        self.reports = []
+        self.loud_passes = []
+
+    # -- the numbers -----------------------------------------------------------
+
+    def add_standoff(self, d):
+        """One profile's worth of standoffs. Thread safe, and the fast path."""
+        d = np.asarray(d, dtype=np.float64).reshape(-1)
+        with self._lock:
+            self._all_profiles += 1
+            if d.size == 0:
+                self._all_empty += 1
+            elif self._all_profiles % self._stride == 0:
+                self._all.append(d)
+                if len(self._all) > self.MAX_KEPT_PROFILES:
+                    # Halve what is held and double the stride, so the buffer
+                    # stays bounded and the sample stays uniform over the sweep.
+                    del self._all[1::2]
+                    self._stride *= 2
+            if self._pass is not None:
+                self._pass["profiles"] += 1
+                if d.size == 0:
+                    self._pass["empty"] += 1
+                else:
+                    self._pass["data"].append(d)
+
+    def start_pass(self, index, total=None, commanded=None):
+        """Begin accumulating for one raster pass."""
+        with self._lock:
+            if commanded is None and self.commanded is not None \
+                    and self.path is not None:
+                segs = self.path.segments
+                if 0 <= index < len(segs):
+                    a, b = segs[index]
+                    seg = self.commanded[a:b]
+                    seg = seg[np.isfinite(seg)]
+                    commanded = float(np.median(seg)) if seg.size else None
+            self._pass = {"index": int(index), "total": total,
+                          "commanded": commanded, "data": [], "profiles": 0,
+                          "empty": 0}
+
+    def end_pass(self, quiet=False):
+        """Close the pass, report it, and say so loudly if it was at a limit."""
+        with self._lock:
+            cur = self._pass
+            self._pass = None
+        if cur is None:
+            return None
+        d = (np.concatenate(cur["data"]) if cur["data"] else np.zeros(0))
+        rep = keyence_range_report(d, commanded=cur["commanded"],
+                                   margin=self.margin,
+                                   n_profiles=cur["profiles"],
+                                   n_empty=cur["empty"],
+                                   warn_fraction=self.warn_fraction)
+        rep["pass"] = cur["index"]
+        self.reports.append(rep)
+        if not rep["ok"]:
+            self.loud_passes.append(cur["index"])
+        if not quiet:
+            what = ("sweep row %d%s standoff"
+                    % (cur["index"] + 1,
+                       "/%d" % cur["total"] if cur["total"] else ""))
+            # A UNIFORM MESH ERROR IS ONE FACT. The bias is the same number on
+            # every row of a raster planned over a surface that is globally
+            # wrong, so it is shouted once and then left in the per-row summary
+            # line, where the number still appears. The limit reasons are NOT
+            # suppressed: those are local, and which rows have them is the
+            # whole point of reporting per row.
+            skip = ("bias",) if self._bias_said else ()
+            if "bias" in (rep.get("why_kinds") or ()):
+                self._bias_said = True
+            for line in describe_range_report(rep, what=what, skip=skip):
+                _standoff_say(line)
+        return rep
+
+    def summary(self, quiet=False):
+        """The whole sweep, and an unmissable block when it went wrong.
+
+        Printed at stop(), which is before the minutes of meshing rather than
+        after them: the operator is told the capture was bad while there is
+        still something to do about it other than look at the result.
+        """
+        with self._lock:
+            d = (np.concatenate(self._all) if self._all else np.zeros(0))
+            profiles, empty, stride = (self._all_profiles, self._all_empty,
+                                       self._stride)
+        rep = keyence_range_report(d, margin=self.margin, n_profiles=profiles,
+                                   n_empty=empty,
+                                   warn_fraction=self.warn_fraction)
+        rep["loud_passes"] = list(self.loud_passes)
+        rep["n_passes"] = len(self.reports)
+        rep["stride"] = stride
+        if quiet:
+            return rep
+        what = ("the whole sweep" if stride == 1 else
+                "the whole sweep (every %dth of %d profiles; see "
+                "MAX_KEPT_PROFILES)" % (stride, profiles))
+        for line in describe_range_report(rep, what=what):
+            _standoff_say(line)
+        if self.loud_passes:
+            _standoff_say(
+                "    ** %d of %d pass(es) measured at the edge of the "
+                "profiler's window: %s. The points those passes contributed "
+                "are not measurements of the part -- at the bottom of its range "
+                "this sensor returns scattered values rather than nothing, and "
+                "the mesh about to be built will contain them. On a flat plate "
+                "that has been 26-39%% of the scan, with nothing downstream "
+                "noticing."
+                % (len(self.loud_passes), rep["n_passes"],
+                   ", ".join("row %d" % (k + 1) for k in self.loud_passes[:12])
+                   + (" ..." if len(self.loud_passes) > 12 else "")))
+            _standoff_say(
+                "    the fix is upstream of the sensor: the surface this "
+                "raster was planned over put it there. Re-calibrate the camera "
+                "and reconstruct the rough surface again, or re-plan over a "
+                "better one, and run check_keyence_standoff() before flying.")
+        return rep
+
+    # -- the subscription ------------------------------------------------------
+
+    def start(self):
+        """Subscribe and spin on our own thread. Never fatal.
+
+        A monitor that takes down the sweep it is watching would be a bad trade,
+        so every failure here degrades to "no monitoring" with a line saying so.
+        The sweep is still worth flying without it.
+        """
+        try:
+            import rclpy
+            from rclpy.node import Node
+            from sensor_msgs.msg import PointCloud2
+        except Exception as e:
+            _standoff_say("    no standoff monitoring on %s (%s)"
+                          % (self.topic, e))
+            return self
+        try:
+            self._node = Node("keyence_standoff_monitor")
+            self._node.create_subscription(PointCloud2, self.topic,
+                                           self._got, 10)
+        except Exception as e:
+            _standoff_say("    no standoff monitoring on %s (%s)"
+                          % (self.topic, e))
+            self._node = None
+            return self
+        self._stop = threading.Event()
+
+        def _spin():
+            try:
+                from dataguzzler_python.context import InitFreeThread
+                InitFreeThread()
+            except Exception:
+                pass
+            while not self._stop.is_set():
+                try:
+                    rclpy.spin_once(self._node, timeout_sec=0.1)
+                except Exception:
+                    break
+
+        self._thread = threading.Thread(target=_spin,
+                                        name="keyence_standoff_monitor")
+        self._thread.daemon = True
+        self._thread.start()
+        return self
+
+    def _got(self, msg):
+        try:
+            self.add_standoff(keyence_profile_standoff(msg,
+                                                       ref_dist=self.ref_dist))
+        except Exception:
+            # One malformed message must not stop the watch: a monitor that
+            # stops counting looks exactly like a sweep with nothing wrong.
+            pass
+
+    def stop(self, quiet=False):
+        """Stop watching and return the summary."""
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        if self._node is not None:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+        self._node = self._thread = self._stop = None
+        return self.summary(quiet=quiet)

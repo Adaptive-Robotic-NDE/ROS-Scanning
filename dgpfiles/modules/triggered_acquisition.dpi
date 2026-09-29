@@ -119,7 +119,8 @@ def _sweep_result(value):
 def run_triggered_path_scan(scan_path, source, pitch_m,
                             approach, sweep, stage, pose_at,
                             setup_after_first=None, segments=None,
-                            progress=None, on_segment_failure="stop"):
+                            progress=None, on_segment_failure="stop",
+                            traces_per_segment=None):
     """Acquire along scan_path, one trace per pitch_m of travel.
 
     Callables, all supplied by the caller:
@@ -165,6 +166,17 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
     Skipped segments are listed in report["skipped"] either way. They are not an
     accounting detail: coverage that was planned and not acquired is the one
     thing a trace list cannot show you by itself.
+
+    traces_per_segment is how many traces a pass HAS -- an int for every
+    segment, or a callable(index, segment) -- and it is also the budget the
+    source is armed with: crossings beyond it are counted and not staged. A
+    rectangular raster passes its column count, because the volume is indexed
+    by column and there is no column m. Left None, a pass has one trace per
+    pitch of its commanded length plus the start trace, the same count
+    ScanPath.trace_count() predicts, which is right for a surface-following
+    path where the trace list is the product. Do not derive a raster's count
+    that way: its pitch is row/(m-1), so the ratio sits exactly on an integer
+    and floor() lands either side of it from one row to the next.
     """
     if segments is None:
         segments = scan_path.acquiring_segments()
@@ -172,7 +184,15 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
         raise ValueError("on_segment_failure must be 'stop' or 'skip', not %r"
                          % (on_segment_failure,))
 
-    expected = scan_path.trace_count(pitch_m, segments)
+    def _want(si, seg):
+        if traces_per_segment is None:
+            # +1e-9 for the same reason ScanPath.trace_count() has it.
+            return int(scan_path.segment_length_m(seg)/pitch_m + 1e-9) + 1
+        if callable(traces_per_segment):
+            return int(traces_per_segment(si, seg))
+        return int(traces_per_segment)
+
+    expected = sum(_want(si, seg) for si, seg in enumerate(segments))
     report = {"segments": len(segments), "expected_traces": expected,
               "staged": 0, "per_segment": [], "started": time.monotonic(),
               "stopped_early": None, "skipped": []}
@@ -183,7 +203,7 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
     for si, seg in enumerate(segments):
         start, end = seg
         seg_len = scan_path.segment_length_m(seg)
-        want = int(np.floor(seg_len/pitch_m)) + 1
+        want = _want(si, seg)
 
         if not approach(start, end-1):
             why = "could not reach the start of pass %d" % (si+1,)
@@ -233,7 +253,11 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
             triggered_here[0] += 1
 
         travel0 = source.travelled_m
-        source.arm(sink, emit_on_arm=False)
+        raw0 = getattr(source, "raw_travelled_m", None)
+        # want-1: the start trace is already staged, so that is how many
+        # crossings this pass may deliver. The budget is what makes the count
+        # exact rather than merely expected.
+        source.arm(sink, emit_on_arm=False, max_triggers=want-1)
         sweep_started = time.monotonic()
         try:
             ok, fraction = _sweep_result(sweep(start, end))
@@ -250,20 +274,28 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
         # of order.
         stager.drain()
 
-        # observed_m is what the probe was SEEN to travel, from live TF; length_m
-        # is what was commanded. The trigger fires on the former, so a shortfall
-        # here is a shortfall in traces, and it is the difference between "the
-        # trigger is wrong" and "the arm did not go where it was told".
+        # observed_m is what the probe was SEEN to progress, from live TF;
+        # length_m is what was commanded. The trigger fires on the former, so a
+        # shortfall here is a shortfall in traces, and it is the difference
+        # between "the trigger is wrong" and "the arm did not go where it was
+        # told". raw_travel_m is the plain sum of every step the poll saw; the
+        # amount by which it exceeds observed_m is wobble and noise, which is
+        # what used to fire the surplus trigger.
+        over = int(getattr(source, "armed_over_budget", 0))
         report["per_segment"].append({"segment": si, "waypoints": end-start,
                                       "length_m": seg_len, "observed_m": observed,
+                                      "raw_travel_m": (None if raw0 is None
+                                                       else source.raw_travelled_m - raw0),
                                       "expected": want,
                                       "triggered": triggered_here[0],
+                                      "over_budget": over,
                                       "staged": triggered_here[0]+1,
                                       "move_ok": bool(ok),
                                       "fraction": fraction,
                                       "sweep_s": sweep_s,
                                       "skipped": False})
         report["staged"] += triggered_here[0]
+        report["over_budget"] = report.get("over_budget", 0) + over
         staged_here = [triggered_here[0]+1]
 
         if progress is not None:
@@ -277,6 +309,15 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
         if staged_here[0] != want:
             report.setdefault("short_passes", []).append(
                 {"segment": si, "expected": want, "staged": staged_here[0]})
+
+        # A source that has found its instrument dead says so (see
+        # TimestampedTriggerSource.fault). Everything it delivered up to now
+        # is genuine; nothing after it would be, so stop here rather than
+        # finish the raster with copies of the last live record.
+        fault = getattr(source, "fault", None)
+        if fault is not None:
+            report["stopped_early"] = "source fault after pass %d: %s" % (si+1, fault)
+            break
 
     stager.drain()
     stager.stop()

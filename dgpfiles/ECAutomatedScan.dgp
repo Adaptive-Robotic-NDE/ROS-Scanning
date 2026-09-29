@@ -1,0 +1,2464 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  ECAutomatedScan.dgp
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Automated eddy-current inspection: part detection, surface
+#   reconstruction, toolpath planning and continuous-motion scanning.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# Automated eddy-current inspection: find the part, measure it, plan over it,
+# scan it in continuous motion.
+#
+# Loading this config SETS EVERYTHING UP AND THEN STOPS. It does not scan on its
+# own and it never asks a question. Call the stages from the dgpy> prompt, or
+# run_automated_scan() for all of them in order.
+#
+# THE FIRST RUN ON HARDWARE -- what each stage should print, how it fails, and
+# the order to run things in -- is ROS-Scanning/docs/ec-automated-scan-first-run.md.
+#
+# ------------------------------------------------------------------------------
+# THE OLDER REFERENCE
+# ------------------------------------------------------------------------------
+# ClientScannerTest.dgp is the workflow this is built from and is deliberately
+# left in place: parts of it are still the only description of how a piece of
+# this cell behaves.
+#
+# Two differences from it matter operationally. clean_mesh() here actually
+# filters, where that file's meshFilter() removed nothing, so MESH_CUTOFF_Z has
+# to be set for this cell and the output mesh will differ. And the arm does not
+# stop at every point to take a reading: this scans in continuous motion, one
+# sample per pitch of travel, correlated by timestamp.
+#
+# ------------------------------------------------------------------------------
+# WHAT AN EDDY-CURRENT TRACE IS HERE
+# ------------------------------------------------------------------------------
+# One complex impedance, not a waveform: the instrument's X and Y outputs on two
+# DAQ channels, combined into one sample per trigger. The trace list is (K, 1)
+# complex with a pose per entry -- the same shape the ultrasound trace list has
+# with nsamples=1, which is what lets the accumulation, projection and toolpath
+# code be shared rather than duplicated.
+#
+# Conditioning -- null, rotation, per-axis gain -- is a compiled math function
+# (spatialnde2-ec-functions), because every parameter is a recording so that
+# turning the rotation re-renders every trace already acquired.
+#
+# THE SCAN DISPLAY IS SPATIAL. spatialnde2's phase-plane rendering draws the
+# impedance figure but carries no position, so it cannot show where on the part a
+# signal came from. Use it to SET the rotation; read the scan off the projected
+# horizontal/vertical/magnitude channels.
+
+from dataguzzler_python import dgpy
+import spatialnde2 as snde
+
+include(dgpy,"dgpy_startup.dpi")
+include(dgpy,"Qt.dpi",prefer_pyqt=False)
+include(dgpy,"matplotlib.dpi")
+include(dgpy,"pint.dpi")
+
+# ==============================================================================
+# TRANSACTION MANAGER -- NOT OPTIONAL FOR THIS CONFIG
+# ==============================================================================
+# The eddy-current correlation IS the timestamp ordering. Under
+# timed_transaction_manager a transaction stamped at time T sees every
+# transaction stamped before T already committed, so a pose transaction stamped
+# at a trigger crossing produces a globalrev carrying exactly the DAQ block that
+# was current then. The ordered manager does not provide that, and it also
+# allows only one open transaction at a time -- which wedges an acquisition
+# thread publishing while the stager stages.
+RECDB_TRANSACTION_MANAGER = "timed"
+
+# The ordering window: a transaction stamped at T is held this long so anything
+# stamped earlier can still arrive and commit first. Too small and correlated
+# reads see an incomplete picture, reported as late transactions.
+TRANSACTION_LATENCY = 0.02
+
+if RECDB_TRANSACTION_MANAGER != "timed":
+    raise RuntimeError(
+        "ECAutomatedScan requires RECDB_TRANSACTION_MANAGER='timed'. The "
+        "eddy-current acquisition correlates the DAQ with position BY "
+        "TIMESTAMP, and the ordered manager commits in thread-completion order "
+        "instead -- which produces traces attached to the wrong places rather "
+        "than an error.")
+
+transaction_clock = snde.measurement_clock_cpp_steady("")
+transmgr = snde.timed_transaction_manager(transaction_clock, TRANSACTION_LATENCY)
+include(snde, "recdb.dpi", transmgr=transmgr, enable_opencl=True)
+include(snde, "recdb_gui.dpi")
+
+import os
+import time
+import numpy as np
+import rclpy
+import copy
+import itertools
+import threading
+from geometry_msgs.msg import TransformStamped, Pose, PoseArray, PoseStamped
+from dataguzzler_python import Qt, QtWrapper
+
+rclpy.init()
+
+import dgpython_rosmotion as rosm
+
+global ros
+ros = rosm.motion('ros', recdb, 'probe_end', 'world')
+
+# Probe position for anything that runs while the arm is moving. `ros` is a dgpy
+# module, so every attribute read takes its context lock, and the thread that
+# called ros.Move() holds it until the move returns -- during a pass that is
+# seconds with no position available, long enough to bind a whole pass of
+# samples to one stale pose. ros.live_pose is a plain threadsafe holder the TF
+# thread pushes into. Fetch it once, here, while nothing is moving.
+global live_pose
+live_pose = ros.live_pose
+
+# ==============================================================================
+# WHICH CELL, AND IN WHICH MODE
+# ==============================================================================
+# The cell manifest under tari_bringup already describes the robot, the sensors
+# and the topics; naming it here lets this config read that description instead
+# of repeating it. What it reads is the WORK VOLUME -- the box parts are placed
+# inside, which every reconstruction and every toolpath planner crops to.
+#
+# Without it each stage invents its own crop from whatever it happens to know
+# and gets it wrong differently each time. modules/work_cell.dpi refuses rather
+# than guessing when the manifest declares none.
+CELL_NAME = os.environ.get("TARI_CELL_NAME") or "ex-ur10e-1"
+# "hardware" unless the environment says otherwise. Taking it from the
+# environment is what lets the wiring that only runs at load time -- the cable
+# guard, the supervisor, the band handed to the motion module -- be rehearsed
+# against the simulated cell without editing this file. The DEFAULT is
+# hardware, so a cell PC that sets nothing runs as hardware.
+CELL_MODE = os.environ.get("TARI_CELL_MODE") or "hardware"
+
+# ==============================================================================
+# TECHNICIAN CONTROLS
+# ==============================================================================
+# Set these two. Everything else is derived, clamped or refused by
+# modules/scan_parameters.dpi, and every scan prints its plan before it moves.
+
+# Distance between samples along a pass, in metres.
+SCAN_STEP_SIZE = 0.001
+
+# How fast the probe sweeps, in metres per second. The sample rate is
+# velocity/step, so once the step is chosen this is a rate request: above the
+# pipeline's ceiling it is scaled down and reported, far above it raises.
+#
+# 10 mm/s is a limit, not a preference: the probe is IN CONTACT for the whole
+# sweep, and the limit near the part is 10 mm/s (NEAR_PART_SPEED below).
+# run_ec_scan() refuses anything faster. It is also exactly the live staging
+# ceiling at a 1 mm step (10 traces/s), so nothing gets clamped.
+SCAN_VELOCITY = 0.010
+
+# ==============================================================================
+# EDDY-CURRENT INSTRUMENT
+# ==============================================================================
+# The instrument's X and Y outputs, as analog inputs on the DAQ. These become
+# recording-database channels with a leading slash.
+EC_DAQ_DEVICE = "PXI1Slot2"
+EC_CHANNELS = ("ai0", "ai1")
+EC_REAL_PATH = "/%s/%s" % (EC_DAQ_DEVICE, EC_CHANNELS[0])
+EC_IMAG_PATH = "/%s/%s" % (EC_DAQ_DEVICE, EC_CHANNELS[1])
+
+# Where the eddy-current readings come from.
+#
+#   "hardware"  the NI-DAQ. The only setting that measures anything.
+#   "none"      no instrument at all. Reconstruction and planning still work --
+#               which is most of the pipeline and most machines -- and
+#               run_ec_scan() refuses rather than inventing data.
+#   "sim"       SimECSource (sim_ec_source.dpi): two free-running channels of
+#               SYNTHETIC volts, published exactly the way ai_voltage publishes
+#               real ones. An ARCHITECTURAL stand-in, not a model of an eddy-
+#               current probe: it exercises the trigger correlation, the trace
+#               accumulator, the impedance-plane conditioning and the projection
+#               end to end without a card. The numbers are not instrument
+#               readings and must never be reported as measurements.
+#
+# "sim" exists so the architecture can be exercised without an instrument. The
+# failures it catches are wiring failures: the conditioning must not be attached
+# to /ec/traces before the accumulator that creates that channel has run,
+# because naming a channel that does not exist yet is SIGABRT for the whole
+# process under the timed transaction manager. EC_SOURCE "none" cannot reach
+# any of that, because it refuses the scan instead of running it.
+#
+# Overridable by the EC_SOURCE environment variable so that a simulation run
+# does not need this file edited. The cell PC gets ROS-Scanning by hand copy (no
+# git yet), so a local edit made to test in simulation travels to the cell on
+# the next copy. An environment variable leaves the file that reaches the arm
+# saying "hardware".
+#
+#     EC_SOURCE=sim dataguzzler-python dgpfiles/ECAutomatedScan.dgp
+EC_SOURCE = os.environ.get("EC_SOURCE", "hardware")
+
+# Only read when EC_SOURCE == "sim". The block IS what a buffered card returns
+# per read, so these two set what EC_BLOCK_REDUCE averages over and what
+# report_smear() measures: 1 kHz in blocks of 20 samples, which at the 10 mm/s
+# sweep is 0.2 mm of travel per block against a 1.00 mm trace pitch.
+EC_SIM_SAMPLE_RATE = 1000.0
+EC_SIM_BLOCK_HZ = 50.0
+
+# What to do with the DAQ block a trigger correlates to. The block spans time and
+# the probe moved during it, so this is a SPATIAL averaging choice: "mean" is
+# quieter and smears, "last" is closest to the crossing and noisier. The scan
+# reports the smear in metres and as a fraction of the step -- check it.
+EC_BLOCK_REDUCE = "mean"
+
+# Impedance-plane conditioning. NONE OF THESE ARE MEANINGFUL DEFAULTS: the null
+# depends on the part and the probe, and the rotation is chosen during setup by
+# turning it until lift-off flattens onto the horizontal axis. Identity values
+# give a readable but unconditioned display. Use null_here() and set_rotation().
+EC_NULL = (0.0, 0.0)
+EC_ROTATION_DEG = 0.0
+EC_GAIN = (1.0, 1.0)
+
+# Where the trace list and the conditioned channels live.
+EC_TRACES_PATH = "/ec/traces"
+EC_COND_PREFIX = "/ec/cond"
+
+# ==============================================================================
+# TOOLPATH
+# ==============================================================================
+# Segments shorter than this are link moves between raster lines, not scanning
+# passes. Noether reports its own segment boundaries, so this only has to
+# separate "line" from "hop between lines" -- and at a 0.3 mm line spacing a
+# hop is 0.3 mm. 5 mm rather than the ultrasound scan's 20 mm: real-cell
+# eddy-current regions are 10-30 mm across, and at 20 mm every pass across such
+# a region would be thrown away as a link move.
+PATH_MIN_SEGMENT_M = 0.005
+
+# How much of a pass has to be reachable for it to count. A surface-following
+# toolpath is ragged and some passes will not plan in full; with a trace list
+# every sample carries the pose it was taken at, so a partial pass costs
+# coverage there and nothing anywhere else.
+PATH_MIN_FRACTION = 0.6
+
+# ==============================================================================
+# MESH FILTERING
+# ==============================================================================
+# A plane in WORLD z, below which vertices are discarded. There is no sensible
+# default: it is a property of where this cell's bench is. On the UR10e cell the
+# table reconstructs at z 0.938-0.956 and a specimen sits from 0.998 up, so
+# anything in 0.96-0.99 separates them. None means DO NOT run the vertex filter,
+# which is what lets loose-part removal run instead -- the two are mutually
+# exclusive in the service.
+MESH_CUTOFF_Z = None
+
+def _scan_module_dir():
+    """Locate dgpfiles/modules regardless of where this config was launched from.
+
+    include() resolves relative paths against the launcher's working directory,
+    not against this file, so 'modules/foo.dpi' only works from one place."""
+    here = os.path.abspath(os.getcwd())
+    for _ in range(4):
+        for cand in (os.path.join(here, "dgpfiles", "modules"),
+                     os.path.join(here, "modules")):
+            if os.path.isdir(cand):
+                return cand
+        here = os.path.dirname(here)
+    raise RuntimeError("cannot find dgpfiles/modules from %s" % (os.getcwd(),))
+
+# ==============================================================================
+# THE REST OF THE SETTINGS
+# ==============================================================================
+# Values carried over from UTPlaneScan.dgp, which is where they were measured.
+# Only the ones eddy current genuinely changes are different, and those say so.
+
+# --- motion -------------------------------------------------------------------
+MOVE_VELOCITY = 0.1              # point-to-point moves between stages
+MOVE_ACCEL = 0.1
+RASTER_VELOCITY = SCAN_VELOCITY  # the sweep speed IS the technician control
+RASTER_ACCEL = 0.05
+
+# The arm does not sweep at the speed it is asked for, and the error is not a
+# constant factor -- it is a curve. Measured on this cell IN SIMULATION:
+# commanded, observed. Every speed below goes through it (motion_scaling()),
+# so on hardware 10 mm/s is only as right as this table: re-measure it there
+# (technician-scan-controls skill) and read the observed speed the dry run and
+# every scan report.
+ROBOT_VELOCITY_CALIBRATION = [
+    (0.0050, 0.0079),
+    (0.0100, 0.0156),
+    (0.0200, 0.0303),
+    (0.0350, 0.0472),
+    (0.0500, 0.0529),
+]
+
+# --- motion safety ------------------------------------------------------------
+# Approved cell limits: at most 50 mm/s away from the part and 10 mm/s near it;
+# contact only where the probe has been planned onto the measured surface;
+# nothing outside the work volume; the warning light on whenever an automated
+# stage moves the arm.
+NEAR_PART_SPEED = 0.010          # m/s: the sweep, and every move onto or off the part
+# m/s, straight-line moves away from the part. NOT 0.050, the limit itself:
+# the calibration table was measured on horizontal sweeps, and other
+# directions run faster at the same MoveIt scaling -- park_arm()'s vertical
+# rise commanded at 50 mm/s peaks at 87.6 mm/s in simulation, and the Azure
+# sweep at 50 mm/s peaks at 74 (p95 56). Both behave like ~1.75 m/s full
+# scale, so 30 mm/s (scaling ~0.020) peaks near 35.
+#
+# 0.040 and not more because the simulated curve above is the only peak
+# measurement that exists: at ~1.75 m/s full scale a commanded 40 mm/s peaks
+# near 47, which is still inside the approved 50 mm/s away limit even on the
+# pessimistic reading. It is the one speed here that could be raised without
+# new measurement.
+#
+# EVERYTHING ELSE NEEDS measure_robot_velocity() ON THE ARM FIRST, and the two
+# that matter most are JOINT_MOVE_SCALING and EC_AXIS_SPEED below. Do not raise
+# those from a guess: the numbers justifying them are simulated peak speeds, and
+# simulation says 0.020 joint scaling already peaks at 55 mm/s -- over the limit.
+# The cell may well be slower than that and have room, but "may well be" is not
+# a measurement, and the thing being bounded is tip speed near a part.
+TRANSIT_SPEED = 0.040
+
+# A contact probe reaches and leaves the surface only along its own axis
+# (contact_motion() in surface_path_scan.dpi). Between passes that start within
+# EC_SHORT_HOP_M of where the probe is, it lifts EC_LIFT_M; otherwise
+# EC_APPROACH_M.
+EC_LIFT_M = 0.010
+EC_APPROACH_M = 0.050
+EC_SHORT_HOP_M = 0.030
+
+# The lift off the part and the descent onto it, along the tool axis. Below
+# NEAR_PART_SPEED on purpose: the calibration was measured on horizontal
+# sweeps, and a vertical move at the same scaling peaks 25% faster in
+# simulation -- 12.5 mm/s where 10 was commanded. 0.008 still peaked at
+# 11.6-11.9 mm/s there (a scaling of 0.0051), so 0.006: at the measured
+# ~2.35 m/s-per-unit-scaling peak of an axial move that is ~9 mm/s.
+EC_AXIS_SPEED = 0.006
+
+# MoveIt velocity SCALING for EVERY automated joint move: into a pass or a
+# sweep row, back to home, to a named pose. A joint move's tip speed is not a
+# Cartesian limit, so this comes from measurement. At MoveIt's default 0.1 the
+# probe tip peaks, in simulation, at 132 mm/s going to over_table, 194 in the
+# Azure sweep, 245 in the Keyence raster (46 mm above the part) and 75-80
+# between eddy-current passes. At 0.02 the peaks are 35 mm/s to over_table and
+# 55 in the Keyence stage's row approaches, still over 50, so 0.015. The dry
+# run and every sim stage report the peak; see the first-run doc.
+JOINT_MOVE_SCALING = 0.015
+
+# UR digital output 0 is this cell's warning light (output 1 is the Keyence
+# laser). Every stage that moves the arm holds it on and switches it off
+# afterwards, errors included. None = no light.
+WARNING_LIGHT_PIN = 0
+# Refuse to move when the light cannot be switched on. None means "yes on
+# hardware"; simulation has no UR I/O controller to switch it with.
+WARNING_LIGHT_REQUIRED = None
+
+# Where the arm goes to look for the part, and where it is left at the end: a
+# named state in the cell's SRDF (tari_cell_ex_ur10e_1). None = do not move
+# there.
+DETECT_POSE = "over_table"
+PARK_POSE = "over_table"
+
+# --- toolpath -----------------------------------------------------------------
+# Between passes. 0.3 mm is the real-cell eddy-current value (0.1 mm for higher
+# resolution); the ultrasound transducer's was 10 mm. At 0.3 mm a whole part is
+# hours: preview_ec_scan() says how many, and EC_SCAN_REGION is how to scan an
+# area that fits in the time the plan allows.
+SCAN_LINE_SPACING = 0.0003
+NOETHER_LINE_SPACING = SCAN_LINE_SPACING
+NOETHER_MESH = None              # None asks obtain_specimen_mesh()
+NOETHER_MESH_OFFSET = (0.0, 0.0, 0.0)
+# The tool axis follows the surface normal: on a curved part the probe has to
+# stay perpendicular to it. The spring fixture gives some compliance; tilt is a
+# known problem, not solved here.
+NOETHER_ORIENTATION = "surface"
+# ONE DIRECTION. A probe dragged in contact leans against its direction of
+# travel in the spring fixture, so a
+# serpentine alternates the lean line by line and the C-scan stripes. Every
+# pass is entered by lift / transit / descend anyway, so the return costs one
+# transit in the air.
+NOETHER_SNAKE = False
+# Which way the passes run. With no offset principal_axis_noether's lines follow
+# the part's SECOND-longest dimension, and on a curved part that sweeps the
+# probe round the curvature inside every pass. pi/2 turns them onto the longest,
+# which is x for the specimens in this cell. noether_cut_axes() in
+# noether_path.dpi states the rule once, from the planner's own source;
+# noether_cut_axis_test.py pins it.
+NOETHER_ROTATION_OFFSET = np.pi/2
+# And the direction of travel along them, -x. The planner keeps no sign of its
+# own, so without this it changes from plan to plan.
+EC_TRAVEL_DIRECTION = (-1.0, 0.0, 0.0)
+# The probe's rotation about its own axis is LOCKED for the scan: every pose is
+# one reference orientation tilted onto the surface normal, never twisted.
+# "fixed" twists with diagonal tilt and
+# flips 180 degrees near the +x end of a cylinder; see regularize_tool_roll().
+NOETHER_TOOL_ROLL = "locked"
+# That reference's tool x axis, in the world, for a probe pointing straight
+# down. +x is close to how this arm holds its tooling over the bench. Set it
+# from the cable-envelope test: the direction that leaves wrist_3 mid-range
+# with the Azure and Keyence cables slack.
+NOETHER_ROLL_REFERENCE = (1.0, 0.0, 0.0)
+NOETHER_UV_METHOD = "planar"
+# THE PROBE TIP ON THE MEASURED SURFACE. probe_end on the ec tooling is the
+# tip: ec_probe -> probe_end is 68.07 mm along the probe axis and the probe mesh
+# ends at 68.32 mm (tari_ur_description urdf/ec/tooling_macro.xacro and
+# meshes/ec_probe.stl). A nonzero offset here is a standoff, which an
+# eddy-current scan does not want.
+NOETHER_Z_OFFSET = 0.0
+# How far PAST the measured surface the tip is commanded, along its own axis:
+# the spring fixture's preload. 0, because it is NOT KNOWN -- nothing in the
+# URDF models the spring. With 0 every error in the fine mesh becomes lift-off
+# (mesh high) or compression (mesh low), one for one. Measure the fixture's
+# travel and put the probe mid-travel.
+EC_PRELOAD_M = 0.0
+# Scan only this part of the toolpath: (xmin, ymin, xmax, ymax) in world
+# metres, or None for everything on the part. Waypoints outside are dropped and
+# passes split where they leave it: the scan area shrinks, the motion never
+# grows beyond the planned surface.
+EC_SCAN_REGION = None
+# LET THE OPERATOR DRAW THE REGION, after the Azure rough mesh and before the
+# Keyence raster pays for it. A 3D window opens on the rough surface with the
+# detector's region already selected, so the job is to CORRECT a box rather
+# than draw one; Accept hands its bounding region to stages 3 and 5.
+#
+# On by default because the detector is not good enough to be trusted alone: it
+# has returned 135 x 287 mm for an 83 x 165 mm plate. Everything else inside
+# such a box -- breadboard, clamps, pins, a stepped mount block -- is then
+# measured, meshed and rastered, for a toolpath an order of magnitude larger
+# than the part needs and tool poses near 90 degrees off vertical where Noether
+# goes over a rim.
+#
+# False for an unattended run. So is run_automated_scan(roi_select=False), and
+# a session with no usable display skips it by itself with a printed reason
+# rather than stopping -- an automated scan must still run with nobody there.
+ROI_SELECT = True
+# The steepest a pose may lean from vertical, in degrees. Beyond it a waypoint
+# is dropped and its pass split, like a region crop -- a contact probe is not
+# planned down a step wall or round a flank it cannot hold. NOT MEASURED: the
+# spring fixture's workable tilt is unknown and 45 is a placeholder. Planned
+# tilt reaches 90 degrees at a step in the reconstructed surface -- 9.6 mm is
+# enough. None = no limit.
+EC_MAX_TILT_DEG = 45.0
+# The tool axis is averaged along each pass over this much travel before the
+# roll is locked; positions are not touched, so the tip still goes where the
+# mesh says. The probe's face is 5.8 mm across (tari_ur_description
+# meshes/ec_probe.stl) and cannot follow the surface's orientation on a finer
+# scale, while a reconstructed mesh's normals change on EVERY waypoint -- and
+# the arm follows them: in simulation a 9 mm pass over a reconstructed surface
+# crawled at 0.3 mm/s against 10 commanded, because at the sweep's MoveIt
+# scaling each orientation change is slow. None or 0 = off.
+EC_AXIS_SMOOTHING_M = 0.006
+# Every pass is resampled to this spacing before it is flown (None = as Noether
+# gave it). Noether's waypoints are wherever a slicing plane crossed a mesh
+# edge -- anywhere from 0.7 micrometres to 0.5 mm apart, hundreds of thousands
+# of them on a reconstruction -- and a uniform 1 mm keeps every sweep request
+# even and a quarter to half the size. The sample pitch is the position
+# trigger's and does not depend on this.
+EC_WAYPOINT_SPACING_M = SCAN_STEP_SIZE
+# Clean the mesh before Noether plans over it: drop faces on non-manifold
+# edges and components under 1% of the faces (clean_mesh_for_planning() in
+# noether_path.dpi). A Poisson-reconstructed mesh routinely has both, and
+# Noether refuses such a mesh outright ("Connecting vertex does not exist ...").
+# False = plan over the mesh as given.
+EC_CLEAN_PLANNING_MESH = True
+
+# What ONE Noether waypoint costs, so a plan can be priced before it is made.
+# All three measured on this stack, not assumed:
+#   * spacing: 911 511 poses over 383.648 m of raw toolpath -> 0.42 mm between
+#     waypoints. Noether sets it from the mesh, so it is a property of the
+#     reconstruction's resolution, not a setting here; re-measure it if the
+#     planner or the mesh pipeline changes.
+#   * bytes: a geometry_msgs/Pose costs 316 bytes of Python objects on this Iron
+#     install (measured over 200 000 of them), and the planner replies with one
+#     per waypoint. That reply is the single largest allocation in the planning
+#     stage.
+#   * gate: 1.7 ms per waypoint of the finished toolpath -- 116 851 waypoints of
+#     a contact toolpath over a 198 422-triangle specimen reconstruction in
+#     194 s on an 8-core dev host, 16.2% of the poses measured and the rest
+#     certified, 366 MB peak. Two things it depends on: cores (the distance
+#     kernel is threaded -- see SURFACE_QUERY_WORKERS) and how much of the path
+#     runs close to the limit, since that is what the sampler refines into. The
+#     cell PC is slower than the dev host, so leave headroom. Re-measure it if
+#     the tooling changes; it is a rate, not a law.
+NOETHER_POSE_SPACING_M = 0.00042
+NOETHER_POSE_REPLY_BYTES = 316
+EC_GATE_SECONDS_PER_POSE = 0.0017
+
+# What a plan has to fit in before plan_ec_path() will build it. These bound the
+# PLANNING stage; SCAN_LIMITS bounds the scan that follows. Separate because
+# they fail differently and at different times: a scan that is too long wastes
+# hours, a plan that is too large takes the dgpy process out -- 8.4 GB and an
+# OOM kill -- and with it every stage already paid for.
+EC_PLAN_LIMITS = {
+    "max_plan_poses": 1500000,
+    "max_plan_memory_bytes": 2*(1 << 30),
+    "max_plan_seconds": 1800.0,
+}
+
+# Run the tooling-clearance gate over the eddy-current toolpath. It is the only
+# thing standing between a toolpath that places the PROBE correctly and a
+# Keyence head or an Azure bracket pressed into the part -- the Keyence stage
+# has done exactly that. Off is a deliberate decision for a bench test
+# with no specimen, never a way to make planning finish sooner: the gate samples
+# (TOOLING_GATE_SAMPLE_ABOVE) rather than measuring 180 000 poses one at a time.
+EC_CHECK_CLEARANCE = True
+
+# PLAN THE KEYENCE RASTER OVER THE AZURE ROUGH MESH EVEN WHEN THE TWO DISAGREE.
+# Stage 2a of run_automated_scan() gauges the rough mesh against the Keyence and
+# refuses stage 3 when they are more than AZURE_GAUGE_MAX_MM apart, because that
+# disagreement is subtracted straight off the profiler's standoff: a 13.6 mm
+# disagreement has cost 26-39% of a 10 inch plate. This is the deliberate "I
+# know, fly it anyway" for an unattended run -- run_automated_scan(allow_azure_bias=True)
+# is the same override for one call. Same shape and same meaning as
+# SPECIMEN_ALLOW_DEAD_ZONE below.
+EC_ALLOW_AZURE_BIAS = False
+
+# --- projection ---------------------------------------------------------------
+# "live" projects each reading as it is taken, at the cost of a second
+# serialised globalrev wait per reading. "deferred" records everything and
+# replays the trace list afterwards for an identical image, much faster.
+PROJECTION_MODE = "live"
+PROJECTION_PIXELS = None         # None derives it from the step size
+PROJECTION_SPOT_RADIUS = None
+PROJECTION_TEXTURED_PART = True
+
+# --- reconstruction -----------------------------------------------------------
+SPECIMEN_SOURCE = "auto"
+SPECIMEN_REGION = None           # None uses the detector, or the work volume
+SPECIMEN_CLEAN_MESH = False
+# THE STANDOFF DECISION. The Azure's depth mode has a minimum RANGE, a camera
+# flown inside it degrades rather than fails, and the sweep therefore has to
+# hold that range. It does NOT have to hold it as height: standing off to the
+# side and aiming back at the part buys the same distance at a height the arm
+# can reach. Which is the point, because the height a straight-down sweep needs
+# is not reachable here -- camera 1.455, probe_end 1.380, floor + 455 mm, and
+# solved against this cell's own kinematics that has NO IK solution at all over
+# the far x column (x >= 1.145), and only 84.6% of the work volume anywhere.
+#
+# So the mode below still decides the range, and SPECIMEN_SWEEP_STYLE decides
+# how the range is bought:
+#
+#   "pan"   (default) hold the range, aim the camera, cover the region from
+#           several directions. The camera height is chosen off a ladder whose
+#           TOP RUNG IS VERTICAL -- height equal to the slant range, so the
+#           lateral stand-off is zero and the tool hangs straight down. That
+#           rung is tried first and, at ex-ur10e-1 with a 198 x 143 mm part,
+#           it is the one that flies: 8 of 8 directions admit a roll, the tilt
+#           is 8-13 degrees (against 22-29 at the rung below, outside every tilt
+#           the cable envelope has been measured at), and probe_end lands at
+#           1.421-1.429 -- 65 mm under the MOTION envelope. The
+#           lateral rungs below it are still there for a sweep that needs real
+#           parallax; see AZURE_PAN_VERTICAL in mesh_reconstruction.dpi.
+#   "dome"  a straight-down raster, height derived from the mode:
+#             NFOV_UNBINNED   0.50 m minimum -> 1.486 over a 31 mm part
+#             WFOV_2X2BINNED  0.25 m minimum -> 1.236
+#           Same geometry as the vertical pan rung, and with rot=False it holds
+#           ONE orientation -- the one the arm is already standing in, so in
+#           the cable band by construction -- and asks for NO wrist rotation at
+#           all. Reachability and the cable band are both checked at plan time,
+#           and a grid whose corners do not reach is pulled in toward its
+#           centre rather than refused, because at this standoff every stop
+#           sees the whole part and the raster is parallax rather than
+#           coverage. THIS IS WHAT STAGE 2 FLIES (see reconstruct_rough).
+#           The pan sweep is for a part whose SIDES matter and can be reached.
+#
+# DO NOT reach for WFOV to fly lower. The eddy-current probe and its holder sit
+# 65-110 mm from the camera, 45.5 degrees off the optical axis. In NFOV's
+# 75 x 65 degrees they clear the bottom of the frame by 11.8 degrees; in WFOV's
+# 120 x 120 they are 15.7 degrees INSIDE it and occupy 2.9% of every frame, at a
+# distance no depth mode can measure. The tooling is rigid to the camera, so no
+# sweep can be planned around it. Computed from the rendered URDF.
+#
+# Changing the mode here without changing the driver's (ur_moveit.launch.py,
+# depth_mode:) is the one way left to get this wrong, so the bring-up's sensor
+# report prints both, and the depth image's SIZE is checked against it.
+SPECIMEN_DEPTH_MODE = "NFOV_UNBINNED"
+# "dome", AND IT IS DECLARED HERE RATHER THAN FORCED INSIDE reconstruct_rough().
+# check_sweep_plan() resolves the style from THIS global, so a stage that
+# overrides it with a kwarg default makes the pre-flight grade a sweep that is
+# not the one the arm goes on to fly.
+#
+# See reconstruct_rough() for why the dome is right for this stage: the pan
+# sweep orbits the part to see its SIDES, and the sides of a thin flat plate
+# cannot be reached from this cell at all.
+SPECIMEN_SWEEP_STYLE = "dome"    # "pan" or "dome"
+SPECIMEN_ALLOW_DEAD_ZONE = False # True flies inside the minimum anyway
+
+# WHAT THE SWEEP IS FOR, which is what decides how few viewing directions it may
+# be flown from before it is REFUSED (AZURE_SWEEP_PURPOSES):
+#
+#   "planning"  1 direction. A height field, which is exactly what Noether needs
+#               to raster the top of a part and what the Keyence pass refines.
+#   "closed"    AZURE_PAN_MIN_DIRECTIONS (2). A surface meant to close over the
+#               part -- metrology, real relief, anything measured rather than
+#               planned over.
+#
+# None leaves it to each caller. run_automated_scan()'s stage 2 goes through
+# reconstruct_rough(), which passes "planning" itself, so this only has to be
+# set to hold that stage to the STRICTER rule. Setting it to "planning" here
+# extends the looser rule to every Azure sweep in the session, capture scenarios
+# included, which is not what you want on a measurement take.
+SPECIMEN_SWEEP_PURPOSE = None
+
+# The top of the part, world z. None takes the detector's measured surface_z for
+# the region it detected, and falls back to the work volume's floor when nothing
+# measured it. THE SWEEP HEIGHT AND THE RANGE CHECK BOTH COME OFF THIS PLANE, so
+# a part whose top the detector cannot see -- a dark or shiny one -- is worth
+# setting by hand: at the floor, a 31 mm part is flown 31 mm inside the depth
+# mode's minimum and the check that exists to catch that measures from the floor
+# too and passes it.
+SPECIMEN_SURFACE_Z = None
+
+# -- pan sweep. None everywhere means "derive it", which is the intent.
+SPECIMEN_SWEEP_SLANT = None      # None = the depth mode's minimum + 30 mm
+SPECIMEN_SWEEP_CAMERA_HEIGHT = None  # None walks the ladder, vertical rung first
+SPECIMEN_SWEEP_DIRECTIONS = 4    # of the 8 candidates, the reachable ones
+SPECIMEN_PAN_STOPS = (4, 2)      # aim points per direction; sets the frame count
+
+# -- dome sweep, used when SPECIMEN_SWEEP_STYLE = "dome".
+SPECIMEN_SWEEP_HEIGHT = None     # None derives it from SPECIMEN_DEPTH_MODE
+SPECIMEN_SWEEP_STOPS = (5, 5)
+KEYENCE_BACKEND = "pc"           # tari_pc_reconstruction; see the Phase B map
+# How the Keyence is pointed over its raster: "fixed" (tool z vertical, the
+# laser line across the direction of travel) or "surface" (follow the rough
+# mesh's normals), which on a strongly curved part can fail to reach even the
+# first pose. See _KeyenceReconstruction.ORIENT in mesh_reconstruction.dpi.
+KEYENCE_ORIENTATION = "fixed"
+
+# --- the synthesised test plate, for working without a real specimen ----------
+TEST_PLATE_SIZE = 0.30
+TEST_PLATE_HEIGHT = 1.00
+TEST_PLATE_BOW = 0.03
+TEST_PLATE_DIVISIONS = 61
+
+# --- plane-scan settings, unused here ----------------------------------------
+# An eddy-current scan follows a surface; there is no rectangular grid. These
+# exist because the shared modules read them.
+SCAN_M = None
+SCAN_N = None
+SCAN_ORIGIN = (0.75, -0.35)
+
+# --- recording ----------------------------------------------------------------
+RECORD_TRACE_LIST = True
+# Where scans are written. NOT a hardcoded home directory: the cell PC runs
+# under a different account and writes to /data/scandata, so a path like
+# "/home/user/scandata" is unwritable there and a session dies with
+# PermissionError before anything can be recorded. Same resolution order as
+# the capture tool's CAPTURE_ROOT (cell_capture_node.dpi): what the site says,
+# then the mount the cell actually has, then this account's own home.
+SCAN_STORAGE_DIR = (os.environ.get("TARI_SCANDATA")
+                    or os.environ.get("SCANDATA_ROOT")
+                    or ("/data/scandata" if os.path.isdir("/data/scandata")
+                        else os.path.expanduser("~/scandata")))
+
+# NOT USED BY EDDY CURRENT. A gate selects a time window of a waveform, and an
+# impedance reading has no time axis -- the equivalent operation is the
+# null/rotation/gain conditioning, which is a compiled math function. Empty
+# rather than absent because the shared modules read the name.
+CSCAN_GATES = []
+
+# Where a waveform digitizer would publish. There is no digitizer here; this
+# names the eddy-current instrument's real channel so anything that reports it
+# names something that exists.
+ASCAN_CHANNEL_PATH = EC_REAL_PATH
+
+# Trace lists are large and the recording database keeps them in memory unless
+# told otherwise. A file-backed storage manager puts them on disk, which is what
+# makes a long scan survivable; the plan's memory check asks whether this exists.
+if SCAN_STORAGE_DIR is not None:
+    os.makedirs(SCAN_STORAGE_DIR, exist_ok=True)
+    scan_storage_manager = snde.setup_file_storage_manager(recdb, SCAN_STORAGE_DIR)
+else:
+    scan_storage_manager = None
+
+# Read by the shared plane-scan code, which an eddy-current scan does not use.
+RASTER_MIN_FRACTION = 1.0
+
+# The ultrasound modules' idea of "the instrument". Left None: this config's
+# instrument is `ec_source`, and the eddy-current scan passes it explicitly
+# rather than through this global. Defined so that anything reporting on it
+# finds a name rather than raising.
+global ascan_source
+ascan_source = None
+
+global SCAN_MODULE_DIR
+SCAN_MODULE_DIR = _scan_module_dir()
+
+# FIRST, because everything else reports through it. progress.dpi is the shared
+# "say what is happening during the slow parts" helper: rate-limited plain
+# lines with elapsed time, a fraction, an honest ETA and a closing line that
+# prints even when the stage is killed. It depends on nothing, so it goes at
+# the top of the list; the mesh reconstruction, the Noether planning and the
+# specimen stages all call into it.
+include(None, os.path.join(SCAN_MODULE_DIR, "progress.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "work_cell.dpi"))
+# The cable envelope: how far wrist 3 may turn before the end-of-arm loom binds,
+# PER TILT, as capture_cable_envelope() measured it. Loaded next to work_cell.dpi
+# because it is the same kind of thing -- a measured property of this cell, read
+# from the manifest, that everything downstream has to respect -- and loaded
+# EARLY because the guard built on it (install_cable_guard(), at the bottom of
+# this file) is on for the whole session rather than only inside a capture
+# scenario.
+include(None, os.path.join(SCAN_MODULE_DIR, "cable_envelope.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "toolpath_segments.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "trace_acquisition.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "surface_projection.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "triggered_acquisition.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "noether_path.dpi"))
+# The independent tooling-clearance check. Loaded next to noether_path.dpi
+# because it is the same kind of thing -- geometry over a planned path, no ROS
+# and no robot -- and because mesh_scan.dpi and mesh_reconstruction.dpi both
+# refuse to fly a sweep without it (they warn and continue if it is absent).
+include(None, os.path.join(SCAN_MODULE_DIR, "tooling_clearance.dpi"))
+# THE C++ BVH BACKEND for SurfaceDistance.signed_distance(), swapped in over
+# the numpy one. Must come AFTER tooling_clearance.dpi (it replaces a method on
+# the class that file defines) and BEFORE anything builds a SurfaceDistance.
+#
+# It is faster and it is MORE correct, both measured rather than claimed: the
+# numpy path stops widening its candidate set at max_k and can return a
+# distance up to 0.19 mm LARGER than the truth -- the optimistic direction --
+# on about one point in ten thousand, while the BVH matches brute force over
+# every triangle exactly. It also declines to prune on exact_within, because an
+# unsigned cap can report a POSITIVE number for a point that is inside the
+# surface; that costs it roughly 4x and can only make the gate more
+# conservative.
+#
+# If the kernel cannot be built or loaded -- no compiler, a read-only cache --
+# this prints one line and leaves the numpy implementation exactly as it was.
+# Set SURFACE_DISTANCE_FAST_REQUIRED = True to make that an error instead,
+# which is what an acceptance run should do: "silently fell back to the slow
+# path" is otherwise indistinguishable from "was fast".
+include(None, os.path.join(SCAN_MODULE_DIR, "surface_distance_fast.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "pitch_crossings.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "timestamped_trigger.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "ec_acquisition.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "scan_parameters.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
+# The Keyence's measuring window, and the three checks that keep the sensor
+# inside it. Same shape as tooling_clearance.dpi above -- geometry over a
+# planned path plus a cheap watch on the sensor's own returns -- and
+# mesh_reconstruction.dpi warns and continues if it is absent. See its header
+# for the kind of raster it exists to refuse.
+include(None, os.path.join(SCAN_MODULE_DIR, "keyence_standoff.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "mesh_reconstruction.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "part_detection.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "specimen.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "mesh_scan.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "surface_path_scan.dpi"))
+# Reads ROI_SELECT, set above, for its default.
+include(None, os.path.join(SCAN_MODULE_DIR, "roi_select.dpi"))
+
+# The limits a scan plan is checked against. DEFAULT_LIMITS is defined by
+# scan_parameters.dpi and carries the measured numbers with the comments saying
+# where each came from, so this has to come after the includes.
+#
+# NO OVERRIDES. Every one of those numbers was measured on the ultrasound
+# pipeline, and the eddy-current path has not been characterised: its readings
+# are 16 bytes rather than tens of kilobytes, so the memory ceiling is far from
+# binding, but the trace-RATE ceiling is a property of the staging pipeline and
+# is the one that will actually bite. Re-measure before relaxing it.
+global SCAN_LIMITS
+SCAN_LIMITS = dict(DEFAULT_LIMITS)
+
+# The Azure dome sweep's ceiling is the transit speed, not the module's 50 mm/s
+# (see TRANSIT_SPEED: a sweep commanded at 50 peaked at 74). Coverage does not
+# suffer -- it is set by the motion gate over path length, not by speed.
+ReconstructionSource.MAX_SWEEP_VELOCITY = min(ReconstructionSource.MAX_SWEEP_VELOCITY,
+                                              TRANSIT_SPEED)
+
+# ==============================================================================
+# INSTRUMENT SETUP
+# ==============================================================================
+
+global daq
+global ec_source
+global ec_cond
+daq = None
+ec_source = None
+ec_cond = None
+
+if EC_SOURCE == "hardware":
+    try:
+        import dgpython_nidaqmx as daqmx
+        daq = daqmx.ai_voltage('daq', recdb,
+                               ["%s/%s" % (EC_DAQ_DEVICE, c) for c in EC_CHANNELS])
+        print("  eddy-current DAQ on %s and %s" % (EC_REAL_PATH, EC_IMAG_PATH))
+    except Exception as _e:
+        # Not fatal. Everything except run_ec_scan() works without the card, and
+        # a machine with no NI-DAQ is the normal case for working on the
+        # reconstruction and planning stages.
+        daq = None
+        print("  NO eddy-current DAQ (%s: %s)" % (type(_e).__name__, _e))
+        print("  reconstruction and planning still work; run_ec_scan() will refuse.")
+elif EC_SOURCE == "sim":
+    include(None, os.path.join(SCAN_MODULE_DIR, "sim_ec_source.dpi"))
+    daq = SimECSource(recdb, transaction_clock, EC_REAL_PATH, EC_IMAG_PATH,
+                      position_fn=lambda: probe_position(),
+                      sample_rate=EC_SIM_SAMPLE_RATE,
+                      block_hz=EC_SIM_BLOCK_HZ)
+    print("  ** SIMULATED eddy-current instrument on %s and %s "
+          "(%.0f Hz in blocks of %d)"
+          % (EC_REAL_PATH, EC_IMAG_PATH, EC_SIM_SAMPLE_RATE, daq.block_samples))
+    print("     THE NUMBERS ARE SYNTHETIC. This is an architectural stand-in "
+          "for the DAQ, not a model of an eddy-current probe -- nothing it "
+          "produces is a measurement of anything.")
+elif EC_SOURCE != "none":
+    raise ValueError("EC_SOURCE must be 'hardware', 'sim' or 'none', not %r"
+                     % (EC_SOURCE,))
+
+
+global ec_ready
+def ec_ready():
+    """Whether an eddy-current scan can actually run, and why not if it cannot."""
+    if daq is None:
+        return (False, "no DAQ: EC_SOURCE=%r and the card did not open" % (EC_SOURCE,))
+    for path in (EC_REAL_PATH, EC_IMAG_PATH):
+        try:
+            recdb.latest.ref[path]
+        except Exception:
+            return (False, "the DAQ is open but %s has no data yet" % (path,))
+    return (True, "ready")
+
+
+global setup_ec
+def setup_ec(pitch_m=None, null=None, rotation_deg=None, gain=None):
+    """Build the trace source and hold the conditioning parameters. Idempotent.
+
+    THE CONDITIONING IS NOT WIRED HERE, and it cannot be. Its input is the trace
+    list, which is an OUTPUT of nd_accumulate_once and does not exist until the
+    scan has staged its first reading -- so the scan wires it, in
+    run_ec_path_scan()'s setup_after_first hook. This call records null,
+    rotation and gain so the values are in force the moment it does.
+
+    The ordering matters: naming a channel that does not exist yet makes
+    spatialnde2 throw on the timed transaction manager's own thread, which is
+    SIGABRT for the whole process rather than an error anybody can read. See the
+    note in ec_acquisition.dpi.
+
+    Still worth calling before a scan: it opens the DAQ path and reports the
+    smear, and set_rotation()/null_here() are callable either side of it.
+    """
+    global ec_source
+    ok, why = ec_ready()
+    if not ok:
+        raise RuntimeError("cannot set up eddy current: %s" % (why,))
+
+    # DOES THE COMPILED CONDITIONING ACTUALLY RUN? Asked here, before anything
+    # moves, because the answer can be "it segfaults" and a segfault twenty
+    # minutes into a scan with the probe on the part is the worst place to find
+    # out. An extension built against a different spatialnde2 imports fine and
+    # crashes the process the first time the math executes. This check runs in a
+    # child, so the crash is a message. See check_ec_conditioning() in
+    # ec_acquisition.dpi.
+    cond_ok, cond_why = check_ec_conditioning()
+    if not cond_ok:
+        raise RuntimeError(
+            "the eddy-current conditioning is not usable, so a scan would lose "
+            "its data or the whole process:\n  %s" % (cond_why,))
+
+    pitch = SCAN_STEP_SIZE if pitch_m is None else pitch_m
+    if ec_source is None:
+        ec_source = ECTimestampedSource(
+            recdb, transaction_clock, EC_REAL_PATH, EC_IMAG_PATH,
+            probe_position, pitch, reduce=EC_BLOCK_REDUCE,
+            pose_path="/ec/trigger_pose")
+        print("  eddy-current source: one complex sample per %.3f mm, "
+              "correlated by timestamp, block reduce=%s"
+              % (pitch*1e3, EC_BLOCK_REDUCE))
+
+    held = ec_conditioning_parameters(
+        null=EC_NULL if null is None else null,
+        rotation_deg=(EC_ROTATION_DEG if rotation_deg is None else rotation_deg),
+        gain=EC_GAIN if gain is None else gain,
+        cond=ec_cond)
+    if ec_cond is None:
+        print("  conditioning parameters held for %s -> %s/{conditioned,"
+              "horizontal,vertical,magnitude}: null (%.5f, %.5f), rotation "
+              "%.1f deg, gain h=%.2f v=%.2f"
+              % ((EC_TRACES_PATH, EC_COND_PREFIX) + tuple(held["null"])
+                 + (held["rotation"],) + tuple(held["gain"])))
+        print("    the math is wired when the scan stages its first trace -- "
+              "%s does not exist before that" % (EC_TRACES_PATH,))
+    return held
+
+
+global teardown_ec
+def teardown_ec():
+    """Release the conditioning channels. Required before a second setup_ec().
+
+    define_channel() does not raise when a channel already exists; it hands back
+    a reserved_channel that is no longer the current owner, and the NEXT
+    transaction fails with 'reserved_channel is not current' nowhere near here.
+    """
+    global ec_source, ec_cond
+    if ec_cond is not None:
+        teardown_ec_conditioning(recdb, ec_cond)
+        ec_cond = None
+    if ec_source is not None:
+        ec_source.stop()
+        ec_source = None
+
+
+global null_here
+def null_here(count=20):
+    """Null on the traces just acquired, which should be over good material.
+
+    Nulling is done on good material by definition, so taking the value from
+    traces the operator watched being taken beats typing in a number from a
+    previous session on a different probe at a different temperature.
+
+    NEEDS TRACES, so it needs a scan (or at least a pass) to have run. There is
+    nothing to average before that, which is why it cannot be part of setup.
+    """
+    if not ec_channel_exists(recdb, EC_TRACES_PATH):
+        raise RuntimeError(
+            "there are no traces to null on yet: %s does not exist until a scan "
+            "has staged its first reading. Run a pass (run_ec_scan(max_passes=1)) "
+            "and null on that, or set a value directly with "
+            "setup_ec(null=(re, im))." % (EC_TRACES_PATH,))
+    null = ec_null_from_traces(recdb, EC_TRACES_PATH, first=0, count=count)
+    ec_conditioning_parameters(null=null, cond=ec_cond)
+    print("  null set to (%.5f, %.5f) from the first %d traces%s"
+          % (null[0], null[1], count,
+             "" if ec_cond is not None else " (held until the scan wires it)"))
+    return null
+
+
+global set_rotation
+def set_rotation(degrees):
+    """Rotate the impedance plane. THIS IS THE SETUP PROCEDURE.
+
+    Turn it until lift-off lies along the horizontal axis; whatever is left
+    vertically is the part. Once the math is wired this re-runs over every trace
+    already acquired, so it is done against a recorded pass rather than by
+    re-scanning. Called before the first scan it sets the value the scan starts
+    with.
+    """
+    val = ec_conditioning_parameters(rotation_deg=float(degrees), cond=ec_cond)
+    print("  rotation %.1f degrees%s"
+          % (val["rotation"],
+             "" if val["live"] else " (held until the scan wires it)"))
+    return val["rotation"]
+
+
+global set_gain
+def set_gain(horizontal=1.0, vertical=1.0):
+    """Per-axis gain. After rotation the two axes carry different quantities."""
+    val = ec_conditioning_parameters(gain=(horizontal, vertical), cond=ec_cond)
+    print("  gain h=%.2f v=%.2f%s"
+          % (val["gain"][0], val["gain"][1],
+             "" if val["live"] else " (held until the scan wires it)"))
+    return val["gain"]
+
+
+global probe_position
+def probe_position():
+    """Where the probe is now, from the TF holder rather than from the module.
+
+    Returns None before TF has produced anything -- the trigger treats that as
+    'no reading' rather than as the origin, which is the difference between
+    waiting and silently scanning from the wrong place.
+    """
+    return live_pose.xyz()
+
+# ==============================================================================
+# THE WORKFLOW, ONE STAGE PER FUNCTION
+# ==============================================================================
+# Each stage takes explicit inputs, returns its result, and can be re-run on its
+# own, so a step that fails can be retried without redoing the steps before it.
+# No stage asks a question, so the whole workflow is driveable from anything,
+# not only from a human at a terminal.
+#
+# Every stage also leaves its result in a global, so the next one can be called
+# from the prompt with no arguments.
+
+global detected_region
+global rough_mesh
+global fine_mesh
+global ec_scan_path
+global ec_scan_x3d
+detected_region = None
+rough_mesh = None
+fine_mesh = None
+ec_scan_path = None
+ec_scan_x3d = None
+
+
+global detected_info
+detected_info = None
+
+
+global _ec_contact
+def _ec_contact():
+    """The contact-motion settings, from this config's names."""
+    # links= names what may touch the part. run_surface_path_scan() declares it
+    # to the planner before the first pass, and without it every descent onto the
+    # surface is truncated by the collision checker and every pass is skipped --
+    # 0 traces of 720 expected, measured in simulation.
+    return contact_motion(lift_m=EC_LIFT_M, approach_m=EC_APPROACH_M,
+                          short_hop_m=EC_SHORT_HOP_M,
+                          near_speed_mps=NEAR_PART_SPEED,
+                          transit_joint_scaling=JOINT_MOVE_SCALING,
+                          accel=RASTER_ACCEL, axis_speed_mps=EC_AXIS_SPEED,
+                          links=TOOLING_CONTACT_LINKS)
+
+
+global _check_contact_speed
+def _check_contact_speed():
+    if SCAN_VELOCITY > NEAR_PART_SPEED*(1.0 + 1e-9):
+        raise RuntimeError(
+            "SCAN_VELOCITY is %.1f mm/s, and the probe is in contact with the part "
+            "for the whole sweep. The limit near the part is %.1f mm/s "
+            "(NEAR_PART_SPEED). Lower SCAN_VELOCITY: "
+            "globals()['SCAN_VELOCITY'] = %.3f"
+            % (SCAN_VELOCITY*1e3, NEAR_PART_SPEED*1e3, NEAR_PART_SPEED))
+
+
+global move_to_named_pose
+def move_to_named_pose(name):
+    """Joint move to a named state in the cell's SRDF. Raises if refused.
+
+    Holds the warning light itself, so it is on even when this is called from
+    the prompt rather than from a stage (holds nest; see warning_light()).
+    """
+    with warning_light("moving to %s" % (name,)):
+        r = ros.JointMove(name, **joint_move_kwargs())
+    if not bool(getattr(getattr(r, "result", None), "success", False)):
+        raise RuntimeError(
+            "the arm would not move to %r: MoveIt refused it (mtc_node's log says "
+            "why). From an invalid start state every goal is refused -- check with "
+            "ros2 service call /check_state_validity moveit_msgs/srv/GetStateValidity "
+            "\"{group_name: ur_manipulator}\"" % (name,))
+    return r
+
+
+global park_arm
+def park_arm(pose=None):
+    """Rise straight up out of the work volume, then go to PARK_POSE.
+
+    Straight up first, because a joint move from near the part sweeps the tool
+    wherever the arm's geometry takes it and the part is not in MoveIt's
+    planning scene. The first EC_APPROACH_M at the near-part speed, the rest at
+    TRANSIT_SPEED, up to the work volume's ceiling.
+
+    A probe still on the part -- ec_touch_down() without ec_lift() -- is first
+    backed off along its OWN axis, as every contact move is; rising in world z
+    from a tilted surface would drag the tip across it.
+
+    The rise is held in the `transit` motion profile rather than taking whatever
+    the session left in force: it has to COMPLETE, and a tenth of a millimetre of
+    shortfall at the work volume's ceiling costs nothing. See the comment on it.
+    """
+    pose = PARK_POSE if pose is None else pose
+    with warning_light("parking the arm"):
+        if ec_scan_path is not None:
+            with motion_profile("scan"):
+                contact_retract(_ec_contact(), positions=ec_scan_path.positions)
+        snap = live_pose.snapshot()
+        if snap is not None:
+            p = np.asarray(snap[0], dtype=np.float64)
+            q = tuple(float(v) for v in snap[1])
+            vol = work_volume()
+            top = vol[2][2] if vol is not None else p[2] + EC_APPROACH_M
+            z = float(p[2])
+            # `transit`, and NAMED rather than inherited. The rise is a clearance
+            # move: it has to COMPLETE (min_fraction=1.0 below -- a short rise is
+            # not a park) and it does not matter within a millimetre where it
+            # stops, since the target is the top of the work volume. That is
+            # exactly what transit's 0.1 mm position_threshold is for; scan's
+            # 0.01 mm sometimes loses a multi-waypoint Cartesian path instead
+            # (measured: 5 of 5 rows completed at 1e-4, 1 of 5 refused partway
+            # at 1e-5).
+            #
+            # Naming it matters because a park runs when something has ALREADY
+            # gone wrong, from wherever the failure left the arm; inheriting
+            # whatever profile the session happens to hold -- `scan`, if a stage
+            # above it is still inside a hold -- gives a recovery path different
+            # settings every time.
+            #
+            # Not about IK branch: the rise is flown by mtc_hub_node, which is
+            # `mode: local` in both profiles, so it follows its seed and stays in
+            # the arm's configuration either way. (The cable guard asks in the
+            # mode the executing node holds -- see CABLE_GUARD_EXECUTORS in
+            # cell_capture_motion.dpi -- so it does not need a profile here to
+            # be right either.)
+            with motion_profile("transit"):
+                for z_to, speed in ((min(z + EC_APPROACH_M, top), NEAR_PART_SPEED),
+                                    (top, TRANSIT_SPEED)):
+                    if z_to <= z + 0.001:
+                        continue
+                    r = ros.CartesianMove([_pose_msg((p[0], p[1], z), q),
+                                           _pose_msg((p[0], p[1], z_to), q)],
+                                          vel=motion_scaling(speed), acc=RASTER_ACCEL,
+                                          min_fraction=1.0)
+                    if not bool(getattr(getattr(r, "result", None), "success", False)):
+                        print("  could not rise straight up to z %.3f; parking from z %.3f"
+                              % (z_to, z))
+                        break
+                    z = z_to
+        if pose:
+            move_to_named_pose(pose)
+            print("  parked at %s" % (pose,))
+
+
+global detect_part
+def detect_part(index=0, pad=0.0, move=True, **kwargs):
+    """Find the specimen with YOLO and return the region to measure.
+
+    Not a hard dependency of anything downstream: every stage takes `region`
+    explicitly, so a specimen the detector cannot see is set by hand and nothing
+    else changes -- run_automated_scan(region=(xmin, ymin, xmax, ymax)).
+
+    move=True goes to DETECT_POSE first: a detection is only as good as the
+    view, and detecting from wherever a sweep left the arm clips the part at the
+    edge of the image.
+    """
+    global detected_region, detected_info
+    if move and DETECT_POSE:
+        with warning_light("moving to %s to look for the part" % (DETECT_POSE,)):
+            move_to_named_pose(DETECT_POSE)
+    # yolo_region() returns (region, info); the region alone is what the Azure
+    # sweep and every later stage take.
+    detected_region, detected_info = yolo_region(index=index, pad=pad, **kwargs)
+    print("  detected region: x %.3f..%.3f  y %.3f..%.3f  (%s, score %.2f, "
+          "surface z %.3f)"
+          % (detected_region[0], detected_region[2], detected_region[1],
+             detected_region[3], detected_info.get("class_name"),
+             detected_info.get("score", 0.0), detected_info.get("surface_z", 0.0)))
+    return detected_region
+
+
+global reconstruct_rough
+def reconstruct_rough(region=None, purpose="planning", **kwargs):
+    """Azure sweep into a TSDF. A PLANNING SURFACE, not a measurement.
+
+    Coarse on purpose: specimen.dpi defaults the voxel to 0.006 rather than
+    0.002 because at 0.002 the TSDF resolves every hole and noise bump and
+    Noether then follows all of it -- 8 m of raster "lines" on a 0.35 m part,
+    measured. 0.006 gives eleven sane segments.
+
+    purpose="planning" IS THE POINT OF THIS STAGE, and it is declared here
+    rather than left to a global default because this function is the one
+    caller that can honestly say it. What comes out of here is handed to
+    reconstruct_fine() to plan a Keyence raster over and to Noether to plan an
+    eddy-current toolpath over -- both of which want the TOP of the part and
+    neither of which can use its sides. A height field is that surface. The
+    global minimum (AZURE_PAN_MIN_DIRECTIONS = 2) is right for a sweep whose
+    output is the measurement, and holding this stage to it refuses the whole
+    run whenever only one direction is admissible. Pass purpose="closed" to hold
+    it to the stricter rule.
+    """
+    global rough_mesh
+    region = detected_region if region is None else region
+    kwargs.setdefault("purpose", purpose)
+    # A STRAIGHT-DOWN RASTER AT ONE FIXED ORIENTATION, which is the whole of
+    # what this stage needs and is the cheapest thing the arm can be asked for.
+    #
+    # The pan sweep orbits the part: 8 candidate azimuths, and to face each one
+    # the camera has to be ROLLED to it, which is wrist_3. That buys views of
+    # the SIDES of the part -- and the sides of a thin flat plate cannot be
+    # reached from this cell at all, so the whole cost is paid for something
+    # that is never collected. It is also fragile: the same region can be
+    # admissible at plan time and then refused at all 8 azimuths and all 6
+    # heights minutes later, which takes out every stage downstream.
+    #
+    # rot=False holds ONE orientation for every stop: whatever the arm is
+    # already in, which is in the cable band by construction because the arm is
+    # standing in it. The stops then differ only in x and y, and the parallax
+    # comes from translation. At 530 mm NFOV_UNBINNED sees 813 x 675 mm, so
+    # every stop sees the entire part; the raster is redundant views, not
+    # coverage, and it can be shrunk to fit the reach without losing any of the
+    # part. That is what _plan_dome() now does instead of refusing.
+    #
+    # Pass style="pan" to get the orbit back for a part whose sides matter and
+    # can be reached.
+    # NOT kwargs.setdefault("style", "dome"): the style is declared once, at
+    # SPECIMEN_SWEEP_STYLE, where check_sweep_plan() and capture_full_pipeline()
+    # can both see it. Forcing it here makes this stage fly a sweep the config
+    # does not describe. Pass style= to override for one call.
+    kwargs.setdefault("rot", False)
+    if kwargs.get("plan_only"):
+        # NOT into rough_mesh: a plan is a ScanPath, and parking one there
+        # would have reconstruct_fine() believe stage 2 had produced a surface.
+        # Nothing moves, so no warning light either.
+        return reconstruct_specimen(source="azure", region=region,
+                                    name="specimen", **kwargs)
+    with warning_light("Azure sweep (rough planning surface)"):
+        rough_mesh = reconstruct_specimen(source="azure", region=region,
+                                          name="specimen", **kwargs)
+    print("  rough mesh: %s" % (rough_mesh,))
+    return rough_mesh
+
+
+global check_rough_plan
+def check_rough_plan(region=None, **kwargs):
+    """WILL STAGE 2 FLY? The same plan reconstruct_rough() would make. No motion.
+
+    It is reconstruct_rough() with plan_only=True, so it goes through the same
+    source, the same kwargs and the same planner -- which is the point. A
+    checker that is a separate implementation of the thing it checks will
+    eventually disagree with it, and IK is randomised, so "eventually" is every
+    run: check_sweep_plan() has reported a sweep flying from 2 directions where
+    reconstruct_rough(), over the same region minutes later, found 0 of 8 and
+    refused.
+
+    Run it before the recorder starts. It prints the raster, where probe_end
+    ends up, the standoff against the depth mode, and how many stops reach.
+    """
+    region = detected_region if region is None else region
+    return reconstruct_rough(region=region, plan_only=True, **kwargs)
+
+
+global reconstruct_fine
+def reconstruct_fine(rough=None, region=None, **kwargs):
+    """Keyence profile raster over the rough mesh: the measurement.
+
+    Needs a surface to plan its raster over, which is what the Azure pass is
+    for. So for a part that has never been measured the honest order is
+    reconstruct_rough() then reconstruct_fine(), which is what
+    run_automated_scan() does. orient= defaults to KEYENCE_ORIENTATION.
+    """
+    global fine_mesh
+    rough = rough_mesh if rough is None else rough
+    if rough is None:
+        raise RuntimeError(
+            "the Keyence raster needs a surface to plan over. Run "
+            "reconstruct_rough() first, or pass rough= a mesh on disk.")
+    kwargs.setdefault("orient", KEYENCE_ORIENTATION)
+    with warning_light("Keyence raster"):
+        fine_mesh = reconstruct_specimen(source="keyence", rough_mesh=rough,
+                                         region=detected_region if region is None else region,
+                                         name="specimen", **kwargs)
+    print("  fine mesh: %s" % (fine_mesh,))
+    return fine_mesh
+
+
+global filter_mesh
+def filter_mesh(mesh=None, cutoff=None, **kwargs):
+    """Run tari_mesh_filter over a reconstructed mesh.
+
+    Two things about the service make it easy to call and get a silent no-op.
+    It runs ONE filter per call (if color_filter / elif vert_filter / elif
+    delete_loose_parts), so asking for two gets the first; and `cutoff` is a
+    plane in WORLD z, which removes nothing at all unless it is set for a cell
+    whose bench sits at z 0.92-1.06.
+
+    cutoff=None means do not run the vertex filter at all, which is what lets
+    loose-part removal run. Set MESH_CUTOFF_Z for this cell to use it.
+    """
+    mesh = (fine_mesh or rough_mesh) if mesh is None else mesh
+    if mesh is None:
+        raise RuntimeError("nothing to filter -- reconstruct something first")
+    cutoff = MESH_CUTOFF_Z if cutoff is None else cutoff
+    out = clean_mesh(mesh, cutoff=cutoff, **kwargs)
+    print("  filtered mesh: %s" % (out,))
+    return out
+
+
+global ec_clearance_report
+ec_clearance_report = None
+
+global plan_ec_path
+def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
+                 max_tilt_deg=None, axis_smoothing_m=None, force=False, **kwargs):
+    """Plan the eddy-current toolpath over a mesh with Noether.
+
+    line_spacing is the distance BETWEEN passes; SCAN_STEP_SIZE is the distance
+    between samples ALONG a pass. They are different quantities and only the
+    second is a technician control, because the first is a property of the probe
+    footprint.
+
+    The tip is planned ON the measured surface (NOETHER_Z_OFFSET 0; probe_end
+    is the tip on this tooling), pushed EC_PRELOAD_M further along its own
+    axis, locked in roll (NOETHER_TOOL_ROLL), and then cropped: to the cell's
+    work volume, which a contact probe must never leave -- on a cell that has
+    not measured one this refuses -- and to EC_SCAN_REGION if it is set, which
+    is how a 0.3 mm scan is kept to an area that fits in the hour the plan
+    allows.
+    """
+    global ec_scan_path, ec_scan_x3d, ec_clearance_report
+    mesh = (fine_mesh or rough_mesh) if mesh is None else mesh
+    region = EC_SCAN_REGION if region is None else region
+    preload = EC_PRELOAD_M if preload is None else float(preload)
+    max_tilt = EC_MAX_TILT_DEG if max_tilt_deg is None else max_tilt_deg
+    smooth = EC_AXIS_SMOOTHING_M if axis_smoothing_m is None else axis_smoothing_m
+    require_work_volume("the eddy-current toolpath")
+
+    # PRICE IT BEFORE BUILDING IT. The planner works at the mesh's resolution
+    # rather than the scan's, so a line spacing the technician can type in one
+    # second can ask for a million waypoints and hundreds of megabytes of
+    # planner reply -- and the failure mode is not a slow plan, it is the dgpy
+    # process being OOM-killed (8.4 GB has done it) with every stage before it
+    # thrown away. force=True is the deliberate override and still prints what
+    # is wrong.
+    ec_plan_estimate = ec_plan_cost(region=region, line_spacing=line_spacing,
+                                    mesh=mesh, report=True)
+    if ec_plan_estimate["plan_errors"] and not force:
+        raise RuntimeError(
+            "this plan will not fit: %s. Scan a smaller area (EC_SCAN_REGION), "
+            "widen SCAN_LINE_SPACING, or plan_ec_path(force=True)."
+            % ("; ".join(ec_plan_estimate["plan_errors"]),))
+
+    if EC_CLEAN_PLANNING_MESH and mesh and str(mesh).endswith(".ply"):
+        cleaned = os.path.splitext(str(mesh))[0] + "_ecplan.ply"
+        cr = clean_mesh_for_planning(str(mesh), cleaned)
+        print("  planning mesh %s: %d of %d faces kept (%d on %d non-manifold edges, "
+              "%d in %d of %d components under 1%%)"
+              % (os.path.basename(cleaned), cr["faces_out"], cr["faces_in"],
+                 cr["faces_on_nonmanifold_edges"], cr["nonmanifold_edges"],
+                 cr["faces_in_small_components"], cr["components"] - cr["components_kept"],
+                 cr["components"]))
+        mesh = cleaned
+    # CHECK CLEARANCE LAST, NOT FIRST. plan_mesh_path() runs the tooling gate
+    # over the path it hands back -- which here is the RAW Noether path, before
+    # the tilt cap, the work-volume crop, EC_SCAN_REGION and the resample below.
+    # On a cylindrical specimen that is 911 511 poses in and 180 539 out: four
+    # fifths of the gate's work spent on poses about to be thrown away, and the
+    # survivors never re-checked at the spacing they actually fly at. The gate
+    # runs once, at the bottom of this function, on exactly the poses
+    # run_ec_scan() will command.
+    kwargs.setdefault("check_clearance", False)
+    # AND THE REGION, so the mesh gate grades the surface being scanned rather
+    # than the whole reconstruction. `region` is consumed here for the cost
+    # estimate and the crop below, so it has to be handed on explicitly;
+    # without it the gate measures the bench too, and a plan over a nearly flat
+    # crown is refused because the flanks either side of it lean past 45
+    # degrees.
+    kwargs.setdefault("region", region)
+    path, x3d = plan_mesh_path(mesh=mesh, line_spacing=line_spacing, **kwargs)
+    reference = getattr(path, "roll_reference", NOETHER_ROLL_REFERENCE)
+    roll_mode = getattr(path, "roll_mode", NOETHER_TOOL_ROLL)
+    uv = globals().get("last_uv_report") or {}
+    if x3d is not None and uv.get("x3d") == x3d and uv.get("rejected"):
+        # The projector would refuse this file when it is built at the scan's
+        # first trace -- with the probe on the part -- and x3d_load_geometry can
+        # abort the whole process doing it. Scan without it; the traces keep
+        # their poses and project_traces() can paint them later.
+        print("  WARNING: the projection surface %s would be REJECTED by the "
+              "projector (MESHUV above). Continuing WITHOUT a projection surface: "
+              "every trace is still recorded with its pose." % (x3d,))
+        x3d = None
+    # Tilt first, on the planned normals: a wall or a flank beyond the band is
+    # dropped before the axis is averaged, so its normals never lean the passes
+    # beside it. An average of axes inside the band stays inside it (a cone is
+    # convex), so the smoothed path needs no second crop.
+    if max_tilt is not None:
+        # SAY WHAT THE CAP COSTS BEFORE TAKING IT. The drop below is the thing
+        # that excludes: past the cable envelope's tilt these poses cannot be
+        # flown, and removing them here -- before the axis is averaged -- is what
+        # keeps a flank's normals from leaning the passes beside it. A bare count
+        # of dropped waypoints says nothing about where on the part they were,
+        # what they cost in travel, or whether the cause was bad normals rather
+        # than an unreachable part. With sound normals the expected input loses
+        # NOTHING here, so a nonzero count is a finding rather than routine.
+        #
+        # tool_reachability_report() measures and excludes nothing; the crop is
+        # still the thing that excludes. Read its docstring for why this is NOT a
+        # measure of normal error -- assert_probe_normal_to_surface() is.
+        # Both names come from mesh_scan.dpi (included above), so either both are
+        # here or neither. Fetched rather than called bare all the same: this is
+        # REPORTING, and a reporting failure must never be able to stop a plan.
+        _reach = globals().get("tool_reachability_report")
+        _say_reach = globals().get("describe_tool_reachability")
+        if _reach is not None and _say_reach is not None:
+            try:
+                for _line in _say_reach(_reach(path, max_tilt_deg=float(max_tilt))):
+                    print(_line)
+            except Exception as _e:
+                print("  (no reachability report: %s: %s -- the crop below still "
+                      "applies)" % (type(_e).__name__, _e))
+        else:
+            print("  (no reachability report: mesh_scan.dpi did not export it -- "
+                  "the crop below still applies)")
+        path = _crop_path_by_mask(
+            path, tool_tilt_deg(path.quats) <= float(max_tilt),
+            "eddy-current toolpath", min_points=2,
+            why="tilted more than EC_MAX_TILT_DEG (%.0f deg)" % (float(max_tilt),))
+    sm = None
+    if smooth and roll_mode == "locked":
+        path = smooth_tool_axis(path, smooth, reference=reference)
+        # DECLINED IS A NORMAL OUTCOME, and it must not be an AttributeError.
+        # smooth_tool_axis() returns the path UNTOUCHED -- with no
+        # `axis_smoothing` -- when the path is already normal-constrained
+        # (orient='normal'), because averaging the repaired normal is a tilt AWAY
+        # from it, which is the one quantity that must be zero. It prints its own
+        # reason when it declines. Reading the attribute unconditionally raises
+        # at the very last line of the stage, after the toolpath is planned and
+        # the X3D written -- a whole plan thrown away by a report.
+        sm = getattr(path, "axis_smoothing", None)
+        if sm is not None:
+            print("  tool axis averaged over %.1f mm of travel "
+                  "(EC_AXIS_SMOOTHING_M): moved up to %.1f deg, %.1f on average; "
+                  "positions unchanged"
+                  % (smooth*1e3, sm["moved_max_deg"], sm["moved_mean_deg"]))
+    elif smooth:
+        print("  NOT averaging the tool axis: the roll is %r, and averaging "
+              "re-locks it" % (roll_mode,))
+    if preload:
+        path = _offset_path_in_tool_frame(path, (0.0, 0.0, -float(preload)))
+        print("  preload: every pose %.2f mm past the measured surface, along "
+              "its own axis" % (preload*1e3,))
+    else:
+        print("  preload: NONE -- the tip is commanded exactly onto the measured "
+              "surface (EC_PRELOAD_M); mesh error is lift-off or compression 1:1")
+    path = _crop_path_to_work_volume(path, "eddy-current toolpath")
+    if region:
+        xmin, ymin, xmax, ymax = [float(v) for v in region]
+        path = _crop_path_to_box(path, (xmin, ymin, -np.inf), (xmax, ymax, np.inf),
+                                 "eddy-current toolpath", min_points=2,
+                                 why="outside EC_SCAN_REGION")
+    if EC_TRAVEL_DIRECTION is not None:
+        path = orient_segments_along(path, EC_TRAVEL_DIRECTION)
+        print("  every pass travels along %s (%d reversed)"
+              % (tuple(EC_TRAVEL_DIRECTION), path.segments_reversed))
+    path.roll_reference = reference
+    path.roll_mode = roll_mode
+    if EC_WAYPOINT_SPACING_M and roll_mode == "locked":
+        path = resample_segments(path, EC_WAYPOINT_SPACING_M, reference=reference)
+        print("  passes resampled to %.2f mm between waypoints (%d -> %d waypoints)"
+              % (EC_WAYPOINT_SPACING_M*1e3, path.resampled["waypoints_before"],
+                 path.resampled["waypoints_after"]))
+        path.roll_reference = reference
+        path.roll_mode = roll_mode
+    path.axis_smoothing = sm         # the crops above make new paths; keep it
+
+    # The tooling gate, on the poses that will actually fly. Contact is allowed
+    # for the probe by name -- contact is what this scan IS -- and every other
+    # link on the plate (the Keyence head 75 mm away, the Azure 230 mm away)
+    # still has to clear. enforce_path_clearance() samples above
+    # TOOLING_GATE_SAMPLE_ABOVE poses and certifies the rest; see
+    # sampled_path_clearance() for what that guarantees.
+    if EC_CHECK_CLEARANCE and _clearance_available("the eddy-current toolpath"):
+        print("  contact is allowed for %s; every other link must clear the part"
+              % (", ".join(TOOLING_CONTACT_LINKS) or "nothing",))
+        path, ec_clearance_report = enforce_path_clearance(
+            path, mesh, allow_links=TOOLING_CONTACT_LINKS,
+            what="eddy-current toolpath")
+        twist_within_limit(path)
+        path.roll_reference = reference
+        path.roll_mode = roll_mode
+        path.axis_smoothing = sm
+
+    segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    if not segs:
+        raise RuntimeError(
+            "no scanning pass is left on the eddy-current toolpath after "
+            "cropping (passes under PATH_MIN_SEGMENT_M = %.0f mm are link moves). "
+            "Check EC_SCAN_REGION against the part." % (PATH_MIN_SEGMENT_M*1e3,))
+    path.roll_report = tool_roll_report(path.quats, segs, reference=reference)
+    rr = path.roll_report
+    print("  eddy-current toolpath: %d passes, %.3f m in contact"
+          % (len(segs), sum(path.segment_length_m(s) for s in segs)))
+    print("    roll %s about x=%s: %.2f deg across the path, %.2f within a pass; "
+          "tilt up to %.1f deg (mean %.1f)"
+          % (roll_mode, tuple(reference), rr["twist_range_deg"],
+             rr["twist_in_pass_deg"], rr["tilt_max_deg"], rr["tilt_mean_deg"]))
+    ec_scan_path, ec_scan_x3d = path, x3d
+    return ec_scan_path, ec_scan_x3d
+
+
+def _ec_hms(seconds):
+    """h:mm:ss. Local on purpose: scan_parameters.dpi's _hms is private to that
+    file, and a .dpi compiles as a function body, so borrowing it would work in
+    the tests (one namespace) and NameError in a running config."""
+    seconds = float(seconds)
+    h, rem = divmod(int(round(seconds)), 3600)
+    m, sec = divmod(rem, 60)
+    return "%d:%02d:%02d" % (h, m, sec) if h else "%d:%02d" % (m, sec)
+
+
+def _ec_bytes(n):
+    """Bytes as MB/GB. Local, for the same reason as _ec_hms."""
+    n = float(n)
+    for unit, scale in (("GB", 1 << 30), ("MB", 1 << 20), ("kB", 1 << 10)):
+        if n >= scale:
+            return "%.1f %s" % (n/scale, unit)
+    return "%d B" % (int(n),)
+
+
+global ec_plan_cost
+def ec_plan_cost(region=None, line_spacing=None, mesh=None, step_m=None,
+                 velocity_mps=None, report=True):
+    """What planning and scanning this area would cost -- BEFORE anything runs.
+
+    The point of this function is that it needs no toolpath. Everything comes
+    from the three technician controls (SCAN_LINE_SPACING between passes,
+    SCAN_STEP_SIZE along one, SCAN_VELOCITY) and the extent of the area, so it
+    can be printed while the operator is still choosing them, and plan_ec_path()
+    can refuse before it commits the cell to half an hour of planning.
+
+    The eddy-current stage is the one where the arithmetic bites. Halving the
+    line spacing doubles the passes, and the passes are what everything scales
+    on: at 0.30 mm a 200 x 150 mm area is ~500 passes, 100 m of travel, 100 000
+    scanning waypoints -- and, because Noether plans at the mesh's own
+    resolution and not at the scan's, 240 000 raw waypoints before the resample.
+
+    Returns a dict; `errors` is empty only if the plan fits.
+    """
+    region = (EC_SCAN_REGION if region is None else region) or detected_region
+    line_spacing = SCAN_LINE_SPACING if line_spacing is None else float(line_spacing)
+    step_m = SCAN_STEP_SIZE if step_m is None else float(step_m)
+    velocity_mps = SCAN_VELOCITY if velocity_mps is None else float(velocity_mps)
+    mesh = (fine_mesh or rough_mesh) if mesh is None else mesh
+
+    if region is not None:
+        xmin, ymin, xmax, ymax = [float(v) for v in region]
+        source = ("EC_SCAN_REGION" if region is EC_SCAN_REGION
+                  else "detected" if region is detected_region
+                  else "the region given")
+    elif mesh:
+        verts = _mesh_vertices(mesh)
+        xmin, ymin = float(verts[:, 0].min()), float(verts[:, 1].min())
+        xmax, ymax = float(verts[:, 0].max()), float(verts[:, 1].max())
+        source = "the whole of %s" % (os.path.basename(str(mesh)),)
+    else:
+        raise RuntimeError(
+            "nothing to price: pass region=(xmin, ymin, xmax, ymax), set "
+            "EC_SCAN_REGION, or reconstruct a mesh first")
+    width, height = abs(xmax - xmin), abs(ymax - ymin)
+
+    # Which way the passes run. With NO rotation offset they run along the
+    # SHORTER side of this rectangle and there is one every line_spacing along
+    # the longer; pi/2 swaps that. noether_cut_axes() in noether_path.dpi is the
+    # one statement of the rule, taken from the planner's source: the cutting
+    # planes are normal to the mesh's SECOND principal axis at pi/2 and to the
+    # FIRST at zero.
+    #
+    # AND THIS IS AN APPROXIMATION, for two reasons worth knowing before an
+    # estimate is trusted. The planner takes its axes from a PCA of the MESH's
+    # vertices, not from this rectangle: "longer side" is only "first principal
+    # axis" when the part lies square to x and y, and the mesh it measures
+    # includes whatever else the sensor saw. Pricing has to work before a mesh
+    # exists, which is the whole point of this function, so it uses the
+    # rectangle -- and mesh_plan_report() reports the real thing once there is
+    # a mesh to measure.
+    along, across = (min(width, height), max(width, height))
+    if noether_pass_axis(globals().get("NOETHER_ROTATION_OFFSET", 0.0)) == 0:
+        along, across = across, along
+    passes = max(1, int(round(across/line_spacing)))
+    travel = passes*along
+    waypoints = passes*(int(along//EC_WAYPOINT_SPACING_M) + 1)
+    raw_poses = int(travel/NOETHER_POSE_SPACING_M) if NOETHER_POSE_SPACING_M else 0
+
+    reply_bytes = raw_poses*NOETHER_POSE_REPLY_BYTES
+    # The path arrays themselves: 7 float64 per pose, and the crops hold the one
+    # being built alongside the one being cropped.
+    path_bytes = 2*raw_poses*7*8 + 2*waypoints*7*8
+    # The clearance gate is now bounded rather than proportional to the path:
+    # its distance queries run inside a byte budget and its poses in blocks, so
+    # this is a constant. Taken from the module so there is one copy of it.
+    gate_bytes = int(globals().get("SURFACE_QUERY_BYTES", 256 << 20))
+    plan_bytes = reply_bytes + path_bytes + gate_bytes
+    gate_seconds = waypoints*EC_GATE_SECONDS_PER_POSE
+    plan_seconds = gate_seconds
+
+    scan = build_scan_plan(travel, passes, step_m=step_m,
+                           velocity_mps=velocity_mps, num_samples=1,
+                           sample_bytes=16, force=True, geom_timeout=0.0)
+
+    errors = []
+    lim = EC_PLAN_LIMITS
+    if raw_poses > lim["max_plan_poses"]:
+        errors.append("the planner would return about %d waypoints, over the "
+                      "%d this config will accept" % (raw_poses, lim["max_plan_poses"]))
+    if plan_bytes > lim["max_plan_memory_bytes"]:
+        errors.append("planning would need about %s of memory, over the %s limit"
+                      % (_ec_bytes(plan_bytes), _ec_bytes(lim["max_plan_memory_bytes"])))
+    if plan_seconds > lim["max_plan_seconds"]:
+        errors.append("planning would take about %s, over the %s limit"
+                      % (_ec_hms(plan_seconds), _ec_hms(lim["max_plan_seconds"])))
+
+    out = {"region": (xmin, ymin, xmax, ymax), "region_source": source,
+           "width_m": width, "height_m": height, "line_spacing_m": line_spacing,
+           "passes": passes, "travel_m": travel, "waypoints": waypoints,
+           "raw_poses": raw_poses, "reply_bytes": reply_bytes,
+           "path_bytes": path_bytes, "gate_bytes": gate_bytes,
+           "plan_bytes": plan_bytes, "plan_seconds": plan_seconds,
+           "gate_seconds": gate_seconds, "scan": scan,
+           "errors": errors + list(scan["errors"]),
+           "plan_errors": errors}
+    if report:
+        print("  what this plan costs, before it is built")
+        print("    area               %.0f x %.0f mm  (%s)"
+              % (width*1e3, height*1e3, source))
+        print("    line spacing       %.2f mm  ->  %d passes, %.1f m of travel"
+              % (line_spacing*1e3, passes, travel))
+        print("    toolpath           %d waypoints at %.2f mm, from about %d the "
+              "planner returns at the mesh's own %.2f mm"
+              % (waypoints, EC_WAYPOINT_SPACING_M*1e3, raw_poses,
+                 NOETHER_POSE_SPACING_M*1e3))
+        print("    planning memory    %s  (%s the planner's reply, %s path arrays, "
+              "%s the clearance gate)"
+              % (_ec_bytes(plan_bytes), _ec_bytes(reply_bytes), _ec_bytes(path_bytes),
+                 _ec_bytes(gate_bytes)))
+        print("    planning time      %s  (the clearance gate, sampled)"
+              % (_ec_hms(plan_seconds),))
+        print("    then the scan      %s, %d traces, %s of trace data"
+              % (_ec_hms(scan["scan_time_s"]), scan["traces"],
+                 _ec_bytes(scan["memory_bytes"])))
+        for e in errors:
+            print("    PLANNING REFUSED: %s" % (e,))
+        for e in scan["errors"]:
+            print("    THE SCAN WILL BE REFUSED: %s" % (e,))
+        for w in scan["warnings"]:
+            print("    warning: %s" % (w,))
+        if errors or scan["errors"]:
+            print("    Scan a smaller area (EC_SCAN_REGION), widen "
+                  "SCAN_LINE_SPACING, raise SCAN_STEP_SIZE -- or say so "
+                  "deliberately: plan_ec_path(force=True) plans it anyway and "
+                  "run_ec_scan(force=True) runs it.")
+    return out
+
+
+global preview_ec_scan
+def preview_ec_scan(path=None):
+    """What the scan would do, without moving. Print this before committing.
+
+    The plan is derived from SCAN_STEP_SIZE and SCAN_VELOCITY: it says how many
+    samples, how long it will take, how much memory it needs, and whether the
+    requested velocity had to be scaled down to keep the pipeline fed. A plan
+    over the limits is PRINTED here, with what is wrong; run_ec_scan() is what
+    refuses it.
+
+    The time is a floor. Its per-pass overhead (5 s) was measured on the UT
+    scan, whose passes need no lift or descent; dry_run_ec_scan() measures the
+    eddy-current one.
+    """
+    path = ec_scan_path if path is None else path
+    if path is None:
+        # NOTHING PLANNED YET, which is exactly when the operator most needs
+        # this. Price the area from the three technician controls instead: it
+        # takes no toolpath, no planner and no robot, and it is the answer to
+        # "can I scan this at 0.30 mm?" before half an hour is spent finding
+        # out. plan_ec_path() runs the same check and refuses on it.
+        print("  no toolpath planned yet -- pricing the area from the current "
+              "settings instead (plan_ec_path() will build it)")
+        return ec_plan_cost()
+    # min_length_m matches what the scan uses to decide which segments are
+    # worth acquiring; without it the plan counts passes that will never run.
+    segments = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    length = sum(path.segment_length_m(s) for s in segments)
+    # num_samples=1 and 16 bytes: an eddy-current reading IS one complex128.
+    plan = plan_current_scan(length, len(segments),
+                             step_m=SCAN_STEP_SIZE, velocity_mps=SCAN_VELOCITY,
+                             num_samples=1, sample_bytes=16, force=True)
+    if plan["errors"]:
+        print("  run_ec_scan() will REFUSE this plan as it stands. Scan a smaller "
+              "area (EC_SCAN_REGION), widen SCAN_LINE_SPACING, or pass "
+              "run_ec_scan(force=True) as a deliberate decision.")
+    return plan
+
+
+global ec_joint_report
+def ec_joint_report(path=None, sample=20, per_pass=5):
+    """wrist_3 along the planned toolpath from IK alone -- nothing moves.
+
+    Solves `sample` passes spread across the path the way each is entered (far
+    end first, then back along it, seeded). The range is what the cables see.
+    """
+    path = ec_scan_path if path is None else path
+    if path is None:
+        raise RuntimeError("no toolpath planned -- call plan_ec_path() first")
+    allsegs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    ids = sorted(set(int(round(v)) for v in
+                     np.linspace(0, len(allsegs) - 1, min(int(sample), len(allsegs)))))
+    with motion_profile("scan"):
+        r = path_joint_report(path, [allsegs[i] for i in ids], per_pass=per_pass)
+    r["segment_ids"] = ids
+    s = r["summary"]
+    fmt = lambda v: "n/a" if v is None else "%.1f" % v
+    print("  IK along %d of %d passes: %d solvable end to end; wrist_3 %s..%s deg, "
+          "up to %s within one pass"
+          % (len(ids), len(allsegs), s["ik_ok"], fmt(s["wrist3_min_deg"]),
+             fmt(s["wrist3_max_deg"]), fmt(s["wrist3_in_pass_max_deg"])))
+    # ...AND SAY WHETHER THE CABLES ALLOW IT, which nothing did at plan time.
+    # plan_ec_path() calls twist_within_limit(), which measures Cartesian tool
+    # twist against an unmeasured 90 degree placeholder and only warns. The
+    # motion guard does refuse an out-of-band move, but not until the arm is
+    # already scanning -- so the failure arrives as a run of dropped passes
+    # mid-scan instead of a number before anything moved. EC_MAX_TILT_DEG = 45
+    # lets waypoints through at tilts up to 44 degrees while the cable envelope
+    # may only have been swept to +/-20; on one measured Keyence mesh 5.9% of
+    # flying waypoints sat at tilts the envelope refuses outright.
+    band = _ec_band_check(r)
+    if band is not None:
+        r["cable_band"] = band
+    return r
+
+
+global _ec_band_check
+def _ec_band_check(report):
+    """Compare a path_joint_report's wrist_3 against the measured cable band.
+
+    Returns the finding, or None when this cell has no envelope (in which case
+    the guard has already said wrist 3 is unchecked, and repeating it here adds
+    nothing). Never raises: this is a report, and a planning stage that cannot
+    ask the question must not fail because of it.
+    """
+    f = globals().get("wrist3_band_deg")
+    if not callable(f):
+        return None
+    try:
+        lo, hi = f(tilt=(0.0, 0.0))
+    except Exception as e:                                        # noqa: BLE001
+        print("  cable band: not checked (%s)" % (str(e).splitlines()[0][:70],))
+        return None
+    bad = []
+    for k, entry in enumerate(report.get("passes", [])):
+        a, b = entry.get("wrist3_min_deg"), entry.get("wrist3_max_deg")
+        if a is None or b is None:
+            continue
+        if a < lo - 1e-6 or b > hi + 1e-6:
+            bad.append((k, a, b))
+    if not bad:
+        print("  cable band: every solved pass is inside %.1f..%.1f deg "
+              "(untilted band)" % (lo, hi))
+        return {"lo_deg": lo, "hi_deg": hi, "outside": []}
+    print("  CABLE BAND: %d of the solved passes need wrist_3 OUTSIDE "
+          "%.1f..%.1f deg -- they will be refused when the scan reaches them, "
+          "not now. Worst %.1f..%.1f deg."
+          % (len(bad), lo, hi, min(x[1] for x in bad), max(x[2] for x in bad)))
+    print("    Either sweep the cable envelope at the tilts this path needs, or "
+          "lower EC_MAX_TILT_DEG (currently %s) until they are inside it."
+          % (globals().get("EC_MAX_TILT_DEG"),))
+    return {"lo_deg": lo, "hi_deg": hi, "outside": bad}
+
+
+global run_ec_scan
+def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=False):
+    """Scan the planned toolpath in continuous motion.
+
+    One complex impedance per SCAN_STEP_SIZE of travel, each carrying the pose it
+    was taken at, conditioned and projected onto the surface.
+
+    The acquisition is shared with the ultrasound scan (surface_path_scan.dpi);
+    what is eddy-current here is what a reading is and which conditioned scalar
+    gets painted onto the part. `component` picks that: "vertical" once the
+    rotation is set -- lift-off is horizontal by then and what is left is the
+    part -- or "magnitude", which ignores the rotation and is the safe choice
+    before one has been chosen.
+
+    The probe is in contact: every pass is entered by lift / transit / descend
+    along the tool axis, swept at no more than NEAR_PART_SPEED, and the probe is
+    lifted clear at the end, error or not. The warning light is on throughout.
+
+    A pass that will not plan is dropped and reported. The traces taken are
+    still correct, because each carries its own pose; the coverage is not.
+    """
+    path = ec_scan_path if path is None else path
+    x3d = ec_scan_x3d if x3d is None else x3d
+    if path is None:
+        raise RuntimeError("no toolpath planned -- call plan_ec_path() first")
+    # ec_cond is NOT required: the conditioning is wired by the scan itself,
+    # once the first reading has given it a trace list to read. Requiring it
+    # here would make the scan impossible to start.
+    if ec_source is None:
+        raise RuntimeError(
+            "eddy current is not set up -- call setup_ec() first (and, once "
+            "there are traces, null_here() and set_rotation() before trusting "
+            "what it paints)")
+    _check_contact_speed()
+    with warning_light("eddy-current scan"):
+        return run_ec_path_scan(path, x3d, ec_source, ec_cond,
+                                prefix="/ec", staging_path="/ec/current",
+                                cond_prefix=EC_COND_PREFIX,
+                                component=component, max_passes=max_passes,
+                                force=force, pitch_m=SCAN_STEP_SIZE,
+                                contact=_ec_contact())
+
+
+global ec_dry_run_report
+ec_dry_run_report = None
+
+global dry_run_ec_scan
+def dry_run_ec_scan(path=None, passes=None, sample=5, park=False):
+    """Fly the eddy-current toolpath exactly as run_ec_scan() would, measuring
+    instead of acquiring. THE FIRST THING TO RUN ON THE PROBE'S BEHALF.
+
+    Same approach (lift / transit / descend), same sweep speed, same motion
+    profile, same warning light -- no DAQ, no trigger, nothing staged. By
+    default `sample` passes spread across the path; passes=[...] picks them
+    (indices into the scanning passes), sample=None flies them all.
+
+    Prints and returns what was flown against what was planned: passes entered
+    and swept, the tip's distance from the planned line and along the normal,
+    tilt and how well it followed the normal, roll against the locked reference,
+    the peak speed of every kind of motion, the closest the tip came to the
+    part between passes, and the wrist_3 range. Left in ec_dry_run_report.
+
+    In simulation there is no spring and no contact, so "along the normal" is
+    tracking error only. On the cell it is what the fixture had to absorb.
+    """
+    global ec_dry_run_report
+    path = ec_scan_path if path is None else path
+    if path is None:
+        raise RuntimeError("no toolpath planned -- call plan_ec_path() first")
+    _check_contact_speed()
+    allsegs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    if not allsegs:
+        raise RuntimeError("no scanning passes on this toolpath")
+    if passes is not None:
+        ids = [int(i) for i in passes]
+    elif sample and int(sample) < len(allsegs):
+        ids = sorted(set(int(round(v)) for v in
+                         np.linspace(0, len(allsegs) - 1, int(sample))))
+    else:
+        ids = list(range(len(allsegs)))
+    segs = [allsegs[i] for i in ids]
+    length = sum(path.segment_length_m(s) for s in segs)
+    # The plan is what sets the sweep speed (raster_velocity()); force=True
+    # because a dry run of a few passes of an over-long scan is the point.
+    plan_current_scan(length, len(segs), step_m=SCAN_STEP_SIZE,
+                      velocity_mps=SCAN_VELOCITY, num_samples=1, sample_bytes=16,
+                      force=True)
+    print("EC dry run: passes %s of %d -- the scan's own motion, nothing acquired"
+          % (ids, len(allsegs)))
+    with warning_light("eddy-current dry run"):
+        try:
+            ec_dry_run_report = fly_surface_path(
+                path, segs=segs, contact=_ec_contact(), label="EC dry run",
+                reference=getattr(path, "roll_reference", NOETHER_ROLL_REFERENCE),
+                segment_ids=ids)
+        finally:
+            if park:
+                park_arm()
+    return ec_dry_run_report
+
+
+global ec_touch_down
+def ec_touch_down(index=0, path=None):
+    """Put the probe on the part at the start of pass `index`, and stop there.
+
+    For nulling the instrument on good material with the probe in contact. It
+    arrives the way every pass does: lift, transit in the air, descend along the
+    tool axis at NEAR_PART_SPEED. ec_lift() takes it off again.
+    """
+    path = ec_scan_path if path is None else path
+    if path is None:
+        raise RuntimeError("no toolpath planned -- call plan_ec_path() first")
+    segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    start, end = segs[int(index)]
+    with warning_light("eddy-current touch-down"):
+        with motion_profile("scan"):
+            ok = contact_approach(_ec_contact(), path.positions, path.quats,
+                                  start, end - 1)
+    if not ok:
+        raise RuntimeError("could not put the probe on the start of pass %d" % (index,))
+    print("  probe on the part at %s (start of pass %d). Null the instrument "
+          "now; ec_lift() when done." % (np.round(path.positions[start], 4), index))
+    return tuple(float(v) for v in path.positions[start])
+
+
+global ec_lift
+def ec_lift():
+    """Lift the probe EC_APPROACH_M clear of the part, along its own axis."""
+    with warning_light("eddy-current lift"):
+        return contact_retract(_ec_contact(),
+                               positions=None if ec_scan_path is None
+                               else ec_scan_path.positions)
+
+
+# ==============================================================================
+# THE AZURE GAUGE: the rough mesh must agree with the Keyence before a raster
+# is planned over it
+# ==============================================================================
+# Stage 3 plans the Keyence raster OVER the stage 2 Azure mesh, so every
+# millimetre that mesh reads LOW is a millimetre the profiler really flies
+# CLOSER to the part. A mesh reading 13.6 mm low across a surface-ground plate
+# (22 mm at one end) flies the head at 66 mm and then at about 58 mm against its
+# 57 mm hard limit: 26-39% of a 10 inch plate comes back as garbage and the
+# probe comes close to touching the sample.
+#
+# verify_calibration() measures the same disagreement standalone, and has read
+# -11.6 to -13.6 mm on this cell. These two functions are what stops
+# run_automated_scan() flying a raster over a mesh that far out.
+#
+# REFUSE-ONLY: a passing gauge does NOT shift the mesh. A pass means the
+# disagreement is inside AZURE_GAUGE_MAX_MM (2.0 mm), which is under 9% of the
+# head's +/-23 mm window -- so a correction applied here would buy margin that
+# was never binding, while making this config a SECOND place where a z
+# correction is applied. The Azure's depth bias belongs in exactly one place,
+# the manifest's depth adapter, where the TSDF, verify_calibration() and RViz
+# all see the same surface (see azure-depth-reads-12mm-long). Shifting the file
+# here would also make the gate the author of the surface it had just graded:
+# the next run's gauge would be measuring a mesh this code had already moved,
+# with nothing on disk saying so.
+#
+# NEITHER IS DECLARED global, deliberately. They are private to this config and
+# are reached only from run_automated_scan() below -- the .dgp body is their
+# enclosing scope, exactly as _ec_hms() and _ec_bytes() are reached from
+# ec_plan_cost() -- and azure_gauge.dpi is included AFTER this point, so a name
+# exported from here could be silently replaced by one of that module's.
+
+def _ec_gauge_verdict(res, max_mm=None, ref_dist_m=None, near_limit_m=None,
+                      allow=False, skip_why=None):
+    """What the Azure gauge's answer means for the raster about to be planned.
+
+    PURE: no ROS, no motion, no printing, no globals, so every branch is
+    covered on the host by azure_gauge_gate_test.py.
+
+    `res` is gauge_mesh_against_keyence()'s dict. res["dz_mm"] is POSITIVE when
+    the MESH READS LOW, which is the direction that costs standoff. Returns
+    (verdict, lines):
+
+        "skip"      nothing was gauged, and nothing is claimed -- carry on
+        "pass"      the mesh agrees with the Keyence inside max_mm
+        "refuse"    it does not, and stage 3 must not run
+        "override"  it does not, and allow= plans over it anyway
+
+    `lines` is what to print, or what to raise with when the verdict is
+    "refuse".
+    """
+    # NOTHING TO DECIDE. A clean no-op that SAYS SO: silence here would be
+    # indistinguishable from a gauge that passed.
+    if skip_why:
+        return ("skip", ["  the rough mesh was NOT gauged against the Keyence: "
+                         "%s. Nothing in this run checked the standoff stage 3 "
+                         "will fly at; verify_calibration() is the standalone "
+                         "check." % (skip_why,)])
+    if not isinstance(res, dict):
+        return ("refuse", ["stage 3 is refused: the Azure gauge returned %r "
+                           "rather than a result dict, so the mesh is "
+                           "ungauged." % (res,)])
+    if max_mm is None:
+        return ("refuse", ["stage 3 is refused: the gauge ran but "
+                           "AZURE_GAUGE_MAX_MM is not defined, so there is no "
+                           "tolerance to gate on."])
+
+    dz = res.get("dz_mm")
+    # NaN IS NOT None, AND THAT LEAKED FABRICATED ARITHMETIC INTO A REFUSAL.
+    # When nothing was measured, gauge_mesh_against_keyence() reports dz_mm as
+    # NaN rather than None -- the mean of no samples. Every guard below tested
+    # `dz is not None`, which NaN passes, so a refusal that measured 0 of 3
+    # points still printed "would fly at nan mm, which is nan mm INSIDE the
+    # head's 57 mm hard limit". A number nobody measured must not appear in the
+    # sentence that tells an operator how close the head will fly. Treat
+    # non-finite as absent, here, once, so every branch downstream inherits it.
+    if dz is not None:
+        dz = float(dz)
+        if dz != dz or dz == float("inf") or dz == float("-inf"):
+            dz = None
+    n_meas, n_req = int(res.get("n_measured") or 0), int(res.get("n_requested") or 0)
+    resid = res.get("residual_mm")
+    over = "" if resid is None else ", residual %.2f mm" % (float(resid),)
+
+    # WHAT IT COSTS, in the units the failure arrives in. The raster is planned
+    # at the reference distance above the MESH, so a mesh that reads dz low puts
+    # the head dz closer to the real surface. Same arithmetic
+    # verify_calibration() prints, with dz's sign the other way round.
+    consequence = ""
+    if dz is not None and ref_dist_m is not None and near_limit_m is not None:
+        flown = float(ref_dist_m)*1e3 - dz
+        margin = flown - float(near_limit_m)*1e3
+        consequence = ("A raster planned over it at the %.0f mm reference "
+                       "distance would fly at %.1f mm, which is %.1f mm %s the "
+                       "head's %.0f mm hard limit."
+                       % (float(ref_dist_m)*1e3, flown, abs(margin),
+                          "clear of" if margin >= 0.0 else "INSIDE",
+                          float(near_limit_m)*1e3))
+
+    if bool(res.get("ok")) and dz is not None and abs(dz) <= float(max_mm):
+        return ("pass", ["  the rough mesh agrees with the Keyence to %+.2f mm "
+                         "over %d of %d points%s (tolerance %.1f mm; + means "
+                         "the mesh reads low). %s"
+                         % (dz, n_meas, n_req, over, float(max_mm),
+                            consequence)])
+
+    if not bool(res.get("ok")) or dz is None:
+        lines = ["the Azure gauge could not measure the rough mesh against the "
+                 "Keyence -- %d of %d points: %s"
+                 % (n_meas, n_req, res.get("why") or "no reason given")]
+    else:
+        lines = ["the Azure rough mesh reads %.2f mm %s against the Keyence "
+                 "over %d of %d points%s, and the tolerance is %.1f mm."
+                 % (abs(dz), "LOW" if dz >= 0.0 else "HIGH", n_meas, n_req,
+                    over, float(max_mm))]
+    if consequence:
+        lines.append(consequence)
+    lines.append("A 13.6 mm error of this kind has flown the head at 66 mm, then "
+                 "at 58 mm against the 57 mm limit, and 26-39% of a 10 inch "
+                 "plate came back as garbage.")
+    if allow:
+        return ("override",
+                ["  ** PLANNING THE KEYENCE RASTER OVER THIS MESH ANYWAY "
+                 "(allow_azure_bias):"] + ["     " + l for l in lines])
+    return ("refuse", ["stage 3 is refused: " + lines[0]]
+            + ["  " + l for l in lines[1:]]
+            + ["  Fix the Azure's depth bias and re-run -- verify_calibration() "
+               "measures it and the correction belongs in the manifest's depth "
+               "adapter. allow_azure_bias=True plans the raster over it "
+               "anyway."])
+
+
+def _ec_azure_gauge(mesh, allow=False):
+    """Fly the Keyence over the rough mesh and decide whether stage 3 may run.
+
+    Raises ValueError on a refusal, which run_automated_scan()'s `finally`
+    turns into a parked arm. Returns {"verdict", "result", "why"} either way,
+    so capture_full_pipeline() records what was measured.
+
+    NO GAUGE IN globals() WARNS AND CONTINUES, and does not refuse. The include
+    at the bottom of this file is unconditional, so in a normal session the only
+    way to get here is a module that loaded without exporting its entry point --
+    but the same contract tooling_clearance.dpi and keyence_standoff.dpi already
+    have with the stages that use them applies: an absent optional module is a
+    deployment state, not a measurement. A gauge that IS present and cannot
+    measure -- no profiles, too few points, an exception -- is a measurement,
+    and that refuses.
+    """
+    say = globals().get("_cal_say") or print
+    gauge = globals().get("gauge_mesh_against_keyence")
+    res, skip = None, None
+    if gauge is None:
+        skip = "azure_gauge.dpi is not loaded, so this session has no gauge"
+    elif not mesh:
+        skip = ("this run has no rough mesh -- stage 2 produced nothing, or a "
+                "caller skipped it")
+    else:
+        try:
+            _n = globals().get("AZURE_GAUGE_POINTS")
+            res = gauge(mesh=mesh, say=say, **({} if _n is None else {"n": _n}))
+        except Exception as e:                                    # noqa: BLE001
+            # NOT re-raised as itself: a gauge that dies has told us nothing
+            # about the mesh, which is a refusal with a reason, not a traceback
+            # out of the middle of a five stage run.
+            res = {"ok": False, "n_measured": 0, "n_requested": 0, "dz_mm": None,
+                   "tilt_mrad": None, "residual_mm": None, "samples": [],
+                   "why": "the gauge raised %s: %s" % (type(e).__name__, e)}
+    verdict, lines = _ec_gauge_verdict(
+        res, max_mm=globals().get("AZURE_GAUGE_MAX_MM"),
+        ref_dist_m=globals().get("KEYENCE_REF_DIST_M"),
+        near_limit_m=(globals().get("KEYENCE_RANGE_M") or (None,))[0],
+        allow=bool(allow), skip_why=skip)
+    if verdict == "refuse":
+        raise ValueError("\n".join(lines))
+    for line in lines:
+        say(line)
+    return {"verdict": verdict, "result": res, "why": skip}
+
+
+global run_automated_scan
+def run_automated_scan(index=0, scan=True, cutoff=None, line_spacing=None,
+                       region=None, park=True, release_yolo_after_detection=True,
+                       roi_select=None, allow_azure_bias=False):
+    """Detect, measure, plan -- and scan, if asked.
+
+    The whole point of the exercise: one call, no questions. It prints what it
+    is doing at each stage and leaves every intermediate result in a global, so
+    a stage that fails can be retried on its own without redoing the ones before
+    it.
+
+    scan=False stops after the plan, which is the useful mode while the cell is
+    being set up: it flies the reconstruction sweeps and shows what the scan
+    would be without committing to it. dry_run_ec_scan() is the next step.
+
+    region=(xmin, ymin, xmax, ymax) skips detection and measures there -- for a
+    part the detector cannot see.
+
+    roi_select=False runs with no operator: the detected region goes straight
+    to the Keyence raster, which is what this did before the selection window
+    existed. None follows the ROI_SELECT config flag (on), True forces the
+    window on for one run. Note that the region is picked AFTER the Azure
+    sweep, so roi_select=False does not make the run any shorter up to that
+    point -- it only stops it waiting for a human.
+
+    allow_azure_bias=True plans the Keyence raster over the Azure rough mesh
+    even when the gauge says the two disagree by more than AZURE_GAUGE_MAX_MM.
+    EC_ALLOW_AZURE_BIAS in a config is the same override for an unattended run.
+    Default False, and it is False for a reason -- see stage 2a.
+
+    The work volume is checked FIRST, before anything moves. The warning light
+    is held for the whole run, and park=True rises out of the work volume and
+    goes to PARK_POSE at the end, error or not.
+    """
+    global detected_region
+    require_work_volume("the automated scan")
+    out = {}
+    _detected = False
+    # SUPERVISED, so stopping External Control on the pendant is a PAUSE.
+    # Unsupervised, stopping the robot program mid-sweep deactivates the
+    # controllers, MoveIt sits on the in-flight goal until its duration monitor
+    # fires, and every later row is "planned in full, EXECUTION refused" against
+    # a controller answering "Can't accept new action goals" -- the sweep
+    # finishes and saves a mesh with holes in it. Inside this block that becomes
+    # a hold at the next row boundary, and ScanAborted if it is not resumed.
+    with supervised("the automated scan"), warning_light("automated scan"):
+        try:
+            if region is None:
+                print("1/5  detecting the specimen")
+                region = detect_part(index=index)
+                _detected = True
+            else:
+                region = tuple(float(v) for v in region)
+                detected_region = region
+                print("1/5  region given by hand, no detection: x %.3f..%.3f  "
+                      "y %.3f..%.3f" % (region[0], region[2], region[1], region[3]))
+            out["region"] = region
+
+            # DETECTION IS OVER. Everything from here -- two reconstruction
+            # sweeps, a mesh filter, a Noether plan, the clearance gate -- is
+            # the expensive half, and it is where a run gets OOM-killed.
+            # yolo_node has been measured at 646% of one core at the cell and
+            # still holds 400% after detection has finished, with its model
+            # loaded and its image subscription live. Release it here, once,
+            # whichever branch above ran: a region given by hand never touches
+            # the detector at all, so it never turns it off either, which is how
+            # a run with no detection still pays for one.
+            if release_yolo_after_detection:
+                release_yolo(quiet=True)
+
+            # GIVE MOVEIT SOMETHING TO AVOID BEFORE THE SWEEP, not after it.
+            # Without this call the planning scene holds no world objects during
+            # the Azure sweep, tari_cpp_mtc logs "Collision checking this
+            # Cartesian path against a planning scene with NO world objects",
+            # and every collision check that stage makes is vacuous. The box is
+            # replaced by the real mesh as soon as the sweep produces one (same
+            # object id), so it is only the scaffolding for the stage that has
+            # no mesh.
+            #
+            # NEVER FATAL. A box is a guess -- the detected top, over the
+            # support the work volume declares -- and a wrong guess must not be
+            # able to stop a scan that ran perfectly well without one before.
+            try:
+                _support = float(require_work_volume("the specimen box")[1][2])
+                # Only this call's detection, never a stale one: a region
+                # given by hand does not touch detected_info, and using the
+                # previous part's surface z would put the box at the wrong
+                # height without saying so.
+                _top = (float(detected_info.get("surface_z"))
+                        if (_detected and detected_info
+                            and detected_info.get("surface_z") is not None)
+                        else None)
+                if _top is None:
+                    print("  no detected surface z for this region, so no "
+                          "specimen box: MoveIt will collision-check the sweep "
+                          "against an empty world")
+                elif _top - _support < 1e-3:
+                    print("  the detected top (%.3f) is not above the support "
+                          "(%.3f), so no specimen box" % (_top, _support))
+                else:
+                    specimen_box_to_planning_scene(
+                        region=region, support_z=_support, height=_top - _support)
+            except Exception as _e:
+                print("  WARNING: no specimen box in the planning scene (%s). "
+                      "The sweep is collision-checked against the robot only."
+                      % (_e,))
+
+            print("2/5  Azure sweep (rough planning surface, purpose='planning')")
+            out["rough"] = reconstruct_rough(region=region)
+
+            # DOES THE MESH AGREE WITH THE KEYENCE? Stage 3 plans the raster
+            # over what stage 2 just made, so this is the seam: after the rough
+            # mesh exists and before anything is planned on top of it. See
+            # _ec_azure_gauge() above for what it refuses and for why a pass
+            # does not shift the mesh.
+            #
+            # BEFORE 2b, NOT AFTER IT. Nothing 2b does changes the surface the
+            # gauge grades, so putting the gate later would only mean asking a
+            # human to draw a region on a picture of the part 12 mm out of place
+            # for a run that is then refused anyway. The whole reason the ROI
+            # window sits where it does is not to spend the operator on a scan
+            # that is not going to happen; a failing gauge is that case.
+            print("2a/5 gauging the rough mesh against the Keyence")
+            out["gauge"] = _ec_azure_gauge(
+                out.get("rough"),
+                allow=bool(allow_azure_bias
+                           or globals().get("EC_ALLOW_AZURE_BIAS", False)))
+
+            # THE OPERATOR NARROWS THE REGION, HERE AND NOWHERE ELSE.
+            # After stage 2 because this is the first 3D surface that exists
+            # and it cost 40 seconds; before stage 3 because that is the
+            # 10-minute Keyence raster and the whole point is not to spend it
+            # on the bench. The detector's region is preselected, so the
+            # operator corrects a box rather than drawing one, and Accept
+            # without touching anything gives back what stage 1 said.
+            #
+            # Unavailable (no display, no PyQt5) prints why and carries on with
+            # the detected region: this must not be able to stop an unattended
+            # run that worked before the window existed. CANCEL IS DIFFERENT --
+            # that is a deliberate "no" from somebody who is standing there,
+            # and it stops the scan.
+            # AND TIGHTEN THE REGION TO WHERE THE PART ACTUALLY IS, before the
+            # operator is shown it and before the 10-minute raster is planned
+            # over it. yolo_region() projects a BOUNDING BOX, and a box round a
+            # part is bigger than the part: a 200 x 200 mm plate has been
+            # detected as 200 x 217 mm. That 8% is bench, no scan can ever cover
+            # it, and region_coverage -- which wants 90% -- then refuses a
+            # Keyence measurement that covered 98% of the plate. The gate is
+            # right about the wrong question.
+            #
+            # The rough mesh is the first thing that knows where the part is, so
+            # this is the first moment the question can be answered. It only ever
+            # SHRINKS the box; the operator's own selection below still wins.
+            _tighten = globals().get("region_of_measured_surface")
+            if region is not None and out.get("rough") and callable(_tighten):
+                try:
+                    region = _tighten(out["rough"], region)
+                    out["region"] = region
+                except Exception as _e:                           # noqa: BLE001
+                    print("    (could not tighten the region to the measured "
+                          "surface: %s: %s)" % (type(_e).__name__, _e))
+
+            out["roi"] = None
+            if roi_select is not False:
+                print("2b/5 region of interest -- draw what should be scanned")
+                region, out["roi"] = refine_region_interactively(
+                    region, out["rough"], enabled=roi_select,
+                    title="Region to scan -- Azure rough mesh")
+                out["region"] = region
+
+            print("3/5  Keyence raster (the measurement)")
+            out["fine"] = reconstruct_fine(rough=out["rough"], region=region)
+
+            print("4/5  filtering the mesh")
+            out["mesh"] = filter_mesh(out["fine"], cutoff=cutoff)
+
+            print("5/5  planning the eddy-current toolpath")
+            # THE REGION REACHES THIS STAGE TOO. Stage 1 said where the part is;
+            # without passing it on, Noether plans over every triangle of the
+            # measured mesh -- which is a reconstruction of whatever the sensor
+            # saw, table and neighbouring specimens included. For a
+            # 301 x 156 mm part that has come out as 18 394 passes, 579 m of
+            # travel and 588 614 traces at 1 mm pitch. That is not a slow plan,
+            # it is the wrong part. EC_SCAN_REGION still wins when somebody set
+            # it, because that is the deliberate "scan this corner" control.
+            # THE SELECTION REACHES THIS STAGE TOO, and for a different reason
+            # than the region does. The region crops the toolpath; the selection
+            # tells the mesh gate WHICH SURFACE its roughness and tilt numbers
+            # are about. Without it the gate grades the optical breadboard, the
+            # clamps and the mount block along with the part, and it loses
+            # almost all of its discrimination: over a whole mesh a bad scan and
+            # a good one have read 55.5 and 52.6 deg normal-turn p99, 6% apart,
+            # while over the plate alone the same two read 10.5 and 4.5 -- 2.3x.
+            out["path"], out["x3d"] = plan_ec_path(
+                mesh=out["mesh"], line_spacing=line_spacing,
+                region=EC_SCAN_REGION if EC_SCAN_REGION else region,
+                roi=out["roi"])
+            out["plan"] = preview_ec_scan(out["path"])
+
+            if not scan:
+                print("stopping before the scan (scan=False). dry_run_ec_scan() "
+                      "flies it without the instrument; run_ec_scan() when ready.")
+                return out
+
+            print("scanning")
+            # ec_source, not ec_cond: the conditioning is wired by the scan and
+            # is None right up to the first staged trace, so testing ec_cond
+            # here would call setup_ec() on every run. The thing being set up is
+            # the SOURCE.
+            if ec_source is None:
+                setup_ec()
+            out["report"] = run_ec_scan(out["path"], out["x3d"])
+            return out
+        finally:
+            if park and PARK_POSE:
+                try:
+                    park_arm()
+                except Exception as e:
+                    print("  WARNING: could not park the arm (%s)" % (e,))
+
+
+include(None, os.path.join(SCAN_MODULE_DIR, "robot_supervisor.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "cell_capture.dpi"))
+
+# Sensor-to-robot calibration. AFTER cell_capture.dpi, which owns the motion
+# gate, the scenario recorder and the taught points it uses.
+#
+# The routine call is verify_calibration(): two minutes, no artifact and no
+# touch-off, and it returns how far the Azure is from the Keyence over a flat.
+# At 13.6 mm the Keyence raster, planned over the Azure's mesh, flies the head
+# at 58 mm against its 57 mm limit and 26-39% of a 10 inch plate comes back as
+# garbage. Run it before a session; calibrate_azure() is for when it fails.
+include(None, os.path.join(SCAN_MODULE_DIR, "calibration.dpi"))
+try:
+    print("")
+    print(describe_calibration())
+except Exception as _e:
+    print("  calibration: could not read the record (%s)" % (_e,))
+
+# THE AZURE GAUGE, which is verify_calibration()'s measurement turned into a gate
+# over the mesh a run is actually about to use. run_automated_scan()'s stage 2a
+# calls it; _ec_azure_gauge() warns and carries on if this file is absent.
+#
+# LAST, AND IT HAS TO BE. It reuses calibration.dpi's Keyence motion and profile
+# helpers (_cal_geom, _cal_profile_points, _cal_say), so it must load AFTER that
+# file -- which is itself loaded after cell_capture.dpi for the motion gate --
+# and after keyence_standoff.dpi, which owns KEYENCE_RANGE_M and
+# KEYENCE_REF_DIST_M, the window the gauge's numbers are reported against.
+# The order here IS the load order: a .dpi is a function body sharing one
+# globals(), so a file that reads a name an earlier include has not defined yet
+# gets a NameError at load, and one that redefines a name silently wins.
+include(None, os.path.join(SCAN_MODULE_DIR, "azure_gauge.dpi"))
+
+# THE SIMULATION HAS NOTHING TO SCAN WITHOUT THIS.
+# The Gazebo world is deliberately bare -- `ros2 service call /get_model_list`
+# returns ['ur'] and nothing else, not even a ground plane, because the stock
+# empty.world made gzserver stall for minutes downloading sun/ground_plane. The
+# table and the specimen exist as MoveIt COLLISION GEOMETRY and in the URDF, so
+# planning sees them and the SENSORS DO NOT: the Azure images empty space and the
+# simulated Keyence reports "0.0% of columns returned" forever. Every stage from
+# reconstruct_rough() onward then works on nothing, without failing.
+#
+# place_gazebo_specimen() puts the test plate into the running world so there IS
+# a surface. UTPlaneScan.dgp includes it for the same reason. Without it the
+# pipeline cannot be exercised end to end in simulation.
+#
+# Included unconditionally because it only DEFINES functions and starts nothing:
+# its Gazebo service calls happen when it is called, and on hardware nobody calls
+# it. Needs write_plate_ply() from noether_path.dpi and the TEST_PLATE_* /
+# SCAN_ORIGIN constants above, so it must come after both.
+include(None, os.path.join(SCAN_MODULE_DIR, "sim_specimen.dpi"))
+
+# ==============================================================================
+# THE CABLE GUARD, ON FOR THE WHOLE SESSION
+# ==============================================================================
+# LAST, after every module is loaded and after `ros` exists, and OUTSIDE any
+# capture scenario.
+#
+# The capture tool gates wrist 3 only inside capture_scenario(..., pipeline=True),
+# so a session started normally and driven with run_automated_scan() would
+# otherwise check nothing: an unguarded sweep has walked wrist_3 from +29
+# degrees through zero to -113, against a measured tight point of 31.3 degrees
+# at that tilt. Installing the guard here refuses every one of those moves.
+#
+# install_cable_guard() wraps `ros`, and pipeline code looks `ros` up as a
+# global at call time, so nothing downstream changes. A refusal comes back as a
+# failed move, not an exception, so a sweep loses a row instead of abandoning a
+# running TSDF. cable_guard_off() lifts it for a block;
+# capture_cable_envelope() is the one caller that needs to.
+try:
+    install_cable_guard()
+except Exception as _e:
+    print("  WARNING: THE CABLE GUARD IS NOT INSTALLED (%s). Wrist 3 is "
+          "unchecked; do not run an automated scan until this is fixed." % (_e,))
+
+# ...AND THE SECOND HALF OF IT, for the callers the wrapper does not cover.
+# install_cable_guard() wraps the `ros` NAME, so anything that resolves `ros` as
+# a global at call time is checked. ApproachInConfiguration picks the IK branch
+# for a whole pass INSIDE the motion module, before any of that, and
+# surface_path_scan.dpi, mesh_scan.dpi and the sweep's own _enter() reach it
+# directly. Handing the band to the module lets it reseed an out-of-band
+# solution at the band centre instead of returning one the guard will then
+# refuse. None is its default and means "behave as before".
+try:
+    ros.WRIST3_BAND = wrist3_band()
+    print("  wrist 3 band handed to the motion module: %.1f..%.1f deg"
+          % (np.degrees(ros.WRIST3_BAND[0]), np.degrees(ros.WRIST3_BAND[1])))
+except KeyError:
+    # Nothing measured for this cell. wrist3_band() says so by raising; the
+    # guard has already warned, and IK keeps its old behaviour.
+    pass
+except Exception as _e:
+    print("  WARNING: could not hand the wrist 3 band to the motion module "
+          "(%s); IK will not reseed out-of-band solutions." % (_e,))
+
+print("ECAutomatedScan ready.")
+print("  step %.3f mm along a pass, %.2f mm between passes, sweep %.1f mm/s"
+      % (SCAN_STEP_SIZE*1e3, SCAN_LINE_SPACING*1e3, SCAN_VELOCITY*1e3))
+print("  near the part %.0f mm/s, away %.0f mm/s, joint moves at MoveIt scaling %s; "
+      "warning light on digital output %s"
+      % (NEAR_PART_SPEED*1e3, TRANSIT_SPEED*1e3, JOINT_MOVE_SCALING, WARNING_LIGHT_PIN))
+_ok, _why = ec_ready()
+print("  eddy current: %s" % (_why,))
+try:
+    print("  " + describe_work_volume())
+except Exception as _e:
+    print("  work volume: unavailable (%s)" % (_e,))
+try:
+    print("  " + describe_cable_envelope().replace("\n", "\n  "))
+except Exception as _e:
+    print("  cable envelope: unavailable (%s)" % (_e,))
+# SAY NOW whether stage 2a will check the Azure against the Keyence, and whether
+# a failure will stop the run. Same reason as the region-of-interest line below:
+# an operator who finds out at stage 3 that nothing was gauged has already spent
+# the sweep, and one who finds out that the gate is overridden has already lost
+# the plate.
+try:
+    if globals().get("gauge_mesh_against_keyence") is None:
+        print("  Azure gauge: NOT AVAILABLE (azure_gauge.dpi did not load). "
+              "Run verify_calibration() before committing to a raster.")
+    elif EC_ALLOW_AZURE_BIAS:
+        print("  Azure gauge: measured at stage 2a but NOT ENFORCED "
+              "(EC_ALLOW_AZURE_BIAS is True). A biased mesh will be rastered "
+              "over, which is what costs a plate.")
+    else:
+        print("  Azure gauge: stage 2a gauges the rough mesh against the "
+              "Keyence over %s points and refuses the raster past %.1f mm "
+              "(allow_azure_bias=True to override)"
+              % (globals().get("AZURE_GAUGE_POINTS", "?"),
+                 float(globals().get("AZURE_GAUGE_MAX_MM", float("nan")))))
+except Exception as _e:
+    print("  Azure gauge: could not be described (%s)" % (_e,))
+# SAY NOW whether the operator will be asked to draw the region, and if not,
+# why not. Finding out that PyQt5 is missing 40 seconds into a run, with the
+# arm parked over the part, is the failure this line exists to prevent.
+try:
+    if not ROI_SELECT:
+        print("  region of interest: OFF (ROI_SELECT); the detected region "
+              "goes straight to the Keyence raster")
+    else:
+        _ok, _why = roi_select_available()
+        print("  region of interest: %s"
+              % ("the operator draws it after the Azure sweep -- %s" % (_why,)
+                 if _ok else "UNAVAILABLE, so the detected region is used "
+                             "as-is: %s" % (_why,)))
+except Exception as _e:
+    print("  region of interest: could not be checked (%s)" % (_e,))
+print("")
+# check_rough_plan(), NOT check_sweep_plan(). The first IS
+# reconstruct_rough(plan_only=True) -- the same source, the same kwargs, the
+# same planner -- so it cannot describe a different sweep from the one that
+# flies. The second is the PAN sweep's pre-flight, and this stage defaults to
+# a dome, so it grades a sweep that is never flown.
+print("  before you commit: check_rough_plan()  -- plans stage 2 without moving")
+print("           anything, through the same planner it will fly, and says")
+print("           whether it reaches, at what standoff and with what headroom.")
+print("  stages:  detect_part()  reconstruct_rough()  gauge_mesh_against_keyence()")
+print("           select_roi(mesh)  reconstruct_fine()  filter_mesh()")
+print("           plan_ec_path()  preview_ec_scan()")
+print("  motion:  dry_run_ec_scan()  ec_joint_report()  ec_touch_down()  ec_lift()")
+print("           park_arm()")
+print("  setup:   setup_ec()  null_here()  set_rotation(deg)  set_gain(h, v)")
+print("  all of it: run_automated_scan(scan=False)   region=(xmin,ymin,xmax,ymax) "
+      "skips detection")
+print("             roi_select=False runs it with nobody there")
+print("             allow_azure_bias=True rasters over a mesh the gauge failed")
+print("  first run on hardware: ROS-Scanning/docs/ec-automated-scan-first-run.md")

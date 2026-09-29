@@ -24,10 +24,27 @@ include(snde, "recdb_gui.dpi")
 rclpy.init()
 
 # 2. Hardware Instantiation
-tari_ur_launch_pkg = get_package_share_directory('tari_ur_launch')
-eddie_current_probe_mesh = os.path.join(tari_ur_launch_pkg, 'meshes', 'ecProbe.x3d')
+tari_ur_description_pkg = get_package_share_directory('tari_ur_description')
+eddie_current_probe_mesh = os.path.join(tari_ur_description_pkg, 'meshes', 'ecProbe.x3d')
 
-ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh=eddie_current_probe_mesh)
+# vision_pipeline.dpi's depthCheck() reads ros.depth_image at YOLO's colour pixels, so
+# motion must subscribe to the depth registered into the colour camera. Which
+# topic that is comes from the cell manifest, the one the bring-up used;
+# motion subscribes to nothing unless told to.
+try:
+    from tari_bringup.cells import load_cell
+    _azure_topics = load_cell("ex-ur10e-1", "hardware").sensor("azure")["topics"]
+except Exception as _e:
+    # Start anyway, without depth: a scan that does not use the camera still
+    # works. The usual cause is TARI_CELL_PATH not naming the site layer --
+    # source tari_setup.bash first.
+    print("WARNING: no Azure topics from the cell manifest (%s); "
+          "ros.depth_image will not be available"
+          % (str(_e).splitlines() or [repr(_e)])[0])
+    _azure_topics = {}
+ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh=eddie_current_probe_mesh,
+                  depth_image_topic=_azure_topics.get("depth"),
+                  camera_info=_azure_topics.get("camera_info"))
 include(rosm, "services.dpi")
 include(rosm, "parameters/parameters.dpi")
 

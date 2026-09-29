@@ -77,25 +77,13 @@ class SimAScanSource(object):
         self.trigger_pitch_m = trigger_pitch_m
         self.poll_period = 1.0 / poll_hz
 
-        # Diagnostics for the position path. travelled_m is the total arc length
-        # the trigger has seen, so travelled_m/trigger_pitch_m should equal
-        # triggers to within one.
-        self.triggers = 0
-        self.travelled_m = 0.0
-        self.burst_dropped = 0
-
         # Arming. A trigger box is armed for a pass and disarmed at the end of
         # it: while armed every trigger is delivered to the sink, and arming
         # resets the phase so trigger 0 is at the start of the pass and trigger k
         # is at exactly k*pitch along it. That per-pass reset is what
         # ScanPath.trace_count() counts, and it is what makes the trigger index
         # usable as a column index.
-        self._sink = None
-        self._armed = False
-        self._reset_phase = False
-        self._emit_on_arm = True
-        self.armed_triggers = 0
-        self.armed_s_m = 0.0
+        self._init_trigger_state(trigger_pitch_m)
 
         # Standoff variation, as seconds of extra round trip per metre of probe
         # travel in (x, y). A tilted plate, a curved part or a sagging fixture
@@ -110,6 +98,9 @@ class SimAScanSource(object):
         self._quit = False
         self.count = 0
         self.errors = 0
+        # Shots refused by the recording database because their timestamp could
+        # no longer be ordered. See _publish().
+        self.dropped_acquisitions = 0
 
         # Position is pushed in by the scan rather than pulled from a callback.
         # Pulling meant calling into the ROS motion module on every publish,
@@ -128,6 +119,44 @@ class SimAScanSource(object):
         self._thread = threading.Thread(target=self._acquisition_loop)
         self._thread.daemon = True
         self._thread.start()
+
+    def _init_trigger_state(self, trigger_pitch_m):
+        """The trigger's own state, with no database and no thread -- so a
+        test harness can build one without either.
+
+        Crossing detection is PitchCrossingDetector (pitch_crossings.dpi),
+        shared with the real timestamped source; that file says why progress
+        is a chord from the last crossing and not a sum of steps. The lock
+        makes arm() atomic with respect to the poll that is in progress: with
+        a flag the watcher honoured next time round, a crossing already being
+        processed was delivered to the new sink with the old phase.
+        """
+        self._lock = threading.Lock()
+        self._detector = PitchCrossingDetector(trigger_pitch_m or 1.0)
+        self.triggers = 0
+        self._sink = None
+        self._armed = False
+        self._emit_on_arm = True
+        self.armed_triggers = 0
+        self.armed_s_m = 0.0
+        # Deliveries this arming may make; surplus crossings are counted and
+        # dropped. See arm().
+        self._budget = None
+        self.armed_over_budget = 0
+        self.over_budget = 0
+
+    @property
+    def travelled_m(self):
+        """Progress the trigger has seen, in total. See pitch_crossings.dpi."""
+        return self._detector.travelled_m
+
+    @property
+    def raw_travelled_m(self):
+        return self._detector.raw_travelled_m
+
+    @property
+    def burst_dropped(self):
+        return self._detector.burst_dropped
 
     def metadata(self):
         meta = snde.constructible_metadata()
@@ -231,8 +260,8 @@ class SimAScanSource(object):
 
     # -- arming -----------------------------------------------------------
 
-    def arm(self, sink, emit_on_arm=True):
-        """Deliver every trigger to sink until disarm(), restarting the phase.
+    def arm(self, sink, emit_on_arm=True, max_triggers=None):
+        """Deliver triggers to sink until disarm(), restarting the phase.
 
         sink(ascan, pos, s_m, index) runs on the acquisition thread, so it must
         not call into a dgpy module -- staging into the recording database is
@@ -241,21 +270,31 @@ class SimAScanSource(object):
         emit_on_arm=False suppresses the trigger at the start of the pass, for
         when the caller has already staged that one itself. The phase reference
         is still taken there, so trigger k still lands at k*pitch along the pass.
+
+        max_triggers caps how many triggers this arming delivers (the arm-time
+        one included, if emitted). A raster pass of m columns has m-1 crossings
+        after its start trace; the m-th would be column m, which does not
+        exist, and staging it shifts every later row. Surplus crossings are
+        counted in armed_over_budget and never reach the sink.
         """
         if self.trigger_mode != "position":
             raise RuntimeError("arm() needs trigger_mode='position'")
-        self._sink = sink
-        self.armed_triggers = 0
-        self.armed_s_m = 0.0
-        self._emit_on_arm = bool(emit_on_arm)
-        self._reset_phase = True
-        self._armed = True
+        with self._lock:
+            self._sink = sink
+            self.armed_triggers = 0
+            self.armed_s_m = 0.0
+            self.armed_over_budget = 0
+            self._budget = None if max_triggers is None else int(max_triggers)
+            self._emit_on_arm = bool(emit_on_arm)
+            self._detector.reset()
+            self._armed = True
 
     def disarm(self):
         """Stop delivering to the sink. Returns how many triggers this pass saw."""
-        self._armed = False
-        self._sink = None
-        return self.armed_triggers
+        with self._lock:
+            self._armed = False
+            self._sink = None
+            return self.armed_triggers
 
     def _publish(self, pos=None, s_m=None):
         """One A-scan. One call == one trigger.
@@ -273,6 +312,13 @@ class SimAScanSource(object):
         never touches the database at all, which is also what keeps it free to
         watch the probe.
         """
+        # When this shot was "taken". Under timed_transaction_manager the
+        # transaction's timestamp is the correlation key, so it belongs to the
+        # acquisition, not to whenever the transaction got opened -- same rule
+        # the real digitizer follows (dgpython-gage-compuscope). Under the
+        # ordered manager it is simply recorded.
+        acq_time = self.recdb.transmgr.get_current_time()
+
         try:
             data = self.synthesize(pos)
         except Exception as e:
@@ -286,7 +332,22 @@ class SimAScanSource(object):
             return
 
         try:
-            with self.recdb.start_transaction() as trans:
+            transact = self.recdb.start_transaction(acq_time)
+        except snde.snde_error as refused:
+            # The database would not order this timestamp behind what it has
+            # already committed. That is a dropped sample, not a fault: count it
+            # and carry on, exactly as the real card does. Sustained growth means
+            # TRANSACTION_LATENCY is too small for this publish rate.
+            self.dropped_acquisitions += 1
+            if self.dropped_acquisitions <= 5:
+                # First line only: snde_error.what() appends a C++ backtrace,
+                # and a dropped sample is routine, not a crash.
+                print("sim_ascan_source: acquisition dropped (%d so far): %s"
+                      % (self.dropped_acquisitions, str(refused).split("\n")[0]))
+            return
+
+        try:
+            with transact as trans:
                 ref = snde.create_ndarray_ref(trans, self.chan,
                                               snde_typenum_for(data))
                 ref.rec.metadata = self.metadata()
@@ -301,8 +362,12 @@ class SimAScanSource(object):
                 print("sim_ascan_source: %s" % (e,))
 
     def _deliver(self, data, pos, s_m):
-        """Hand one trigger to the sink, if armed."""
+        """Hand one trigger to the sink, if armed and within the budget."""
         if not self._armed or self._sink is None:
+            return
+        if self._budget is not None and self.armed_triggers >= self._budget:
+            self.armed_over_budget += 1
+            self.over_budget += 1
             return
         try:
             self._sink(data, pos, self.armed_s_m if s_m is None else s_m,
@@ -326,72 +391,34 @@ class SimAScanSource(object):
             time.sleep(self.period)
 
     # A real trigger box fires on distance travelled, not on a clock, and it does
-    # not care where the probe is in any grid -- it integrates arc length along
-    # whatever path the machine follows and emits a pulse every pitch. That is
-    # what makes it work for a Noether toolpath as well as a raster.
-    #
-    # MAX_BURST exists because arc length is global: the link move between two
-    # raster rows is a real 0.3 m of travel and would legitimately emit ~60
-    # triggers in one poll. Firing them is correct -- they land during the
-    # traverse and the scan ignores them -- but a first sample after a long stall
-    # can look like a teleport, so the burst is capped and counted rather than
-    # allowed to stall the loop.
-    MAX_BURST = 128
-
+    # not care where the probe is in any grid -- it emits a pulse every pitch of
+    # progress along whatever path the machine follows. That is what makes it
+    # work for a Noether toolpath as well as a raster. How "progress" is
+    # measured, and the burst cap, are PitchCrossingDetector's.
     def _position_trigger_loop(self):
-        last = None            # last observed position
-        residual = 0.0         # arc length accumulated since the last trigger
-        pitch = float(self.trigger_pitch_m)
-
         while not self._quit:
-            if self._reset_phase:
-                # arm() asked for a new pass: forget where we were, so the next
-                # observed position becomes this pass's origin.
-                self._reset_phase = False
-                last = None
-                residual = 0.0
-
             pos = self.current_position()
             if pos is None:
                 time.sleep(self.poll_period)
                 continue
-            p = np.asarray(pos, dtype=np.float64)
 
-            if last is None:
-                # Trigger 0 where the probe starts, so trigger k is at exactly
-                # k*pitch of travel from it.
-                last = p
-                self.armed_s_m = 0.0
-                if self._emit_on_arm or not self._armed:
-                    self._publish(tuple(p), 0.0)
-                    self.triggers += 1
-                time.sleep(self.poll_period)
-                continue
-
-            step = p - last
-            d = float(np.linalg.norm(step))
-            if d > 0.0:
-                self.travelled_m += d
-                total = residual + d
-                # NOT total//pitch. Binary floating point makes 0.5//0.01 == 49,
-                # because 0.01 is a hair above 1/100 -- so travelling an exact
-                # multiple of the pitch fires one trigger too few. One missing
-                # trigger shifts every later column, which is the failure this
-                # config has already been bitten by twice, so absorb a crossing
-                # that lands within a rounding error of the boundary.
-                n = int(total/pitch + 1e-9)
-                if n > self.MAX_BURST:
-                    self.burst_dropped += n - self.MAX_BURST
-                    n = self.MAX_BURST
-                for k in range(1, n+1):
-                    # where along this step the k-th crossing falls
-                    along = k*pitch - residual
-                    self.armed_s_m += pitch
-                    self._publish(tuple(last + step*(min(along, d)/d)),
-                                  self.armed_s_m)
-                    self.triggers += 1
-                residual = max(0.0, total - n*pitch)
-                last = p
+            with self._lock:
+                # The scan retunes the pitch between passes (set_trigger_pitch).
+                self._detector.pitch_m = float(self.trigger_pitch_m)
+                primed = self._detector.primed
+                crossings = self._detector.feed(pos)
+                if not primed:
+                    # Trigger 0 where the probe starts, so trigger k is at
+                    # exactly k*pitch of progress from it.
+                    self.armed_s_m = 0.0
+                    if self._emit_on_arm or not self._armed:
+                        self._publish(tuple(crossings[0][0]), 0.0)
+                        self.triggers += 1
+                else:
+                    for p_k, s_k, frac in crossings:
+                        self.armed_s_m = s_k
+                        self._publish(tuple(p_k), s_k)
+                        self.triggers += 1
 
             time.sleep(self.poll_period)
 
@@ -406,9 +433,12 @@ class SimAScanSource(object):
                 "triggers": self.triggers,
                 "published": self.count,
                 "travelled_m": self.travelled_m,
+                "raw_travelled_m": self.raw_travelled_m,
                 "expected_triggers": expected,
                 "error_triggers": self.triggers - 1 - expected,
+                "over_budget": self.over_budget,
                 "burst_dropped": self.burst_dropped,
+                "dropped_acquisitions": self.dropped_acquisitions,
                 "errors": self.errors}
 
     def stop(self):

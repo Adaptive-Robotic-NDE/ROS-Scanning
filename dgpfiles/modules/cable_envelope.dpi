@@ -1,0 +1,978 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  cable_envelope.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Per-tilt wrist-3 rotation limits from the measured cable envelope.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# THE CABLE ENVELOPE -- how far wrist 3 may turn, PER TILT
+# ==============================================================================
+# The Azure Kinect, the Keyence LJ-V7080 and the eddy-current probe all hang off
+# the end of the arm and all three are cabled back along it. Turn wrist 3 far
+# enough and the loom binds, then pulls. There is no sensor for that, so the
+# only limit that exists is one an operator measured by watching the cables
+# while the wrist was stepped round: capture_cable_envelope(), scenario 6.
+#
+# THE THREE THINGS THIS MODULE EXISTS TO GET RIGHT:
+#
+# 1. THE BAND DEPENDS ON THE TILT. The measurement is five separate sweeps --
+#    no tilt, +/-40 deg about world x, +/-20 deg about world y -- and they do
+#    not agree:
+#
+#        no tilt      31.3 .. 301.3 deg      (270 deg of travel)
+#        tilt x +40   87.3 .. 327.3
+#        tilt x -40  179.6 .. 254.6          (75 deg -- the tightest by far)
+#        tilt y +20   63.6 .. 303.6
+#        tilt y -20   30.3 .. 255.3
+#
+#    Intersecting all five into ONE band -- 179.6..254.6 -- and enforcing that at
+#    every pose whatever the tilt refuses moves at 255, 257 and 168..250 deg that
+#    are well inside the band for the tilt actually commanded. An untilted pose
+#    has 270 degrees of legal travel and would be given 75. The band at a tilt is
+#    the band measured at that tilt.
+#
+# 2. ABSOLUTE ANGLE IS WHAT MATTERS. The cable physically wraps, so wrist_3 =
+#    +200 deg and wrist_3 = -160 deg are the same TOOL ORIENTATION and opposite
+#    CABLE STATES. Nothing here wraps, folds, normalises or offers a branch
+#    360 degrees away, and nothing downstream may either. The safe set is a
+#    single continuous band in the absolute wrist_3 joint angle, and it is only
+#    known where it was measured.
+#
+# 3. IT HAS TO BE ENFORCED WHERE THE ARM ACTUALLY MOVES. A check that runs only
+#    inside a capture scenario leaves a normal run_automated_scan() unguarded,
+#    and an unguarded sweep will command wrist_3 = 29.3, 21.9, -32.3, -55.1 and
+#    -113.0 deg in sequence -- starting below the measured tight point of 31.3,
+#    walking through zero, and ending 113 deg the wrong side of it, with the
+#    emergency stop as the only thing left to stop it. install_cable_guard() in
+#    cell_capture_motion.dpi is the enforcement; this module is the model it
+#    asks.
+#
+# WHAT IS *NOT* HERE. No envelope for a tilt nobody measured. Outside
+# |tx| <= 40 deg or |ty| <= 20 deg this raises rather than extrapolating: a
+# cable limit invented by running a line off the end of the data is an
+# unmeasured number, of the same kind as the blanket TOOLING_TWIST_LIMIT_DEG in
+# tooling_clearance.dpi.
+#
+# Pure model, no ROS, no robot, no dgpy: cable_envelope_test.py runs the whole
+# of it on the host with numpy.
+
+# Each .dpi is its own function body: another part's imports are not visible,
+# and anything the including config must see is declared global before it is
+# assigned.
+import json
+import math
+import os
+
+import numpy as np
+
+global CableRefused
+global CableEnvelope
+global load_cable_envelope
+global cable_envelope_model
+global cable_envelope_reload
+global wrist3_band
+global wrist3_band_deg
+global wrist3_tilt_of
+global check_wrist3
+# A DIAGNOSTIC, not a substitution -- see its docstring. Exported because the fix
+# for the fault it identifies lives in whatever chose the branch, not here, and
+# that code has to be able to ask.
+global wrist3_branch_in_band
+global describe_cable_envelope
+global cable_envelope_from_rows
+global cable_envelope_document
+global cable_envelope_manifest_block
+global _cable_parse_label
+global _cable_envelope_from_doc
+global CABLE_ENVELOPE_MARGIN_DEG
+global CABLE_ENVELOPE_SCHEMA
+global CABLE_TILT_TOL_DEG
+global _cable_quat_matrix
+global _cable_quat_inv
+global _cable_tilt_label
+
+
+#: Written into every file this module produces, and checked when one is read.
+#: Schema 1 is per_tilt rows plus a top-level lo_rad/hi_rad that is the
+#: INTERSECTION of every tilt, and that is the number it enforces. Schema 2 keeps
+#: the rows, gives each one its tilt coordinates outright, and has no enforced
+#: global band at all.
+CABLE_ENVELOPE_SCHEMA = "cable_envelope/2"
+
+#: One-element caches. The measurement is a file on disk that does not change
+#: while a config runs, and every gated motion asks for it.
+_CABLE = [None]
+_CABLE_LOOKED = [False]
+_CABLE_WARNED = []
+
+
+#: How far INSIDE the measured band every check stays, degrees.
+#:
+#: ZERO, deliberately, and this is the one number in the module that looks like
+#: it ought to be padded. It is not, because the data is already one step
+#: inside: capture_cable_envelope() records `reached_deg`, the last step the
+#: operator CONFIRMED was still slack, and the operator says "tight" only at the
+#: NEXT step. So a band whose edge reads 301.3 deg was actually measured slack
+#: at 301.3 and tight at 316.3, with a 15 degree step. Subtracting a margin on
+#: top of that subtracts it twice, and a band narrowed for reasons that are not
+#: about the pose in hand refuses moves the cables can hold.
+#:
+#: Raise it from the prompt if a specific loom needs it, and say why in the
+#: capture session notes. Pass margin_deg= to one call to narrow just that one.
+CABLE_ENVELOPE_MARGIN_DEG = 0.0
+
+#: How far a commanded tilt may sit outside the measured hull and still be
+#: treated as ON it, degrees. Floating point and a planner's rounding, not
+#: slack: 40.0000001 deg of tilt is the +40 sample.
+CABLE_TILT_TOL_DEG = 0.5
+
+
+class CableRefused(RuntimeError):
+    """A motion would turn wrist 3 outside the measured cable envelope, or to a
+    tilt where the envelope was never measured. Nothing moved."""
+
+
+# ------------------------------------------------------------------------------
+# Quaternion helpers
+# ------------------------------------------------------------------------------
+# Deliberately local copies. noether_path.dpi has the same two, but this module
+# is loaded by the motion gate and has to work in a config that never loads the
+# toolpath planner -- and cable_envelope_test.py runs it with nothing but numpy.
+
+def _cable_quat_matrix(q):
+    """Rotation matrix from an (x, y, z, w) quaternion. Columns are the axes."""
+    x, y, z, w = (float(v) for v in q)
+    n = math.sqrt(x*x + y*y + z*z + w*w)
+    if n == 0.0:
+        return np.eye(3)
+    x, y, z, w = x/n, y/n, z/n, w/n
+    return np.array([
+        [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
+        [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
+        [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]], dtype=np.float64)
+
+
+def _cable_quat_inv(q):
+    """The inverse of an (x, y, z, w) quaternion."""
+    x, y, z, w = (float(v) for v in q)
+    n = x*x + y*y + z*z + w*w
+    if n == 0.0:
+        raise ValueError("a zero quaternion has no inverse")
+    return (-x/n, -y/n, -z/n, w/n)
+
+
+def _cable_tilt_label(tx_deg, ty_deg):
+    """The label capture_cable_envelope() writes for a tilt, so an old file and
+    a new one name the same sample the same way."""
+    if abs(tx_deg) < 1e-6 and abs(ty_deg) < 1e-6:
+        return "no tilt"
+    if abs(ty_deg) < 1e-6:
+        return "tilt x %+.0f deg" % (tx_deg,)
+    if abs(tx_deg) < 1e-6:
+        return "tilt y %+.0f deg" % (ty_deg,)
+    return "tilt x %+.0f y %+.0f deg" % (tx_deg, ty_deg)
+
+
+def _cable_parse_label(label):
+    """(tx_deg, ty_deg) from one of capture_cable_envelope()'s labels, or None.
+
+    Only needed to read a file written before the schema carried tx_deg/ty_deg.
+    Schema 2 says the numbers outright.
+    """
+    s = str(label or "").strip().lower()
+    if s in ("no tilt", "none", ""):
+        return (0.0, 0.0)
+    tx = ty = 0.0
+    seen = False
+    parts = s.replace("deg", " ").replace(",", " ").split()
+    i = 0
+    while i < len(parts) - 1:
+        if parts[i] in ("x", "y"):
+            try:
+                v = float(parts[i + 1])
+            except ValueError:
+                return None
+            if parts[i] == "x":
+                tx = v
+            else:
+                ty = v
+            seen = True
+            i += 2
+            continue
+        i += 1
+    return (tx, ty) if seen else None
+
+
+def wrist3_tilt_of(quat, home_quat=None):
+    """(tx_deg, ty_deg): where a commanded tool orientation sits in the tilt
+    plane the cable envelope was measured over.
+
+    capture_cable_envelope() builds each tilt as
+
+        quat_mul(_cap_q_axis(axis, radians(deg)), home_quat)
+
+    -- a WORLD-frame rotation about world x or world y applied to `home_quat` --
+    so the tilt coordinates of a commanded orientation q are the x and y
+    components of the rotation vector of `q * inverse(home_quat)`, in degrees.
+
+    WHAT IS COMPUTED, AND WHY IT IS NOT LITERALLY THAT PRODUCT. The residual
+    rotation q * inverse(home_quat) carries the wrist-3 roll as well as the
+    tilt, and the roll is the very coordinate the band constrains: the envelope
+    is measured by holding a tilt and sweeping wrist 3 through it, so the tilt
+    of a pose must not drift as the wrist turns. Rotation vectors do not
+    separate cleanly -- rotvec(Rz(phi) Rx(alpha)) is not (alpha, 0, phi) once
+    phi is large, and this band is centred near 166 deg -- so what is returned
+    is the MINIMAL rotation carrying the home tool axis onto the commanded tool
+    axis. For every pose in the measured family (a pure world x or world y tilt
+    of home, with any wrist-3 roll on top) that is exactly the x and y of the
+    rotation vector above; unlike it, it is invariant to the roll.
+
+    The z component of that minimal rotation is dropped. For the usual home --
+    tool axis vertical -- it is identically zero, and where it is not it is a
+    turn about the tool axis, which is what the band bounds rather than what
+    selects the band.
+    """
+    home = (0.0, 0.0, 0.0, 1.0) if home_quat is None else home_quat
+    a0 = _cable_quat_matrix(home)[:, 2]
+    a = _cable_quat_matrix(quat)[:, 2]
+    a0 = a0/np.linalg.norm(a0)
+    a = a/np.linalg.norm(a)
+    axis = np.cross(a0, a)
+    s = float(np.linalg.norm(axis))
+    c = float(np.clip(np.dot(a0, a), -1.0, 1.0))
+    angle = math.atan2(s, c)
+    if s < 1e-12:
+        # Parallel (no tilt) or antiparallel (the tool is upside down: a
+        # 180 degree tilt, direction undefined, and far outside any hull).
+        return (0.0, 0.0) if c > 0.0 else (180.0, 0.0)
+    v = (axis/s)*angle
+    return (math.degrees(float(v[0])), math.degrees(float(v[1])))
+
+
+# ------------------------------------------------------------------------------
+# The model
+# ------------------------------------------------------------------------------
+
+class CableEnvelope(object):
+    """The measured wrist-3 bands, and the rule for the tilts between them.
+
+    Built from the five-point cross capture_cable_envelope() flies: three
+    samples along x at ty = 0 and three along y at tx = 0, sharing the untilted
+    one at the middle.
+
+    THE INTERPOLATION RULE, and why it is this one. `lo` and `hi` are
+    interpolated SEPARATELY and LINEARLY along x (using the ty = 0 row) and,
+    independently, along y (using the tx = 0 column), between the two samples
+    that bracket the tilt on that axis. The two answers are then combined by
+    taking the tighter of them -- an intersection -- in the only space where
+    they can be compared, which is as DEVIATIONS from the untilted band they
+    share:
+
+        lo = lo_0 + (lo_x(tx) - lo_0) + (lo_y(ty) - lo_0)
+        hi = hi_0 + (hi_x(tx) - hi_0) + (hi_y(ty) - hi_0)
+
+    clamped so that `lo` is never below the smallest measured lo and `hi` never
+    above the largest measured hi. Each axis contributes what tilting along it
+    does to each end, and a tilt along both pays for both.
+
+      * Separately for lo and hi, because they are two different cables
+        reaching their limit in two different directions. They are not a centre
+        and a width, and the measurement says so -- turning from no tilt to
+        x -40 moves lo UP by 148 deg and hi DOWN by only 47, while turning to
+        x +40 moves BOTH up.
+      * Linearly, because five points is what there is. Any smoother fit puts
+        curvature into the answer that nothing measured.
+      * As deviations rather than as absolute bands, because the literal
+        max-of-the-los / min-of-the-his over the two absolute bands is WRONG at
+        three of the five measured samples, in the over-restrictive direction.
+        At tx = +40, ty = 0 the y row is being evaluated at ty = 0, where it
+        returns the UNTILTED band -- a statement about the origin, not about
+        (+40, 0) -- and intersecting with it cuts the measured 327.3 back to
+        301.3. That is 26 degrees of measured, confirmed-slack travel thrown
+        away by arithmetic, which is the same mistake as the global
+        intersection, one axis smaller. A row's deviation carries to a
+        neighbouring tilt; its absolute value does not.
+      * The clamp, because a cross has no diagonal data and composing two
+        widening deviations could otherwise claim an endpoint past anything
+        ever observed. Inside the clamp, a diagonal is at least as tight as the
+        measurement: (-40, -20) comes out 178.5..208.5, tighter on both ends
+        than either row alone.
+      * On either measured row -- which is every one of the five samples, and
+        every tilt along the two axes -- this returns that row exactly. The
+        model never softens what was actually observed, and never invents past
+        it.
+
+    NO GLOBAL INTERSECTION ACROSS TILTS. The band at tilt A is the band measured
+    at tilt A.
+
+    Outside the measured hull -- |tx| beyond the x samples or |ty| beyond the y
+    samples -- band() RAISES. Extrapolating a cable limit is inventing one.
+    """
+
+    def __init__(self, samples, home_quat=(0.0, 0.0, 0.0, 1.0), cell=None,
+                 mode=None, measured=None, step_deg=None, source=None,
+                 notes=None):
+        #: [(tx_deg, ty_deg, lo_rad, hi_rad, label)], as measured.
+        self.samples = []
+        for s in samples:
+            tx, ty, lo, hi, label = s
+            lo, hi = float(lo), float(hi)
+            if hi <= lo:
+                raise ValueError("cable envelope sample %r is empty or inside "
+                                 "out: %.1f..%.1f deg"
+                                 % (label, math.degrees(lo), math.degrees(hi)))
+            self.samples.append((float(tx), float(ty), lo, hi,
+                                 label or _cable_tilt_label(tx, ty)))
+        if not self.samples:
+            raise ValueError("a cable envelope needs at least the untilted sample")
+        self.home_quat = tuple(float(v) for v in home_quat)
+        self.cell = cell
+        self.mode = mode
+        self.measured = measured
+        self.step_deg = None if step_deg is None else float(step_deg)
+        self.source = source
+        self.notes = notes
+        self._x = self._axis_row(0, 1)
+        self._y = self._axis_row(1, 0)
+        if not self._x or not self._y:
+            raise ValueError("a cable envelope needs the untilted sample on both "
+                             "axes; got %s" % ([s[4] for s in self.samples],))
+        untilted = [s for s in self.samples
+                    if abs(s[0]) <= CABLE_TILT_TOL_DEG and abs(s[1]) <= CABLE_TILT_TOL_DEG]
+        if not untilted:
+            raise ValueError("a cable envelope needs the untilted sample: it is "
+                             "the origin both rows are measured against")
+        #: The band both rows share, and the origin deviations are taken from.
+        self.lo0, self.hi0 = untilted[0][2], untilted[0][3]
+        #: Nothing this model returns lies outside what was measured.
+        self.lo_floor = min(s[2] for s in self.samples)
+        self.hi_ceiling = max(s[3] for s in self.samples)
+
+    # -- the measured rows ---------------------------------------------------
+
+    def _axis_row(self, which, other):
+        """The samples along one axis (the other tilt zero), sorted."""
+        row = [(s[which], s[2], s[3], s[4]) for s in self.samples
+               if abs(s[other]) <= CABLE_TILT_TOL_DEG]
+        return sorted(row)
+
+    @property
+    def tx_range(self):
+        return (self._x[0][0], self._x[-1][0])
+
+    @property
+    def ty_range(self):
+        return (self._y[0][0], self._y[-1][0])
+
+    def _interp(self, row, t, axis_name):
+        """(lo_rad, hi_rad, "between which samples") along one measured row."""
+        lo_t, hi_t = row[0][0], row[-1][0]
+        if t < lo_t - CABLE_TILT_TOL_DEG or t > hi_t + CABLE_TILT_TOL_DEG:
+            raise CableRefused(
+                "tilt %s %+.1f deg is outside the measured cable envelope "
+                "(%s was swept only at %s). The envelope is not extrapolated: "
+                "measure it there with capture_cable_envelope(tilts=...), or "
+                "pass allow_outside=True and take responsibility for the cables."
+                % (axis_name, t, axis_name,
+                   ", ".join("%+.0f" % r[0] for r in row)))
+        t = min(max(t, lo_t), hi_t)
+        for (ta, la, ha, na), (tb, lb, hb, nb) in zip(row, row[1:]):
+            if ta - 1e-9 <= t <= tb + 1e-9:
+                if tb - ta < 1e-9:
+                    return la, ha, na
+                f = (t - ta)/(tb - ta)
+                if f <= 1e-9:
+                    return la, ha, na
+                if f >= 1.0 - 1e-9:
+                    return lb, hb, nb
+                return (la + f*(lb - la), ha + f*(hb - ha),
+                        "%.0f%% of the way from %s to %s" % (f*100.0, na, nb))
+        raise CableRefused("tilt %s %+.1f deg falls between no two samples" % (axis_name, t))
+
+    # -- the answer ----------------------------------------------------------
+
+    def band(self, tilt=None, quat=None, margin_deg=None, allow_outside=False):
+        """(lo_rad, hi_rad) for this tilt, and the tilt it was taken at.
+
+        Returns (lo_rad, hi_rad). `tilt` is (tx_deg, ty_deg); `quat` is a
+        commanded tool orientation, from which the tilt is read. Neither: the
+        untilted band.
+
+        `margin_deg` narrows the band by that much at each end
+        (CABLE_ENVELOPE_MARGIN_DEG, 0.0, by default -- see the note on it).
+        `allow_outside=True` clamps a tilt outside the measured hull to the
+        nearest measured one instead of raising; it exists for a deliberate,
+        supervised move and is not what the automated pipeline should pass.
+        """
+        lo, hi, _why = self.band_with_reason(tilt=tilt, quat=quat,
+                                             margin_deg=margin_deg,
+                                             allow_outside=allow_outside)
+        return lo, hi
+
+    def band_with_reason(self, tilt=None, quat=None, margin_deg=None,
+                         allow_outside=False):
+        """(lo_rad, hi_rad, why) -- `why` names the tilt and the samples used,
+        so a refusal can say where its numbers came from."""
+        tx, ty = self.tilt_of(tilt=tilt, quat=quat)
+        if allow_outside:
+            tx = min(max(tx, self.tx_range[0]), self.tx_range[1])
+            ty = min(max(ty, self.ty_range[0]), self.ty_range[1])
+        lo_x, hi_x, why_x = self._interp(self._x, tx, "x")
+        lo_y, hi_y, why_y = self._interp(self._y, ty, "y")
+        # The two rows combined as deviations from the band they share, then
+        # held inside the measured extremes. See the class docstring for why
+        # this and not the max/min of the two absolute bands.
+        lo = max(self.lo0 + (lo_x - self.lo0) + (lo_y - self.lo0), self.lo_floor)
+        hi = min(self.hi0 + (hi_x - self.hi0) + (hi_y - self.hi0), self.hi_ceiling)
+        m = math.radians(float(CABLE_ENVELOPE_MARGIN_DEG if margin_deg is None
+                               else margin_deg))
+        lo, hi = lo + m, hi - m
+        if hi <= lo:
+            raise CableRefused(
+                "the cable envelope at tilt (x %+.1f, y %+.1f) deg is empty "
+                "(%s against %s, margin %.1f deg). That tilt turns the wrist "
+                "out of every band the cables allow; nothing can move there."
+                % (tx, ty, why_x, why_y, math.degrees(m)))
+        why = "tilt (x %+.1f, y %+.1f) deg: %s" % (tx, ty, why_x)
+        if why_y != why_x:
+            why += " combined with %s" % (why_y,)
+        if m:
+            why += ", margin %.1f deg" % (math.degrees(m),)
+        return lo, hi, why
+
+    def band_deg(self, tilt=None, quat=None, margin_deg=None, allow_outside=False):
+        """The same band in degrees, for reading and for tests."""
+        lo, hi = self.band(tilt=tilt, quat=quat, margin_deg=margin_deg,
+                           allow_outside=allow_outside)
+        return math.degrees(lo), math.degrees(hi)
+
+    def tilt_of(self, tilt=None, quat=None):
+        """(tx_deg, ty_deg) from whichever of the two the caller gave."""
+        if tilt is not None and quat is not None:
+            raise ValueError("give a tilt or an orientation, not both")
+        if quat is not None:
+            return wrist3_tilt_of(quat, self.home_quat)
+        if tilt is None:
+            return (0.0, 0.0)
+        t = np.asarray(tilt, float).reshape(-1)
+        if t.size != 2:
+            raise ValueError("a tilt is (tx_deg, ty_deg), not %r" % (tilt,))
+        return (float(t[0]), float(t[1]))
+
+    def contains(self, wrist3_rad, tilt=None, quat=None, margin_deg=None,
+                 allow_outside=False):
+        """Is this ABSOLUTE wrist_3 angle inside the band for this tilt?
+
+        Absolute. Nothing is wrapped into (-pi, pi] or offered a branch 2*pi
+        away: +200 deg and -160 deg are the same tool orientation and different
+        cable states, and treating them as interchangeable is what this module
+        exists to prevent.
+        """
+        lo, hi = self.band(tilt=tilt, quat=quat, margin_deg=margin_deg,
+                           allow_outside=allow_outside)
+        w = float(wrist3_rad)
+        return lo - 1e-9 <= w <= hi + 1e-9
+
+    # -- reporting -----------------------------------------------------------
+
+    def describe(self):
+        out = ["cable envelope: %s/%s, measured %s%s"
+               % (self.cell or "?", self.mode or "?", self.measured or "?",
+                  "" if not self.source else " (%s)" % (self.source,))]
+        for tx, ty, lo, hi, label in self.samples:
+            out.append("  %-18s wrist 3 %+7.1f .. %+7.1f deg  (%.0f deg of travel)"
+                       % (label, math.degrees(lo), math.degrees(hi),
+                          math.degrees(hi - lo)))
+        if CABLE_ENVELOPE_MARGIN_DEG:
+            out.append("  margin %.1f deg at each end" % (CABLE_ENVELOPE_MARGIN_DEG,))
+        out.append("  a tilt between these is interpolated along each axis and "
+                   "pays for both; outside them nothing is invented")
+        return "\n".join(out)
+
+    def document(self, enforced=True, extra=None):
+        """The JSON/YAML form: schema 2, per-tilt, no enforced global band."""
+        per = []
+        for tx, ty, lo, hi, label in self.samples:
+            per.append({"tilt": label, "tx_deg": tx, "ty_deg": ty,
+                        "lo_deg": math.degrees(lo), "hi_deg": math.degrees(hi),
+                        "lo_rad": lo, "hi_rad": hi})
+        lo_i = max(s[2] for s in self.samples)
+        hi_i = min(s[3] for s in self.samples)
+        doc = {"schema": CABLE_ENVELOPE_SCHEMA,
+               "cell": self.cell, "mode": self.mode, "measured": self.measured,
+               "home_quat": list(self.home_quat), "step_deg": self.step_deg,
+               "margin_deg": float(CABLE_ENVELOPE_MARGIN_DEG),
+               "per_tilt": per, "enforced": bool(enforced),
+               # KEPT, AND NOT ENFORCED. Schema 1 put this number at the top
+               # level and checked every motion against it at every tilt. It is
+               # recorded because it is a fact about the measurement -- the band
+               # that holds whatever the tilt -- and it is named so that nothing
+               # mistakes it for the limit.
+               "intersection_not_enforced": {
+                   "lo_deg": math.degrees(lo_i) if hi_i > lo_i else None,
+                   "hi_deg": math.degrees(hi_i) if hi_i > lo_i else None,
+                   "why": "informational: the band common to every measured "
+                          "tilt. NOT the limit -- each tilt has its own."}}
+        if self.notes:
+            doc["notes"] = self.notes
+        if extra:
+            doc.update(extra)
+        return doc
+
+
+# ------------------------------------------------------------------------------
+# Reading a measurement
+# ------------------------------------------------------------------------------
+
+def cable_envelope_from_rows(rows, step_deg=None, home_quat=(0.0, 0.0, 0.0, 1.0),
+                             cell=None, mode=None, measured=None, source=None):
+    """A CableEnvelope from capture_cable_envelope()'s `per_tilt` rows.
+
+    Understands both schemas. Schema 2 rows carry tx_deg/ty_deg outright;
+    schema 1 rows carry only the label capture_cable_envelope() printed -- "no
+    tilt", "tilt x +40 deg" -- so those are parsed instead. Reading a schema 1
+    file costs nothing and means a measurement already on a cell PC keeps
+    working.
+    """
+    samples = []
+    for row in rows or ():
+        if row.get("lo_deg") is None or row.get("hi_deg") is None:
+            continue                                  # a tilt the arm could not take
+        tx, ty = row.get("tx_deg"), row.get("ty_deg")
+        if tx is None or ty is None:
+            parsed = _cable_parse_label(row.get("tilt"))
+            if parsed is None:
+                raise ValueError("cable envelope row %r says neither tx_deg/ty_deg "
+                                 "nor a tilt this can parse" % (row.get("tilt"),))
+            tx, ty = parsed
+        lo = row.get("lo_rad")
+        hi = row.get("hi_rad")
+        lo = math.radians(float(row["lo_deg"])) if lo is None else float(lo)
+        hi = math.radians(float(row["hi_deg"])) if hi is None else float(hi)
+        samples.append((float(tx), float(ty), lo, hi, row.get("tilt")))
+    return CableEnvelope(samples, home_quat=home_quat, cell=cell, mode=mode,
+                         measured=measured, step_deg=step_deg, source=source)
+
+
+def cable_envelope_document(rows, **kw):
+    """The document _save_cable_limits() writes, from measured rows."""
+    return cable_envelope_from_rows(rows, **kw).document()
+
+
+def cable_envelope_manifest_block(model=None, mode=None):
+    """The `cable_envelope:` YAML for the cell manifest, ready to paste.
+
+    The measurement file lives under CAPTURE_ROOT on whichever machine ran the
+    test, and no other machine can see it. The manifest travels with the cell,
+    so it is the default source (see _cable_envelope_from_manifest) -- but only
+    once somebody puts the numbers in it. This prints them in the right shape so
+    that is a paste rather than a transcription.
+    """
+    m = cable_envelope_model() if model is None else model
+    if m is None:
+        return "# nothing measured"
+    which = mode or m.mode or globals().get("CELL_MODE") or "hardware"
+    out = ["cable_envelope:",
+           "  home_quat: [%s]" % (", ".join("%.6f" % v for v in m.home_quat),),
+           "  %s:" % (which,),
+           "    measured: \"%s\"" % (m.measured or "",)]
+    if m.step_deg:
+        out.append("    step_deg: %.1f" % (m.step_deg,))
+    out.append("    per_tilt:")
+    for tx, ty, lo, hi, label in m.samples:
+        out.append("      - {tilt: \"%s\", tx_deg: %.1f, ty_deg: %.1f, "
+                   "lo_deg: %.4f, hi_deg: %.4f}"
+                   % (label, tx, ty, math.degrees(lo), math.degrees(hi)))
+    return "\n".join(out)
+
+
+def _cable_envelope_from_doc(doc, source=None):
+    rows = doc.get("per_tilt")
+    if not rows:
+        raise ValueError("no per_tilt rows in %s" % (source or "the document",))
+    return cable_envelope_from_rows(
+        rows, step_deg=doc.get("step_deg"),
+        home_quat=doc.get("home_quat") or (0.0, 0.0, 0.0, 1.0),
+        cell=doc.get("cell"), mode=doc.get("mode"),
+        measured=doc.get("measured"), source=source)
+
+
+def _cable_envelope_from_manifest(cell=None, mode=None):
+    """(model, where) from the cell manifest's `cable_envelope:` block.
+
+    THE MANIFEST IS THE DEFAULT SOURCE. A fresh dgpy session has to know the
+    band without the operator re-running a 40 minute wrist test, which is
+    exactly the state a scan starts in: the file capture_cable_envelope() writes
+    lives under CAPTURE_ROOT on whichever machine ran it, and every other
+    machine has nothing. The manifest travels with the cell.
+    """
+    name = cell or globals().get("CELL_NAME")
+    which = mode or globals().get("CELL_MODE")
+    if not name or not which:
+        return None, None
+    raw = where = None
+    try:
+        from tari_bringup.cells import load_cell
+        c = load_cell(name, which)
+        where = "the %s manifest (%s)" % (name, getattr(c, "source", "?"))
+        getter = getattr(c, "cable_envelope", None)
+        if getter is not None:
+            raw = getter()
+    except Exception:
+        raw = where = None
+    if raw is None:
+        # tari_bringup is older than Cell.cable_envelope(), or is not
+        # importable at all. The manifest is still a file; read it.
+        try:
+            from tari_bringup.cells import find_manifest
+            import yaml
+            path = find_manifest(name)
+            with open(path) as h:
+                data = yaml.safe_load(h) or {}
+            where = "the %s manifest (%s)" % (name, path)
+            block = data.get("cable_envelope") or {}
+            raw = block.get(which) if which in block else None
+            if raw is not None and "home_quat" not in raw and "home_quat" in block:
+                raw = dict(raw, home_quat=block["home_quat"])
+        except Exception:
+            return None, None
+    if not raw:
+        return None, where
+    doc = dict(raw)
+    doc.setdefault("cell", name)
+    doc.setdefault("mode", which)
+    return _cable_envelope_from_doc(doc, source=where), where
+
+
+def load_cable_envelope(path_or_dict=None, quiet=True):
+    """The cable envelope model, or None if nothing has ever been measured.
+
+    `path_or_dict` is a file, a already-parsed document, or a CableEnvelope.
+    None looks in two places, in this order:
+
+      1. the file capture_cable_envelope() wrote for THIS cell and mode
+         (CAPTURE_ROOT/cable_limits_<cell>_<mode>.json) -- the fresher
+         measurement, on the machine that made it;
+      2. the cell manifest's `cable_envelope:` block -- the default, because it
+         is what a session that never ran the capture tool can see.
+
+    None is a real answer and callers must handle it: it means nobody has
+    measured this cell's cables, and the honest response is to say so rather
+    than to invent a band.
+    """
+    if isinstance(path_or_dict, CableEnvelope):
+        return path_or_dict
+    model = where = None
+    if isinstance(path_or_dict, dict):
+        model, where = _cable_envelope_from_doc(path_or_dict, "a document"), "a document"
+    elif path_or_dict:
+        with open(path_or_dict) as h:
+            model = _cable_envelope_from_doc(json.load(h), str(path_or_dict))
+        where = str(path_or_dict)
+    else:
+        f = globals().get("_cable_limits_file")
+        f = f() if callable(f) else None
+        if f and os.path.exists(f):
+            try:
+                with open(f) as h:
+                    model = _cable_envelope_from_doc(json.load(h), f)
+                where = f
+            except Exception as e:
+                _cable_say("  cable envelope: %s is unreadable (%s); falling back "
+                           "to the manifest" % (f, e))
+        if model is None:
+            model, where = _cable_envelope_from_manifest()
+    _CABLE[0] = model
+    # ...AND RECORD THAT THE LOOKUP HAS HAPPENED. Without this, loading an
+    # explicit file sets the model and the very next cable_envelope_model() --
+    # which every wrist3_band() goes through -- sees _CABLE_LOOKED still False,
+    # reloads from the DEFAULT locations, and overwrites what was just asked for.
+    #     load_cable_envelope("/path/to/a/fresh/measurement.json")
+    # would then appear to work and silently do nothing, which is exactly what an
+    # operator reaches for at the cell after re-measuring.
+    _CABLE_LOOKED[0] = True
+    if not quiet:
+        if model is None:
+            _cable_say("  no cable envelope for this cell: wrist 3 is UNCHECKED. "
+                       "Run capture_cable_envelope(), or add a cable_envelope: "
+                       "block to the cell manifest.")
+        else:
+            _cable_say("  " + model.describe().replace("\n", "\n  "))
+    return model
+
+
+def cable_envelope_model(reload=False):
+    """The loaded model, loading it the first time. None when unmeasured."""
+    if reload or not _CABLE_LOOKED[0]:
+        _CABLE_LOOKED[0] = True
+        try:
+            load_cable_envelope(quiet=True)
+        except Exception as e:
+            _cable_say("  cable envelope: could not be loaded (%s); wrist 3 is "
+                       "UNCHECKED" % (e,))
+            _CABLE[0] = None
+    return _CABLE[0]
+
+
+def cable_envelope_reload(quiet=False):
+    """Forget the loaded model and read it again -- after a fresh measurement,
+    or an edited manifest."""
+    _CABLE_LOOKED[0] = True
+    return load_cable_envelope(quiet=quiet)
+
+
+def _cable_say(msg):
+    say = globals().get("_capture_say")
+    if callable(say):
+        say(msg)
+    else:
+        print(msg)
+
+
+# ------------------------------------------------------------------------------
+# The two questions everything else asks
+# ------------------------------------------------------------------------------
+
+def wrist3_band(tilt=None, quat=None, margin_deg=None, allow_outside=False,
+                model=None):
+    """(lo_rad, hi_rad): the wrist_3 band for this tilt, in ABSOLUTE joint angle.
+
+    `tilt` is (tx_deg, ty_deg) as wrist3_tilt_of() returns them; `quat` is a
+    commanded tool orientation to read the tilt from. Raises CableRefused for a
+    tilt outside the measured hull, and KeyError when nothing has been measured
+    at all -- neither is a band, and neither may be replaced by one.
+    """
+    m = cable_envelope_model() if model is None else model
+    if m is None:
+        raise KeyError("no cable envelope has been measured for this cell. "
+                       "Run capture_cable_envelope(), or add a cable_envelope: "
+                       "block to the cell manifest.")
+    return m.band(tilt=tilt, quat=quat, margin_deg=margin_deg,
+                  allow_outside=allow_outside)
+
+
+def wrist3_band_deg(tilt=None, quat=None, **kw):
+    """wrist3_band() in degrees."""
+    lo, hi = wrist3_band(tilt=tilt, quat=quat, **kw)
+    return math.degrees(lo), math.degrees(hi)
+
+
+def _cable_wrist3_values(qs):
+    """The wrist_3 angles in a mixed bag of joint configurations and angles.
+
+    A 6 (or more) element item is a joint configuration and wrist_3 is [5];
+    a bare number is already the wrist_3 angle, in radians. None is skipped --
+    an IK solver that could not answer has not said anything about the wrist.
+    """
+    out = []
+    for q in qs if qs is not None else ():
+        if q is None:
+            continue
+        if np.isscalar(q) or (isinstance(q, np.ndarray) and q.ndim == 0):
+            out.append(float(q))
+            continue
+        v = np.asarray(q, float).reshape(-1)
+        if v.size == 1:
+            out.append(float(v[0]))
+        elif v.size >= 6:
+            out.append(float(v[5]))
+        else:
+            raise ValueError("%r is neither a wrist_3 angle nor a 6 joint "
+                             "configuration" % (q,))
+    return out
+
+
+def check_wrist3(qs, what, quats=None, tilt=None, margin_deg=None,
+                 allow_outside=False, model=None, require=False):
+    """Refuse a move that would turn wrist 3 outside the cable band for its tilt.
+
+    `qs` is the joint configurations the move would pass through (or bare
+    wrist_3 angles in radians). THOSE TWO ARE AMBIGUOUS FOR EXACTLY SIX VALUES:
+    a single 6-DOF configuration passed as a bare list is read as six wrist_3
+    angles, because nothing distinguishes them. Pass a LIST of configurations --
+    check_wrist3([q], ...) for one -- and never the configuration itself. `quats` is the tool orientation(s) commanded, so
+    the band is taken at the tilt actually asked for rather than at some global
+    worst case; `tilt` names (tx_deg, ty_deg) directly instead. Neither: the
+    untilted band, which is what a joint move with no pose to read means.
+
+    Raises CableRefused, naming the angle, the band and the tilt the band came
+    from. Returns the (lo_rad, hi_rad) it checked against, or None when there is
+    nothing to check against: with no measurement this does NOT refuse (a cell
+    whose cables have never been measured still has to be able to move, and the
+    cable test is itself a motion) unless `require=True`. It says so once.
+
+    Nothing here wraps an angle. wrist_3 = +200 deg is inside the untilted band
+    and wrist_3 = -160 deg is outside it, and they describe the same tool
+    orientation; that is the point.
+    """
+    m = cable_envelope_model() if model is None else model
+    if m is None:
+        if require:
+            raise CableRefused(
+                "%s cannot be checked: no cable envelope has been measured for "
+                "this cell. Run capture_cable_envelope(), or add a "
+                "cable_envelope: block to the cell manifest." % (what,))
+        if not _CABLE_WARNED:
+            _CABLE_WARNED.append(True)
+            _cable_say("  WRIST 3 IS UNCHECKED: no cable envelope for this cell. "
+                       "Run capture_cable_envelope() before scanning.")
+        return None
+    raw = list(qs) if qs is not None else []
+    w = _cable_wrist3_values(raw)
+    if not w:
+        return None
+
+    # One band per tilt commanded ALONG the move. A Cartesian move may tilt the
+    # tool as it goes, and the tightest tilt on the path is not always the one
+    # at its end -- x -40 gives 75 degrees of travel where no tilt gives 270.
+    if quats is None:
+        pairs = [(m.tilt_of(tilt=tilt), w)]
+    else:
+        qq = [quats] if _is_single_quat(quats) else list(quats)
+        if len(qq) == len(raw):
+            # Point for point. `raw` may carry None where IK had no answer --
+            # an unsolved point says nothing about the wrist, so it is dropped
+            # here rather than shifting every later pose onto the wrong tilt.
+            pairs = [(m.tilt_of(quat=q), _cable_wrist3_values([j]))
+                     for j, q in zip(raw, qq) if j is not None]
+        else:
+            # One orientation for the whole move, or a count that does not line
+            # up with the configurations: check every angle against every tilt.
+            pairs = [(m.tilt_of(quat=q), w) for q in qq]
+
+    band = None
+    for t, angles in pairs:
+        lo, hi, why = m.band_with_reason(tilt=t, margin_deg=margin_deg,
+                                         allow_outside=allow_outside)
+        band = (lo, hi)
+        bad = [x for x in angles if x < lo - 1e-9 or x > hi + 1e-9]
+        if bad:
+            worst = max(bad, key=lambda x: max(lo - x, x - hi))
+            raise CableRefused(
+                "%s would turn wrist 3 to %+.1f deg (the move spans %+.1f..%+.1f). "
+                "The cables allow %+.1f..%+.1f deg at %s. Nothing moved.\n"
+                "  This is an ABSOLUTE joint angle: turning the other way round "
+                "to the same tool orientation is a different cable state and is "
+                "not a fix.%s" % (what, math.degrees(worst),
+                                  math.degrees(min(angles)), math.degrees(max(angles)),
+                                  math.degrees(lo), math.degrees(hi), why,
+                                  _branch_note(worst, lo, hi)))
+    return band
+
+
+def wrist3_branch_in_band(wrist3_rad, band):
+    """The 2*pi-equivalent of `wrist3_rad` that lies inside `band`, or None.
+
+    A DIAGNOSTIC, AND NEVER A SUBSTITUTION. Nothing in this file may hand this
+    value to a motion: the cable physically wraps, so wrist_3 = -189.9 deg and
+    wrist_3 = +170.1 deg are the same tool ORIENTATION and different cable
+    states, and THE ABSOLUTE ANGLE GOVERNS. See the docstring of check_wrist3().
+
+    What it is FOR is telling the two failures apart, which the refusal alone
+    could not. When no branch of the requested angle is in band, the pose itself
+    is out of reach of the cables and the toolpath has to change. When one IS,
+    the pose is reachable and an IK SOLVER PICKED THE WRONG BRANCH -- a different
+    fault, in a different place, with a different fix, and the only one of the
+    two that a guard refusal reads as a false alarm.
+    """
+    lo, hi = float(band[0]), float(band[1])
+    x = float(wrist3_rad)
+    two_pi = 2.0*math.pi
+    # wrist_3 has +/-360 deg of travel on this arm (joint_limits.yaml), so at
+    # most one turn either way is a real alternative the solver could have taken.
+    for k in (-2, -1, 1, 2):
+        c = x + k*two_pi
+        if lo - 1e-9 <= c <= hi + 1e-9 and abs(c) <= two_pi + 1e-9:
+            return c
+    return None
+
+
+def _branch_note(worst_rad, lo, hi):
+    """The sentence a refusal adds when an in-band branch of the same
+    orientation existed. Empty when there is none."""
+    alt = wrist3_branch_in_band(worst_rad, (lo, hi))
+    if alt is None:
+        return ("\n  No turn of this joint reaches that orientation inside the "
+                "band, so this is the TOOLPATH asking for a pose the cables "
+                "cannot hold -- not a solver choice. Change the pose.")
+    return ("\n  BUT %+.1f deg -- the same tool orientation, one turn away -- IS "
+            "inside the band, so the arm CAN hold this pose and an IK solver "
+            "chose the branch that cannot. THE BUG IS UPSTREAM OF THIS GUARD. "
+            "Do not widen the band and do not substitute the branch here: make "
+            "whatever solved this pose prefer the in-band one, then ask again.\n"
+            "  One known cause: the guard judges a CartesianMove with "
+            "ros.SolveIK, which move_group serves, while the move itself is "
+            "executed by mtc_hub_node -- and under the `transit` profile, which "
+            "is what a cell holds outside a motion_profile() block, move_group "
+            "is `mode: global` and mtc_hub_node is `mode: local` "
+            "(tari_ur_description/config/motion_profiles.yaml). A global solver "
+            "does not follow its seed, so the guard is handed a branch a whole "
+            "turn from where the arm stands and refuses a move the executing "
+            "node would have solved in band. The guard is right about the angle "
+            "it was given; it was given the wrong angle."
+            % (math.degrees(alt),))
+
+
+def _is_single_quat(q):
+    try:
+        v = np.asarray(q, float)
+    except Exception:
+        return False
+    return v.ndim == 1 and v.size == 4
+
+
+def describe_cable_envelope():
+    """One block of text about the cable envelope in force, for a banner."""
+    m = cable_envelope_model()
+    if m is None:
+        return ("cable envelope: NONE MEASURED -- wrist 3 is unchecked. "
+                "capture_cable_envelope() measures it.")
+    return m.describe()

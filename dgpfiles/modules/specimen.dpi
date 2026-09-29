@@ -10,13 +10,14 @@
 # scan stage: one function, returning (mesh, x3d). Everything downstream is
 # unchanged.
 #
-# The default, source="auto", resolves to exactly what scenario B did before this
-# module existed: NOETHER_MESH if it is set, the synthesised test plate
-# otherwise. That is deliberate -- the 29-pass / 1740-trace acceptance scan has
-# to keep producing the same numbers, and it does that by taking the same branch
-# it always did.
+# The default, source="auto", is NOETHER_MESH if it is set and the synthesised
+# test plate otherwise. Keep it that way: the 29-pass / 1740-trace acceptance
+# scan is graded on those exact numbers, and it only produces them by taking that
+# branch.
 
 import os
+
+import numpy as np
 
 # A .dpi is compiled as a function body, so anything the including config needs
 # to see has to be declared global before it is assigned.
@@ -25,6 +26,17 @@ global reconstruct_specimen
 global specimen_mesh
 global specimen_x3d
 global specimen_source_used
+global SPECIMEN_SCENE_ID
+global SPECIMEN_SCENE_FRAME
+global SPECIMEN_SCENE_MAX_TRIANGLES
+global specimen_to_planning_scene
+global specimen_box_to_planning_scene
+global remove_specimen_from_scene
+global planning_scene_objects
+global allow_specimen_contact
+global specimen_scene_state
+global specimen_contact_allowed
+global _put_in_scene_if_there_is_one
 
 
 # The last mesh obtained, and how. Kept so a scan started from the prompt after a
@@ -34,11 +46,46 @@ specimen_x3d = None
 specimen_source_used = None
 
 
+def _put_in_scene_if_there_is_one(mesh, to_scene):
+    """Apply the specimen to the planning scene, unless there is no cell.
+
+    THE POINT OF THE WHOLE FILE, and the reason it is called from here rather
+    than left to the caller: every guard downstream -- tari_cpp_mtc's collision
+    callback, MoveIt's own state validity, the refusal that stops a row -- is a
+    no-op while the scene holds no world objects, and an arm that is checking
+    against an empty world will press a probe straight into the part. The moment
+    the pipeline knows what the part is and where, MoveIt should know too.
+
+    `to_scene=None` (the default) means "apply it if there is a planning scene".
+    A tree with no move_group -- an offline projection, a host-side test, a
+    config that only regrids a finished scan -- says so once and carries on. A
+    cell that HAS a planning scene and will not take the object raises: that is
+    the difference between "no guard was asked for" and "the guard was asked for
+    and is not there", and only the second one is dangerous.
+    """
+    if to_scene is False:
+        print("  NOT put in the planning scene (to_scene=False). Nothing is "
+              "checked against this part until specimen_to_planning_scene() is "
+              "called.")
+        return None
+    try:
+        planning_scene_objects()
+    except Exception as e:
+        if to_scene:
+            raise
+        print("  not put in the planning scene: %s" % (e,))
+        print("  NOTHING IS CHECKED AGAINST THE PART. That is correct with no "
+              "cell running and wrong with one; call "
+              "specimen_to_planning_scene() once move_group is up.")
+        return None
+    return specimen_to_planning_scene(mesh=mesh)
+
+
 def obtain_specimen_mesh(source=None, region=None, clean=None, cutoff=None,
-                         x3d=None, name="specimen", **kwargs):
+                         x3d=None, name="specimen", to_scene=None, **kwargs):
     """A mesh of the part and its parameterized X3D, from whichever route works.
 
-        "auto"     NOETHER_MESH if set, else the test plate   (today's behaviour)
+        "auto"     NOETHER_MESH if set, else the test plate
         "file"     NOETHER_MESH, and fail if it is not set
         "plate"    make_test_plate(), the regression specimen
         "azure"    rough reconstruction, Azure Kinect + TSDF
@@ -52,6 +99,12 @@ def obtain_specimen_mesh(source=None, region=None, clean=None, cutoff=None,
     A reconstructed mesh has no UV parameterization, so one is generated with
     Blender (mesh_to_x3d). The test plate already carries one, which is why that
     branch skips the step.
+
+    AND IT GOES IN THE PLANNING SCENE. Whatever route produced the mesh, this is
+    the moment the pipeline knows what the part is and where it is, so that is
+    the moment MoveIt is told -- see _put_in_scene_if_there_is_one() for what
+    `to_scene` None/True/False mean. Pass to_scene=False only when the intent is
+    that nothing be checked against the part.
     """
     global specimen_mesh, specimen_x3d, specimen_source_used
 
@@ -61,57 +114,69 @@ def obtain_specimen_mesh(source=None, region=None, clean=None, cutoff=None,
     if source == "auto":
         source = "file" if NOETHER_MESH else "plate"
 
-    if source == "file":
-        if not NOETHER_MESH:
+    # THE STAGE, as one named span. Everything under it -- the sweep, the
+    # filter, Blender, the planning scene -- reports inside it and indents under
+    # it, so the log says where a run is at the granularity an operator thinks
+    # in. The closing line is what says how long the whole stage took, and it
+    # prints when the stage fails or is killed as well -- without it there is no
+    # way to tell a stage that is still working from one that is wedged.
+    with progress("obtaining the specimen mesh (source=%s)" % (source,)) as stage:
+        if source == "file":
+            if not NOETHER_MESH:
+                raise ValueError(
+                    "SPECIMEN_SOURCE='file' but NOETHER_MESH is None. Set it, or use "
+                    "'plate' for the test specimen, or 'azure'/'keyence' to go and "
+                    "make a mesh.")
+            mesh = NOETHER_MESH
+            if not os.path.exists(mesh):
+                raise IOError("no such mesh: %s" % (mesh,))
+
+        elif source == "plate":
+            # Writes both formats, and the X3D it writes is already parameterized --
+            # so this branch returns early rather than going near Blender.
+            mesh, plate_x3d = make_test_plate(name=name if name != "specimen"
+                                              else "test_plate")
+            specimen_mesh, specimen_x3d, specimen_source_used = mesh, plate_x3d, source
+            _put_in_scene_if_there_is_one(mesh, to_scene)
+            stage.result("test plate %s" % (os.path.basename(mesh),))
+            return mesh, plate_x3d
+
+        elif source in ("azure", "keyence"):
+            mesh = reconstruct_specimen(source, region=region, name=name, **kwargs)
+
+        else:
             raise ValueError(
-                "SPECIMEN_SOURCE='file' but NOETHER_MESH is None. Set it, or use "
-                "'plate' for the test specimen, or 'azure'/'keyence' to go and "
-                "make a mesh.")
-        mesh = NOETHER_MESH
-        if not os.path.exists(mesh):
-            raise IOError("no such mesh: %s" % (mesh,))
+                "specimen source must be auto/file/plate/azure/keyence, not %r"
+                % (source,))
 
-    elif source == "plate":
-        # Writes both formats, and the X3D it writes is already parameterized --
-        # so this branch returns early rather than going near Blender.
-        mesh, plate_x3d = make_test_plate(name=name if name != "specimen"
-                                          else "test_plate")
-        specimen_mesh, specimen_x3d, specimen_source_used = mesh, plate_x3d, source
-        return mesh, plate_x3d
+        if clean and source in ("azure", "keyence"):
+            # Only reconstructions. A mesh put on disk deliberately is not this
+            # function's to filter, and the test plate is analytic.
+            #
+            # OFF by default (SPECIMEN_CLEAN_MESH). What crops is the cell's
+            # work volume, applied by the reconstruction itself before there is a
+            # vertex to filter. `cutoff` is here so a caller who knows their own
+            # specimen can still ask for a world-z cutoff plane deliberately; with no
+            # service falls through to loose-part removal, which keeps only the
+            # biggest connected component and says so.
+            mesh = clean_mesh(mesh, cutoff=cutoff)
+            print("  cleaned: %s" % mesh)
 
-    elif source in ("azure", "keyence"):
-        mesh = reconstruct_specimen(source, region=region, name=name, **kwargs)
+        if x3d is None:
+            x3d = mesh_to_x3d(mesh)
 
-    else:
-        raise ValueError(
-            "specimen source must be auto/file/plate/azure/keyence, not %r"
-            % (source,))
-
-    if clean and source in ("azure", "keyence"):
-        # Only reconstructions. A mesh someone put on disk deliberately is not
-        # ours to filter, and the test plate is analytic.
-        #
-        # OFF by default (SPECIMEN_CLEAN_MESH), and this used to pass a
-        # SPECIMEN_SUPPORT_Z world-z plane that has since been deleted -- see the
-        # constant's obituary in UTPlaneScan.dgp. What crops now is the cell's
-        # work volume, applied by the reconstruction itself before there is a
-        # vertex to filter. `cutoff` is here so a caller who knows their own
-        # specimen can still ask for the plane deliberately; with no cutoff the
-        # service falls through to loose-part removal, which keeps only the
-        # biggest connected component and says so.
-        mesh = clean_mesh(mesh, cutoff=cutoff)
-        print("  cleaned: %s" % mesh)
-
-    if x3d is None:
-        x3d = mesh_to_x3d(mesh)
-
-    specimen_mesh, specimen_x3d, specimen_source_used = mesh, x3d, source
+        specimen_mesh, specimen_x3d, specimen_source_used = mesh, x3d, source
+        _put_in_scene_if_there_is_one(mesh, to_scene)
+        stage.result("%s + %s" % (os.path.basename(mesh),
+                                  os.path.basename(x3d)))
     return mesh, x3d
 
 
 def reconstruct_specimen(source="azure", region=None, name="specimen",
                          rough_mesh=None, vel=None, acc=None, fly=None,
-                         settle_s=None, source_kwargs=None, **kwargs):
+                         settle_s=None, source_kwargs=None,
+                         expect_top_z=None, require_top=False,
+                         plan_only=False, **kwargs):
     """Fly a reconstruction sweep and return the mesh file it produced.
 
     source="azure"    a dome sweep over `region`, TSDF integrated.
@@ -125,13 +190,21 @@ def reconstruct_specimen(source="azure", region=None, name="specimen",
     `source_kwargs` goes to the ReconstructionSource's CONSTRUCTOR, which is
     where the parameters that decide what the sensor measures live -- the TSDF
     voxel size, the depth truncation, the motion gate, the profiler's line
-    spacing. **kwargs goes to the SWEEP instead. Without this the source was
-    built with no arguments and a rough mesh could only be made coarse enough to
-    plan over by driving the classes by hand from the prompt, which is how the
-    2026-08-16 run went and is exactly the "step you cannot press a button for"
-    that the direction section is about.
+    spacing. **kwargs goes to the SWEEP instead. Without the split the source is
+    constructed with no arguments, and making a rough mesh coarse enough to plan
+    over then means driving the classes by hand from the prompt.
+
+    `expect_top_z` is the world z of the top of the part, if anything knows it:
+    the mesh is checked against it and a short mesh is reported (or raised, with
+    require_top=True). None takes yolo_region()'s measured `surface_z` when the
+    region came from the detector, which is the case that matters -- see
+    _check_reached_the_top() below.
     """
-    region = SPECIMEN_REGION if region is None else region
+    # Checked HERE, in front of both sources and before anything is planned or
+    # the warning light comes on, because a bad region is what sends the arm
+    # somewhere unexpected. check_region()'s docstring has the failure mode.
+    region = check_region(SPECIMEN_REGION if region is None else region,
+                          "the %s reconstruction" % (source,), quiet=True)
     vel = MOVE_VELOCITY if vel is None else vel
     acc = MOVE_ACCEL if acc is None else acc
     source_kwargs = dict(source_kwargs or {})
@@ -146,22 +219,88 @@ def reconstruct_specimen(source="azure", region=None, name="specimen",
         # segments. Coarse is the requirement here, not a compromise.
         source_kwargs.setdefault("voxel_length", 0.006)
         source_kwargs.setdefault("sdf_trunc", 0.024)
+        # The DEPTH MODE, which is what decides how high the sweep must fly, and
+        # the only knob the standoff decision comes down to. Declared in the
+        # config so it is one line, and read here so both the range check and
+        # the derived height come from the same string.
+        source_kwargs.setdefault("depth_mode", globals().get("SPECIMEN_DEPTH_MODE"))
+        source_kwargs.setdefault("allow_dead_zone",
+                                 bool(globals().get("SPECIMEN_ALLOW_DEAD_ZONE", False)))
         src = AzureReconstruction(**source_kwargs)
         sweep_kwargs = dict(kwargs)
-        sweep_kwargs.setdefault("height", SPECIMEN_SWEEP_HEIGHT)
-        sweep_kwargs.setdefault("x", SPECIMEN_SWEEP_STOPS[0])
-        sweep_kwargs.setdefault("y", SPECIMEN_SWEEP_STOPS[1])
-        # No camera tilt by default. The tilt exists to see a part from more
-        # than one direction, which a closed surface needs; for anything the
-        # sweep looks down on it costs coverage instead, because a +/-15 degree
-        # tilt walks the footprint 94 mm at this standoff and pushes the edges
-        # of the part out of a frame that is only 0.46 x 0.34 m to begin with.
-        # Turn it back on for a part with real relief.
-        sweep_kwargs.setdefault("rot", False)
-        # None, so AzureReconstruction.reconstruct() derives the sweep speed
-        # from the measured frame rate. MOVE_VELOCITY is the speed for getting
-        # somewhere, not for measuring on the way.
-        vel = None
+        style = str(sweep_kwargs.pop("style", None)
+                    or globals().get("SPECIMEN_SWEEP_STYLE")
+                    or AZURE_SWEEP_STYLE_DEFAULT).lower()
+        sweep_kwargs["style"] = style
+        # WHAT THE SWEEP IS FOR, which is what decides how many viewing
+        # directions it must have before it is refused. Left to the config, then
+        # to AZURE_SWEEP_PURPOSES' default -- reconstruct_rough() in the
+        # automated scan passes purpose="planning" explicitly, because a rough
+        # surface for Noether to raster over IS a height field and refusing one
+        # for having a single viewing direction stops the pipeline at stage 2.
+        # See AZURE_SWEEP_PURPOSES in mesh_reconstruction.dpi.
+        if globals().get("SPECIMEN_SWEEP_PURPOSE") is not None:
+            sweep_kwargs.setdefault("purpose", SPECIMEN_SWEEP_PURPOSE)
+        if style == "pan":
+            # THE PAN SWEEP TAKES A RANGE, NOT A HEIGHT. Everything the depth
+            # mode decides is still decided by the depth mode -- the range to
+            # hold is its minimum plus the margin -- but the sweep buys that
+            # range sideways, so what is left to choose is how high to fly, and
+            # that is the arm's business rather than the camera's. None derives
+            # it from the work volume's ceiling: as near to straight down as the
+            # tool can be without leaving the cell's declared box.
+            if globals().get("SPECIMEN_SWEEP_CAMERA_HEIGHT") is not None:
+                sweep_kwargs.setdefault(
+                    "height", float(SPECIMEN_SWEEP_CAMERA_HEIGHT))
+            if globals().get("SPECIMEN_SWEEP_DIRECTIONS") is not None:
+                sweep_kwargs.setdefault("directions",
+                                        int(SPECIMEN_SWEEP_DIRECTIONS))
+            if globals().get("SPECIMEN_PAN_STOPS") is not None:
+                sweep_kwargs.setdefault("stops", tuple(SPECIMEN_PAN_STOPS))
+            # None, so reconstruct() derives the sweep speed from the measured
+            # frame rate, exactly as the dome branch below does.
+            vel = None
+        else:
+            # SPECIMEN_SWEEP_HEIGHT = None means DERIVE IT from the depth mode
+            # and the support the part rests on, which is what makes changing
+            # the mode a one-line change: the height follows. A number still
+            # overrides, and is still checked -- a hand-written 1.35 puts the
+            # camera 72 mm inside NFOV_UNBINNED's minimum. See the pan branch
+            # above for why this is not the default: the height it derives is
+            # not reachable everywhere.
+            height = SPECIMEN_SWEEP_HEIGHT
+            if height is None:
+                # FROM THE TOP OF THE PART, not from the bench. sweep_height_for
+                # defaults support_z to the work volume's floor and its own
+                # docstring calls that the conservative end -- it is not:
+                # a part standing 31 mm proud is 31 mm CLOSER to the camera
+                # than the bench, so floor + 530 mm is 499 mm from the part,
+                # inside NFOV_UNBINNED's 500 mm minimum, with the range check
+                # measuring from the same bench and reporting 530.
+                aim_z, aim_why = sweep_surface_z(region)
+                height = sweep_height_for(src.depth_mode, support_z=aim_z)
+                fw, fh, mm_px = depth_mode_footprint(src.depth_mode)
+                print("    sweep height %.3f derived from %s (%.0f mm minimum + "
+                      "%.0f mm margin above %s, z %.4f): the camera sees "
+                      "%.0f x %.0f mm at %.2f mm/pixel"
+                      % (height, src.depth_mode,
+                         1e3*AZURE_DEPTH_MODES[src.depth_mode][0],
+                         1e3*AZURE_STANDOFF_MARGIN, aim_why, aim_z,
+                         1e3*fw, 1e3*fh, mm_px))
+            sweep_kwargs.setdefault("height", height)
+            sweep_kwargs.setdefault("x", SPECIMEN_SWEEP_STOPS[0])
+            sweep_kwargs.setdefault("y", SPECIMEN_SWEEP_STOPS[1])
+            # No camera tilt by default. The tilt exists to see a part from more
+            # than one direction, which a closed surface needs; for anything the
+            # sweep looks down on it costs coverage instead, because a +/-15
+            # degree tilt walks the footprint 94 mm at this standoff and pushes
+            # the edges of the part out of a frame that is only 0.46 x 0.34 m to
+            # begin with. Turn it back on for a part with real relief.
+            sweep_kwargs.setdefault("rot", False)
+            # None, so AzureReconstruction.reconstruct() derives the sweep speed
+            # from the measured frame rate. MOVE_VELOCITY is the speed for
+            # getting somewhere, not for measuring on the way.
+            vel = None
     else:
         src = keyence_reconstruction_class(KEYENCE_BACKEND)(**source_kwargs)
         if rough_mesh is None:
@@ -173,13 +312,586 @@ def reconstruct_specimen(source="azure", region=None, name="specimen",
                 "pass rough_mesh=.")
         sweep_kwargs = dict(kwargs, mesh=rough_mesh)
         # The fine pass is slow by nature: the profiler needs the surface to
-        # cross its laser line at a rate it can resolve.
-        vel = min(vel, src.velocity)
-        acc = min(acc, src.velocity)
+        # cross its laser line at a rate it can resolve. That speed is a probe
+        # SPEED in m/s and CartesianMove takes a MoveIt SCALING, which is not
+        # the same number -- passing 0.01 straight through flew the raster at
+        # 15.6 mm/s.
+        #
+        # None, so _reconstruct() converts it, from THIS raster's own kinematics
+        # where IK can be had and from the cell-wide velocity curve where it
+        # cannot (path_motion_scaling). Converting here instead and handing down
+        # a scaling would SKIP the path-aware conversion entirely for this
+        # sensor -- _reconstruct() only converts when vel is None.
+        # src.sweep_velocity() carries the profiler's speed, the same way the
+        # Azure's carries the camera's.
+        vel = None
+        # ACCELERATION IS NOT CAPPED BY A VELOCITY SCALING.
+        # `min(acc, to_scaling(src.velocity))` compares two different quantities:
+        # to_scaling() answers "what scaling gives this SPEED", and using that
+        # number as an acceleration cap pins the Keyence raster to acc 0.0064
+        # against the Azure sweep's 0.1.
+        #
+        # Both scale the same joint limits, so the time to reach the commanded
+        # speed is (sv x vmax)/(sa x amax) -- with sa == sv that is a constant
+        # ~0.6 s per ramp however slow the move, and a raster row of a few
+        # centimetres is then mostly ramp. It cannot raise the peak speed; the
+        # velocity scaling still bounds that.
 
-    print("reconstructing the specimen with the %s (%s)"
-          % (source, type(src).__name__))
-    mesh = src.reconstruct(out, region=region, fly=fly, vel=vel, acc=acc,
-                           settle_s=settle_s, **sweep_kwargs)
-    print("  specimen mesh: %s" % mesh)
+    return _run_reconstruction(src, out, region, fly, vel, acc, settle_s,
+                               sweep_kwargs, plan_only, expect_top_z,
+                               require_top,
+                               "%s (%s)" % (source, type(src).__name__))
+
+
+global _run_reconstruction
+def _run_reconstruction(src, out, region, fly, vel, acc, settle_s, sweep_kwargs,
+                        plan_only, expect_top_z, require_top, source):
+    """The part of reconstruct_specimen() that takes the time, as one span.
+
+    Split out so the plan-and-fly is a named progress block without indenting
+    the parameter derivation above it. The sweep itself already prints its rows;
+    what this adds is a stage that says when it began, and how long it ran for
+    when it fails or is killed.
+    """
+    if plan_only:
+        # THE SAME PLAN THE RUN WOULD MAKE, because it is made by the same
+        # call with the same source and the same kwargs -- not by a parallel
+        # "checker" that can drift from it. A separate checker has reported 2
+        # admissible directions and margin +1 over the same region and cable
+        # file where the real plan found 0 of 8. Nothing moves here.
+        print("  PLAN ONLY -- nothing will move")
+        with progress("planning the %s sweep, nothing will move" % (source,),
+                      announce=True):
+            return src.plan_sweep(region=region, **sweep_kwargs)
+    # announce=True so this opens with a timestamped line WHEREVER it is called
+    # from. It is usually nested inside obtain_specimen_mesh(), and a nested
+    # block is silent by default (see rule 4 in progress.dpi) -- but the wall
+    # time the sweep started at is what a stalled run has to be diagnosed from.
+    with progress("reconstructing the specimen with the %s" % (source,),
+                  announce=True) as stage:
+        mesh = src.reconstruct(out, region=region, fly=fly, vel=vel, acc=acc,
+                               settle_s=settle_s, **sweep_kwargs)
+        print("  specimen mesh: %s" % mesh)
+        _check_reached_the_top(mesh, region, expect_top_z, require_top)
+        stage.result(os.path.basename(mesh))
     return mesh
+
+
+def _check_reached_the_top(mesh, region, expect_top_z, require_top):
+    """Did the mesh reach the top of the part, if anything knows where that is?
+
+    The detector already measured it: yolo_region() returns `surface_z`, the top
+    of the part, deprojected from the middle of its bounding box. So whenever a
+    region came from a detection there is a number the reconstruction can be
+    held to. Nothing else catches a sweep that stopped short of the crest: a
+    mesh 46 mm low is still dense and clean, and goes on to be the surface the
+    Keyence raster and the EC toolpath are planned over.
+
+    Reported, not raised, unless require_top=True: a part with a small top
+    relative to the detection box, or one the sweep only half covered, is a
+    weaker mesh rather than a wrong one. It is loud because nothing else here
+    says a word.
+
+    THE AUTHORITY CHAIN IS: the caller's `expect_top_z`, then the detector's
+    `surface_z`, then nothing -- and the line it prints says which one it used.
+    No taught point is consulted. The automated pipeline does not read operator
+    touch-offs at all; they belong to calibration and to the teach/capture
+    scenarios, where an operator is standing there. See the note below the
+    detector lookup for what this check can and cannot tell you as a result.
+    """
+    # WHAT THE DETECTOR THINKS, which is an AZURE measurement.
+    detector_top = None
+    if region is not None:
+        # Only when the region IS the detection's, so surface_z describes the
+        # part this sweep actually flew over.
+        detected = globals().get("detected_region")
+        if detected is not None and tuple(float(v) for v in detected) == tuple(region):
+            detector_top = (globals().get("detected_info") or {}).get("surface_z")
+
+    # WHAT THIS CHECK IS, AND WHAT IT IS NOT.
+    #
+    # With the detector's number, both sides of the comparison come from the
+    # same Azure depth image: yolo_region() deprojects it and the TSDF
+    # integrates it, so a RANGE BIAS in the camera cancels and this check
+    # cannot see it. It will report "-1.7 mm, within a 10 mm tolerance" and pass
+    # over a rough mesh that is 13 mm low, and the Keyence raster Noether plans
+    # over that mesh then flies 13.6 mm closer to the part than intended for the
+    # whole scan.
+    #
+    # So what this catches is COVERAGE -- a sweep that stopped short of the
+    # part's crest, a 46 mm miss being the common case.
+    # Camera-against-reality is a different question and has its own stage:
+    # gauge_mesh_against_keyence() at stage 2a (azure_gauge.dpi), which puts an
+    # independent sensor on the surface. Do not try to answer it here; there is
+    # no second measurement in this function to answer it with.
+    top = expect_top_z
+    authority = "the caller's expect_top_z"
+    if top is None and detector_top is not None:
+        top, authority = detector_top, "the detector's surface_z (an AZURE measurement)"
+    if top is None:
+        return None
+    print("    the part's top is taken from %s: z %.4f" % (authority, float(top)))
+
+    ok, measured, n = reconstruction_covers(mesh, float(top), footprint=region,
+                                            what="  the rough mesh")
+    if not ok:
+        text = ("the reconstruction is %.0f mm SHORT of the part's measured top "
+                "(%.4f against %.4f over %d vertices in the region). Everything "
+                "downstream plans over this surface, so a missing top is a "
+                "missing top in the toolpath too. Check that the part is in the "
+                "Gazebo world / in front of the camera, and that the sweep did "
+                "not fly inside the depth mode's minimum."
+                % (1e3*(float(top) - measured), measured, float(top), n))
+        if require_top:
+            raise RuntimeError(text)
+        print("    ** %s" % (text,))
+    return ok
+
+
+# ==============================================================================
+# AND PUT IT WHERE MOVEIT CAN SEE IT
+# ==============================================================================
+# A mesh of the part is not the same thing as the planner knowing the part is
+# there. With no specimen in the planning scene every collision check the arm
+# makes -- including the one tari_cpp_mtc's raster stage does -- is a check
+# against an empty world. That stage says so loudly ("Collision checking ...
+# against a planning scene with NO world objects"); this is the other half.
+#
+# WHY THE MESH, AND NOT A PRIMITIVE FITTED TO THE REGION.
+#
+# The tempting cheap option is a box over the detected region, the height of the
+# part. It is right for the cal plate and actively dangerous for the cylinder:
+# a box that contains a 63 mm cylinder is 63 mm tall everywhere, so the flank --
+# the only place the tooling has to get close to -- is buried inside the box
+# along with the air beside it. The planner
+# then refuses the poses that were fine and cannot distinguish them from the
+# poses that were not. On a curved part a bounding primitive is not a
+# conservative approximation of the surface; it is a different surface.
+#
+# The mesh is what both specimens already have, from the same reconstruction the
+# scan is planned over, in the same world coordinates. FCL meshes a BVH from it
+# and checks it exactly. So: the mesh, whichever stage produced it, and the
+# primitive only for the case where there is no mesh yet (specimen_box_...,
+# below) -- which is the Azure sweep, where the camera is 300+ mm away and a
+# bounding box costs nothing.
+#
+# REMOVABLE, because the eddy-current scan has to touch the part. Two ways, both
+# deliberate and neither accidental:
+#
+#   allow_specimen_contact(["ec_probe", "probe_holder"])   the pair is entered in
+#       the scene's allowed-collision matrix, so the probe may touch the
+#       specimen and nothing else on the tooling may. This is the one to use:
+#       the Keyence head and the Azure bracket keep their protection.
+#   remove_specimen_from_scene()   the object goes away entirely. Blunt, and
+#       only right when the specimen is about to be replaced.
+#
+# Note that RasterScan.action -- what ros.CartesianMove speaks -- has no
+# allow_contact_links field, unlike JointMove.action, so a Cartesian pass cannot
+# declare contact per move. The scene's matrix is what is available, which is
+# why it lives here rather than at the call site.
+
+#: What the specimen is called in the planning scene. One name, so a second
+#: reconstruction REPLACES the object rather than adding a second one -- an
+#: ADD with an existing id is an update in MoveIt.
+SPECIMEN_SCENE_ID = "specimen"
+
+#: The frame the reconstructions are already in.
+SPECIMEN_SCENE_FRAME = "world"
+
+#: Above this, the mesh is clustered down before it is applied. FCL builds a BVH
+#: over every triangle and MTC pulls the whole scene over a service call at the
+#: start of every task, so an unreduced Poisson mesh (hundreds of thousands of
+#: triangles) costs real time on every plan. Both specimens at this cell are far
+#: below it, so nothing in normal use is touched.
+SPECIMEN_SCENE_MAX_TRIANGLES = 60000
+
+#: What the last apply did, so a scan started later from the prompt can ask.
+specimen_scene_state = None
+specimen_contact_allowed = ()
+
+
+def _cluster_mesh(verts, tris, max_triangles):
+    """Reduce a mesh by snapping vertices to a grid, until it fits the budget.
+
+    Vertex clustering rather than edge collapse because it needs no library and
+    cannot fold a surface over on itself. It moves the surface by up to half the
+    grid diagonal, so the grid is reported and the clearance check's own pad is
+    sized in the same units.
+    """
+    verts = np.asarray(verts, dtype=np.float64)
+    tris = np.asarray(tris, dtype=np.int64)
+    if tris.shape[0] <= max_triangles:
+        return verts, tris, 0.0
+    extent = verts.max(axis=0) - verts.min(axis=0)
+    grid = float(np.linalg.norm(extent))/200.0
+    for _ in range(12):
+        keys = np.round(verts/grid).astype(np.int64)
+        uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+        centres = np.zeros((uniq.shape[0], 3))
+        counts = np.bincount(inverse, minlength=uniq.shape[0]).astype(np.float64)
+        for k in range(3):
+            centres[:, k] = np.bincount(inverse, weights=verts[:, k],
+                                        minlength=uniq.shape[0])/counts
+        newtris = inverse[tris]
+        keep = ((newtris[:, 0] != newtris[:, 1]) & (newtris[:, 1] != newtris[:, 2])
+                & (newtris[:, 0] != newtris[:, 2]))
+        newtris = newtris[keep]
+        if newtris.shape[0] <= max_triangles:
+            return centres, newtris, grid
+        grid *= 1.5
+    return centres, newtris, grid
+
+
+def _apply_scene_diff(scene, timeout=30.0):
+    """Send one PlanningScene diff to move_group. The READ-BACK is the verdict.
+
+    Not the acknowledgement, and this is measured rather than defensive: a diff
+    carrying a 6000-triangle mesh is applied -- the object is in the scene
+    afterwards, checked -- and the reply does not always come back within 30 s
+    on this middleware, while the same call with a primitive answers instantly.
+    A 150 kB request over Fast DDS is the difference.
+
+    So a missing reply is reported and not raised on. Every caller verifies what
+    is actually in the scene afterwards, which is the only thing that matters
+    and is what would have to be checked anyway.
+    """
+    try:
+        # Up to `timeout` seconds of silence on a big mesh, and the case this
+        # function exists for is the one where the reply never comes -- so the
+        # heartbeat is the difference between "waiting for move_group" and
+        # "wedged".
+        with progress("applying the planning scene diff", heartbeat=True):
+            res = call_ros_service("apply_scene", {"scene": scene},
+                                   timeout=timeout, wait=10.0)
+    except RuntimeError as e:
+        if "did not answer" not in str(e):
+            raise
+        print("  (move_group did not acknowledge the scene diff within %.0f s; "
+              "checking what is in the scene instead)" % (timeout,))
+        return None
+    if not getattr(res, "success", False):
+        raise RuntimeError(
+            "move_group REFUSED the planning scene diff. Without it the "
+            "specimen is not in the scene, and every collision check the arm "
+            "makes is against an empty world -- nothing stops the tooling being "
+            "driven into the part.")
+    return res
+
+
+def _empty_diff():
+    from moveit_msgs.msg import PlanningScene
+    scene = PlanningScene()
+    scene.is_diff = True
+    scene.robot_state.is_diff = True
+    return scene
+
+
+def specimen_to_planning_scene(mesh=None, object_id=None, frame=None,
+                               max_triangles=None, verify=True):
+    """Put the specimen mesh in the planning scene as a collision object.
+
+    mesh defaults to the last one obtain_specimen_mesh() produced, so the honest
+    sequence -- reconstruct, then scan -- needs no path typed twice.
+
+    Returns a dict with what was applied: the object id, the triangle count, the
+    bounding box in world, and the clustering grid if the mesh was reduced.
+    """
+    global specimen_scene_state
+    from moveit_msgs.msg import CollisionObject
+    from shape_msgs.msg import Mesh, MeshTriangle
+    from geometry_msgs.msg import Point, Pose
+
+    mesh = specimen_mesh if mesh is None else mesh
+    if mesh is None:
+        raise ValueError(
+            "there is no specimen mesh yet, so there is nothing to put in the "
+            "scene. obtain_specimen_mesh() first, or pass mesh=. For the stage "
+            "BEFORE a mesh exists use specimen_box_to_planning_scene().")
+    object_id = SPECIMEN_SCENE_ID if object_id is None else object_id
+    frame = SPECIMEN_SCENE_FRAME if frame is None else frame
+    max_triangles = (SPECIMEN_SCENE_MAX_TRIANGLES if max_triangles is None
+                     else max_triangles)
+
+    verts, _normals, tris = read_ply_mesh(mesh)
+    verts, tris, grid = _cluster_mesh(verts, tris, max_triangles)
+
+    msg = Mesh()
+    msg.vertices = [Point(x=float(v[0]), y=float(v[1]), z=float(v[2]))
+                    for v in verts]
+    msg.triangles = [MeshTriangle(vertex_indices=[int(t[0]), int(t[1]), int(t[2])])
+                     for t in tris]
+
+    obj = CollisionObject()
+    obj.header.frame_id = frame
+    obj.id = object_id
+    obj.meshes = [msg]
+    obj.mesh_poses = [Pose()]
+    obj.mesh_poses[0].orientation.w = 1.0
+    obj.operation = CollisionObject.ADD
+
+    scene = _empty_diff()
+    scene.world.collision_objects = [obj]
+    _apply_scene_diff(scene)
+
+    lo = verts.min(axis=0)
+    hi = verts.max(axis=0)
+    state = {"id": object_id, "frame": frame, "mesh": mesh,
+             "triangles": int(tris.shape[0]), "vertices": int(verts.shape[0]),
+             "cluster_grid_m": grid,
+             "bbox": (tuple(lo), tuple(hi))}
+    print("planning scene: %r is %d triangles of %s in %s"
+          % (object_id, state["triangles"], os.path.basename(mesh), frame))
+    print("  x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f m"
+          % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+    if grid:
+        print("  reduced to fit %d triangles on a %.1f mm grid; the surface may "
+              "have moved by up to %.1f mm"
+              % (max_triangles, grid*1e3, grid*np.sqrt(3.0)/2.0*1e3))
+    if verify:
+        names = planning_scene_objects()
+        if object_id not in names:
+            raise RuntimeError(
+                "move_group accepted the diff but %r is not in the scene "
+                "afterwards (it holds: %s). Nothing is being avoided."
+                % (object_id, ", ".join(names) or "nothing"))
+        print("  move_group confirms the scene holds: %s" % (", ".join(names),))
+    specimen_scene_state = state
+    return state
+
+
+def specimen_box_to_planning_scene(region=None, height=None, support_z=None,
+                                   object_id=None, frame=None, pad=0.0,
+                                   verify=True):
+    """A box over the detected region, for the stage before a mesh exists.
+
+    The Azure sweep is the case: nothing has measured the part yet, the camera
+    is at arm's length, and what the planner needs is "something is here, do not
+    fly through it". `region` is (xmin, ymin, xmax, ymax) -- checked, because
+    that tuple order is easy to get wrong -- `support_z` is the
+    surface the part rests on and `height` how tall it is above that.
+
+    Deliberately NOT the representation a scan uses. See the note at the top of
+    this section: a box over a cylinder buries the flank the tooling has to get
+    close to.
+    """
+    global specimen_scene_state
+    from moveit_msgs.msg import CollisionObject
+    from shape_msgs.msg import SolidPrimitive
+    from geometry_msgs.msg import Pose
+
+    region = check_region(SPECIMEN_REGION if region is None else region,
+                          "the planning-scene box", quiet=True)
+    object_id = SPECIMEN_SCENE_ID if object_id is None else object_id
+    frame = SPECIMEN_SCENE_FRAME if frame is None else frame
+    if support_z is None:
+        volume = work_volume()
+        if volume is None:
+            raise ValueError("no work volume, so no support height; pass "
+                             "support_z=")
+        support_z = float(volume[2][0]) - 0.0015   # the floor is support + 1.5 mm
+    if height is None:
+        raise ValueError(
+            "a box needs a height: how far above %.4f m the part stands. "
+            "Measure it (the reconstruction's own mesh extent, or the Keyence) "
+            "rather than guessing -- a box that is too short is worse than no "
+            "box." % (support_z,))
+
+    xmin, ymin, xmax, ymax = [float(v) for v in region]
+    prim = SolidPrimitive()
+    prim.type = SolidPrimitive.BOX
+    prim.dimensions = [abs(xmax - xmin) + 2*pad, abs(ymax - ymin) + 2*pad,
+                       float(height) + 2*pad]
+    pose = Pose()
+    pose.orientation.w = 1.0
+    pose.position.x = 0.5*(xmin + xmax)
+    pose.position.y = 0.5*(ymin + ymax)
+    pose.position.z = float(support_z) + 0.5*float(height)
+
+    obj = CollisionObject()
+    obj.header.frame_id = frame
+    obj.id = object_id
+    obj.primitives = [prim]
+    obj.primitive_poses = [pose]
+    obj.operation = CollisionObject.ADD
+
+    scene = _empty_diff()
+    scene.world.collision_objects = [obj]
+    _apply_scene_diff(scene)
+    print("planning scene: %r is a %.0f x %.0f x %.0f mm box centred at "
+          "(%.3f, %.3f, %.3f) in %s"
+          % (object_id, prim.dimensions[0]*1e3, prim.dimensions[1]*1e3,
+             prim.dimensions[2]*1e3, pose.position.x, pose.position.y,
+             pose.position.z, frame))
+    state = {"id": object_id, "frame": frame, "box": tuple(prim.dimensions),
+             "centre": (pose.position.x, pose.position.y, pose.position.z)}
+    if verify:
+        names = planning_scene_objects()
+        if object_id not in names:
+            raise RuntimeError("move_group accepted the diff but %r is not in "
+                               "the scene (it holds: %s)"
+                               % (object_id, ", ".join(names) or "nothing"))
+    specimen_scene_state = state
+    return state
+
+
+def remove_specimen_from_scene(object_id=None, verify=True):
+    """Take the specimen out of the planning scene.
+
+    For replacing a part, or for a stage that has decided -- deliberately, and
+    having said so -- that it wants no collision checking against the specimen
+    at all. Prefer allow_specimen_contact() for a contact scan: it keeps the
+    Keyence and the Azure protected.
+    """
+    global specimen_scene_state, specimen_contact_allowed
+    from moveit_msgs.msg import CollisionObject
+
+    object_id = SPECIMEN_SCENE_ID if object_id is None else object_id
+    obj = CollisionObject()
+    obj.id = object_id
+    obj.header.frame_id = SPECIMEN_SCENE_FRAME
+    obj.operation = CollisionObject.REMOVE
+    scene = _empty_diff()
+    scene.world.collision_objects = [obj]
+    _apply_scene_diff(scene)
+    print("planning scene: %r removed. NOTHING is checked against it until it "
+          "is put back." % (object_id,))
+    if verify:
+        names = planning_scene_objects()
+        if object_id in names:
+            raise RuntimeError("%r is still in the scene after a REMOVE"
+                               % (object_id,))
+    specimen_scene_state = None
+    specimen_contact_allowed = ()
+    return True
+
+
+def planning_scene_objects():
+    """The names of the world objects move_group currently holds."""
+    from moveit_msgs.msg import PlanningSceneComponents
+    comp = PlanningSceneComponents()
+    comp.components = PlanningSceneComponents.WORLD_OBJECT_NAMES
+    res = call_ros_service("get_scene", {"components": comp}, timeout=30.0,
+                           wait=10.0)
+    return [o.id for o in res.scene.world.collision_objects]
+
+
+def _read_acm(comp, attempts=3):
+    """get_scene for the allowed-collision matrix, retried. See below."""
+    for attempt in range(attempts):
+        try:
+            return call_ros_service("get_scene", {"components": comp},
+                                    timeout=30.0, wait=10.0)
+        except RuntimeError as e:
+            if attempt == attempts - 1 or "did not answer" not in str(e):
+                raise
+            print("  the allowed-collision matrix did not come back within 30 s "
+                  "(attempt %d of %d); move_group is busy -- retrying"
+                  % (attempt + 1, attempts))
+
+
+def allow_specimen_contact(links=None, allow=True, object_id=None):
+    """Enter (or clear) "this link may touch the specimen" in the scene's matrix.
+
+    The eddy-current scan is a CONTACT scan: the probe is meant to be on the
+    part, and a planner that refuses contact refuses the measurement. So the
+    contact is declared, by name, for the links that make it -- and only those.
+    Everything else on the tooling still has to clear the specimen, which is the
+    whole point: a standoff stage that plans only for its own sensor can
+    otherwise drive the contact probe on the same plate into the part, and such
+    a stage allows nothing.
+
+    The matrix is read from move_group, modified and written back whole, because
+    MoveIt's diff handling REPLACES the matrix when a diff carries one. Reading
+    first is what keeps the robot's own self-collision pairs from the SRDF.
+
+    The read is RETRIED, because the first matrix query after a large mesh is
+    applied can take longer than the 30 s the service call allows: a
+    13 200-triangle specimen goes in and reads back fine, and the very next
+    query -- for the matrix -- times out, then answers at once on a second
+    attempt, because move_group is building its BVH. A retry is right where a
+    longer timeout is not: it says something is slow rather than hanging on it.
+    """
+    global specimen_contact_allowed
+    from moveit_msgs.msg import PlanningSceneComponents, AllowedCollisionEntry
+
+    object_id = SPECIMEN_SCENE_ID if object_id is None else object_id
+    links = (list(TOOLING_CONTACT_LINKS) if links is None else list(links))
+
+    comp = PlanningSceneComponents()
+    comp.components = PlanningSceneComponents.ALLOWED_COLLISION_MATRIX
+    res = _read_acm(comp)
+    acm = res.scene.allowed_collision_matrix
+    names = list(acm.entry_names)
+    values = [list(row.enabled) for row in acm.entry_values]
+
+    unknown = [l for l in links if l not in names]
+    if unknown:
+        # A misspelled link name would silently allow nothing. The failure mode
+        # of "nothing" here is a refused scan rather than a collision, but the
+        # refusal looks like a planner fault, so name the bad link instead.
+        raise ValueError(
+            "the planning scene has no link(s) %s, so naming them allows "
+            "nothing. The scene knows: %s"
+            % (unknown, ", ".join(sorted(n for n in names
+                                         if not n.startswith("<"))[:40])))
+    for name in [object_id]:
+        if name not in names:
+            names.append(name)
+            for row in values:
+                row.append(False)
+            values.append([False]*len(names))
+    # Square it up: a matrix read back can be ragged if an object was added
+    # between components.
+    for row in values:
+        while len(row) < len(names):
+            row.append(False)
+
+    oi = names.index(object_id)
+    for link in links:
+        li = names.index(link)
+        values[li][oi] = bool(allow)
+        values[oi][li] = bool(allow)
+
+    scene = _empty_diff()
+    scene.allowed_collision_matrix.entry_names = names
+    scene.allowed_collision_matrix.entry_values = [
+        AllowedCollisionEntry(enabled=row) for row in values]
+    _apply_scene_diff(scene)
+    # Read it back: the acknowledgement is not the authority, the scene is.
+    res = _read_acm(comp)
+    back = res.scene.allowed_collision_matrix
+    got = list(back.entry_names)
+    # WHAT "NOT IN THE MATRIX" MEANS, and it is not the same in both directions.
+    # MoveIt's ACM message carries only the entries that are not default, so an
+    # object nothing is allowed to touch is absent from entry_names entirely.
+    # Absent therefore means "allowed nothing", which IS the answer when clearing
+    # and is a failure when asserting. Measured against a live move_group:
+    # allow -> the name appears with both links; clear -> the name is gone AND
+    # the row that was legal becomes invalid again (contact specimen/ec_probe).
+    # The entry does persist -- nothing republishes the scene underneath it, and
+    # re-applying the collision object does not clear it.
+    if allow and object_id not in got:
+        raise RuntimeError(
+            "%r is not in the allowed-collision matrix after the diff, so the "
+            "contact declaration did not take and the scan that needs contact "
+            "would be refused. Check that the scene still holds the object "
+            "(planning_scene_objects()) -- re-adding it is what drops the row."
+            % (object_id,))
+    landed = []
+    if object_id in got:
+        oi = got.index(object_id)
+        landed = [got[i] for i, row in enumerate(back.entry_values)
+                  if oi < len(row.enabled) and row.enabled[oi]]
+    missing = [l for l in links if (l in landed) != bool(allow)]
+    if missing:
+        raise RuntimeError(
+            "the matrix came back with %s %s %r, which is not what was asked"
+            % (missing, "not allowed to touch" if allow else "still allowed to touch",
+               object_id))
+    specimen_contact_allowed = tuple(links) if allow else ()
+    print("planning scene: contact with %r is now %s for %s. Everything else on "
+          "the tooling is still checked against it (the matrix is %d x %d, so "
+          "the robot's own pairs survived)."
+          % (object_id, "ALLOWED" if allow else "refused", ", ".join(links),
+             len(got), len(back.entry_values)))
+    return tuple(links)

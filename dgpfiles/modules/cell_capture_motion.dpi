@@ -1,0 +1,2066 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  cell_capture_motion.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Motion gate for cell data capture: speed limits, work envelope, cable
+#   band and operator preview.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# CELL CAPTURE, PART 2: the motion gate
+# ==============================================================================
+# Every motion the capture tool makes -- its own, and the pipeline's when a
+# scenario flies the pipeline -- goes through here. APPROVED CELL LIMITS, and
+# where each one is enforced:
+#
+#   * previewed in RViz and confirmed at the prompt before it runs: the ARM
+#     going through the motion on /display_planned_path, which the
+#     MotionPlanning display in the shipped RViz configs animates, plus the path
+#     as a line and the waypoints on /capture/preview_markers and
+#     /capture/preview.
+#     NO SHIPPED RVIZ CONFIG SUBSCRIBES TO THOSE TWO -- no .rviz in
+#     tari_ur_description or tari_ur_soft_launch mentions either topic, so the
+#     line and the waypoints are not on screen and only the arm animation is.
+#     Adding a MarkerArray display on /capture/preview_markers to
+#     view_robot.rviz and view_simbot.rviz is the missing half; until then
+#     preview_audience() says so before every confirmation.
+#   * at most CAPTURE_SPEED_AWAY away from the part and CAPTURE_SPEED_NEAR near
+#     it, enforced three ways (see _Monitor):
+#       - BEFORE: the MoveIt scaling is bounded from the joint velocity limits
+#         MoveIt itself applies (read from mtc_hub_node), through IK along a
+#         Cartesian path or FK along a joint move, so no checked point of the
+#         tooling can exceed 0.8-0.85 x the limit; the cell's velocity
+#         calibration can only make it slower;
+#       - DURING: the tool's speed is measured from TF, in TF's own stamps; above
+#         CAPTURE_OVERSPEED_FACTOR x the limit the arm is STOPPED (UR program
+#         paused on hardware, the trajectory replaced by a hold in simulation)
+#         and the scenario ends;
+#       - AFTER: a measured peak above the limit (+CAPTURE_SPEED_TOLERANCE) is
+#         reported as OVER THE LIMIT, never "ok", and every later move of that
+#         kind is slowed by the measured ratio;
+#   * nothing outside the work volume: every straight-line leg is sampled at
+#     5 mm and every joint move through FK at 2 degrees, and one sample outside
+#     the box refuses the move;
+#   * the warning light on (the scenario holds it; see cell_capture_take.dpi).
+#
+# The pipeline's motions are gated by swapping `ros` for a proxy for the length
+# of a scenario (gated_pipeline()); pipeline code looks `ros` up as a global at
+# call time, so reconstruct_specimen() and run_automated_scan() run unchanged,
+# with every CartesianMove / JointMove / MoveJoints / ApproachInConfiguration /
+# FreeMove confirmed.
+#
+# ONE of those rules is not only for capture sessions. The cable envelope --
+# how far wrist 3 may turn before the loom binds -- has to hold on EVERY motion
+# this cell makes, scenario or not. install_cable_guard() wraps `ros` for the
+# WHOLE session using the same proxy design, with no prompts and only that one
+# question; see THE CABLE GUARD at the bottom of this file, and
+# cable_envelope.dpi for the model.
+
+# Each .dpi is its own function body: another part's imports are not visible.
+import collections
+import contextlib
+import math
+import os
+import threading
+import time
+
+import numpy as np
+
+global capture_envelope
+global near_context
+global capture_move
+global capture_move_joints
+global capture_approach
+global capture_transit
+global gated_pipeline
+global _cable_limits_file
+global install_cable_guard
+global remove_cable_guard
+global cable_guard_off
+global cable_guard_on
+global CABLE_GUARD_IK_SAMPLES
+global CABLE_GUARD_EXECUTORS
+global CABLE_GUARD_REQUIRE_MEASUREMENT
+global logged_service_calls
+global _cap_pose
+global _cap_xyzq
+global _cap_q_axis
+global _cap_densify
+global _check_envelope
+global _speed_class
+global _Stub
+global _local_ik
+global _check_wrist3
+global _ik_target
+global _load_cable_limits
+global preview_audience
+global _preview_audience_line
+
+
+#: The preview publishers, and who is supposed to be listening to each.
+PREVIEW_AUDIENCE = (
+    ("marker_pub", "/capture/preview_markers", "RViz (the path and waypoints)"),
+    ("display_pub", "/display_planned_path", "RViz MotionPlanning (the arm animating)"),
+    ("preview_pub", "/capture/preview", "the recorder (replayable poses)"),
+)
+
+
+def preview_audience():
+    """How many subscribers each preview topic has. {topic: (count, who)}.
+
+    THE PREVIEW IS A SAFETY FEATURE AND IT CAN FAIL SILENTLY. A publish to a
+    topic nothing has discovered succeeds: _preview() reports no error and the
+    events are recorded as sent, while the recorder's own graph poll shows
+    `absent: /capture/events, /capture/preview` for the whole take. The operator
+    then confirms motions with no way to know whether the arm in RViz is the arm
+    that is about to move.
+
+    A publisher with no subscriber is exactly as quiet as a broken one, which is
+    why this is asked rather than assumed. rclpy answers it locally, from the
+    publisher's own matched-subscription count, so it needs nothing on the
+    graph to be working.
+    """
+    out = {}
+    for attr, topic, who in PREVIEW_AUDIENCE:
+        pub = getattr(capture_node, attr, None)
+        try:
+            n = int(pub.get_subscription_count()) if pub is not None else -1
+        except Exception:
+            n = -1
+        out[topic] = (n, who)
+    return out
+
+
+def _preview_audience_line(audience=None):
+    """One line naming the preview topics nobody is listening to, or ""."""
+    audience = preview_audience() if audience is None else audience
+    dark = ["%s (%s)" % (t, who) for t, (n, who) in sorted(audience.items())
+            if n <= 0]
+    if not dark:
+        return ""
+    hint = ("Is RViz up, and is it the shipped config (view_robot.rviz / "
+            "view_simbot.rviz)?")
+    if audience.get("/capture/preview_markers", (1,))[0] <= 0:
+        # Known: no shipped .rviz has a display for it. See the header comment.
+        hint = ("No shipped RViz config has a MarkerArray display on "
+                "/capture/preview_markers -- add one (Add > By topic) and the "
+                "path and waypoints appear. " + hint)
+    return ("NOBODY IS RECEIVING THE PREVIEW on %s. What you are about to "
+            "confirm is NOT on screen. %s" % (", ".join(dark), hint))
+
+
+def _cap_q_axis(axis, angle):
+    a = np.asarray(axis, float)
+    a = a/np.linalg.norm(a)
+    s = math.sin(angle/2.0)
+    return (a[0]*s, a[1]*s, a[2]*s, math.cos(angle/2.0))
+
+
+def _cap_pose(xyz, q):
+    from geometry_msgs.msg import Pose, Quaternion
+    p = Pose()
+    p.position.x, p.position.y, p.position.z = [float(v) for v in xyz]
+    p.orientation = Quaternion(x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3]))
+    return p
+
+
+def _cap_xyzq(p):
+    """(xyz ndarray, xyzw tuple) from a Pose, PoseStamped, TransformStamped or pair."""
+    if hasattr(p, "pose"):
+        p = p.pose
+    if hasattr(p, "transform"):
+        t, r = p.transform.translation, p.transform.rotation
+        return np.array([t.x, t.y, t.z]), (r.x, r.y, r.z, r.w)
+    if hasattr(p, "position"):
+        o = p.orientation
+        return (np.array([p.position.x, p.position.y, p.position.z]),
+                (o.x, o.y, o.z, o.w))
+    xyz, q = p
+    return np.asarray(xyz, float).reshape(3), tuple(float(v) for v in q)
+
+
+def _cap_densify(points, step=0.005):
+    pts = [np.asarray(p, float) for p in points]
+    out = [pts[0]]
+    for a, b in zip(pts, pts[1:]):
+        n = max(1, int(math.ceil(np.linalg.norm(b - a)/step)))
+        out.extend(a + (b - a)*k/float(n) for k in range(1, n + 1))
+    return np.array(out)
+
+
+def capture_envelope():
+    """Where the ARM may go: the motion volume when the cell declares one, else
+    the work volume's x/y from its floor up to CAPTURE_ABOVE_VOLUME over its top.
+    None when no volume is declared at all.
+
+    `top` and `floor` stay the WORK volume's either way, because they are what
+    the rest of this file means by them -- the height a part may reach and the
+    surface it stands on, used to choose transit heights and speed classes. Only
+    the BOUNDS move.
+
+    See motion_volume() in work_cell.dpi for why the two are different questions.
+    Holding the whole tooling inside the part box is a constraint nobody wants:
+    the Keyence's 73 mm lateral offset puts probe_end on the work volume's wall
+    while the laser is correctly over the part, and the sweep cannot be entered.
+    """
+    vol = work_volume()
+    if vol is None:
+        return None
+    _frame, lo, hi = vol
+    env = {"lo": np.asarray(lo, float), "hi": np.asarray(hi, float),
+           "top": float(hi[2]), "floor": float(lo[2]),
+           "ceiling": float(hi[2]) + float(CAPTURE_ABOVE_VOLUME),
+           "bounds": "the work volume"}
+    mv = globals().get("motion_volume")
+    mv = mv(quiet=True) if callable(mv) else None
+    if mv is not None:
+        _mframe, mlo, mhi = mv
+        env.update(lo=np.asarray(mlo, float), hi=np.asarray(mhi, float),
+                   floor=float(mlo[2]), ceiling=float(mhi[2]),
+                   bounds="the motion volume")
+    return env
+
+
+def _check_envelope(points, what, tol=0.001, allow_entry=True):
+    """Refuse a path that leaves the envelope.
+
+    A path that STARTS outside -- the arm parked over the table, or wherever
+    the pendant left it, including ON the table below the floor, where
+    touch-off leaves the tip by construction -- may enter, provided that once
+    inside it stays inside and nothing on the way in is below the floor or
+    below where it started. Leaving is refused."""
+    env = capture_envelope()
+    if env is None:
+        raise CaptureRefused(
+            "%s: cell %s mode %s has no work volume, and nothing moves without "
+            "one. Measure it with capture_touch_off()." % (what, CELL_NAME, CELL_MODE))
+    p = np.asarray(points, float).reshape(-1, 3)
+    lo, hi = env["lo"], env["hi"]
+    inside = ((p[:, 0] >= lo[0] - tol) & (p[:, 0] <= hi[0] + tol) &
+              (p[:, 1] >= lo[1] - tol) & (p[:, 1] <= hi[1] + tol) &
+              (p[:, 2] >= env["floor"] - tol) & (p[:, 2] <= env["ceiling"] + tol))
+    if inside.all():
+        return env
+    if allow_entry and not inside[0] and inside.any():
+        k = int(np.argmax(inside))
+        if inside[k:].all() and (p[:k, 2] >= min(env["floor"], p[0, 2]) - tol).all():
+            _capture_say("  %s starts outside the work volume and enters it" % what)
+            return env
+    p = p[~inside] if inside[0] else p
+    bad = []
+    for axis, name in ((0, "x"), (1, "y")):
+        if (p[:, axis] < lo[axis] - tol).any():
+            bad.append("%s %.3f < %.3f" % (name, p[:, axis].min(), lo[axis]))
+        if (p[:, axis] > hi[axis] + tol).any():
+            bad.append("%s %.3f > %.3f" % (name, p[:, axis].max(), hi[axis]))
+    if (p[:, 2] < env["floor"] - tol).any():
+        bad.append("z %.3f below the floor %.3f" % (p[:, 2].min(), env["floor"]))
+    if (p[:, 2] > env["ceiling"] + tol).any():
+        bad.append("z %.3f above the motion ceiling %.3f" % (p[:, 2].max(), env["ceiling"]))
+    if bad:
+        raise CaptureRefused("%s would leave the work volume: %s. Nothing moved."
+                             % (what, "; ".join(bad)))
+    return env
+
+
+@contextlib.contextmanager
+def near_context(points):
+    """Tell the gate where the part is, for the length of a block.
+
+    Inside it, "near" means within CAPTURE_NEAR_DISTANCE of those points or of
+    the table; outside it, anywhere below the top of the work volume is near."""
+    prev = _CAP.get("near_points")
+    _CAP["near_points"] = None if points is None else np.asarray(points, float).reshape(-1, 3)
+    try:
+        yield
+    finally:
+        _CAP["near_points"] = prev
+
+
+def _speed_class(samples):
+    env = capture_envelope()
+    p = np.asarray(samples, float).reshape(-1, 3)
+    known = _CAP.get("near_points")
+    d = float(CAPTURE_NEAR_DISTANCE)
+    if known is not None and len(known):
+        sub = p[::max(1, len(p)//400)]
+        dist = np.sqrt(((sub[:, None, :] - known[None, :, :])**2).sum(-1)).min()
+        near = dist < d or (p[:, 2] < env["floor"] + d).any()
+    else:
+        near = (p[:, 2] < env["top"] + 1e-3).any()
+    return ("near", float(CAPTURE_SPEED_NEAR)) if near else ("away", float(CAPTURE_SPEED_AWAY))
+
+
+def _scaling_for(speed):
+    f = globals().get("motion_scaling")
+    if f is not None:
+        return float(f(speed))
+    cal = globals().get("ROBOT_VELOCITY_CALIBRATION")
+    return float(velocity_scaling_for(speed, cal)) if cal else float(speed)
+
+
+def _speed_of_scaling(s):
+    """The tool speed a MoveIt scaling produces, from the cell's calibration
+    (commanded scaling -> observed m/s), for capping a scaling pipeline code
+    asked for. Below the table: its first ratio; above it: its last slope --
+    the curve saturates, so this errs slow, which is the safe way round."""
+    s = float(s)
+    cal = globals().get("ROBOT_VELOCITY_CALIBRATION")
+    f = globals().get("velocity_from_scaling")
+    if cal and f:
+        return float(f(s, cal))
+    if not cal:
+        return s*1.6
+    xs = [float(a) for a, _b in cal]
+    ys = [float(b) for _a, b in cal]
+    if s <= xs[0]:
+        return s*ys[0]/xs[0]
+    if s >= xs[-1]:
+        return ys[-1] + (s - xs[-1])*(ys[-1] - ys[-2])/(xs[-1] - xs[-2])
+    return float(np.interp(s, xs, ys))
+
+
+def _slerp(qa, qb, t):
+    qa, qb = np.asarray(qa, float), np.asarray(qb, float)
+    d = float(np.dot(qa, qb))
+    if d < 0.0:
+        qb, d = -qb, -d
+    if d > 0.9995:
+        q = qa + t*(qb - qa)
+        return q/np.linalg.norm(q)
+    th = math.acos(d)
+    return (math.sin((1.0 - t)*th)*qa + math.sin(t*th)*qb)/math.sin(th)
+
+
+def _path_samples(points, step=0.01, max_samples=60):
+    """(xyz, quat) along straight legs, about every `step` m or 5 degrees."""
+    out = [points[0]]
+    for (xa, qa), (xb, qb) in zip(points, points[1:]):
+        ang = 2.0*math.degrees(math.acos(min(1.0, abs(float(np.dot(qa, qb))))))
+        n = max(1, int(math.ceil(np.linalg.norm(np.asarray(xb) - np.asarray(xa))/step)),
+                int(math.ceil(ang/5.0)))
+        for k in range(1, n + 1):
+            t = k/float(n)
+            out.append((np.asarray(xa) + t*(np.asarray(xb) - np.asarray(xa)),
+                        tuple(_slerp(qa, qb, t))))
+    if len(out) > max_samples:
+        idx = sorted(set(np.linspace(0, len(out) - 1, max_samples).round().astype(int)))
+        out = [out[i] for i in idx]
+    return out
+
+
+def _head_offset():
+    """probe_end -> the Keyence HEAD (lj_v7080_frame), in probe_end's frame.
+
+    The speed bound checks the probe tip and this: the physical sensor body.
+    NOT lj_v7080_optical_frame, which is not tooling at all but the point 80+ mm
+    out along the beam where the surface is measured -- the farthest point from
+    any rotation, so bounding it makes a tilt crawl at ~1.3 mm/s at the tip to
+    keep an imaginary point under 8 mm/s."""
+    off = _CAP.get("head_offset")
+    if off is None:
+        try:
+            import rclpy.time
+            t = capture_node.tf_buffer.lookup_transform("probe_end", "lj_v7080_frame",
+                                                        rclpy.time.Time())
+            tr = t.transform.translation
+            off = np.array([tr.x, tr.y, tr.z])
+            _CAP["head_offset"] = off
+        except Exception:
+            off = None
+    return off
+
+
+def _joint_vmax():
+    """The joint velocity limits MoveIt applies, rad/s (capture_node.planning_vmax)."""
+    try:
+        return np.asarray(capture_node.planning_vmax(), float)
+    except Exception:
+        return np.asarray(UR_JOINT_VMAX, float)
+
+
+def _gain(kind):
+    return float((_CAP.get("speed_gain") or {}).get(kind, 1.0))
+
+
+@contextlib.contextmanager
+def _local_ik():
+    """move_group's IK in 'local' mode for a block, so a seeded solution stays
+    in the seed's branch and an IK chain along a line is a path the arm can
+    actually follow. (The transit profile leaves move_group GLOBAL, where a seed
+    is only a starting guess, and a transit fallback solved that way can swing
+    the tip clear across the cell -- to x 0.075, z -0.309.) Nests; restores what
+    was there."""
+    depth = int(_CAP.get("ik_local_depth", 0))
+    _CAP["ik_local_depth"] = depth + 1
+    prev = None
+    if depth == 0:
+        try:
+            prev = _CAP["real_ros"].SetIKMode("local")
+        except Exception as e:
+            _capture_say("  (could not put move_group's IK in local mode: %s)" % (e,))
+    try:
+        yield
+    finally:
+        _CAP["ik_local_depth"] = depth
+        if depth == 0 and prev and prev != "local":
+            try:
+                _CAP["real_ros"].SetIKMode(prev)
+            except Exception:
+                pass
+
+
+def _cable_limits_file():
+    """Where capture_cable_envelope() writes its measurement on THIS machine.
+
+    cable_envelope.dpi looks this up by name and prefers it over the manifest
+    when it exists, so a session on the machine that just ran the test uses the
+    fresh numbers and every other session uses the manifest.
+    """
+    return os.path.join(os.path.expanduser(CAPTURE_ROOT),
+                        "cable_limits_%s_%s.json" % (CELL_NAME, CELL_MODE))
+
+
+def _load_cable_limits(quiet=True):
+    """Kept for the call in cell_capture.dpi and at the prompt: load the cable
+    envelope and say what it is. The model lives in cable_envelope.dpi now --
+    per tilt, not one intersected window."""
+    return cable_envelope_reload(quiet=quiet)
+
+
+def _check_wrist3(qs, what, quats=None):
+    """Refuse a move that would turn wrist 3 outside the cable band FOR ITS TILT.
+
+    `qs` are the joint configurations the move passes through; `quats` are the
+    tool orientations commanded, which is what selects the band -- an untilted
+    pose has 270 degrees of travel and a pose tilted -40 about world x has 75.
+    One number for both refuses capture runs at angles nowhere near a cable.
+
+    No measurement yet: no check, and it says so once. The cable test comes
+    second at a new cell precisely because the arm has to be able to move before
+    the cables have been measured -- and the test is itself a motion.
+    """
+    if _CAP.get("wrist3_unchecked") or _CAP.get("cable_guard_off"):
+        return
+    try:
+        check_wrist3(qs, what, quats=quats,
+                     require=bool(CABLE_GUARD_REQUIRE_MEASUREMENT))
+    except CableRefused as e:
+        raise CaptureRefused(str(e))
+
+
+global path_motion_scaling
+def path_motion_scaling(poses, speed, quiet=True):
+    """The MoveIt scaling that moves the tooling along THIS path at `speed`.
+
+    None when IK along the path cannot be had, so the caller falls back to
+    motion_scaling() -- the cell-wide velocity curve.
+
+    WHY A PATH NEEDS ITS OWN NUMBER. motion_scaling() is one curve, measured on
+    0.3 m scanning rows, and it maps a speed to a scaling as if every path had
+    the same Jacobian. They do not, and the error is not small or one-signed.
+    Measured on this cell:
+
+        a Keyence calibration pose set    full scale 0.26..0.85 m/s
+        free-space row near the part      full scale 2.17 m/s
+        the curve assumes                 about 1.55 m/s
+
+    So the same curve asks for 10 mm/s and delivers 2.5 on one path and 17 on
+    another. Undershooting costs time -- a Keyence calibration set run off the
+    curve flies at a median 0.30 of the speed commanded and takes 29 minutes.
+    OVERshooting costs the measurement: a reconstruction sweep flown faster than
+    sweep_velocity() opens the accumulator's motion gate on travel for which no
+    frame exists, and the mesh comes back with holes in it.
+
+    THE 0.8 IS NOT SPARE MARGIN, it is the model's own bias. |dp| / max_i(|dq_i|
+    / vmax_i) is a lower bound on the time a segment takes, so it under-states
+    the speed -- by about 22% on hardware (predicted 5.4 mm/s, measured 6.6).
+    0.8/1.22 is 0.98, and moves whose scaling comes from this bound land at
+    0.85..0.94 of what they ask for.
+    """
+    P = [_cap_xyzq(p) for p in poses]
+    if len(P) < 2:
+        return None
+    try:
+        path = _path_samples(P)
+        with _local_ik():
+            qs = _ik_along(path, capture_node.current_joints())
+    except Exception as e:                                    # noqa: BLE001
+        if not quiet:
+            print("    (no IK along the path, so the cell-wide velocity curve "
+                  "decides the scaling: %s)" % (e,))
+        return None
+    s, full = _cartesian_scaling_bound(path, qs, float(speed))
+    if full is None:
+        if not quiet:
+            print("    (IK did not solve along this path, so the cell-wide "
+                  "velocity curve decides the scaling)")
+        return None
+    return float(s)
+
+
+def _cartesian_scaling_bound(path, qs, v_limit):
+    """The largest MoveIt scaling at which no checked point of the tooling can
+    exceed v_limit along this path, from IK along it and the joint limits.
+
+    ROBOT_VELOCITY_CALIBRATION is an AVERAGE over 0.3 m rows, ramps
+    included, and it under-predicts the peak of a longer move by about 2x
+    (measured in sim: a move asked for at 50 mm/s peaked at 106). A segment
+    cannot be crossed faster than its slowest joint allows, so at scaling 1
+    its points move at most |dp| / max_i(|dq_i|/vmax_i)."""
+    offs = [np.zeros(3)]
+    off = _head_offset()
+    if off is not None:
+        offs.append(off)
+    full = 0.0
+    vj = _joint_vmax()
+    for k in range(1, len(path)):
+        if qs[k] is None or qs[k - 1] is None:
+            return float(v_limit)/float(CAPTURE_FULL_SCALE_MPS), None
+        t = float(np.max(np.abs(np.asarray(qs[k]) - np.asarray(qs[k - 1]))/vj))
+        if t < 1e-9:
+            continue
+        for o in offs:
+            pa = path[k - 1][0] + quat_to_matrix(path[k - 1][1]).dot(o)
+            pb = path[k][0] + quat_to_matrix(path[k][1]).dot(o)
+            full = max(full, float(np.linalg.norm(pb - pa))/t)
+    if full <= 0.0:
+        return float(v_limit)/float(CAPTURE_FULL_SCALE_MPS), None
+    return 0.8*float(v_limit)/full, full
+
+
+def _ik_along(path, q0):
+    real = _CAP["real_ros"]
+    qs, seed = [], q0
+    for x, q in path:
+        try:
+            qk = real.SolveIK(_cap_pose(x, q), seed=seed, timeout=0.5)
+        except Exception:
+            qk = None
+        qs.append(list(qk) if qk is not None else None)
+        if qk is not None:
+            seed = qk
+    return qs
+
+
+def _ik_chain(P, q0, max_points=20):
+    """Joint values along a Cartesian path, for the RViz preview only."""
+    real = _CAP["real_ros"]
+    idx = sorted(set(np.linspace(0, len(P) - 1, min(len(P), max_points)).round().astype(int)))
+    qs = [list(q0)] if q0 else []
+    seed = q0
+    for i in idx:
+        try:
+            q = real.SolveIK(_cap_pose(*P[i]), seed=seed)
+        except Exception:
+            q = None
+        if q is not None:
+            qs.append(list(q))
+            seed = q
+    return qs
+
+
+def _preview(label, P=(), path_points=None, joint_path=None, cls="away"):
+    from geometry_msgs.msg import PoseArray, Point
+    from visualization_msgs.msg import Marker, MarkerArray
+    from moveit_msgs.msg import DisplayTrajectory, RobotTrajectory
+    from trajectory_msgs.msg import JointTrajectoryPoint
+    from builtin_interfaces.msg import Duration
+    try:
+        pa = PoseArray()
+        pa.header.frame_id = "world"
+        pa.poses = [_cap_pose(x, q) for x, q in P]
+        capture_node.preview_pub.publish(pa)
+        ma = MarkerArray()
+        clear = Marker()
+        clear.action = Marker.DELETEALL
+        ma.markers.append(clear)
+        colour = (1.0, 0.45, 0.0) if cls == "near" else (0.1, 0.8, 0.2)
+        pts = [] if path_points is None else list(path_points)
+        if len(pts) > 1500:
+            pts = pts[::int(math.ceil(len(pts)/1500.0))] + [pts[-1]]
+        for mid, (mtype, scale, points) in enumerate((
+                (Marker.LINE_STRIP, 0.003, pts),
+                (Marker.SPHERE_LIST, 0.008, [x for x, _q in P]))):
+            m = Marker()
+            m.header.frame_id = "world"
+            m.ns = "capture"
+            m.id = mid + 1
+            m.type = mtype
+            m.action = Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = scale
+            m.color.r, m.color.g, m.color.b, m.color.a = colour + (1.0,)
+            m.points = [Point(x=float(a[0]), y=float(a[1]), z=float(a[2])) for a in points]
+            if len(m.points) >= (2 if mtype == Marker.LINE_STRIP else 1):
+                ma.markers.append(m)
+        if P or pts:
+            t = Marker()
+            t.header.frame_id = "world"
+            t.ns = "capture"
+            t.id = 10
+            t.type = Marker.TEXT_VIEW_FACING
+            t.action = Marker.ADD
+            at = (P[0][0] if P else pts[-1])
+            t.pose.position.x, t.pose.position.y = float(at[0]), float(at[1])
+            t.pose.position.z = float(at[2]) + 0.06
+            t.pose.orientation.w = 1.0
+            t.scale.z = 0.025
+            t.color.r = t.color.g = t.color.b = t.color.a = 1.0
+            t.text = label
+            ma.markers.append(t)
+        capture_node.marker_pub.publish(ma)
+        if joint_path and len(joint_path) >= 2:
+            dt = DisplayTrajectory()
+            dt.trajectory_start.joint_state.name = list(UR_JOINTS)
+            dt.trajectory_start.joint_state.position = [float(v) for v in joint_path[0]]
+            rt = RobotTrajectory()
+            rt.joint_trajectory.joint_names = list(UR_JOINTS)
+            for k, q in enumerate(joint_path):
+                pt = JointTrajectoryPoint()
+                pt.positions = [float(v) for v in q]
+                ts = 0.25*k
+                pt.time_from_start = Duration(sec=int(ts), nanosec=int((ts % 1.0)*1e9))
+                rt.joint_trajectory.points.append(pt)
+            dt.trajectory.append(rt)
+            capture_node.display_pub.publish(dt)
+    except Exception as e:
+        _capture_say("  (preview failed: %s)" % (e,))
+    # A publish that nobody has discovered looks identical to one that worked.
+    # Said once per change of state rather than per motion, because a warning on
+    # every move is a warning nobody reads -- but it IS repeated in the confirm
+    # prompt itself, which is the moment it matters.
+    line = _preview_audience_line()
+    if line != _CAP.get("preview_dark"):
+        _CAP["preview_dark"] = line
+        if line:
+            _capture_say("  ** " + line)
+        else:
+            _capture_say("  preview is being received (%s)"
+                         % ", ".join("%s x%d" % (t, n) for t, (n, _w)
+                                     in sorted(preview_audience().items())))
+
+
+class _Stub(object):
+    """What a skipped move returns to pipeline code that expects a result."""
+    class result(object):
+        success = False
+        fraction = 0.0
+
+
+class _Monitor(object):
+    """Measures the tool's speed (and the wrench, on contact moves) while a
+    move runs, and stops the arm when either goes over.
+
+    Speed is the chord over >= 0.1 s of the tool's TF positions, timed by
+    TF's OWN STAMPS (capture_node.tip). NOT by the wall clock of live_pose's
+    polls: under load TF arrives in bursts, so 0.3 s of motion delivered inside
+    0.15 s of wall time reads double, and a 50 mm/s move measures 82.8 and is
+    still called "ok". live_pose is used only if no TF stamps arrive at all
+    (source "poll" in the move record)."""
+
+    WINDOW_S = 0.10
+
+    def __init__(self, limit, label, force_limit=None):
+        self.limit = float(limit)
+        self.label = label
+        self.force_limit = force_limit
+        self.max_v = 0.0
+        self.max_force = None
+        self.violations = 0
+        self.stopped = None
+        self.why = None
+        self.samples = 0
+        self.source = "tf"
+        self._stop = threading.Event()
+        self._t0 = capture_node.tip_latest_stamp() or 0
+        w = capture_node.recent_wrench(0.5)
+        self.f0 = w[:, :3].mean(0) if w is not None else None
+
+    def __enter__(self):
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self.t.join(timeout=2.0)
+        return False
+
+    def _trip(self, why):
+        self.violations += 1
+        if self.stopped is None:
+            self.why = why
+            try:
+                self.stopped = capture_node.stop_arm() or "NOT STOPPED: no way to stop it"
+            except Exception as e:
+                self.stopped = "NOT STOPPED: %s" % (e,)
+
+    def _add(self, hist, t, p):
+        self.samples += 1
+        hist.append((t, np.asarray(p, float)))
+        while len(hist) > 2 and hist[-1][0] - hist[1][0] >= self.WINDOW_S:
+            hist.popleft()
+        span = hist[-1][0] - hist[0][0]
+        if span >= self.WINDOW_S - 1e-6:
+            v = float(np.linalg.norm(hist[-1][1] - hist[0][1])/span)
+            self.max_v = max(self.max_v, v)
+            if v > self.limit*float(CAPTURE_OVERSPEED_FACTOR):
+                self._trip("overspeed: %.1f mm/s measured, %.1f allowed"
+                           % (v*1e3, self.limit*1e3))
+
+    def _run(self):
+        hist = collections.deque()
+        last = self._t0
+        t_start = time.monotonic()
+        poll, last_poll = False, None
+        while not self._stop.is_set():
+            if not poll:
+                rows = capture_node.tip_since(last)
+                if rows:
+                    last = rows[-1][0]
+                    for st, x, y, z in rows:
+                        self._add(hist, st*1e-9, (x, y, z))
+                elif self.samples == 0 and time.monotonic() - t_start > 1.5:
+                    poll, self.source = True, "poll"
+            else:
+                snap = live_pose.snapshot()
+                if snap is not None and snap[2] != last_poll:
+                    last_poll = snap[2]
+                    self._add(hist, snap[2], snap[0])
+            if self.force_limit and self.f0 is not None:
+                w = capture_node.recent_wrench(0.1)
+                if w is not None:
+                    f = float(np.linalg.norm(w[:, :3] - self.f0, axis=1).max())
+                    self.max_force = max(self.max_force or 0.0, f)
+                    if f > self.force_limit:
+                        self._trip("force change %.1f N, %.1f allowed" % (f, self.force_limit))
+            time.sleep(0.02)
+
+
+def _slow_down(kind, limit, peak):
+    """A move of this kind went faster than allowed: scale every later one down
+    by the measured ratio (with 10% to spare). Per session; never speeds up."""
+    g = _CAP.setdefault("speed_gain", {})
+    old = float(g.get(kind, 1.0))
+    new = max(0.05, old*0.9*float(limit)/float(peak))
+    g[kind] = min(old, new)
+    _capture_say("  measured %.1f mm/s against %.1f allowed: every later %s move now "
+                 "goes at %.0f%% of its computed scaling" % (peak*1e3, limit*1e3, kind,
+                                                            100.0*g[kind]))
+
+
+def _record_move(rec):
+    take = _CAP.get("take")
+    rec = dict(rec)
+    rec["event"] = "move"
+    if take is not None:
+        take.moves.append(rec)
+    capture_node.event(rec)
+    v = rec.get("observed_max_mps")
+    if rec.get("stopped"):
+        state = "STOPPED (%s; %s)" % (rec.get("stop_reason"), rec["stopped"])
+    elif rec.get("ok"):
+        state = "OVER THE LIMIT" if rec.get("over_limit") else "ok"
+    elif rec.get("answer", "go") != "go":
+        state = rec["answer"]
+    else:
+        state = "FAILED (planner %.0f%%)" % (100.0*float(rec.get("fraction") or 0.0))
+    if state == "ok" and rec.get("over_limit"):
+        state = "OVER THE LIMIT"
+    _capture_say("    %s: %s%s" % (
+        rec["label"], state,
+        (", peak %.1f mm/s of %.1f allowed (%.1f commanded%s)"
+         % (v*1e3, rec["limit_mps"]*1e3, rec["commanded_mps"]*1e3,
+            "" if rec.get("speed_source", "tf") == "tf" else ", poll-timed"))
+        if v else ""))
+
+
+def _after_move(mon, rec, res, raise_on_fail, what):
+    ok = bool(getattr(getattr(res, "result", None), "success", False))
+    peak = float(mon.max_v)
+    over = peak > float(rec["limit_mps"])*(1.0 + float(CAPTURE_SPEED_TOLERANCE))
+    rec.update(ok=ok, fraction=float(getattr(getattr(res, "result", None), "fraction", 1.0 if ok else 0.0) or 0.0),
+               observed_max_mps=peak, speed_source=mon.source, speed_samples=mon.samples,
+               over_limit=over, violations=mon.violations, stopped=mon.stopped,
+               stop_reason=mon.why, max_force_change_n=mon.max_force,
+               t1_ros_ns=capture_node.now_ns())
+    if over:
+        _slow_down(rec["kind"], rec["limit_mps"], peak)
+    _record_move(rec)
+    if mon.stopped:
+        raise CaptureStopped("%s: %s -- %s.%s" % (
+            what, mon.why, mon.stopped,
+            " Check the cell, then press play on the pendant." if CELL_MODE == "hardware" else ""))
+    if not ok and raise_on_fail:
+        raise CaptureMotionFailed("%s did not complete (planner reached %.0f%%)"
+                                  % (what, rec["fraction"]*100.0))
+    return res
+
+
+def _decide(label, prompt, rec, raise_on_fail, extra=None):
+    ans = confirm(prompt, extra)
+    rec["answer"] = ans
+    if ans == "go":
+        return None
+    _record_move(rec)
+    if extra and ans in extra.values():
+        return ans
+    if ans == "abort":
+        raise CaptureAbort(label)
+    if raise_on_fail:
+        raise CaptureSkip(label)
+    return _Stub()
+
+
+global _cap_where_it_lands
+def _cap_where_it_lands(P):
+    """"probe_end ... and the Keyence at ..." for the last pose of a move.
+
+    EVERY preview and every confirm prompt is drawn in probe_end, because that
+    is the frame a move commands. For a Keyence scenario that means the operator
+    is asked to approve a marker sitting ~75 mm to the SIDE of the feature they
+    taught, with a label like "to the first pose over flat" that reads as if the
+    tip were over it. The move is right; the picture is not, and it reads as if
+    the tooling offset were being ignored.
+
+    So say both, always, derived from the commanded pose itself -- no scenario
+    has to pass anything, and a scenario that forgot to apply the offset shows
+    up here as a laser point that is nowhere near the taught feature.
+    """
+    try:
+        x, q = P[-1]
+        x = np.asarray(x, float).reshape(3)
+        line = "  probe_end -> (%.4f, %.4f, %.4f)" % (x[0], x[1], x[2])
+        off = None
+        try:
+            off = _cap_keyence_offset()
+        except Exception:
+            off = None
+        if off is not None:
+            o = x + quat_to_matrix(q).dot(off)
+            line += "   Keyence measures at (%.4f, %.4f, %.4f)" % (o[0], o[1], o[2])
+        return line
+    except Exception:
+        return ""
+
+
+def capture_move(poses, label, speed=None, scaling=None, min_fraction=1.0,
+                 raise_on_fail=True, force_limit=None):
+    """A straight-line (Cartesian) move from where the tool is through `poses`.
+
+    Checked against the work volume at 5 mm and against the cable envelope,
+    speed-bounded, previewed, confirmed, monitored. `scaling` is a MoveIt
+    scaling somebody else asked for (pipeline code); it is honoured only as far
+    as the speed rule allows."""
+    P = [_cap_xyzq(p) for p in poses]
+    snap = live_pose.snapshot()
+    if snap is None:
+        raise CaptureRefused("%s: no TF for probe_end" % label)
+    cur = (np.asarray(snap[0], float), tuple(snap[1]))
+    samples = _cap_densify([cur[0]] + [x for x, _q in P])
+    _check_envelope(samples, label)
+    cls, vmax = _speed_class(samples)
+    v = min([vmax] + [s for s in (speed, _speed_of_scaling(scaling) if scaling else None) if s])
+    path = _path_samples([cur] + P)
+    with _local_ik():
+        qs = _ik_along(path, capture_node.current_joints())
+    # The ORIENTATION at every sampled point, so each one is judged against the
+    # band for the tilt it is actually commanding. A Cartesian move may tilt as
+    # it goes, and the tightest tilt is not always the one at the end.
+    _check_wrist3(qs, label, quats=[q for _x, q in path])
+    s_bound, full_scale = _cartesian_scaling_bound(path, qs, v)
+    # THE PATH'S OWN KINEMATICS DECIDE THE SCALING, not the cell-wide velocity
+    # curve, whenever IK along the path succeeded (full_scale is not None).
+    #
+    # NOT min(curve, bound): that makes every move as slow as the more
+    # pessimistic of two estimates of different quality. The curve is ONE number
+    # per speed, measured on 0.3 m scanning rows; the bound is computed from
+    # this path's joint excursions. They disagree most where the path is nothing
+    # like a scanning row -- a calibration pose set, where consecutive poses
+    # differ by 50 degrees of tilt and 30 mm of travel, so the joints move a
+    # long way for very little tip motion and `full_scale` falls to 0.26 m/s
+    # against the 2-4 m/s of a row.
+    #
+    # MEASURED OVER 50 Cartesian moves at the cell:
+    #   where the bound already bound (verify, pipeline)  0.85..0.94 x commanded
+    #   where the curve bound     (keyence and azure cal) 0.12..0.67 x commanded
+    # -- 14 keyence calibration moves flew at a median 0.30 of the 10 mm/s they
+    # were commanded at, and the set took 29 minutes. Nothing was near a limit:
+    # 0 over the speed limit, 0 stopped, worst peak 0.66 x its limit.
+    #
+    # This is not a loosening of the speed rule. The bound is derived FROM the
+    # limit -- it is the scaling at which no checked point of the tooling can
+    # exceed 0.8 x v_limit, given the joint velocity limits MoveIt enforces --
+    # and _Monitor still watches TF in flight and stops the move on a real
+    # excursion. The curve remains the fallback for a path IK could not solve,
+    # where there is nothing else to go on.
+    s = s_bound if full_scale is not None else min(_scaling_for(v), s_bound)
+    if scaling:
+        s = min(s, float(scaling))
+    s *= _gain("cartesian")
+    # ACCELERATION IS NOT THE SAME KNOB AS VELOCITY and pinning them together
+    # costs the short moves. Both scale the joint limits, so the time to reach
+    # the commanded speed is (sv x vmax)/(sa x amax) -- constant at sv == sa,
+    # about 0.6 s per ramp on this arm. A 150 s calibration move does not care.
+    # A five-waypoint sweep row of 86 mm does: ten ramps in an 11 s move, which
+    # is why it peaked at 13 mm/s of the 30 it was commanded at while its
+    # scaling was already at the kinematic bound.
+    #
+    # ONLY AWAY FROM THE PART. The reconstruction sweep flies acc 0.1 against
+    # vel 0.02 on every row with no protective stop and nothing over the speed
+    # limit, so that much is measured -- but it is measured in free space,
+    # clear of anything. Near the part, and in
+    # anything that may touch it, acceleration stays tied to velocity until
+    # there is evidence for it there too. Raising acceleration does not raise
+    # the peak speed; the velocity scaling still bounds that, and _Monitor
+    # still watches TF.
+    acc = s
+    if cls == "away":
+        acc = min(CAPTURE_ACC_SCALING_MAX, max(s, CAPTURE_ACC_SCALING_FLOOR))
+    length = float(np.linalg.norm(np.diff(samples, axis=0), axis=1).sum())
+    _preview(label, P, samples, [q for q in qs if q is not None], cls)
+    rec = {"label": label, "kind": "cartesian", "class": cls, "limit_mps": vmax,
+           "commanded_mps": v, "scaling": s, "scaling_calibrated": _scaling_for(v),
+           "scaling_bound": s_bound, "full_scale_mps": full_scale,
+           "acc_scaling": acc,
+           "gain": _gain("cartesian"), "waypoints": len(P), "length_m": length,
+           "t0_ros_ns": capture_node.now_ns()}
+    _lands = _cap_where_it_lands(P)
+    stub = _decide(label, "%s\n  %d waypoint(s), %.0f mm straight-line, %s the part: "
+                   "%.1f mm/s%s" % (label, len(P), length*1e3, cls, v*1e3,
+                                    ("\n" + _lands) if _lands else ""),
+                   rec, raise_on_fail)
+    if stub is not None:
+        return stub
+    timeout = max(300.0, 3.0*length/max(v, 1e-3) + 60.0)
+    with _Monitor(vmax, label, force_limit) as mon:
+        res = _CAP["real_ros"].CartesianMove([_cap_pose(x, q) for x, q in P], vel=s, acc=acc,
+                                             min_fraction=min_fraction,
+                                             result_timeout=timeout)
+    return _after_move(mon, rec, res, raise_on_fail, label)
+
+
+def capture_move_joints(q_target, label, speed=None, scaling=None, raise_on_fail=True,
+                        links=("probe_end", "lj_v7080_frame"), extra=None,
+                        check_wrist=True):
+    """A joint-space move, checked and speed-bounded through forward kinematics.
+
+    The path is sampled every 2 degrees of the largest joint change; the probe
+    tip must stay in the envelope at every sample. The velocity scaling is the
+    largest for which no checked link can exceed 0.85 x the class speed limit,
+    given the joint velocity limits MoveIt applies: tip speed <= |dp/dlambda|max
+    x dlambda/dt, and dlambda/dt <= scaling x min_i(vmax_i/|dq_i|)."""
+    q0 = capture_node.current_joints()
+    if q0 is None:
+        raise CaptureRefused("%s: joint_states are not arriving" % label)
+    q0 = np.asarray(q0, float)
+    q1 = np.asarray(q_target, float).reshape(6)
+    dq = np.abs(q1 - q0)
+    if dq.max() < 1e-5:
+        return "noop"
+    n = int(min(60, max(8, math.degrees(dq.max())/2.0)))
+    lam = np.linspace(0.0, 1.0, n)
+    path = [q0 + l*(q1 - q0) for l in lam]
+    fks = [capture_node.fk(q, links=links) for q in path]
+    if any(f is None for f in fks):
+        links = ("probe_end",)
+        fks = [capture_node.fk(q, links=links) for q in path]
+    if any(f is None for f in fks):
+        raise CaptureRefused("%s: /compute_fk did not answer; the move cannot be "
+                             "checked, so it is not made" % label)
+    tip = np.array([f[0][0] for f in fks])
+    _check_envelope(tip, label)
+    # AFTER the FK, not before it, so the band is chosen at the tilt each
+    # interpolated configuration actually puts the tool at. A joint move has no
+    # commanded orientation to read -- FK is the only thing that knows -- and
+    # checking it against the untilted band instead was over-restrictive at
+    # x +40 (301 deg rather than the measured 327) and permissive at x -40.
+    if check_wrist:
+        _check_wrist3([list(q) for q in path], label,
+                      quats=[f[0][1] for f in fks])
+    cls, vmax = _speed_class(tip)
+    v = min([vmax] + [x for x in (speed,) if x])
+    vj = _joint_vmax()
+    lam_rate = min(vj[i]/dq[i] for i in range(6) if dq[i] > 1e-9)
+    dpdl = 0.0
+    for k in range(len(links)):
+        pts = np.array([f[k][0] for f in fks])
+        dpdl = max(dpdl, float(np.linalg.norm(np.diff(pts, axis=0), axis=1).max())*(n - 1))
+    s = 0.85*v/(dpdl*lam_rate) if dpdl > 1e-9 else 0.05
+    if scaling:
+        s = min(s, float(scaling))
+    s *= _gain("joint")
+    # Never rounded UP to a "minimum" scaling: that would break the bound.
+    s = float(min(max(s, 1e-4), 0.2))
+    duration = 1.0/(s*lam_rate)
+    length = float(np.linalg.norm(np.diff(tip, axis=0), axis=1).sum())
+    _preview(label, [(tip[-1], fks[-1][0][1])], tip, [list(q) for q in path], cls)
+    rec = {"label": label, "kind": "joint", "class": cls, "limit_mps": vmax,
+           "commanded_mps": v, "scaling": s, "gain": _gain("joint"),
+           "max_joint_deg": math.degrees(dq.max()),
+           "tip_path_m": length, "min_duration_s": duration,
+           "t0_ros_ns": capture_node.now_ns(), "target": [float(x) for x in q1]}
+    stub = _decide(label, "%s\n  joint move: largest joint %.1f deg, tip path %.0f mm, %s "
+                   "the part: tooling <= %.1f mm/s (takes >= %.0f s)"
+                   % (label, math.degrees(dq.max()), length*1e3, cls, v*1e3, duration),
+                   rec, raise_on_fail, extra)
+    if stub is not None:
+        return stub
+    with _Monitor(vmax, label) as mon:
+        res = _CAP["real_ros"].JointMove([float(x) for x in q1], vel=s, acc=s,
+                                         result_timeout=max(120.0, 3.0*duration + 60.0))
+    return _after_move(mon, rec, res, raise_on_fail, label)
+
+
+def capture_approach(start, end, label, raise_on_fail=True):
+    """Enter a pass in a configuration that reaches both ends -- the pipeline's
+    ApproachInConfiguration, through the gate. Returns the joints, or None."""
+    real = _CAP["real_ros"]
+    xe, qe = _cap_xyzq(end)
+    xs, qs_ = _cap_xyzq(start)
+    q_end = real.SolveIK(_cap_pose(xe, qe), seed=capture_node.current_joints())
+    if q_end is None:
+        # In the scan motion profile (0.01 mm threshold, local) one IK call from
+        # a seed 0.3 m away does not converge -- the pipeline then goes to its
+        # home configuration to retry, which may be outside the work volume and
+        # is refused. An IK chain from the tool to the pass end, 20 mm a step,
+        # converges and stays in this configuration.
+        snap = live_pose.snapshot()
+        if snap is not None:
+            with _local_ik():
+                chain = _ik_line((np.asarray(snap[0], float), tuple(snap[1])), (xe, qe),
+                                 capture_node.current_joints())
+            q_end = chain[-1] if chain else None
+    if q_end is None:
+        q_end = _ik_target(xe, qe)
+    q_start = real.SolveIK(_cap_pose(xs, qs_), seed=q_end) if q_end else None
+    if q_start is None and q_end is not None:
+        with _local_ik():
+            chain = _ik_line((xe, qe), (xs, qs_), q_end)
+        q_start = chain[-1] if chain else None
+    if q_start is None:
+        _capture_say("  %s: no IK solution at the pass %s (%.3f, %.3f, %.3f), IK mode %s"
+                     % (label, "end" if q_end is None else "start",
+                        *(xe if q_end is None else xs), real.IKMode()))
+        if raise_on_fail:
+            raise CaptureMotionFailed("%s: no configuration reaches both ends" % label)
+        return None
+    # A pass approach is meant to be a reposition: a few degrees, a few tens of
+    # millimetres, at the near-the-part speed. When the configuration the pass
+    # needs is far from the one the arm is in -- coming off an Azure dome to the
+    # first raster row, say -- the "approach" is a whole-arm reconfiguration,
+    # and capture_move_joints' speed model cannot bound it: a 61.4 deg approach
+    # with a 515 mm tip path commanded at 10 mm/s measures 16.5 and peaks at
+    # 390, and the monitor stops the arm. Send that one through capture_transit
+    # instead -- up, across, down, each leg a Cartesian move whose speed IS
+    # bounded correctly (19-24 mm/s against 30 allowed) -- and then approach
+    # from there, which is short.
+    q_now = capture_node.current_joints()
+    if q_now is not None:
+        swing = math.degrees(float(np.abs(np.asarray(q_start, float)
+                                          - np.asarray(q_now, float)).max()))
+        if swing > float(CAPTURE_APPROACH_MAX_DEG):
+            _capture_say("  %s: %.0f deg of arm between here and the pass "
+                         "(limit %.0f); transiting to the pass start first"
+                         % (label, swing, float(CAPTURE_APPROACH_MAX_DEG)))
+            try:
+                capture_transit((xs, qs_), label + ": to the pass start")
+            except CaptureStopped:
+                raise          # the monitor stopped the arm: that ends it
+            except (CaptureMotionFailed, CaptureRefused) as e:
+                # The transit's own legs are Cartesian, so the last one -- the
+                # descent onto the pass start -- can be short where the joint
+                # move would have got there (as little as 46% of a raster row's
+                # descent). Getting part of the way is still worth
+                # having: whatever it did move, the joint approach below is now
+                # smaller than it was. Say so and go on.
+                _capture_say("  %s: the transit to the pass start did not "
+                             "complete (%s); approaching from here instead"
+                             % (label, str(e).splitlines()[0]))
+            # Re-solve in whatever configuration the transit left us in, so the
+            # approach is short AND still spans the pass where it can.
+            seed = capture_node.current_joints()
+            q_end2 = real.SolveIK(_cap_pose(xe, qe), seed=seed)
+            q_start2 = real.SolveIK(_cap_pose(xs, qs_), seed=q_end2 or seed)
+            if q_start2 is not None:
+                q_start = q_start2
+    res = capture_move_joints(q_start, label, raise_on_fail=raise_on_fail)
+    if res == "noop":
+        return q_start
+    ok = bool(getattr(getattr(res, "result", None), "success", False))
+    return q_start if ok else None
+
+
+def _ik_line(a, b, seed, step=0.02, max_jump=0.35):
+    """IK along the straight line between poses a and b ((xyz, quat)), each point
+    seeded from the one before, in local mode. The solutions, the last one b's;
+    None if a point has no solution or any joint jumps more than max_jump rad --
+    i.e. the arm cannot follow this line from the configuration it starts in."""
+    real = _CAP["real_ros"]
+    xa, qa = np.asarray(a[0], float), a[1]
+    xb, qb = np.asarray(b[0], float), b[1]
+    ang = 2.0*math.degrees(math.acos(min(1.0, abs(float(np.dot(qa, qb))))))
+    n = max(1, int(math.ceil(np.linalg.norm(xb - xa)/step)), int(math.ceil(ang/5.0)))
+    out, q = [], seed
+    for k in range(1, n + 1):
+        t = k/float(n)
+        sol = real.SolveIK(_cap_pose(xa + t*(xb - xa), _slerp(qa, qb, t)), seed=q, timeout=0.5)
+        if sol is None:
+            return None
+        if q is not None and float(np.max(np.abs(np.asarray(sol) - np.asarray(q)))) > max_jump:
+            return None
+        out.append(list(sol))
+        q = sol
+    return out
+
+
+def _ik_target(x, q, local_only=False):
+    """Joints for pose (x, q): seeded from here in local mode, and if that
+    does not converge, global -- the joint move made to it is checked anyway.
+
+    EXPORTED, because calibration.dpi's _cal_fly_to() needs exactly this: the
+    joint-space alternative to a Cartesian leg that would not plan. The local
+    solve keeps the arm in the branch it is already in; the global fallback is
+    a genuinely different branch, which is the point of a retry.
+
+    THE FIRST SOLVE IS EXPLICITLY IN LOCAL MODE, through _local_ik(). Passing
+    `seed=` does not put move_group in local mode: the IK mode is a NODE
+    parameter, `transit` leaves move_group `global`
+    (tari_ur_description/config/motion_profiles.yaml), and a global solver treats
+    a seed as a starting guess it is free to leave. Without the explicit mode,
+    every caller outside a motion_profile("scan") block -- which is every
+    calibration leg and every gauge point -- gets a branch chosen with no regard
+    for where the arm is standing. Two ways that shows up, with the arm parked at
+    over_table (wrist_3 = +154 deg):
+
+      a 162 mm lateral step solves to wrist_3 = -178.5 deg. The same tool
+      orientation one turn away is +181.5 deg, 27.5 deg from where the arm stands
+      and inside the cable band; -178.5 is 332 deg away and outside it. The cable
+      guard refuses the move -- correctly, for the angle it was given.
+
+      a step from the end of an Azure sweep solves to a joint route that swings
+      the tip to x -0.476, y -0.758, z -0.111, which the FK guard refuses as
+      leaving the work volume. Same cause, one level up: the POSE is in the
+      volume, the PATH to a far branch is not.
+
+    Both read as "the arm cannot reach this pose" and neither is about reach.
+    _local_ik()'s own docstring names the same trap.
+
+    `local_only=True` skips the global fallback, for a caller that wants the
+    prediction the EXECUTOR would make and nothing else. A guard that refuses on
+    a global-mode branch refuses a move that would have been solved in band by
+    the node that actually flies it.
+    """
+    real = _CAP["real_ros"]
+    seed = capture_node.current_joints()
+    with _local_ik():
+        sol = real.SolveIK(_cap_pose(x, q), seed=seed, timeout=1.0)
+    if sol is None and not local_only:
+        prev = None
+        try:
+            prev = real.SetIKMode("global")
+            sol = real.SolveIK(_cap_pose(x, q), seed=seed, timeout=2.0)
+        finally:
+            if prev:
+                real.SetIKMode(prev)
+    return sol
+
+
+def capture_transit(target, label, final_speed=None):
+    """Go to `target`: straight up (or down) to a transit height, straight
+    across, straight down. Lateral travel happens above the work volume, clear
+    of parts; the last CAPTURE_NEAR_DISTANCE of a descent is its own, slow, leg.
+
+    The transit height is the highest one, from CAPTURE_TRANSIT_ABOVE over the
+    work volume down to CAPTURE_NEAR_DISTANCE over a known part (or the volume
+    top, when no geometry is known), at which IK can FOLLOW all three legs in
+    the arm's current configuration -- checked point by point before anything
+    moves. The far edge of a cell is often out of reach at the preferred height
+    with the tool pointing down, and "reachable at some height" is not the same
+    as "reachable from here" -- ask only the former and the planner stops 90% of
+    the way across."""
+    x, q = _cap_xyzq(target)
+    env = capture_envelope()
+    if env is None:
+        _check_envelope([x], label)
+    _check_envelope([x], label + " (the target)")
+    snap = live_pose.snapshot()
+    if snap is None:
+        raise CaptureRefused("%s: no TF for probe_end" % label)
+    cur, cq = np.asarray(snap[0], float), tuple(snap[1])
+    q0 = capture_node.current_joints()
+    tz_pref = min(max(env["top"] + float(CAPTURE_TRANSIT_ABOVE), x[2]), env["ceiling"] - 0.005)
+    parts = _CAP.get("near_points")
+    floor_lat = (float(parts[:, 2].max()) + float(CAPTURE_NEAR_DISTANCE)
+                 if parts is not None and len(parts) else env["top"])
+    floor_lat = min(max(floor_lat, x[2]), tz_pref)
+    dang = 2.0*math.degrees(math.acos(min(1.0, abs(float(np.dot(cq, q))))))
+    lateral = float(np.linalg.norm(cur[:2] - x[:2]))
+    if lateral < 0.002:
+        # Straight up or down, and/or turning in place: no transit height.
+        if dang < 0.5:
+            if np.linalg.norm(cur - x) > 0.0005:
+                capture_move([(x, q)], label + ": straight to the target", speed=final_speed)
+            return
+        try:
+            capture_move([(x, q)], label + ": turn in place", speed=final_speed)
+        except CaptureMotionFailed:
+            qt = _ik_target(x, q)
+            if qt is None:
+                raise CaptureRefused("%s: no IK solution for the new orientation here. "
+                                     "Nothing more moved." % label)
+            # MoveIt collision-checks the interpolated joint path; FK checks the
+            # envelope every 2 degrees; the cable envelope applies.
+            capture_move_joints(qt, label + ": turn in place (joint move)")
+        return
+    plan = None
+    with _local_ik():
+        for tz in list(np.arange(tz_pref, floor_lat - 1e-9, -0.025)) or [tz_pref]:
+            up = (_ik_line((cur, cq), (np.array([cur[0], cur[1], tz]), cq), q0)
+                  if abs(cur[2] - tz) > 0.002 else [])
+            if up is None:
+                continue
+            across = _ik_line((np.array([cur[0], cur[1], tz]), cq),
+                              (np.array([x[0], x[1], tz]), q), up[-1] if up else q0)
+            if across is None:
+                continue
+            down = _ik_line((np.array([x[0], x[1], tz]), q), (x, q), across[-1])
+            if down is None:
+                continue
+            plan = (float(tz), up, across, down)
+            break
+    if plan is None:
+        raise CaptureRefused(
+            "%s: from here the arm cannot follow up-across-down to the target at any "
+            "transit height from z %.3f down to %.3f with this orientation (IK checked "
+            "every 20 mm). Nothing moved. Move the arm nearer (pendant), or choose a "
+            "target it can reach from this configuration." % (label, tz_pref, floor_lat))
+    tz, up, across, down = plan
+    if tz < env["top"] - 1e-6:
+        _capture_say("  %s: travelling at z %.3f, the highest the arm can follow here" % (label, tz))
+    near_gap = float(CAPTURE_NEAR_DISTANCE) + 0.02
+    if abs(cur[2] - tz) > 0.002:
+        if cur[2] < tz:
+            z_mid = cur[2] + near_gap
+            if _CAP.get("near_points") is not None and z_mid < tz - 0.01:
+                capture_move([(np.array([cur[0], cur[1], z_mid]), cq)], label + ": lift off")
+                cur = np.array([cur[0], cur[1], z_mid])
+        capture_move([(np.array([cur[0], cur[1], tz]), cq)], label + ": to transit height")
+    above = (np.array([x[0], x[1], tz]), q)
+    try:
+        capture_move([above], label + ": across, above the part")
+    except CaptureMotionFailed:
+        # The IK chain says the line is followable, so the joint move to its
+        # end stays in this configuration; FK still checks every 2 degrees.
+        capture_move_joints(across[-1], label + ": across, above the part (joint move)")
+    if tz - x[2] > 0.002:
+        z_mid = x[2] + near_gap
+        if _CAP.get("near_points") is not None and tz > z_mid + 0.01:
+            capture_move([(np.array([x[0], x[1], z_mid]), q)], label + ": descend")
+        capture_move([(x, q)], label + ": onto the target", speed=final_speed)
+
+
+def _gate_refused(what, e):
+    """A pipeline move the gate refused BEFORE moving: say so, record it, and
+    hand the pipeline an ordinary failed result, so its own handling runs --
+    a row that 'did not fly' leaves a gap and the sweep goes on, and the
+    reconstruction is stopped and saved as usual. Raising instead aborts the
+    pipeline mid-sweep with its TSDF still running and no mesh."""
+    msg = (str(e).splitlines() or [repr(e)])[0]
+    _capture_say("  REFUSED for the pipeline: %s" % msg)
+    take = _CAP.get("take")
+    if take is not None:
+        take.errors.append("refused: " + msg)
+    capture_node.event({"event": "refused", "what": what, "why": msg})
+    return _Stub()
+
+
+class _GatedRos(object):
+    """`ros` for pipeline code during a scenario: motions go through the gate,
+    everything else goes to the real motion module. A refusal (nothing moved)
+    comes back to the pipeline as a failed move; a STOP (CaptureStopped) or
+    an operator abort ends the scenario."""
+
+    def __init__(self, real):
+        self.__dict__["_real"] = real
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_real"], name)
+
+    def _guard(self, what, fn, *a, **k):
+        try:
+            return fn(*a, **k)
+        except CaptureStopped:
+            raise
+        except CaptureRefused as e:
+            return _gate_refused(what, e)
+
+    def CartesianMove(self, msg, vel=0.1, acc=0.1, ik_frame="probe_end",
+                      goal_timeout=15.0, result_timeout=300.0, min_fraction=1.0):
+        poses = list(msg.poses) if hasattr(msg, "poses") else list(msg)
+        return self._guard("CartesianMove", capture_move, poses,
+                           "pipeline: Cartesian move, %d poses" % len(poses),
+                           scaling=vel, min_fraction=min_fraction, raise_on_fail=False)
+
+    def JointMove(self, msg, vel=0.1, acc=0.1, **kw):
+        if isinstance(msg, str):
+            q = capture_node.named_state(msg)
+            if q is None:
+                raise CaptureRefused("the pipeline asked for named pose %r and the "
+                                     "capture gate cannot resolve it (no SRDF on "
+                                     "/robot_description_semantic)" % msg)
+            return self._guard("JointMove", capture_move_joints, q,
+                               "pipeline: joint move to %s" % msg, scaling=vel,
+                               raise_on_fail=False)
+        return self._guard("JointMove", capture_move_joints, list(msg), "pipeline: joint move",
+                           scaling=vel, raise_on_fail=False)
+
+    def MoveJoints(self, positions, secs=5.0, joint_names=None, plan=True, **kw):
+        return self._guard("MoveJoints", capture_move_joints, list(positions),
+                           "pipeline: MoveJoints", raise_on_fail=False)
+
+    def ApproachInConfiguration(self, start, end, secs=6.0, plan=True, **kw):
+        try:
+            r = self._guard("ApproachInConfiguration", capture_approach, start, end,
+                            "pipeline: approach a pass", raise_on_fail=False)
+            return None if isinstance(r, _Stub) else r
+        except Exception as e:
+            _capture_say("  pipeline: approach a pass raised %s: %s"
+                         % (type(e).__name__, (str(e).splitlines() or [""])[0]))
+            raise
+
+    def FreeMove(self, msg, vel=0.1, acc=0.1, **kw):
+        q = self.__dict__["_real"].SolveIK(_cap_pose(*_cap_xyzq(msg)),
+                                           seed=capture_node.current_joints())
+        if q is None:
+            return _Stub()
+        return self._guard("FreeMove", capture_move_joints, q,
+                           "pipeline: free move (made as a joint move)", scaling=vel,
+                           raise_on_fail=False)
+
+    def Move(self, *a, **k):
+        raise CaptureRefused("ros.Move is not gated; nothing in the pipeline should use it")
+
+
+@contextlib.contextmanager
+def gated_pipeline():
+    """Swap `ros` for the gate for the length of a block.
+
+    Restores whatever `ros` WAS, not the raw motion module: the cable guard is
+    installed as `ros` for the whole session, and putting the raw module back
+    would quietly uninstall it the first time a capture scenario flew the
+    pipeline. The capture gate is the stricter of the two, so the swap itself
+    loses nothing while it is in force.
+    """
+    g = globals()
+    prev = g.get("ros")
+    g["ros"] = _GatedRos(_CAP["real_ros"])
+    try:
+        yield
+    finally:
+        g["ros"] = prev
+
+
+# ==============================================================================
+# THE CABLE GUARD -- the one gate that is on for the WHOLE session
+# ==============================================================================
+# _GatedRos above exists only inside a capture scenario. Ungated, a plain
+# run_automated_scan() checks wrist 3 nowhere at all, and an EC scan walks the
+# MTC node through wrist_3 = 29.3, 29.3, 21.9, -32.3, -55.1 and -113.0 degrees
+# in that order. The measured tight point at that tilt is 31.3: the scan starts
+# below it, walks through zero and asks for -113, which binds the loom and ends
+# at the emergency stop.
+#
+# twist_within_limit() is NOT this check. It measures CARTESIAN TOOL TWIST
+# against a number its own docstring calls UNMEASURED, and it warns and returns:
+# it refuses nothing and is not a cable limit (see tooling_clearance.dpi).
+#
+# So this is the same proxy design as _GatedRos -- pipeline code looks `ros` up
+# as a global at call time, so wrapping it needs no change anywhere else -- with
+# three deliberate differences:
+#
+#   * NO PROMPTS. _GatedRos previews every motion in RViz and waits for the
+#     operator. That is right for a capture session with somebody at the
+#     keyboard and wrong for an automated scan, which must run unattended. This
+#     one refuses or passes, silently either way, and prints only when it
+#     refuses.
+#   * ONE QUESTION. Not the work volume, not the speed, not the warning light --
+#     only the wrist-3 band for the tilt commanded. Everything else the capture
+#     gate does needs a capture session to do it in.
+#   * A REFUSAL IS A FAILED MOVE, NOT AN EXCEPTION, for the same reason
+#     _gate_refused() gives: raising out of the middle of a sweep leaves the
+#     TSDF running and produces no mesh, while a failed move runs the pipeline's
+#     own handling and the scan goes on with a gap.
+#
+# cable_guard_off() lifts it. capture_cable_envelope() is the one caller that
+# needs to: it cannot measure the band without leaving it.
+#
+# AND IT HAS TO ASK THE SAME QUESTION THE ARM WILL ANSWER. The guard predicts a
+# pose move's wrist 3 with ros.SolveIK, which /move_group serves, while the node
+# that flies the move is usually somebody else with its own copy of the solver's
+# settings -- including `mode`, which decides whether a seed is followed or
+# ignored. Judging a move by a solver that is free to pick another branch gets
+# both errors: a refusal of a move that would have flown in band (see
+# CABLE_GUARD_EXECUTORS below), and, the other way round, a pass for a move the
+# executing node then flies somewhere the guard never looked. So every
+# prediction is made
+# in the mode the EXECUTING node currently holds -- CABLE_GUARD_EXECUTORS says
+# which node that is, _solving_as() scopes and restores move_group's mode, and
+# the refusal says which solver answered and whether it was the right one.
+
+
+#: IK is a service call. A Cartesian row has up to 60 waypoints and a scan has
+#: hundreds of rows, so the guard solves this many poses per Cartesian move
+#: (spread evenly, always including the first and last) rather than all of them.
+#: A Cartesian move stays in one IK branch, so wrist 3 runs monotonically
+#: between the ends and the ends are what bound it.
+CABLE_GUARD_IK_SAMPLES = 2
+
+#: WHICH NODE EXECUTES each motion the guard judges -- and therefore whose IK
+#: settings decide the branch wrist 3 actually ends up in.
+#:
+#: Without this map the guard asks the WRONG SOLVER. It predicts a move by
+#: calling ros.SolveIK, which /move_group serves; the move itself is executed
+#: somewhere else. Under the `transit` profile -- what a cell holds
+#: outside a motion_profile() block -- every node is `mode: local` EXCEPT
+#: /move_group, which is `mode: global` on purpose, because it also serves RViz
+#: markers, teaching and one-off moves to poses the arm cannot reach without
+#: changing branch (tari_ur_description/config/motion_profiles.yaml, and the
+#: `mode:` comment in kinematics.yaml). `local` descends from the seed and stays
+#: on the seed's branch; `global` may leave it and ignore the seed entirely.
+#:
+#: Asked of a GLOBAL solver, "what branch will this CartesianMove use?" comes
+#: back as -189.9 deg -- a full turn from the +159..+177 deg the arm is standing
+#: at -- while the LOCAL solver in /mtc_hub_node that actually flies a
+#: CartesianMove answers +170.1, which is in band. The refusal is arithmetically
+#: right and about a different move than the one that would have flown.
+#:
+#: THE BAND IS NOT THE BUG, AND +/-360 SUBSTITUTION IS NOT THE FIX: the cable
+#: physically wraps, so ABSOLUTE wrist-3 angle governs and an equivalent
+#: orientation a full turn away is a different, unsafe, configuration.
+#:
+#: A motion whose target is joint values needs no entry: those are commanded
+#: exactly and no solver is consulted. A name here that is not in
+#: motion_profiles.yaml's `nodes:` list simply will not answer, which the guard
+#: reports rather than papering over.
+CABLE_GUARD_EXECUTORS = {
+    # execute_raster, on mtc_hub_node (dgpython_rosmotion's _raster_scan_client).
+    "CartesianMove": "/mtc_hub_node",
+    # execute_pipeline_move, same node.
+    "FreeMove": "/mtc_hub_node",
+    # the `dgpython` action, served by dgpython_action_server.
+    "Move": "/dgpython_action_server",
+    # ApproachInConfiguration is the odd one: it chooses the configuration with
+    # its OWN two ros.SolveIK calls and then flies a joint move to it, so
+    # /move_group really is the deciding solver and the guard matching it means
+    # matching whatever move_group currently holds -- global included. A refusal
+    # there is genuine: that branch is the one the arm would be sent to.
+    "ApproachInConfiguration": "/move_group",
+}
+
+#: Refuse every motion at a cell whose cables have NEVER been measured?
+#:
+#: False, and the reason is a circle rather than an opinion. The cable test
+#: needs a position to fly to, which it takes from the work volume, which is
+#: measured by capture_touch_off() -- a motion. Refusing motion until the cables
+#: are measured means a new cell cannot be brought up at all. So an unmeasured
+#: cell says once, loudly, that wrist 3 is unchecked, and the run sheet's order
+#: (cables first where a volume already exists) is the answer rather than a
+#: lockout.
+#:
+#: Set it True from the prompt at a cell where the envelope is expected to be in
+#: the manifest and its absence means something is misconfigured.
+CABLE_GUARD_REQUIRE_MEASUREMENT = False
+
+
+def cable_guard_on():
+    """Whether the cable guard is checking right now."""
+    return not _CAP.get("cable_guard_off")
+
+
+@contextlib.contextmanager
+def cable_guard_off(why="deliberately outside the cable envelope"):
+    """Lift the cable guard for the length of a block, and say why.
+
+    THE ONLY LEGITIMATE USE IS MEASURING THE BAND. capture_cable_envelope()
+    steps wrist 3 until the operator says the cables are tight, which means
+    leaving the band by construction, one confirmed step at a time. Everything
+    else that wants this wants a wider band, and the way to get a wider band is
+    to measure one.
+    """
+    prev = _CAP.get("cable_guard_off")
+    _CAP["cable_guard_off"] = True
+    _capture_say("  CABLE GUARD OFF: %s" % (why,))
+    try:
+        yield
+    finally:
+        _CAP["cable_guard_off"] = prev
+        if not prev:
+            _capture_say("  cable guard back on")
+
+
+def _cable_guard_refuse(what, e):
+    """A move the cable guard refused: say so once, record it, and hand the
+    caller an ordinary failed result.
+
+    EVERY LINE OF THE REFUSAL IS PRINTED. check_wrist3() ends its message with
+    _branch_note(), which is what tells the two failures apart: whether NO turn
+    of wrist 3 reaches that orientation in band (the TOOLPATH wants a pose the
+    cables cannot hold -- change the pose) or whether one does (the pose is
+    reachable and AN IK SOLVER PICKED THE WRONG BRANCH -- a different fault in a
+    different place). Print only the first line and the operator sees "would
+    turn wrist 3 to -189.9 deg", none of the diagnosis, and two different faults
+    that read identically in the log.
+
+    The take's error list and the /capture/events entry keep the one-line
+    summary -- they are indexes, not the report -- plus `detail` with the whole
+    text so a replay can tell the two apart as well.
+    """
+    lines = str(e).splitlines() or [repr(e)]
+    msg = lines[0]
+    print("  CABLE GUARD REFUSED %s: %s" % (what, msg))
+    for line in lines[1:]:
+        print("  %s" % (line.strip(),))
+    take = _CAP.get("take")
+    if take is not None:
+        take.errors.append("cable guard refused: " + msg)
+    node = globals().get("capture_node")
+    if node is not None:
+        try:
+            node.event({"event": "cable_refused", "what": what, "why": msg,
+                        "detail": str(e)})
+        except Exception:
+            pass
+    return _Stub()
+
+
+class _CableGuardedRos(object):
+    """`ros` for the whole session: wrist 3 is checked against the cable band
+    for the tilt commanded, and a move that leaves it does not happen.
+
+    Everything that is not a motion goes straight through, including SolveIK,
+    which this uses itself.
+    """
+
+    def __init__(self, real):
+        self.__dict__["_real"] = real
+
+    def __getattr__(self, name):
+        return getattr(self.__dict__["_real"], name)
+
+    def __repr__(self):
+        return "<cable guard over %r>" % (self.__dict__["_real"],)
+
+    # -- the check ----------------------------------------------------------
+
+    def _real_ros(self):
+        return self.__dict__["_real"]
+
+    def _ik(self, poses, seed=None):
+        """(joint configurations, orientations) for these poses, Nones where IK
+        had no answer. Chained, so the branch follows the path.
+
+        Call it inside _solving_as(), never bare: this goes to move_group, and
+        which BRANCH it comes back in depends on move_group's IK mode, which is
+        not in general the mode of the node that will fly the move.
+        """
+        real = self._real_ros()
+        # SEED THE FIRST POSE FROM WHERE THE ARM ACTUALLY IS. The chain below
+        # follows the branch from pose to pose, but it needs a START: with
+        # seed=None the first SolveIK goes out unseeded, move_group logs "Found
+        # empty JointState message", and an unseeded solve is free to answer on
+        # any branch. The same Azure dome sweep planned twice, minutes apart:
+        #     19 of 25 stops reach,  wrist_3 +145..+165 deg   (20 deg of travel)
+        #     25 of 25 stops reach,  wrist_3 -199..+188 deg   (387 deg of travel)
+        # Same region, same code, different answers -- which is also how a
+        # pre-flight comes to disagree with the flight it is supposed to predict.
+        # Every seeded SolveIK in this file falls back to
+        # capture_node.current_joints() for the same reason.
+        if seed is None:
+            try:
+                seed = capture_node.current_joints()
+            except Exception:
+                seed = None
+        # WHERE THE ARM IS, so a failed direct solve can be retried by WALKING
+        # there. See the block below.
+        here = None
+        try:
+            snap = live_pose.snapshot()
+            if snap is not None:
+                here = (np.asarray(snap[0], float).reshape(3), tuple(snap[1]))
+        except Exception:                                         # noqa: BLE001
+            here = None
+        qs, quats = [], []
+        for p in poses:
+            _x, q = _cap_xyzq(p)
+            quats.append(q)
+            sol = None
+            # 0.5 s then 2.0 s, the same ladder as _cap_ik_or_none() above. Under
+            # simulation load move_group answers /compute_ik too slowly for the
+            # short timeout and logs "failed to send response (timeout)", so the
+            # caller saw "no IK solution" for a pose that solves fine.
+            for _t in (0.5, 2.0):
+                try:
+                    sol = real.SolveIK(p if not isinstance(p, tuple)
+                                       else _cap_pose(_x, q),
+                                       seed=seed, timeout=_t)
+                except Exception:
+                    sol = None
+                if sol is not None:
+                    break
+            # ONE SOLVE OVER 300 mm IS NOT THE QUESTION THE EXECUTOR ANSWERS, and
+            # asking it that way is how the guard goes blind on the pipeline's own
+            # moves. _solving_as() puts move_group in the executing node's mode,
+            # which under both `transit` (mtc_hub_node) and `scan` is LOCAL --
+            # gradient descent from the seed. A local solver asked to jump from
+            # where the arm stands to a pose a third of a metre away frequently
+            # does not converge, while the Cartesian planner that flies the move
+            # gets there in millimetre steps and converges at every one.
+            #
+            # A guard with no answer does not refuse: _check() prints "wrist 3
+            # cannot be judged there. It is NOT being checked on moves like this
+            # one" and passes. Without the walk below that happens on every gauge
+            # move and every pass entry -- the cable envelope installed, armed,
+            # and silent on exactly the moves it was installed for.
+            #
+            # So walk it: interpolate from the last place the chain KNOWS (the
+            # previous pose, or the arm's live pose for the first) and chain the
+            # solve along it, which is both what the executor does and what
+            # capture_move() has always done with _ik_along().
+            if sol is None and here is not None:
+                try:
+                    walk = _path_samples([here, (np.asarray(_x, float).reshape(3),
+                                                 q)])
+                    chain = _ik_along(walk, seed)
+                    got = [c for c in chain if c is not None]
+                    # The LAST sample is the commanded pose. A chain that solved
+                    # part way and then stopped says the arm cannot follow this
+                    # line, which is a motion-planning answer and not a wrist
+                    # angle -- so only a chain that reached the end counts.
+                    if chain and chain[-1] is not None:
+                        sol = chain[-1]
+                    elif got:
+                        _CAP.setdefault("cable_guard_partial", 0)
+                        _CAP["cable_guard_partial"] += 1
+                except Exception:                                 # noqa: BLE001
+                    pass
+            qs.append(list(sol) if sol is not None else None)
+            if sol is not None:
+                seed = list(sol)
+            here = (np.asarray(_x, float).reshape(3), q)
+        return qs, quats
+
+    def _executor_mode(self, node):
+        """The pick_ik search mode `node` is holding right now, or None.
+
+        Asked of the node itself rather than worked out from a profile name,
+        because nothing tracks which profile is in force: motion_profile() is a
+        block, move_kinds overlay inside it, and an operator can set a parameter
+        by hand. The node is the authority on what the node will do.
+
+        Not cached, deliberately. The mode changes at every motion_profile()
+        boundary, and a stale reading is the exact class of fault being fixed
+        here. It costs one get_parameters round trip per guarded move, against
+        the CABLE_GUARD_IK_SAMPLES SolveIK service calls the guard already makes
+        on the same move.
+        """
+        real = self._real_ros()
+        try:
+            got = real.GetMotionParameters(["mode"], nodes=[node], timeout=2.0)
+            mode = (got.get(node) or {}).get("mode")
+        except Exception:
+            return None
+        return str(mode) if mode else None
+
+    @contextlib.contextmanager
+    def _solving_as(self, what_method, seed=None):
+        """Solve the guard's IK the way the node that EXECUTES `what_method`
+        will solve it, then put move_group's mode back.
+
+        Yields a provenance dict, which _check() turns into the last paragraph
+        of a refusal. A guard that refuses a move has to be able to say whether
+        it was judging the same question the executor will ask; without that,
+        "wrist 3 would reach -189.9 deg" is unfalsifiable at the console.
+
+        Never fatal, and never leaves the cell in the guard's mode: the restore
+        is in a finally, so an exception out of the solve or the check (a
+        CableRefused is exactly that) still puts it back. Where the mode cannot
+        be read or cannot be set, the guard goes on and judges with whatever
+        move_group holds, and SAYS the prediction is unverified -- refusing to
+        check because a solver knob is missing would be worse than checking
+        approximately.
+        """
+        real = self._real_ros()
+        node = CABLE_GUARD_EXECUTORS.get(what_method)
+        try:
+            seed_w3 = None if seed is None else float(np.asarray(seed, float).reshape(-1)[5])
+        except Exception:
+            seed_w3 = None
+        how = {"method": what_method, "node": node, "want": None, "solved": None,
+               "matched": False, "why": None, "exact": False,
+               "seed_wrist3": seed_w3}
+        want = None if node is None else self._executor_mode(node)
+        how["want"] = want
+        # Read move_group's own mode FIRST, rather than taking SetIKMode's return
+        # value: SetIKMode can raise after the parameter has been applied (its
+        # reply timing out, say), and then its return value never arrives. Asking
+        # first means the restore below knows what to go back to whatever happens
+        # -- and leaving a cell in the guard's mode would refuse the operator's
+        # next interactive move, a worse failure than the one being fixed.
+        try:
+            before = real.IKMode()
+        except Exception:
+            before = None
+        how["solved"] = before
+        switched = False
+        if node is None:
+            how["why"] = ("nothing in CABLE_GUARD_EXECUTORS says which node flies "
+                          "a %s" % (what_method,))
+        elif want is None:
+            how["why"] = "%s did not say what IK mode it is in" % (node,)
+        elif want == before:
+            how["matched"] = True             # already right; nothing to switch
+        else:
+            switched = True
+            try:
+                real.SetIKMode(want)
+                how["solved"] = want
+                how["matched"] = True
+            except Exception as e:
+                how["why"] = ("move_group would not go into %r mode (%s)"
+                              % (want, (str(e).splitlines() or [repr(e)])[0]))
+        try:
+            yield how
+        finally:
+            # `before` is None when move_group is not up or is not running
+            # pick_ik, in which case there is nothing to put back -- the same
+            # reasoning as _local_ik(). SetIKMode() is a no-op when the mode it
+            # is handed is already in force, so this is safe to call blind, and
+            # it is called whenever a switch was ATTEMPTED: a set that reported a
+            # failure may still have taken effect.
+            if switched and before:
+                try:
+                    real.SetIKMode(before)
+                except Exception as e:
+                    print("  cable guard: could not confirm move_group's IK mode "
+                          "is back to %r (%s). If it is not, interactive moves "
+                          "and teaching may be refused: ros.SetIKMode(%r)."
+                          % (before, (str(e).splitlines() or [repr(e)])[0], before))
+
+    @staticmethod
+    def _provenance(how):
+        """The paragraph a refusal ends with: which solver answered, in which
+        mode, and whether that is the solver that would have flown the move."""
+        if how is None:
+            return ""
+        if how.get("exact"):
+            return ("\n  These are the joint values COMMANDED, not a solve: no IK "
+                    "solver chose this branch, so the angle above is exactly "
+                    "where the arm would have been sent. The fix is upstream of "
+                    "any solver -- whatever picked these joints.")
+        seed = ""
+        if how.get("seed_wrist3") is not None:
+            seed = (", seeded from the arm's own joints (wrist 3 %+.1f deg)"
+                    % (math.degrees(how["seed_wrist3"]),))
+        node = how.get("node") or "the executing node"
+
+        def named(m):
+            return "%r mode" % (m,) if m else "a mode it could not read"
+
+        if how.get("matched"):
+            return ("\n  Predicted with move_group's IK in %s%s, which is what "
+                    "%s -- the node that EXECUTES a %s -- is holding, so THIS IS "
+                    "THE BRANCH THE MOVE WOULD HAVE TAKEN."
+                    % (named(how.get("solved")), seed, node, how.get("method")))
+        return ("\n  BUT THE PREDICTION IS UNVERIFIED: %s. The guard solved with "
+                "move_group in %s%s, while a %s is executed by %s, which solves "
+                "in %s. A global solver does not follow its seed, so the angle "
+                "above may be a branch %s would never have chosen. Fix that "
+                "first -- check %s is up and running pick_ik -- and ask again "
+                "before touching the toolpath or the band."
+                % (how.get("why") or "the executing node's IK mode is unknown",
+                   named(how.get("solved")), seed, how.get("method"), node,
+                   named(how.get("want")), node, node))
+
+    def _check(self, what, qs, quats=None, how=None):
+        """Raise CableRefused if this move leaves the band. Nothing to judge
+        (no IK, no measurement) passes -- and says so rather than pretending.
+
+        `how` is _solving_as()'s provenance; it is appended to the refusal so
+        the operator can tell a real out-of-envelope pose from a guard that was
+        asking the wrong solver.
+        """
+        if not cable_guard_on():
+            return
+        if qs is not None and not any(q is not None for q in qs):
+            if not _CAP.get("cable_guard_blind"):
+                _CAP["cable_guard_blind"] = True
+                print("  cable guard: IK answered for no pose of %s, so wrist 3 "
+                      "cannot be judged there. It is NOT being checked on moves "
+                      "like this one." % (what,))
+            return
+        try:
+            return check_wrist3(qs, what, quats=quats,
+                                require=bool(CABLE_GUARD_REQUIRE_MEASUREMENT))
+        except CableRefused as e:
+            # The band, the angle and the branch note are check_wrist3's to
+            # write and are not second-guessed here; this adds only what the
+            # guard knows and it does not -- where the angle came from.
+            raise CableRefused(str(e) + self._provenance(how))
+
+    def _sampled(self, poses):
+        """At most CABLE_GUARD_IK_SAMPLES of these, first and last included."""
+        n = len(poses)
+        k = max(2, int(CABLE_GUARD_IK_SAMPLES))
+        if n <= k:
+            return list(poses)
+        idx = sorted(set(np.linspace(0, n - 1, k).round().astype(int)))
+        return [poses[i] for i in idx]
+
+    def _joint_check(self, what, targets):
+        """Joint configurations, whose tilt comes from FK when FK is available.
+
+        wrist_3 runs monotonically along a joint move, so checking the ends
+        bounds the whole of it.
+        """
+        quats = None
+        node = globals().get("capture_node")
+        if node is not None:
+            try:
+                fks = [node.fk(q, links=("probe_end",)) for q in targets]
+                if all(f is not None for f in fks):
+                    quats = [f[0][1] for f in fks]
+            except Exception:
+                quats = None
+        if quats is None and not _CAP.get("cable_guard_nofk"):
+            _CAP["cable_guard_nofk"] = True
+            print("  cable guard: no FK, so a joint move's TILT is unknown and it "
+                  "is judged against the untilted band. That is the conservative "
+                  "reading, not the right one; start capture_node for the right one.")
+        # No IK mode to match: a joint move carries the joint values, and FK is
+        # one-to-one. The angle checked is the angle commanded, exactly.
+        self._check(what, targets, quats=quats, how={"exact": True})
+
+    def _current(self):
+        node = globals().get("capture_node")
+        try:
+            return None if node is None else node.current_joints()
+        except Exception:
+            return None
+
+    # -- the motions --------------------------------------------------------
+
+    def CartesianMove(self, msg, *a, **k):
+        poses = list(msg.poses) if hasattr(msg, "poses") else list(msg)
+        real = self._real_ros()
+        if cable_guard_on() and poses:
+            try:
+                seed = self._current()
+                with self._solving_as("CartesianMove", seed=seed) as how:
+                    qs, quats = self._ik(self._sampled(poses), seed=seed)
+                    self._check("a Cartesian move of %d poses" % len(poses),
+                                qs, quats, how=how)
+            except CableRefused as e:
+                return _cable_guard_refuse("CartesianMove", e)
+        return real.CartesianMove(msg, *a, **k)
+
+    def JointMove(self, msg, *a, **k):
+        real = self._real_ros()
+        if cable_guard_on():
+            q = None
+            if isinstance(msg, str):
+                node = globals().get("capture_node")
+                q = None if node is None else node.named_state(msg)
+                what = "the joint move to %r" % (msg,)
+            else:
+                q = list(msg)
+                what = "a joint move"
+            if q is not None:
+                try:
+                    self._joint_check(what, [list(q)])
+                except CableRefused as e:
+                    return _cable_guard_refuse("JointMove", e)
+        return real.JointMove(msg, *a, **k)
+
+    def MoveJoints(self, positions, *a, **k):
+        real = self._real_ros()
+        if cable_guard_on():
+            try:
+                self._joint_check("a MoveJoints", [list(positions)])
+            except CableRefused as e:
+                return _cable_guard_refuse("MoveJoints", e)
+        return real.MoveJoints(positions, *a, **k)
+
+    def FreeMove(self, msg, *a, **k):
+        real = self._real_ros()
+        if cable_guard_on():
+            try:
+                seed = self._current()
+                with self._solving_as("FreeMove", seed=seed) as how:
+                    qs, quats = self._ik([msg], seed=seed)
+                    self._check("a free move", qs, quats, how=how)
+            except CableRefused as e:
+                return _cable_guard_refuse("FreeMove", e)
+        return real.FreeMove(msg, *a, **k)
+
+    def ApproachInConfiguration(self, start, end, *a, **k):
+        real = self._real_ros()
+        if cable_guard_on():
+            # The same two solves the real method is about to make: the end
+            # first, then the start seeded from it. The configuration the row is
+            # entered in is exactly what decides where the wrist ends up, so
+            # this is the one that matters most.
+            try:
+                seed = self._current()
+                with self._solving_as("ApproachInConfiguration", seed=seed) as how:
+                    qs, quats = self._ik([end, start], seed=seed)
+                    self._check("entering a pass", qs, quats, how=how)
+            except CableRefused as e:
+                _cable_guard_refuse("ApproachInConfiguration", e)
+                return None            # its documented "IK failed" answer
+        return real.ApproachInConfiguration(start, end, *a, **k)
+
+    def Move(self, msg, *a, **k):
+        real = self._real_ros()
+        if cable_guard_on():
+            try:
+                poses = list(msg) if isinstance(msg, (list, tuple)) else [msg]
+                if not isinstance(msg, str):
+                    seed = self._current()
+                    with self._solving_as("Move", seed=seed) as how:
+                        qs, quats = self._ik(self._sampled(poses), seed=seed)
+                        self._check("a Move of %d pose(s)" % len(poses),
+                                    qs, quats, how=how)
+                elif not _CAP.get("cable_guard_named"):
+                    _CAP["cable_guard_named"] = True
+                    print("  cable guard: ros.Move(%r) names an SRDF state; wrist 3 "
+                          "is not checked on those." % (msg,))
+            except CableRefused as e:
+                return _cable_guard_refuse("Move", e)
+        return real.Move(msg, *a, **k)
+
+
+def install_cable_guard(quiet=False):
+    """Put the cable guard in front of `ros` for the rest of this session.
+
+    Idempotent. Called once from ECAutomatedScan.dgp after every module is
+    loaded, so run_automated_scan() and everything it calls are covered without
+    any of them changing: they look `ros` up as a global at call time.
+    """
+    g = globals()
+    cur = g.get("ros")
+    if isinstance(cur, _CableGuardedRos):
+        return cur
+    if cur is None:
+        raise RuntimeError("there is no `ros` to guard yet; install the cable "
+                           "guard after the motion module is created")
+    _CAP.setdefault("real_ros", cur)
+    g["ros"] = _CableGuardedRos(cur)
+    if not quiet:
+        # One line. The bands themselves are printed once by cell_capture.dpi
+        # when it loads them and once by the config's banner; a third copy is
+        # noise, and noise is how a warning stops being read.
+        if cable_envelope_model() is None:
+            print("  cable guard installed, but NOTHING IS MEASURED: wrist 3 is "
+                  "unchecked. capture_cable_envelope() measures it; the cell "
+                  "manifest's cable_envelope: block carries it between sessions.")
+        else:
+            print("  cable guard ON: every ros motion is checked against the "
+                  "wrist-3 band for the tilt it commands.")
+    return g["ros"]
+
+
+def remove_cable_guard():
+    """Take the guard back off. There is no good reason to; cable_guard_off()
+    is the supervised way to leave the band for one block."""
+    g = globals()
+    if isinstance(g.get("ros"), _CableGuardedRos):
+        g["ros"] = g["ros"].__dict__["_real"]
+        print("  cable guard REMOVED -- wrist 3 is unchecked for the rest of "
+              "this session.")
+    return g.get("ros")
+
+
+@contextlib.contextmanager
+def logged_service_calls():
+    """Record every call_ros_service() -- key, service, type, every request
+    field and the ROS time -- in the take and on /capture/events. That is what
+    `ros2 run tari_bringup record replay` repeats against the bag."""
+    g = globals()
+    orig = g["call_ros_service"]
+
+    def wrapped(key, fields=None, timeout=300.0, wait=15.0):
+        name, module, tname = RECON_SERVICES[key]
+        entry = {"event": "service_call", "key": key, "service": name,
+                 "srv": "%s/%s" % (module.replace(".", "/"), tname),
+                 "ros_time_ns": capture_node.now_ns(), "fields": _cap_jsonable(fields or {})}
+        t0 = time.monotonic()
+        try:
+            res = orig(key, fields, timeout=timeout, wait=wait)
+            entry["ok"] = True
+            entry["response"] = _cap_jsonable(res)
+            return res
+        except Exception as e:
+            entry["ok"] = False
+            entry["error"] = (str(e).splitlines() or [repr(e)])[0]
+            raise
+        finally:
+            entry["call_s"] = time.monotonic() - t0
+            take = _CAP.get("take")
+            if take is not None:
+                take.service_calls.append(entry)
+            capture_node.event(entry)
+
+    g["call_ros_service"] = wrapped
+    try:
+        yield
+    finally:
+        g["call_ros_service"] = orig

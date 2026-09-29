@@ -8,9 +8,9 @@ this path exists and why it is the one to reach for on a new part or a new cell.
 points mean and the traps behind them; read it before teaching a part you care
 about.
 
-Verified end to end in simulation on 2026-08-18 by exactly the runbook below:
-183 of 183 traces staged, every pass `move_ok` at `fraction 1.0`, 0 stager
-errors, 0 late transactions.
+The runbook below has been verified end to end in simulation: 183 of 183 traces
+staged, every pass `move_ok` at `fraction 1.0`, 0 stager errors, 0 late
+transactions.
 
 ---
 
@@ -284,6 +284,33 @@ All three take the same `(t1, t2, t3, m, n)` and build identical geometry.
 the start of the scan — trigger k must be column k, so it is not yours to choose
 independently of `m`.
 
+**The volume is built from the trace poses, not from arrival order.** At the end
+of a triggered scan `regrid_volume()` rewrites `/ut_scan_volume` by putting each
+trace in the cell its recorded pose falls in. That matters because a trace can go
+missing -- a transaction the recording database refused because its timestamp
+could no longer be ordered, a crossing the trigger never published, a pass that
+came up short -- and filling the volume in arrival order turns one missing trace
+into a shear across everything after it, with nothing in the volume to show for
+it. Placed by pose, a missing trace leaves its own cell empty (NaN) and its
+neighbours do not move. The trace list is untouched either way; this is about the
+quick look telling the truth. You can re-run `regrid_volume()` from the prompt at
+any time, and `res['regrid']` reports what it did.
+
+**The triggered scan holds its last column half a pitch inside the far edge.**
+The trigger for column m−1 fires when the probe has progressed (m−1) pitches,
+and a pass that stopped exactly there would leave that crossing to a coin flip
+against noise — on the UR7e cell it came out as rows of 49, 50 or 51 traces and
+a sheared C-scan. Every physical scanner solves this with overtravel past the
+last sample. Here the overtravel is taken *inside* the taught rectangle: the
+columns are placed at `row/(m−1+½)` instead of `row/(m−1)`, and the row is still
+commanded to t2's edge, so the probe goes exactly where it was taught and never
+beyond it (it may be in contact with the part). The cost is a scan area shorter
+by half a pitch on the t2 side — 0.6 mm at a 1.2 mm step — and a pitch about
+1% finer than `Scan2DPlane` would use for the same `m`; the volume metadata
+records the actual pitch. `TRIGGER_END_MARGIN` in `modules/plane_scan.dpi` is
+the knob, and `_check_overtravel_within_taught` refuses a path whose rows end
+anywhere but on the taught edge.
+
 Both continuous forms take `max_rows=` and `force=`; the point-to-point form
 takes `max_points=`. The volume is allocated at full size either way, so a short
 run is a dry run of the real geometry rather than a different scan.
@@ -296,6 +323,9 @@ run is a dry run of the real geometry rather than a different scan.
 | `per_segment[k].move_ok` / `.fraction` | did the row execute, and how much of it the planner covered |
 | `skipped` | rows that did not run at all |
 | `short_passes` | rows whose trigger count disagreed with the grid |
+| `regrid` | how the volume was rebuilt from the trace poses: cells `filled`, cells left `empty` because no trace reached them, traces that landed `outside_grid`, `collisions` where two traces claimed one cell, and `worst_cell_residual` -- how far the worst trace sat from its cell centre, in cells. Over about 0.5 means the grid does not describe where the probe actually went |
+| `over_budget`, `per_segment[k].over_budget` | crossings past the row's m−1 that were counted and not staged. A few per row is normal (the probe overtravels to the taught edge); every row would mean the pitch is wrong |
+| `per_segment[k].observed_m` vs `.raw_travel_m` | progress the trigger measured against the plain sum of every TF step; the excess in the second is wobble and noise, which used to fire the surplus trigger |
 | `stager_errors`, `stager_last_error` | staging failures — should be 0 |
 | `late_transactions`, `max_lateness_secs` | the timestamped-acquisition window — should be 0 |
 | `stager_max_queue_depth` | how close the staging pipeline came to falling behind |

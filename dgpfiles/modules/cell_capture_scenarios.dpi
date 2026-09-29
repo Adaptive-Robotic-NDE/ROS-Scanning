@@ -1,0 +1,1154 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  cell_capture_scenarios.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Cell-capture scenarios that need no pipeline: touch-off, profiler
+#   ladder and timing, cable envelope and robot velocity.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# CELL CAPTURE, PART 4: scenarios 1, 2, 3 and 6 -- the ones that need no pipeline
+# ==============================================================================
+
+# Each .dpi is its own function body: another part's imports are not visible.
+import datetime
+import math
+import os
+import time
+
+import numpy as np
+
+global capture_touch_off
+global capture_keyence_ladder
+global capture_keyence_timing
+global capture_cable_envelope
+global capture_robot_velocity
+global velocity_table_from_rungs
+global describe_velocity_table
+global sim_teach
+global capture_to_middle
+global _cap_point
+global _cap_tool_quat
+global _cap_keyence_offset
+global _cap_probe_for_optical
+global _cap_profile_check
+global _cap_pick_quat
+global _cap_inside
+
+
+def _cap_point(name):
+    if name not in taught_points:
+        raise KeyError("no taught point %r. Jog the probe tip there with the pendant "
+                       "and call teach_point(%r). Taught: %s"
+                       % (name, name, ", ".join(sorted(taught_points)) or "none"))
+    return np.asarray(taught_points[name]["xyz"], float)
+
+
+def _cap_tool_quat(z, x_hint):
+    """Tool orientation with tool z along `z` and tool x as close to `x_hint`."""
+    z = np.asarray(z, float)
+    z = z/np.linalg.norm(z)
+    x = np.asarray(x_hint, float) - np.dot(x_hint, z)*z
+    x = x/np.linalg.norm(x)
+    y = np.cross(z, x)
+    return tuple(float(v) for v in matrix_to_quat(np.column_stack([x, y, z])))
+
+
+def _cap_inside(points):
+    """Whether the probe tip stays inside the motion envelope along these
+    points (straight legs, sampled at 5 mm) -- _check_envelope without raising."""
+    try:
+        _check_envelope(_cap_densify(points, 0.005), "candidate", allow_entry=False)
+        return True
+    except CaptureRefused:
+        return False
+
+
+def _cap_pick_quat(qs, paths=None):
+    """Of orientations that are the same to the sensor (a laser line has no
+    sign), the one that turns wrist 3 least from where it is now and keeps it
+    inside the cable envelope -- judged by local IK for the tool turned in
+    place here. The first one if IK cannot say. `paths`, if given, is the
+    probe-tip path each orientation implies (the sensor is offset from the
+    tip, so the two signs put the tip on opposite sides): orientations whose
+    path leaves the work volume are dropped first."""
+    if paths is not None:
+        ok = [q for q, pts in zip(qs, paths) if _cap_inside(pts)]
+        if not ok:
+            raise CaptureRefused("every orientation of the sensor here would take the probe "
+                                 "tip out of the work volume; teach points further inside it")
+        qs = ok
+    snap = live_pose.snapshot()
+    q0 = capture_node.current_joints()
+    if snap is None or q0 is None or len(qs) < 2:
+        return qs[0]
+    here = np.asarray(snap[0], float)
+    model = cable_envelope_model()
+    best = None
+    for i, q in enumerate(qs):
+        with _local_ik():
+            sol = _CAP["real_ros"].SolveIK(_cap_pose(here, q), seed=q0, timeout=1.0)
+        if sol is None:
+            key = (2, float(i))
+        else:
+            w = float(sol[5])
+            # The band AT THIS ORIENTATION. The two candidates differ by 180
+            # degrees of roll about the tool axis and share a tilt, so this is
+            # not a formality: at x -40 only 75 degrees of wrist travel exists
+            # and one of the two signs is usually outside it.
+            try:
+                inside = model is None or model.contains(w, quat=q)
+            except CableRefused:
+                inside = False          # a tilt nobody measured is not "inside"
+            key = (0 if inside else 1, abs(w - q0[5]))
+        if best is None or key < best[0]:
+            best = (key, q)
+    return best[1]
+
+
+def _cap_keyence_offset():
+    """probe_end -> lj_v7080_optical_frame, in probe_end's frame, from live TF."""
+    t = getattr(_CAP["real_ros"], "keyence_t", None)
+    if t is None:
+        raise CaptureRefused("no probe_end -> lj_v7080_optical_frame transform yet")
+    tr = t.transform.translation
+    return np.array([tr.x, tr.y, tr.z], float)
+
+
+def _cap_probe_for_optical(optical_xyz, q, off):
+    """Where probe_end goes so the Keyence optical frame is at optical_xyz."""
+    return np.asarray(optical_xyz, float) - quat_to_matrix(q).dot(off)
+
+
+def _cap_profile_check(take, what, require=True):
+    facts = profile_topic_facts(sensor_topic("keyence", "profiles", "/profiles"))
+    take.results.setdefault("profile_checks", []).append(dict(facts, what=what))
+    _capture_say("  %s: %.1f Hz, %.0f points per profile" % (
+        what, facts["rate_hz"] or 0.0, facts["points_per_msg"]))
+    if require and not facts["points_per_msg"]:
+        raise CaptureRefused("%s: the Keyence returns nothing here (laser on? surface "
+                             "inside its range?)" % what)
+    return facts
+
+
+def capture_to_middle(height=None):
+    """Gated move to the middle of the work volume at transit height, keeping
+    the tool's orientation: a known place to start a pipeline scenario from,
+    and the way out when a pipeline move to its own home is refused."""
+    env = capture_envelope()
+    if env is None:
+        _check_envelope([[0.0, 0.0, 0.0]], "to the middle")
+    snap = live_pose.snapshot()
+    if snap is None:
+        raise CaptureRefused("to the middle: no TF for probe_end")
+    z = env["top"] + float(CAPTURE_TRANSIT_ABOVE) if height is None else float(height)
+    mid = np.array([0.5*(env["lo"][0] + env["hi"][0]), 0.5*(env["lo"][1] + env["hi"][1]), z])
+    with _local_ik():
+        capture_transit((mid, tuple(snap[1])), "to the middle of the work volume")
+    return mid.tolist()
+
+
+def sim_teach(name, xyz, quat=(0.0, 0.0, 0.0, 1.0), note="sim stand-in"):
+    """SIMULATION ONLY: move the probe tip to xyz and teach it there -- the
+    stand-in for an operator jogging with the pendant."""
+    if CELL_MODE != "sim":
+        raise CaptureRefused("sim_teach() stands in for the teach pendant in simulation. "
+                             "On hardware, jog with the pendant and call teach_point().")
+    with near_context([xyz]):
+        capture_transit((np.asarray(xyz, float), tuple(quat)), "sim stand-in: to %s" % name)
+    time.sleep(0.5)
+    return teach_point(name, note=note)
+
+
+# ------------------------------------------------------------------------------
+# 1. Work-volume touch-off
+# ------------------------------------------------------------------------------
+
+def capture_touch_off(corners=("corner_1", "corner_2", "corner_3", "corner_4"),
+                      height=0.32, floor_offset=0.0015, reuse_taught=False, teach=None):
+    """SCENARIO 1. Measure the work volume by touching the table's usable corners.
+
+    For each corner the operator jogs the probe tip onto the table with the
+    teach pendant and presses Enter; world -> probe_end is recorded there
+    (teach_point). The box is the corners' x/y extent; its floor is the highest
+    corner plus `floor_offset` (so the table is cropped and parts are not);
+    its top is floor + `height`. The proposed work_volume.<mode> block is
+    written into the session AND a local override manifest that the running
+    session, and every later one, picks up immediately. The recorder runs throughout (core
+    topics), so the bag shows what joint_states and TF did while jogging.
+
+    reuse_taught=True uses corners already taught. teach=f stands in for the
+    operator (simulation): f(name) puts the tip there and teaches it, inside the
+    take, so the bag has the teaching motion as it would at the cell.
+    """
+    params = {"corners": list(corners), "height": height, "floor_offset": floor_offset,
+              "stand_in": teach is not None}
+    with capture_scenario("touch_off", sets=("core",), expect_s=900.0, params=params,
+                          motion=teach is not None, uses=corners) as take:
+        for k, name in enumerate(corners):
+            if reuse_taught and name in taught_points:
+                continue
+            if teach is not None:
+                teach(name)
+                continue
+            ans = confirm("TOUCH-OFF %d/%d: with the teach pendant, jog the probe tip "
+                          "onto the table at usable corner %d (%s). Stop, then press "
+                          "Enter to record it." % (k + 1, len(corners), k + 1, name))
+            if ans == "abort":
+                raise CaptureAbort("touch-off")
+            if ans == "skip":
+                continue
+            teach_point(name, note="touch-off corner %d" % (k + 1))
+        pts = np.array([_cap_point(n) for n in corners])
+        floor = float(pts[:, 2].max()) + float(floor_offset)
+        lo = (float(pts[:, 0].min()), float(pts[:, 1].min()), floor)
+        hi = (float(pts[:, 0].max()), float(pts[:, 1].max()), floor + float(height))
+        comment = ["MEASURED %s by touch-off (cell_capture, session %s)."
+                   % (datetime.datetime.now().isoformat(timespec="minutes"),
+                      os.path.basename(_session()["dir"]))]
+        comment += ["%s: probe tip at (%.4f, %.4f, %.4f)" % ((n,) + tuple(p))
+                    for n, p in zip(corners, pts)]
+        comment += ["floor = highest corner + %.1f mm; top = floor + %.0f mm; the "
+                    "corners spread %.1f mm in z" % (floor_offset*1e3, height*1e3,
+                                                     (pts[:, 2].max() - pts[:, 2].min())*1e3)]
+        files = write_work_volume_proposal(lo, hi, comment)
+        take.results.update(box={"min": lo, "max": hi}, corners=pts.tolist(), files=files,
+                            corner_z_spread_mm=float((pts[:, 2].max() - pts[:, 2].min())*1e3))
+        dome = globals().get("SPECIMEN_SWEEP_HEIGHT")
+        env = capture_envelope()
+        if dome is not None and env is not None and not (env["top"] <= dome <= env["ceiling"]):
+            take.results["warning"] = (
+                "SPECIMEN_SWEEP_HEIGHT %.3f is outside the motion envelope %.3f..%.3f: "
+                "the Azure dome will be refused. Set it between them." % (dome, env["top"], env["ceiling"]))
+            _capture_say("  WARNING: " + take.results["warning"])
+        _capture_say("  proposed block: %s\n  override now in use: %s"
+                     % (files["proposal"], files["override"]))
+    return take.results
+
+
+# ------------------------------------------------------------------------------
+# 2. Keyence static ladder over a flat
+# ------------------------------------------------------------------------------
+
+def capture_keyence_ladder(point="flat", standoffs_mm=(-20, -10, 0, 10, 20),
+                           tilts_deg=(5, 10, 20), tilt_standoffs_mm=(-10, 0, 10),
+                           hold_s=2.0, settle_s=0.5, line_deg=90.0, clearance=None):
+    """SCENARIO 2. The Keyence held still over a flat at standoffs and tilts.
+
+    `point` is a taught point ON the flat (the cal plate top): the probe tip
+    touched there. The laser line lies along world direction `line_deg` (0 =
+    world x; the default 90, world y, is the tool's own orientation, so the
+    ladder turns the wrist no more than its tilts do). Standoffs move the
+    sensor along its own axis from the reference distance; tilts turn it about
+    the point where its axis meets the flat -- "along" rolls the line plane,
+    "across" pitches it -- so the measured spot stays put. Each pose is held
+    `hold_s` with the laser on; the bag has /profiles, TF and an event per
+    hold."""
+    p = _cap_point(point)
+    clearance = CAPTURE_CLEARANCE if clearance is None else clearance
+    off = _cap_keyence_offset()
+    line = np.array([math.cos(math.radians(line_deg)), math.sin(math.radians(line_deg)), 0.0])
+    zup = np.array([0.0, 0.0, 1.0])
+    # WHICH SIDE THE TIP GOES TO IS A CHOICE. A laser line has no sign, so
+    # line_deg and line_deg+180 place the same line over the same feature -- but
+    # they put the tool's x the opposite way, and with the sensor 75 mm off the
+    # tip along that axis they put the PROBE on opposite sides of the taught
+    # point. Taking the first without choosing aborts on the first move whenever
+    # the taught point is within 75 mm of the far edge of the touched-off
+    # volume, after the take has started and the recorder is running. So pick
+    # between them with _cap_pick_quat, as capture_keyence_timing and the
+    # cylinder passes do.
+    _cands = [_cap_tool_quat(zup, np.cross(line, zup)),
+              _cap_tool_quat(zup, np.cross(-line, zup))]
+    base = _cap_pick_quat(
+        _cands,
+        [[_cap_probe_for_optical(p + (mm/1000.0)*quat_to_matrix(qq)[:, 2], qq, off)
+          for mm in standoffs_mm] for qq in _cands])
+    axes = {"along": line, "across": np.cross(line, zup)}
+    plan = [("standoff %+d mm" % s, s, None, 0.0) for s in standoffs_mm]
+    for s in tilt_standoffs_mm:
+        for ax in ("along", "across"):
+            for t in tilts_deg:
+                for sign in (1, -1):
+                    plan.append(("standoff %+d mm, tilt %s %+d deg" % (s, ax, sign*t),
+                                 s, ax, sign*t))
+    poses, dropped = [], []
+    for label, s, ax, t in plan:
+        q = base if ax is None else quat_mul(_cap_q_axis(axes[ax], math.radians(t)), base)
+        z = quat_to_matrix(q)[:, 2]
+        optical = p + (s/1000.0)*z
+        probe = _cap_probe_for_optical(optical, q, off)
+        if probe[2] < p[2] + clearance:
+            dropped.append(label)
+            continue
+        poses.append((label, s, ax, t, optical, probe, q))
+    if dropped:
+        _capture_say("  %d pose(s) dropped: the probe tip would come within %.0f mm of "
+                     "the flat: %s" % (len(dropped), clearance*1e3, "; ".join(dropped)))
+    g = np.linspace(-0.05, 0.05, 11)
+    grid = np.array([[p[0] + a, p[1] + b, p[2]] for a in g for b in g])
+    params = {"point": point, "flat_xyz": p.tolist(), "standoffs_mm": list(standoffs_mm),
+              "tilts_deg": list(tilts_deg), "tilt_standoffs_mm": list(tilt_standoffs_mm),
+              "hold_s": hold_s, "line_deg": line_deg, "keyence_offset": off.tolist(),
+              "dropped": dropped, "poses": len(poses)}
+    with capture_scenario("keyence_ladder", sets=("core", "keyence"),
+                          expect_s=len(poses)*(hold_s + settle_s + 15.0) + 120.0,
+                          params=params, laser=True, near_points=grid, uses=[point]) as take:
+        first = poses[0]
+        capture_transit((first[5], first[6]), "ladder: to the first pose over %s" % point)
+        _cap_profile_check(take, "at the reference distance over %s" % point)
+        for label, s, ax, t, optical, probe, q in poses:
+            try:
+                capture_move([(probe, q)], "ladder: %s" % label)
+            except CaptureSkip:
+                continue
+            time.sleep(settle_s)
+            t0 = capture_node.now_ns()
+            time.sleep(hold_s)
+            snap = live_pose.snapshot()
+            take.event(event="hold", label=label, standoff_mm=s, tilt_axis=ax, tilt_deg=t,
+                       optical_target=optical.tolist(), probe_target=probe.tolist(),
+                       quat=list(q), t_start_ros_ns=t0, t_end_ros_ns=capture_node.now_ns(),
+                       probe_actual=list(snap[0]) if snap else None)
+        here = np.asarray(live_pose.snapshot()[0], float)
+        capture_move([(here + np.array([0, 0, 0.08]), poses[-1][6])], "ladder: lift clear")
+        take.results["holds"] = sum(1 for e in take.events if e.get("event") == "hold")
+    return take.results
+
+
+# ------------------------------------------------------------------------------
+# 3. Keyence timing across a sharp edge
+# ------------------------------------------------------------------------------
+
+def capture_keyence_timing(edge=("edge_a", "edge_b"), speeds_mm_s=(5.0, 10.0),
+                           round_trips=3, half_span_mm=30.0, ref_below_top_mm=8.0,
+                           clearance=None):
+    """SCENARIO 3. Back-and-forth passes across a sharp edge, at two speeds.
+
+    edge_a/edge_b are taught ON the upper surface at the edge (two points
+    along it). The laser line lies along the edge and the sensor travels
+    across it, `half_span_mm` each side, with its reference distance
+    `ref_below_top_mm` under the top so both levels are in range. The edge's
+    apparent position differs between the two directions by speed x latency;
+    two speeds separate latency from everything else. Speeds above the
+    near-part limit are clamped to it."""
+    a, b = _cap_point(edge[0]), _cap_point(edge[1])
+    clearance = CAPTURE_CLEARANCE if clearance is None else clearance
+    u = b - a
+    u[2] = 0.0
+    u = u/np.linalg.norm(u)
+    zup = np.array([0.0, 0.0, 1.0])
+    n = np.cross(zup, u)
+    c = 0.5*(a + b)
+    top = float(0.5*(a[2] + b[2]))
+    off = _cap_keyence_offset()
+    h = half_span_mm/1000.0
+    oc = np.array([c[0], c[1], top - ref_below_top_mm/1000.0])
+    cands = [_cap_tool_quat(zup, np.cross(u, zup)), _cap_tool_quat(zup, np.cross(-u, zup))]
+    q = _cap_pick_quat(cands, [[_cap_probe_for_optical(oc - h*n, qq, off),
+                                _cap_probe_for_optical(oc + h*n, qq, off)] for qq in cands])
+    p_start = _cap_probe_for_optical(oc - h*n, q, off)
+    p_end = _cap_probe_for_optical(oc + h*n, q, off)
+    if min(p_start[2], p_end[2]) < top + clearance:
+        raise CaptureRefused("timing passes would bring the probe tip within %.0f mm of "
+                             "the edge's top" % (clearance*1e3))
+    speeds = []
+    for v in speeds_mm_s:
+        v = float(v)/1000.0
+        if v > CAPTURE_SPEED_NEAR:
+            _capture_say("  %.0f mm/s is above the near-part limit; using %.0f mm/s"
+                         % (v*1e3, CAPTURE_SPEED_NEAR*1e3))
+            v = CAPTURE_SPEED_NEAR
+        speeds.append(v)
+    # THE PART IS AT `top`, NOT AT `oc`. oc is where the SENSOR's reference
+    # distance sits, ref_below_top_mm BELOW the taught surface; feeding that to
+    # near_points would put the "near the part" radius and capture_transit's
+    # lateral floor that far inside the specimen, so transits over the edge
+    # would fly that much lower than intended. Every scenario uses the real
+    # surface: the ladder its taught grid, contact its taught endpoints, the
+    # cylinder its true flank.
+    line = np.array([[oc[0] + s*u[0], oc[1] + s*u[1], top]
+                     for s in np.linspace(-0.05, 0.05, 11)])
+    params = {"edge": list(edge), "edge_top_z": top, "speeds_mps": speeds,
+              "round_trips": round_trips, "half_span_mm": half_span_mm,
+              "ref_below_top_mm": ref_below_top_mm, "across": n.tolist(),
+              "along": u.tolist(), "keyence_offset": off.tolist()}
+    passes = 2*round_trips*len(speeds)
+    with capture_scenario("keyence_timing", sets=("core", "keyence"),
+                          expect_s=passes*(2*h/min(speeds) + 8.0) + 120.0,
+                          params=params, laser=True, near_points=line, uses=list(edge)) as take:
+        capture_transit((p_start, q), "timing: to the start of the first pass")
+        _cap_profile_check(take, "at the edge", require=False)
+        k = 0
+        for v in speeds:
+            for trip in range(round_trips):
+                for target, direction in ((p_end, "+"), (p_start, "-")):
+                    k += 1
+                    t0 = capture_node.now_ns()
+                    capture_move([(target, q)], "timing: %.0f mm/s, pass %d/%d (%s)"
+                                 % (v*1e3, k, passes, direction), speed=v)
+                    take.event(event="pass", speed_mps=v, direction=direction,
+                               to=target.tolist(), t_start_ros_ns=t0,
+                               t_end_ros_ns=capture_node.now_ns())
+                    time.sleep(0.5)
+        capture_move([(p_start + np.array([0, 0, 0.08]), q)], "timing: lift clear")
+        take.results["passes"] = k
+    return take.results
+
+
+# ------------------------------------------------------------------------------
+# 6. Cable envelope
+# ------------------------------------------------------------------------------
+
+def capture_cable_envelope(position=None, home_quat=(0.0, 0.0, 0.0, 1.0), step_deg=15.0,
+                           max_deg=180.0, full_circle=False, wrist_deg_s=5.0,
+                           tilts=((None, 0.0),
+                                  ("x", 20.0), ("x", 40.0),
+                                  ("x", -20.0), ("x", -40.0),
+                                  ("y", 20.0), ("y", 40.0),
+                                  ("y", -20.0), ("y", -40.0))):
+    """SCENARIO 6. How far wrist 3 can turn before the cables are tight.
+
+    NINE TILTS, AND BOTH AXES REACH 40 DEGREES. A measurement that sweeps x to
+    +/-40 but y only to +/-20 refuses six of the Azure pan sweep's eight
+    directions -- not because the cables would bind but because nothing has been
+    measured where the sweep wants to go. A pan sweep tilts by the slant range
+    PLUS the region's own extent, which for a 198 x 143 mm part is 26-31 degrees
+    (22-29 of it about y on six of the eight directions), and only the two
+    directions along y stay inside the narrower hull. Run pan_tilts_needed() for
+    the part in front of you before trusting this list: a bigger region needs a
+    steeper tilt than any of these.
+
+    The +/-20 rungs also pin the middle of each row. Between 0 and -40 about x
+    the measured `lo` moves 148 degrees, and with only the endpoints everything
+    in between is a straight line nobody checked.
+
+    At `position` (default: over the middle of the work volume, at transit
+    height) and each tilt of the home orientation that the Azure and Keyence
+    views need, wrist 3 is stepped `step_deg` at a time, each step previewed and
+    confirmed, first one way and then the other. Answer "t" when the cables are
+    tight: that angle is recorded and the wrist goes back to where it started.
+    The joint angles, TF and wrench at every step are in the bag and in
+    scenario.json.
+
+    `max_deg` is how far the sweep goes FROM THE START ANGLE in each direction,
+    so the default 180 covers 360 degrees centred on wherever the wrist happened
+    to be. WHAT THAT LEAVES UNKNOWN: a wrist starting at 166.3 deg gives a sweep
+    covering 16..327 deg absolute, which says nothing whatever about 0, or about
+    the -113 an automated scan may then ask for. The band is in ABSOLUTE joint
+    angle and it is only known where it was swept.
+
+    `full_circle=True` sweeps the whole +/-360 degrees of wrist 3's travel
+    instead, which is what makes the answer absolute: it crosses zero in both
+    directions and keeps going until the cables say stop or the joint limit
+    does, so the band is known all the way round rather than only near the start
+    angle. It is the slower test -- 48 steps per tilt per direction at the
+    default 15 deg step, against 12 -- and every step is still previewed and
+    confirmed, so budget for it.
+
+    THE ANSWER IS PER TILT. Each tilt's own band is saved and each is enforced
+    only at that tilt (cable_envelope.dpi). The intersection of every tilt is
+    recorded as a fact about the measurement and is NOT a limit: enforcing it
+    everywhere gives an untilted pose 75 degrees of travel where 270 was
+    measured, and refuses runs that are nowhere near a cable.
+    """
+    env = capture_envelope()
+    if env is None:
+        _check_envelope([[0, 0, 0]], "cable test")
+    if position is None:
+        position = np.array([0.5*(env["lo"][0] + env["hi"][0]),
+                             0.5*(env["lo"][1] + env["hi"][1]),
+                             env["top"] + float(CAPTURE_TRANSIT_ABOVE)])
+    position = np.asarray(position, float)
+    if full_circle:
+        # wrist_3's own travel, not a window around the start. UR wrists turn
+        # +/-2*pi; sweeping that from any start reaches every angle the joint
+        # has, so nothing -- zero included -- is left unmeasured.
+        max_deg = 360.0
+    axes = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+    scaling = math.radians(wrist_deg_s)/UR_JOINT_VMAX[5]
+    params = {"position": position.tolist(), "home_quat": list(home_quat),
+              "step_deg": step_deg, "max_deg": max_deg, "full_circle": bool(full_circle),
+              "wrist_deg_s": wrist_deg_s, "tilts": [list(t) for t in tilts]}
+    nsteps = len(tilts)*2*int(max_deg/step_deg)
+    with capture_scenario("cable_envelope", sets=("core",),
+                          expect_s=nsteps*(step_deg/wrist_deg_s + 10.0) + 300.0,
+                          params=params) as take:
+        out = []
+        # The one motion that is ALLOWED out of the band, because it is the
+        # motion that measures the band. Both gates are lifted: the capture
+        # tool's own check and the always-on pipeline guard.
+        _CAP["wrist3_unchecked"] = True
+        try:
+            with cable_guard_off("capture_cable_envelope: measuring the band"):
+                _cable_steps(take, out, tilts, axes, home_quat, position,
+                             step_deg, max_deg, scaling)
+        finally:
+            _CAP["wrist3_unchecked"] = False
+        take.results["tilts"] = out
+        take.results["envelope"] = _save_cable_limits(out, step_deg,
+                                                     home_quat=home_quat,
+                                                     full_circle=full_circle)
+    return take.results
+
+
+def _cable_steps(take, out, tilts, axes, home_quat, position, step_deg, max_deg, scaling):
+        for axis, deg in tilts:
+            q = tuple(home_quat) if axis is None else \
+                quat_mul(_cap_q_axis(axes[axis], math.radians(deg)), home_quat)
+            tag = "no tilt" if axis is None else "tilt %s %+.0f deg" % (axis, deg)
+            try:
+                # Every tilt from the untilted orientation, never tilt to tilt:
+                # +40 to -40 about x in one go is an 80 degree turn the arm
+                # may not follow in one configuration.
+                capture_transit((position, tuple(home_quat)), "cable test: to no tilt")
+                capture_transit((position, q), "cable test: %s" % tag)
+            except CaptureSkip:
+                continue
+            except (CaptureRefused, CaptureMotionFailed) as e:
+                # A tilt the arm cannot take here is a result, not the end of
+                # the test: record it and go on to the next one.
+                out.append({"tilt": tag, "unreachable": (str(e).splitlines() or [""])[0]})
+                _capture_say("  %s: not reachable here, skipped (%s)" % (tag, out[-1]["unreachable"]))
+                continue
+            q0 = capture_node.current_joints()
+            # The tilt AS NUMBERS, not only as a label. The label is what the
+            # operator reads; (tx_deg, ty_deg) is what the model interpolates
+            # over, and deriving it back out of a string later is a step that
+            # can only go wrong.
+            row = {"tilt": tag, "wrist3_start_deg": math.degrees(q0[5]), "joints_start": q0,
+                   "tx_deg": float(deg) if axis == "x" else 0.0,
+                   "ty_deg": float(deg) if axis == "y" else 0.0}
+            for direction in (1, -1):
+                k, limit = 0, None
+                while True:
+                    k += 1
+                    ang = direction*k*step_deg
+                    if abs(ang) > max_deg + 1e-6:
+                        limit = {"reached_max_deg": direction*max_deg,
+                                 "reached_deg": direction*(k - 1)*step_deg}
+                        break
+                    target = list(q0)
+                    target[5] = q0[5] + math.radians(ang)
+                    ans = capture_move_joints(
+                        target, "cable test (%s): wrist 3 to %+.0f deg from the start "
+                        "(%.0f deg absolute). Watch the cables." % (tag, ang, math.degrees(target[5])),
+                        scaling=scaling, raise_on_fail=False, extra={"t": "tight"})
+                    if ans == "tight":
+                        now = capture_node.current_joints()
+                        limit = {"tight_at_deg": direction*(k - 1)*step_deg,
+                                 "reached_deg": direction*(k - 1)*step_deg,
+                                 "wrist3_abs_deg": math.degrees(now[5]), "joints": now}
+                        break
+                    if isinstance(ans, _Stub) or not bool(getattr(getattr(ans, "result", None),
+                                                                  "success", False)):
+                        limit = {"skipped_at_deg": ang,
+                                 "reached_deg": direction*(k - 1)*step_deg}
+                        break
+                    w = capture_node.recent_wrench(0.5)
+                    take.event(event="cable_step", tilt=tag, wrist3_rel_deg=ang,
+                               joints=capture_node.current_joints(),
+                               probe=list(live_pose.snapshot()[0]),
+                               wrench=w.mean(0).tolist() if w is not None else None)
+                row["positive" if direction > 0 else "negative"] = limit
+                capture_move_joints(q0, "cable test (%s): wrist 3 back to the start" % tag,
+                                    check_wrist=False)
+            out.append(row)
+            _capture_say("  %s: %s" % (tag, {k: v for k, v in row.items() if k in ("positive", "negative")}))
+
+
+def _save_cable_limits(rows, step_deg, home_quat=(0.0, 0.0, 0.0, 1.0),
+                       full_circle=False):
+    """Each tilt's own wrist-3 band, saved where load_cable_envelope() finds it.
+
+    ONE BAND PER TILT, and nothing else is enforced. Intersecting every tilt
+    into a single window and enforcing that at every pose whatever the tilt
+    collapses measurements spanning 75 to 270 degrees of travel into one 75
+    degree window, and refuses poses that are inside the band for the tilt
+    actually commanded. The intersection is still recorded, under a name that
+    says it is not the limit, because it is a true fact about the measurement;
+    it is simply not what anything checks against.
+
+    The band each row contributes is `reached_deg`, the last step the operator
+    CONFIRMED was still slack -- one step inside where they said "tight". So
+    what is written here is already conservative by a step, which is why
+    cable_envelope.dpi's default margin is zero and must stay zero: padding a
+    number that is already padded is how 270 degrees of travel becomes 75.
+
+    A tilt whose band is narrower than two steps is kept in the file and marked,
+    not silently dropped: an unbelievably narrow band is a result about the
+    cables at that tilt, and hiding it would let a pose fly there unchecked.
+    """
+    import json
+    per = []
+    narrow = []
+    for row in rows:
+        if "wrist3_start_deg" not in row:        # a tilt the arm could not take
+            continue
+        w0 = math.radians(row["wrist3_start_deg"])
+        neg = (row.get("negative") or {}).get("reached_deg")
+        pos = (row.get("positive") or {}).get("reached_deg")
+        if neg is None or pos is None:
+            continue
+        a, b = w0 + math.radians(neg), w0 + math.radians(pos)
+        if b <= a:
+            continue
+        if "tx_deg" in row and "ty_deg" in row:
+            tilt = (float(row["tx_deg"]), float(row["ty_deg"]))
+        else:                                    # an older row, tilt only as a label
+            tilt = _cable_parse_label(row["tilt"])
+        if tilt is None:
+            _capture_say("  cable envelope: cannot tell what tilt %r is; skipped"
+                         % (row["tilt"],))
+            continue
+        entry = {"tilt": row["tilt"], "tx_deg": tilt[0], "ty_deg": tilt[1],
+                 "lo_deg": math.degrees(a), "hi_deg": math.degrees(b),
+                 "lo_rad": a, "hi_rad": b,
+                 "wrist3_start_deg": row["wrist3_start_deg"],
+                 "reached_neg_deg": neg, "reached_pos_deg": pos}
+        if b - a < math.radians(2*step_deg):
+            entry["narrow"] = True
+            narrow.append(row["tilt"])
+        per.append(entry)
+
+    if not per:
+        _capture_say("  cable envelope NOT saved: no tilt produced a band. Nothing "
+                     "is enforced and wrist 3 stays unchecked.")
+        return {"enforced": False, "per_tilt": [], "file": None}
+
+    model = cable_envelope_from_rows(
+        per, step_deg=step_deg, home_quat=home_quat, cell=CELL_NAME, mode=CELL_MODE,
+        measured=datetime.datetime.now().isoformat(timespec="seconds"))
+    doc = model.document(enforced=True, extra={
+        "full_circle": bool(full_circle),
+        # What was actually swept, in ABSOLUTE joint angle. The band is only
+        # known here: a sweep covering 16..327 deg says nothing about the -113 an
+        # automated scan may go on to ask for.
+        "swept_deg": [min(e["lo_deg"] for e in per), max(e["hi_deg"] for e in per)],
+        "narrow_tilts": narrow})
+    # document() rebuilds per_tilt from the model, so put the provenance back:
+    # which step was confirmed slack, where the wrist started, whether the band
+    # is too narrow to believe. A band with no provenance cannot be argued with.
+    by_label = {e["tilt"]: e for e in per}
+    for out_row in doc["per_tilt"]:
+        src = by_label.get(out_row["tilt"])
+        if src:
+            for k in ("wrist3_start_deg", "reached_neg_deg", "reached_pos_deg", "narrow"):
+                if k in src:
+                    out_row[k] = src[k]
+    f = os.path.join(os.path.expanduser(CAPTURE_ROOT),
+                     "cable_limits_%s_%s.json" % (CELL_NAME, CELL_MODE))
+    os.makedirs(os.path.dirname(f), exist_ok=True)
+    with open(f, "w") as h:
+        json.dump(doc, h, indent=1)
+    cable_envelope_reload(quiet=False)
+    if narrow:
+        _capture_say("  NARROW (under two %.0f deg steps, so barely measured): %s"
+                     % (step_deg, ", ".join(narrow)))
+    if not full_circle:
+        _capture_say("  swept %.0f..%.0f deg absolute; OUTSIDE THAT NOTHING IS KNOWN. "
+                     "capture_cable_envelope(full_circle=True) measures the whole turn."
+                     % (doc["swept_deg"][0], doc["swept_deg"][1]))
+    _capture_say("  paste this into the cell manifest so a fresh session knows it "
+                 "without re-running the test:")
+    for line in cable_envelope_manifest_block(model).splitlines():
+        _capture_say("    " + line)
+    doc["file"] = f
+    return doc
+
+
+# ------------------------------------------------------------------------------
+# 9. Robot velocity: what a commanded speed and a joint scaling actually do HERE
+# ------------------------------------------------------------------------------
+# WHY THIS EXISTS. ROBOT_VELOCITY_CALIBRATION and JOINT_MOVE_SCALING in
+# ECAutomatedScan.dgp were both measured IN SIMULATION and their own comments
+# say so. Every speed in the pipeline goes through them: motion_scaling() turns
+# a technician's mm/s into a MoveIt scaling through that table, and
+# JOINT_MOVE_SCALING is the scaling of every automated joint move -- into a
+# pass, to a named pose, between passes.
+#
+# A simulated curve applied to real hardware is a guess, and the guess is
+# load-bearing in both directions: too slow wastes the visit, too fast breaks
+# the approved limit near the part. Nothing in a log settles it either -- only
+# a scan that printed `observed probe speed` measures this arm at any scaling,
+# and that is what this scenario does deliberately.
+#
+# WHAT IT MEASURES, and they are two different questions:
+#
+#   the Cartesian curve   commanded scaling -> observed tip speed, on a straight
+#                         line in free space. This IS ROBOT_VELOCITY_CALIBRATION.
+#   the joint-move peak   tip speed produced by a JOINT move at a given scaling.
+#                         A joint move's tip speed is NOT a Cartesian limit --
+#                         it depends on the arm's configuration -- so it cannot
+#                         be read off the curve and has to be flown.
+
+def velocity_table_from_rungs(rungs):
+    """Rungs -> a ROBOT_VELOCITY_CALIBRATION table, or a reason there is none.
+
+    The table is consumed by velocity_from_scaling() and velocity_scaling_for()
+    (scan_parameters.dpi), which interpolate between consecutive rows. A table
+    is therefore not just a list of measurements.
+
+    WHAT DOES NOT HAPPEN, checked against those two functions rather than
+    assumed: a bad table does NOT crash them. Both open with an early return
+    for the below-the-first-row case and then test `s <= s1` / `v <= v1` in
+    order, which makes every degenerate pair unreachable -- a duplicate scaling,
+    two equal speeds, a zero in the first row. All five degenerate shapes return
+    a number.
+
+    WHICH IS THE PROBLEM. The number is wrong and nothing says so:
+
+      * A rung whose speed FELL as the scaling rose makes the curve claim that
+        more scaling produces less speed -- scaling 0.0156 -> 10.0 mm/s against
+        scaling 0.0303 -> 9.0 mm/s, say. That is false about any real arm, and
+        it is exactly what _slow_down() produces when one move overshoots and
+        every later move is cut.
+      * It also makes the inverse ambiguous. Every speed inside the dip has two
+        scalings that produce it, and velocity_scaling_for() silently returns
+        the LOWER one -- so the pipeline commands a slower scaling than the
+        speed needs, permanently, from a constant somebody pasted into a config.
+        A contaminated rung is how "the arm is too slow" gets baked in.
+      * Two rows at one scaling assert two different speeds for one command.
+        Harmless to the arithmetic, self-contradictory as a record.
+
+    So the rows are deduped and checked here, and anything dropped is NAMED
+    rather than quietly smoothed: a speed that fell is a real fact about the
+    measurement, and the operator is the one who should decide whether to
+    re-run.
+
+    Returns {"table", "dropped", "ok", "why"}.
+    """
+    rows = []
+    for r in rungs:
+        if not r.get("ok") or r.get("observed_mps") is None:
+            continue
+        s, v = float(r["scaling"]), float(r["observed_mps"])
+        # A ZERO IS NOT A MEASUREMENT. A move that was refused, stalled, or
+        # never left the start reports 0 m/s, and a 0 sorts to the FRONT -- the
+        # one place both interpolators use as their below-the-table anchor
+        # (`cal[0][1]*s/cal[0][0]`). A zero there is the only input that can
+        # actually divide by zero in those functions, and short of that it makes
+        # every slow speed extrapolate off a point the arm never reached.
+        if not (s > 0.0 and v > 0.0):
+            continue
+        rows.append((s, v, r))
+    rows.sort(key=lambda t: t[0])
+
+    table, dropped = [], []
+    for s, v, r in rows:
+        if table and abs(s - table[-1][0]) < 1e-9:
+            # Same scaling twice: the framework clamped two different requested
+            # speeds to one scaling. Keep the faster observation, drop the other
+            # -- but say so, because it means the ladder has fewer rungs than it
+            # looks like and the curve is flatter here than it appears.
+            if v > table[-1][1]:
+                dropped.append((table[-1][0], table[-1][1], "duplicate scaling"))
+                table[-1] = (s, v)
+            else:
+                dropped.append((s, v, "duplicate scaling"))
+            continue
+        if table and v <= table[-1][1]:
+            dropped.append((s, v, "speed did not rise with scaling"))
+            continue
+        table.append((s, v))
+
+    if len(table) < 2:
+        return {"table": [], "dropped": dropped, "ok": False,
+                "why": "only %d usable rung(s): a curve needs at least two, and "
+                       "they must be at different scalings with the speed rising"
+                       % (len(table),)}
+
+    # ROUND-TRIP IT THROUGH THE REAL INTERPOLATORS, not through a second copy of
+    # their arithmetic. If the table this produces cannot be inverted by the
+    # functions the pipeline actually calls, it is not a table.
+    fwd = globals().get("velocity_from_scaling")
+    inv = globals().get("velocity_scaling_for")
+    if fwd is not None and inv is not None:
+        for s, v in table:
+            try:
+                back = float(fwd(float(inv(v, table)), table))
+            except Exception as e:                          # noqa: BLE001
+                return {"table": [], "dropped": dropped, "ok": False,
+                        "why": "the table breaks the interpolators it is for "
+                               "(%s at scaling %.4f)" % (e, s)}
+            if abs(back - v) > 1e-6:
+                return {"table": [], "dropped": dropped, "ok": False,
+                        "why": "the table does not round-trip: %.4f m/s -> "
+                               "scaling -> %.4f m/s" % (v, back)}
+    return {"table": table, "dropped": dropped, "ok": True, "why": ""}
+
+
+def describe_velocity_table(result):
+    """The measurement as lines: the table, what was dropped, and what to do."""
+    lines = []
+    t = result.get("table") or []
+    if not t:
+        lines.append("  NO VELOCITY TABLE: %s" % (result.get("why") or "no rungs",))
+        return lines
+    lines.append("  commanded scaling -> observed tip speed, measured on this arm:")
+    for s, v in t:
+        lines.append("      scaling %.4f  ->  %6.1f mm/s" % (s, v*1e3))
+    for s, v, why in result.get("dropped") or []:
+        lines.append("      (dropped scaling %.4f at %.1f mm/s: %s)" % (s, v*1e3, why))
+    lines.append("")
+    lines.append("  PASTE INTO THE CONFIG (ECAutomatedScan.dgp), replacing")
+    lines.append("  ROBOT_VELOCITY_CALIBRATION -- the values there were measured "
+                 "in SIMULATION:")
+    lines.append("")
+    lines.append("    ROBOT_VELOCITY_CALIBRATION = [")
+    for s, v in t:
+        lines.append("        (%.4f, %.4f)," % (s, v))
+    lines.append("    ]")
+    lines.append("")
+    lines.append("  To try it for the rest of THIS session without editing the "
+                 "file:")
+    lines.append("    globals()['ROBOT_VELOCITY_CALIBRATION'] = [%s]"
+                 % ", ".join("(%.4f, %.4f)" % (s, v) for s, v in t))
+    jp = result.get("joint")
+    if jp:
+        lines.append("")
+        lines.append("  JOINT moves (NOT the same question -- a joint move's tip "
+                     "speed depends on the arm's configuration, so it cannot be "
+                     "read off the curve above):")
+        for row in jp:
+            lines.append("      scaling %.4f  ->  peak %6.1f mm/s at the tip%s"
+                         % (row["scaling"], row["observed_mps"]*1e3,
+                            "" if not row.get("over_limit") else "   OVER THE LIMIT"))
+        under = [r for r in jp if r.get("ok") and not r.get("over_limit")]
+        if under:
+            best = max(under, key=lambda r: r["scaling"])
+            lines.append("    the largest scaling that stayed inside the limit "
+                         "was %.4f (peak %.1f mm/s). JOINT_MOVE_SCALING is %s."
+                         % (best["scaling"], best["observed_mps"]*1e3,
+                            globals().get("JOINT_MOVE_SCALING")))
+    return lines
+
+
+def capture_robot_velocity(speeds_mm_s=(5.0, 10.0, 20.0, 30.0, 40.0, 50.0),
+                           length_mm=300.0, position=None, repeats=2,
+                           joint_scalings=(0.010, 0.015, 0.020, 0.030),
+                           joint_deg=20.0, quat=(0.0, 0.0, 0.0, 1.0)):
+    """SCENARIO 9. The cell's own speed curve, measured instead of assumed.
+
+    Flies a straight horizontal line in FREE SPACE at a ladder of commanded
+    speeds, records what MoveIt scaling each one actually produced and what tip
+    speed came out, and prints a ROBOT_VELOCITY_CALIBRATION table to paste into
+    the config. Then does the same for JOINT moves, which is a separate number
+    (JOINT_MOVE_SCALING) and cannot be derived from the first.
+
+    Nothing is near the part and nothing touches it. If the line cannot be
+    placed clear of the part this REFUSES rather than measuring the near-part
+    regime, which is a different limit and cannot reach the speeds of interest.
+
+    DRIVEN BY SPEED, NOT BY SCALING, and that is not a detail. capture_move()
+    computes its own scaling from the path's kinematics and treats a `scaling=`
+    argument only as a CAP (cell_capture_motion.dpi) -- so asking for a scaling
+    measures the framework, not the arm. Asking for a SPEED and recording the
+    scaling it actually commanded measures the pair that the table is made of.
+
+    300 mm because that is what the existing table was measured on ("0.3 m
+    scanning rows"), and the number is path-dependent: a short move is mostly
+    ramp and never reaches its commanded speed.
+
+    `repeats` round trips per rung; the table takes the MEDIAN of the per-move
+    peaks, not the maximum, so one overshoot does not set the curve. The spread
+    is recorded.
+
+    IT STOPS CLIMBING when a rung's observed speed reaches the away limit, or
+    when the monitor stops a move. Two reasons: going higher is outside the
+    approved envelope, and _slow_down() has by then scaled every later move down
+    (cell_capture_motion.dpi), so later rungs would be measured against a moving
+    gain and the table would be wrong in a way nothing downstream could detect.
+
+    WHAT IT DOES NOT COVER: one straight line, one place in the box, one
+    orientation. A pose set whose consecutive poses differ by 50 degrees of tilt
+    moves the joints a long way for very little tip motion and is bounded by the
+    path's own kinematics instead -- that is what _cartesian_scaling_bound() is
+    for, and it is measured per move, not here.
+    """
+    env = capture_envelope()
+    if env is None:
+        _check_envelope([[0, 0, 0]], "velocity test")
+    if position is None:
+        position = np.array([0.5*(env["lo"][0] + env["hi"][0]),
+                             0.5*(env["lo"][1] + env["hi"][1]),
+                             env["top"] + float(CAPTURE_TRANSIT_ABOVE)])
+    position = np.asarray(position, float)
+
+    # The long axis of the box, so the line is as close to `length_mm` as the
+    # cell allows. Clipped to fit with a margin rather than refused: a shorter
+    # line is a worse measurement, and the report says how short it had to be.
+    margin = 0.02
+    room = {0: float(env["hi"][0] - env["lo"][0]) - 2*margin,
+            1: float(env["hi"][1] - env["lo"][1]) - 2*margin}
+    axis = 0 if room[0] >= room[1] else 1
+    want = float(length_mm)/1000.0
+    span = max(0.0, min(want, room[axis],
+                        2.0*min(position[axis] - env["lo"][axis] - margin,
+                                env["hi"][axis] - position[axis] - margin)))
+    if span < 0.05:
+        raise CaptureRefused(
+            "there is no room for a velocity test line here: %.0f mm along %s "
+            "at %s, and under 50 mm is all ramp. Pass position= somewhere with "
+            "more room." % (span*1e3, "xy"[axis], position.round(3).tolist()))
+    d = np.zeros(3)
+    d[axis] = 1.0
+    p_a = position - 0.5*span*d
+    p_b = position + 0.5*span*d
+
+    # FREE SPACE OR NOTHING. _speed_class() calls it "near" when the path comes
+    # within CAPTURE_NEAR_DISTANCE of anything known to be the part, or dips to
+    # the work volume's top; at the near limit the ladder cannot climb and the
+    # number measured would not be the one the table is for.
+    cls, vmax = _speed_class(_cap_densify([p_a, p_b]))
+    if cls != "away":
+        raise CaptureRefused(
+            "the velocity test line is classed '%s', not 'away': it passes "
+            "within %.0f mm of the part or below the work volume's top. This "
+            "test measures the FREE-SPACE curve; move the line up or clear of "
+            "the specimen." % (cls, float(CAPTURE_NEAR_DISTANCE)*1e3))
+
+    # ASKED-FOR SPEEDS ABOVE THE LIMIT ARE NOT RUNGS. capture_move() clamps
+    # `speed` to vmax itself, so every rung above the away limit would be flown
+    # at the SAME speed, come back at the same scaling, and show up as duplicate
+    # rows -- arm time spent to learn nothing. Clip and say so.
+    wanted = sorted(float(s)/1000.0 for s in speeds_mm_s)
+    speeds = sorted({min(v, vmax) for v in wanted})
+    clipped = [v for v in wanted if v > vmax + 1e-12]
+    if clipped:
+        _capture_say("  %s above the %.0f mm/s away limit and not flown as "
+                     "separate rungs (capture_move clamps them to the limit "
+                     "anyway): %s mm/s"
+                     % ("a speed was" if len(clipped) == 1 else "speeds were",
+                        vmax*1e3, ", ".join("%.0f" % (v*1e3) for v in clipped)))
+    params = {"position": position.tolist(), "axis": "xy"[axis],
+              "span_m": span, "requested_length_mm": length_mm,
+              "speeds_mps": speeds, "speeds_requested_mps": wanted,
+              "repeats": int(repeats),
+              "joint_scalings": [float(s) for s in joint_scalings],
+              "joint_deg": float(joint_deg), "limit_mps": vmax,
+              "calibration_in_force": list(
+                  globals().get("ROBOT_VELOCITY_CALIBRATION") or [])}
+    n = len(speeds)*2*int(repeats) + 2*len(joint_scalings)
+    with capture_scenario("robot_velocity", sets=("core",),
+                          expect_s=n*(span/min(speeds) + 12.0) + 180.0,
+                          params=params) as take:
+        rungs = []
+        stop_why = None     # each rung transits to p_a itself, below
+        for v in speeds:
+            peaks, scalings, gains, ok_all = [], [], [], True
+            # From the same end every time. A rung that broke early would
+            # otherwise leave the arm at the far end, making the next rung's
+            # first leg a zero-length move -- and ramp profiles are only
+            # comparable between rungs that start from the same place.
+            try:
+                capture_transit((p_a, tuple(quat)),
+                                "velocity: back to the start of the line")
+            except (CaptureRefused, CaptureMotionFailed) as e:
+                stop_why = "could not return to the start of the line: %s" % (
+                    (str(e).splitlines() or [""])[0],)
+                _capture_say("  STOPPING THE LADDER HERE: %s" % (stop_why,))
+                break
+            for trip in range(int(repeats)):
+                for target, way in ((p_b, "+"), (p_a, "-")):
+                    try:
+                        capture_move(
+                            [(target, tuple(quat))],
+                            "velocity: %.0f mm/s over %.0f mm (%s, trip %d/%d)"
+                            % (v*1e3, span*1e3, way, trip + 1, int(repeats)),
+                            speed=v, raise_on_fail=False)
+                    except CaptureStopped as e:
+                        # The monitor halted the arm. That IS the answer for
+                        # this rung -- it is the limit, found -- and it is not a
+                        # reason to lose the rungs already measured.
+                        ok_all = False
+                        stop_why = (str(e).splitlines() or [""])[0]
+                    except (CaptureRefused, CaptureMotionFailed) as e:
+                        ok_all = False
+                        stop_why = (str(e).splitlines() or [""])[0]
+                    rec = (take.moves or [{}])[-1]
+                    if not rec.get("ok"):
+                        ok_all = False
+                    if rec.get("observed_max_mps") is not None:
+                        peaks.append(float(rec["observed_max_mps"]))
+                        scalings.append(float(rec["scaling"]))
+                        gains.append(float(rec.get("gain") or 1.0))
+                    take.event(event="velocity_move", commanded_mps=v,
+                               scaling=rec.get("scaling"),
+                               observed_mps=rec.get("observed_max_mps"),
+                               gain=rec.get("gain"), direction=way,
+                               stopped=rec.get("stopped"))
+                    if stop_why:
+                        break
+                if stop_why:
+                    break
+            if not peaks:
+                rungs.append({"commanded_mps": v, "ok": False,
+                              "why": "no move on this rung reported a speed"})
+                continue
+            med = float(np.median(peaks))
+            row = {"commanded_mps": v, "scaling": float(np.median(scalings)),
+                   "observed_mps": med, "peaks_mps": peaks,
+                   "spread_mps": float(max(peaks) - min(peaks)),
+                   "gain": float(min(gains)), "ok": bool(ok_all),
+                   "over_limit": bool(med > vmax*(1.0 + float(CAPTURE_SPEED_TOLERANCE)))}
+            rungs.append(row)
+            _capture_say("  %.0f mm/s asked -> scaling %.4f -> %.1f mm/s observed "
+                         "(spread %.1f over %d moves)"
+                         % (v*1e3, row["scaling"], med*1e3,
+                            row["spread_mps"]*1e3, len(peaks)))
+            if stop_why:
+                pass                    # a move already ended the ladder
+            elif row["over_limit"]:
+                stop_why = ("%.1f mm/s observed against the %.1f mm/s limit"
+                            % (med*1e3, vmax*1e3))
+            elif row["gain"] < 1.0 - 1e-9:
+                stop_why = ("a move overshot and _slow_down() cut every later "
+                            "move to %.0f%% of its computed scaling, so higher "
+                            "rungs would not be comparable" % (100.0*row["gain"],))
+            if stop_why:
+                _capture_say("  STOPPING THE LADDER HERE: %s" % (stop_why,))
+                break
+        take.results["rungs"] = rungs
+        take.results["stopped_climbing"] = stop_why
+
+        # --- the joint half ---------------------------------------------------
+        # A joint move's tip speed is a different quantity and the fastest case
+        # is a shoulder-pan sweep at the arm's current extension, which is what
+        # this flies. capture_move_joints() checks the tip path against the
+        # envelope at every sample and refuses if it leaves the box, so a pan
+        # that would swing out is a skipped rung and not a hazard.
+        joint = []
+        q0 = capture_node.current_joints()
+        for s in sorted(float(x) for x in joint_scalings):
+            target = list(q0)
+            target[0] = q0[0] + math.radians(float(joint_deg))
+            peaks = []
+            failed = None
+            for q_to, way in ((target, "out"), (list(q0), "back")):
+                try:
+                    capture_move_joints(
+                        q_to, "velocity: joint move at scaling %.4f (%s)" % (s, way),
+                        scaling=s, raise_on_fail=False)
+                except (CaptureRefused, CaptureMotionFailed) as e:
+                    failed = (str(e).splitlines() or [""])[0]
+                    break
+                rec = (take.moves or [{}])[-1]
+                if rec.get("observed_max_mps") is not None:
+                    peaks.append(float(rec["observed_max_mps"]))
+            if failed or not peaks:
+                joint.append({"scaling": s, "ok": False,
+                              "why": failed or "no move reported a speed"})
+                _capture_say("  joint scaling %.4f: not measured (%s)"
+                             % (s, joint[-1]["why"]))
+                continue
+            med = float(np.median(peaks))
+            over = bool(med > vmax*(1.0 + float(CAPTURE_SPEED_TOLERANCE)))
+            joint.append({"scaling": s, "observed_mps": med, "peaks_mps": peaks,
+                          "ok": True, "over_limit": over})
+            _capture_say("  joint scaling %.4f -> tip peak %.1f mm/s%s"
+                         % (s, med*1e3, "   OVER THE %.0f mm/s LIMIT" % (vmax*1e3,)
+                            if over else ""))
+            if over:
+                _capture_say("  STOPPING THE JOINT LADDER HERE.")
+                break
+        # BACK WHERE IT STARTED, whatever happened above. A rung that failed on
+        # its way out leaves the arm rotated, and the next thing an operator
+        # does should not begin from a pose this test chose.
+        try:
+            capture_move_joints(list(q0), "velocity: back to the starting joints",
+                                raise_on_fail=False)
+        except (CaptureRefused, CaptureMotionFailed) as e:
+            _capture_say("  NOTE: could not return to the starting joints (%s). "
+                         "The arm is where the last joint move left it."
+                         % ((str(e).splitlines() or [""])[0],))
+        take.results["joint"] = joint
+
+        out = velocity_table_from_rungs(rungs)
+        out["joint"] = joint
+        out["span_m"] = span
+        out["axis"] = "xy"[axis]
+        out["limit_mps"] = vmax
+        out["stopped_climbing"] = stop_why
+        take.results["calibration"] = out
+        take.results["file"] = _save_velocity_calibration(out, params)
+        for line in describe_velocity_table(out):
+            _capture_say(line)
+        if span < want - 1e-6:
+            _capture_say("  NOTE: the line was %.0f mm, not the %.0f mm asked "
+                         "for -- that is all the work volume allows here. A "
+                         "shorter line spends more of itself ramping, so these "
+                         "speeds are if anything LOW." % (span*1e3, want*1e3))
+    return take.results
+
+
+def _save_velocity_calibration(out, params):
+    """Keep the measurement beside the cable limits, under a name that says
+    which cell and mode it is for. The table itself still has to be pasted into
+    the config by hand: ROBOT_VELOCITY_CALIBRATION lives in ECAutomatedScan.dgp,
+    not in the manifest, and a routine that silently changed how fast the arm
+    moves would be the wrong kind of helpful."""
+    import json
+    doc = {"cell": CELL_NAME, "mode": CELL_MODE,
+           "measured": datetime.datetime.now().isoformat(timespec="seconds"),
+           "params": params, "table": [[float(s), float(v)] for s, v in
+                                       (out.get("table") or [])],
+           "dropped": [[float(s), float(v), w] for s, v, w in
+                       (out.get("dropped") or [])],
+           "joint": out.get("joint") or [], "ok": bool(out.get("ok")),
+           "why": out.get("why", ""), "span_m": out.get("span_m"),
+           "axis": out.get("axis"), "limit_mps": out.get("limit_mps"),
+           "stopped_climbing": out.get("stopped_climbing")}
+    f = os.path.join(os.path.expanduser(CAPTURE_ROOT),
+                     "robot_velocity_%s_%s.json" % (CELL_NAME, CELL_MODE))
+    os.makedirs(os.path.dirname(f), exist_ok=True)
+    with open(f, "w") as h:
+        json.dump(doc, h, indent=1)
+    return f

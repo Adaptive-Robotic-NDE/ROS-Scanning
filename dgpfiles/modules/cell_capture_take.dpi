@@ -1,0 +1,786 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  cell_capture_take.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Takes, the bag recorder and the work-volume override for cell data
+#   capture.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# CELL CAPTURE, PART 3: takes, the recorder, and the work-volume override
+# ==============================================================================
+# A TAKE is one bag and its sidecars, in its own directory in the session:
+#
+#   NN_<scenario>_<time>/bag/                 the MCAP bag (tari_bringup record)
+#   NN_<scenario>_<time>/capture.json         recorder sidecar: code state,
+#                                             manifest, static TF, camera info,
+#                                             Keyence rate, counts and drops
+#   NN_<scenario>_<time>/scenario.json        this side: parameters, taught
+#                                             points, every move and answer,
+#                                             every service call (for replay),
+#                                             results
+#   NN_<scenario>_<time>/recorder.log         the recorder's output
+#
+# The recorder is its own process -- `ros2 run tari_bringup record` -- started
+# here and stopped with SIGINT, so the bag is closed properly; it works just as
+# well started by hand (while jogging, say).
+
+# Each .dpi is its own function body: another part's imports are not visible.
+import contextlib
+import datetime
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import time
+import traceback
+
+import numpy as np
+
+global capture_probe
+global start_take
+global stop_take
+global capture_scenario
+global capture_laser
+global activate_work_volume_override
+global clear_work_volume_override
+global write_work_volume_proposal
+global _manifest_with_volume
+
+
+class _Take(object):
+    def __init__(self, scenario, name, tdir, sets, specimen, lighting, notes):
+        self.scenario = scenario
+        self.name = name
+        self.dir = tdir
+        self.sets = list(sets)
+        self.specimen = specimen
+        self.lighting = lighting
+        self.notes = notes
+        self.params = {}
+        self.uses = []
+        self.events = []
+        self.moves = []
+        self.confirmations = []
+        self.service_calls = []
+        self.results = {}
+        self.errors = []
+        self.files = []
+        self.aborted = False
+        self.proc = None
+        self.report = None
+        self.started = datetime.datetime.now().isoformat(timespec="seconds")
+        self.t0_ros_ns = capture_node.now_ns()
+
+    def event(self, **kw):
+        rec = capture_node.event(kw)
+        self.events.append(rec)
+        return rec
+
+    def keep_file(self, path, name=None):
+        """Copy a file the scenario produced (a mesh, say) into the take."""
+        if path and os.path.exists(path):
+            dst = os.path.join(self.dir, name or os.path.basename(path))
+            shutil.copyfile(path, dst)
+            self.files.append({"source": path, "copy": dst})
+            return dst
+        return None
+
+
+def _recorder_cmd():
+    try:
+        from ament_index_python.packages import get_package_prefix
+        exe = os.path.join(get_package_prefix("tari_bringup"), "lib", "tari_bringup", "record")
+        if os.path.exists(exe):
+            return [exe]
+    except Exception:
+        pass
+    return ["ros2", "run", "tari_bringup", "record"]
+
+
+def _repo_roots():
+    roots = []
+    sm = globals().get("SCAN_MODULE_DIR")
+    if sm:
+        roots.append(os.path.dirname(os.path.dirname(os.path.abspath(sm))))
+    try:
+        import dataguzzler_python
+        roots.append(os.path.dirname(os.path.dirname(os.path.abspath(dataguzzler_python.__file__))))
+    except Exception:
+        pass
+    for name in ("spatialnde2-ec-functions", "dgpython-nidaqmx"):
+        p = os.path.expanduser("~/software_ws/%s" % name)
+        if os.path.isdir(p):
+            roots.append(p)
+    return roots
+
+
+def capture_probe(sets=("core",), seconds=3.0, expect_s=0.0):
+    """What a take of these topic sets would cost: the recorder's `probe`."""
+    cmd = _recorder_cmd() + [
+        "probe", "--cell", CELL_NAME, "--mode", CELL_MODE, "--sets", ",".join(sets),
+        "--seconds", str(seconds), "--image-rate", str(CAPTURE_IMAGE_RATE),
+        "--reserve-gb", str(CAPTURE_RESERVE_GB), "--expect-seconds", str(expect_s),
+        "--out", _session()["dir"], "--json"]
+    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         timeout=seconds + 60)
+    lines = [l for l in out.stdout.decode(errors="replace").splitlines() if l.startswith("{")]
+    if not lines:
+        raise RuntimeError("record probe printed nothing: %s"
+                           % out.stderr.decode(errors="replace")[-400:])
+    return json.loads(lines[-1])
+
+
+def _human(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0 or u == "TB":
+            return "%.1f %s" % (n, u)
+        n /= 1024.0
+
+
+#: Bytes per second a PLANNED topic costs once it starts, for topics that are
+#: deliberately silent while the probe listens. Keyed by the recorder's set name.
+#:
+#: THE PROBE MEASURES BYTES, and it runs BEFORE capture_scenario() enters
+#: _laser_hold() -- it has to, because it is what decides whether the take fits
+#: on the disk and the recorder has not started yet. So /profiles delivers
+#: nothing for the three seconds it listens and contributes zero to the number
+#: the operator is shown. That is not conservative, it is wrong by a factor of
+#: ten: over a 1094 s laser take at this cell /profiles was 237 989 messages and
+#: 3 077 673 748 bytes -- 2.82 MB/s, which was 91% of everything that take
+#: wrote. 800 columns x 16 bytes at 217.6 Hz.
+#:
+#: Added to the estimate as a floor, never as a replacement: if the laser
+#: happens to be on and the probe DID see profiles, the measured number is
+#: bigger and the measured number wins.
+global CAPTURE_GATED_SET_BPS
+CAPTURE_GATED_SET_BPS = {"keyence": 2.82e6}
+
+#: How long start_take() waits for the recorder to subscribe to /capture/events
+#: before it says the events are not being recorded. The recorder subscribes to
+#: the scenario's own topics after the readiness gate has already returned, and
+#: discovery tells the PUBLISHER some time after that again -- /capture/events
+#: matches about 0.8 s behind the core topics at this cell. The publisher is
+#: transient-local, so a late subscriber still receives everything already
+#: published and a late match costs nothing; this only has to be long enough to
+#: tell "late" from "never".
+global CAPTURE_EVENT_AUDIENCE_S
+CAPTURE_EVENT_AUDIENCE_S = 5.0
+
+
+global _wait_for_audience
+def _wait_for_audience(pub, seconds=None, sleep=None, clock=None):
+    """How many subscribers `pub` has, waiting up to `seconds` for the first.
+
+    Returns as soon as one matches, so the usual cost is one call and no wait.
+    Returns 0 only if none ever matched, which is the only case worth a warning
+    on a transient-local topic.
+    """
+    seconds = CAPTURE_EVENT_AUDIENCE_S if seconds is None else float(seconds)
+    clock = time.monotonic if clock is None else clock
+    sleep = time.sleep if sleep is None else sleep
+    deadline = clock() + seconds
+    while True:
+        n = int(pub.get_subscription_count())
+        if n >= 1 or clock() >= deadline:
+            return n
+        sleep(0.2)
+
+
+def _probe_gated_bps(est, sets):
+    """(extra bytes/s, [note]) for planned topics the probe could not see.
+
+    A topic counts as gated when it is in a set with a declared cost, it was
+    PLANNED for this take, and it delivered nothing while the probe listened.
+    A topic that is planned and silent because its driver is dead costs nothing
+    real -- but it is also not a take anybody wants, and over-estimating the
+    disk is the safe direction.
+    """
+    extra, notes = 0.0, []
+    for name, t in sorted((est.get("topics") or {}).items()):
+        bps = CAPTURE_GATED_SET_BPS.get(t.get("set"))
+        if bps is None or t.get("projected_bps"):
+            continue
+        extra += float(bps)
+        notes.append("%s was silent while the estimate was taken (the laser is "
+                     "switched on after the recorder starts); counted at its "
+                     "measured %.1f MB/s" % (name, float(bps)/1e6))
+    return extra, notes
+
+
+def start_take(scenario, sets=("core",), expect_s=120.0, specimen=None, lighting=None,
+               notes=None, meta=None, image_rate=None, probe=True):
+    """Start the recorder for one take. Refuses on hardware if the estimate
+    for `expect_s` seconds does not fit above CAPTURE_RESERVE_GB."""
+    sess = _session()
+    specimen = sess["specimen"] if specimen is None else specimen
+    lighting = sess["lighting"] if lighting is None else lighting
+    notes = sess["notes"] if notes is None else notes
+    sess["takes"] += 1
+    name = "%02d_%s" % (sess["takes"], scenario)
+    tdir = os.path.join(sess["dir"], "%s_%s" % (name, datetime.datetime.now().strftime("%H%M%S")))
+    if probe:
+        try:
+            est = capture_probe(sets, 3.0, expect_s)
+            # NOT `notes`: that name is the caller's free-text note and reaches
+            # the recorder as --notes. Rebinding it to the LIST this returns
+            # makes Popen raise
+            #   TypeError: expected str, bytes or os.PathLike object, not list
+            # and takes the whole scenario down with it -- and only on the takes
+            # where a gated topic was silent during the probe, which is every
+            # first laser take, because the laser is switched on AFTER the
+            # recorder starts.
+            gated, gate_notes = _probe_gated_bps(est, sets)
+            need = float(est.get("take_bytes", 0)) + gated*float(expect_s)
+            fits = (est.get("fits", True) if not gated else
+                    need < float(est["free_bytes"]) - CAPTURE_RESERVE_GB*1e9)
+            _capture_say("  %s: ~%s for %.0f s (%.0f MB/min); %s free"
+                         % (name, _human(need), expect_s,
+                            est.get("projected_mb_per_min", 0) + gated*60/1e6,
+                            _human(est["free_bytes"])))
+            for note in gate_notes:
+                _capture_say("    + " + note)
+            if not fits:
+                msg = ("not enough disk for %s: needs ~%s, %s free, %.0f GB reserve"
+                       % (name, _human(need), _human(est["free_bytes"]),
+                          CAPTURE_RESERVE_GB))
+                if CELL_MODE == "hardware":
+                    raise CaptureRefused(msg)
+                _capture_say("  WARNING: " + msg)
+        except CaptureRefused:
+            raise
+        except Exception as e:
+            _capture_say("  (size estimate failed: %s)" % (e,))
+    os.makedirs(tdir, exist_ok=True)
+    cmd = _recorder_cmd() + [
+        "--cell", CELL_NAME, "--mode", CELL_MODE, "--sets", ",".join(sets),
+        "--out", tdir, "--scenario", scenario, "--specimen", specimen or "",
+        "--lighting", lighting or "", "--notes", notes or "",
+        "--image-rate", str(CAPTURE_IMAGE_RATE if image_rate is None else image_rate),
+        "--reserve-gb", str(CAPTURE_RESERVE_GB), "--expect-seconds", str(expect_s),
+        "--code-dir", os.path.join(sess["dir"], "code"),
+        # A dgpy that dies mid-take takes the recording down with it, closed.
+        "--stop-with-pid", str(os.getpid())]
+    for r in _repo_roots():
+        cmd += ["--repo", r]
+    for k, v in (meta or {}).items():
+        cmd += ["--meta", "%s=%s" % (k, v)]
+    # EVERY ARGUMENT IS A STRING OR THE TAKE NEVER STARTS, and this says which
+    # one is not. subprocess raises "expected str, bytes or os.PathLike object,
+    # not list" from inside fork_exec with no clue which of the thirty
+    # arguments it means, and it raises it at the cell with the arm live.
+    bad = [(i, a) for i, a in enumerate(cmd) if not isinstance(a, str)]
+    if bad:
+        raise CaptureRefused(
+            "the recorder command is malformed and the take was not started: "
+            + "; ".join("argument %d after %r is %s %r"
+                        % (i, cmd[i-1] if i else "", type(a).__name__, a)
+                        for i, a in bad))
+    log_path = os.path.join(tdir, "recorder.log")
+    log = open(log_path, "w")
+    take = _Take(scenario, name, tdir, sets, specimen, lighting, notes)
+    take.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+    take.log_path = log_path
+    deadline = time.monotonic() + 40.0
+    ready = False
+    while time.monotonic() < deadline:
+        text = open(log_path, errors="replace").read()
+        if "CAPTURE_RECORDING" in text:
+            ready = True
+            # Let discovery subscribe to what is there before anything moves.
+            t_sub = time.monotonic() + 8.0
+            while time.monotonic() < t_sub and "recording /joint_states" not in \
+                    open(log_path, errors="replace").read():
+                time.sleep(0.2)
+            time.sleep(1.0)
+            break
+        if take.proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    if not ready:
+        tail = open(log_path, errors="replace").read()[-1500:]
+        try:
+            os.killpg(take.proc.pid, signal.SIGINT)
+        except Exception:
+            pass
+        raise RuntimeError("the recorder did not start:\n%s" % tail)
+    _CAP["take"] = take
+    take.event(event="take_start", take=name, scenario=scenario, dir=tdir,
+               sets=list(sets), specimen=specimen, lighting=lighting, notes=notes)
+    _capture_say("recording %s -> %s" % (name, tdir))
+    # DID THE RECORDER ACTUALLY FIND OUR EVENT TOPIC? When it does not, the take
+    # runs to the end with none of what this tool did in the bag, and the only
+    # sign is one line in the final report -- after the data is taken. So it is
+    # worth a line at the top rather than a footnote.
+    #
+    # BUT ASK THE QUESTION OVER A WINDOW, NOT ONCE. A single
+    # get_subscription_count() immediately after publishing take_start cries
+    # wolf on every take: the readiness gate above returns as soon as
+    # /joint_states is in recorder.log, the recorder subscribes to the
+    # scenario's own topics after that -- /capture/events about 0.8 s behind the
+    # core topics -- and the publisher learns of a new subscriber through
+    # discovery some time after the subscriber itself logs it.
+    #
+    # That alarm is false because the publisher is RELIABLE + TRANSIENT_LOCAL
+    # depth 100 (cell_capture_node.dpi), so a subscriber that matches late still
+    # gets the backlog -- take_start included. A late match costs nothing; only
+    # a match that never happens costs anything. So poll until it matches and
+    # report only the genuine failure.
+    try:
+        n = _wait_for_audience(capture_node.events_pub)
+        if n < 1:
+            _capture_say(
+                "  ** THE RECORDER IS NOT RECEIVING /capture/events after %.0f s. "
+                "The bag will hold the sensors and the robot but not what this "
+                "tool did, so an offline replay cannot be lined up with the "
+                "take. recorder.log says which topics it subscribed to."
+                % CAPTURE_EVENT_AUDIENCE_S)
+    except Exception as e:
+        _capture_say("  (could not check the event topic's audience: %s)" % (e,))
+    line = globals().get("_preview_audience_line")
+    line = line() if line else ""
+    if line:
+        _capture_say("  ** " + line)
+        _CAP["preview_dark"] = line
+    return take
+
+
+def _speed_summary(moves):
+    """Every executed move's measured peak against its limit, in one place."""
+    mv = [m for m in moves if m.get("observed_max_mps") is not None
+          and m.get("answer", "go") == "go"]
+    ratios = [m["observed_max_mps"]/m["limit_mps"] for m in mv if m.get("limit_mps")]
+    return {"moves": len(mv),
+            "over_limit": sum(1 for m in mv if m.get("over_limit")),
+            "stopped": sum(1 for m in mv if m.get("stopped")),
+            "worst_peak_over_limit": max(ratios) if ratios else None,
+            "peak_mps_by_class": {c: max([m["observed_max_mps"] for m in mv
+                                          if m.get("class") == c] or [0.0])
+                                  for c in ("near", "away")},
+            "gain": dict(_CAP.get("speed_gain") or {})}
+
+
+def _write_scenario(take):
+    rep = take.report or {}
+    doc = {"scenario": take.scenario, "take": take.name, "dir": take.dir,
+           "cell": CELL_NAME, "mode": CELL_MODE,
+           "session": (_CAP.get("session") or {}).get("dir"),
+           "specimen": take.specimen, "lighting": take.lighting, "notes": take.notes,
+           "params": take.params, "started": take.started,
+           "ended": datetime.datetime.now().isoformat(timespec="seconds"),
+           "aborted": take.aborted, "errors": take.errors, "results": take.results,
+           "taught_points": {k: taught_points[k] for k in take.uses if k in taught_points},
+           "work_volume": work_volume(), "motion_envelope": capture_envelope(),
+           "speed_limits_mps": {"near": CAPTURE_SPEED_NEAR, "away": CAPTURE_SPEED_AWAY},
+           "events": take.events, "moves": take.moves,
+           "confirmations": take.confirmations, "service_calls": take.service_calls,
+           "files": take.files,
+           "speed": _speed_summary(take.moves),
+           "recorder": {k: rep.get(k) for k in ("critical_lost", "absent_topics")},
+           "bag_bytes": (rep.get("recorder") or {}).get("bytes_written")}
+    with open(os.path.join(take.dir, "scenario.json"), "w") as f:
+        json.dump(_cap_jsonable(doc), f, indent=1)
+
+
+def stop_take(take=None, timeout=240.0):
+    """Stop the recorder (SIGINT, so the bag closes), read its sidecar, write
+    scenario.json, and say what was lost."""
+    take = take or _CAP.get("take")
+    if take is None:
+        return None
+    take.event(event="take_stop", take=take.name)
+    time.sleep(1.0)
+    try:
+        os.killpg(take.proc.pid, signal.SIGINT)
+    except Exception:
+        pass
+    try:
+        take.proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _capture_say("  recorder did not stop in %.0f s; terminating" % timeout)
+        take.proc.terminate()
+        try:
+            take.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            take.proc.kill()
+    cj = os.path.join(take.dir, "capture.json")
+    if os.path.exists(cj):
+        with open(cj) as f:
+            take.report = json.load(f)
+    _write_scenario(take)
+    _CAP["take"] = None
+    rep = take.report or {}
+    rec = rep.get("recorder") or {}
+    _capture_say("stopped %s: %s, %.0f s%s" % (
+        take.name, _human(rec.get("bytes_written", 0)), rec.get("ros_duration_s") or 0,
+        "" if rep else " -- NO capture.json, the bag may not have closed"))
+    if rep.get("critical_lost"):
+        _capture_say("  LOST MESSAGES on critical topics: %s" % rep["critical_lost"])
+    for name, t in sorted((rep.get("topics") or {}).items()):
+        if t.get("subscribed"):
+            lost = t["dds_lost"]["lost"]
+            _capture_say("  %-50s %7d msgs%s%s" % (
+                name, t["received"], (", lost %d%s" % (lost, "" if t["dds_lost"]["exact"] else " (est.)")) if lost else "",
+                (", thinned %d" % t["throttled"]) if t.get("throttled") else ""))
+    if rep.get("absent_topics"):
+        _capture_say("  absent: %s" % ", ".join(rep["absent_topics"]))
+    sp = _speed_summary(take.moves)
+    if sp["moves"]:
+        _capture_say("  %d moves: %d over the speed limit, %d stopped; worst peak %.2f x its limit"
+                     % (sp["moves"], sp["over_limit"], sp["stopped"],
+                        sp["worst_peak_over_limit"] or 0.0))
+    return rep
+
+
+def capture_laser(on):
+    """The Keyence laser (UR digital output CAPTURE_LASER_PIN)."""
+    if _CAP.get("laser_unavailable") and CELL_MODE == "sim":
+        return False
+    try:
+        set_digital_out(int(CAPTURE_LASER_PIN), bool(on))
+        _capture_say("  Keyence laser %s" % ("ON" if on else "off"))
+        return True
+    except Exception as e:
+        if CELL_MODE == "hardware" and on:
+            raise CaptureRefused("could not switch the Keyence laser on (digital output "
+                                 "%d): %s" % (CAPTURE_LASER_PIN, e))
+        _CAP["laser_unavailable"] = str(e)
+        _capture_say("  no laser switch here (%s)" % ((str(e).splitlines() or [""])[0],))
+        return False
+
+
+@contextlib.contextmanager
+def _laser_hold():
+    capture_laser(True)
+    try:
+        yield
+    finally:
+        capture_laser(False)
+
+
+@contextlib.contextmanager
+def _own_light(what):
+    """The warning light when the config offers no warning_light()."""
+    pin = int(CAPTURE_WARNING_LIGHT_PIN)
+    try:
+        set_digital_out(pin, True)
+    except Exception as e:
+        if CELL_MODE == "hardware":
+            raise CaptureRefused("could not switch the warning light on (digital output "
+                                 "%d): %s. The arm does not move with it dark." % (pin, e))
+    try:
+        yield pin
+    finally:
+        try:
+            set_digital_out(pin, False)
+        except Exception:
+            pass
+
+
+def _light_hold(what):
+    if "warning_light" in globals() and "WARNING_LIGHT_PIN" in globals():
+        if globals()["WARNING_LIGHT_PIN"] is None and CELL_MODE == "hardware":
+            raise CaptureRefused("WARNING_LIGHT_PIN is None, and the light must be on "
+                                 "whenever the capture tool moves the arm")
+        return warning_light(what)
+    return _own_light(what)
+
+
+def _preflight_motion(what):
+    if capture_envelope() is None:
+        raise CaptureRefused("%s: no work volume for %s/%s. Measure it first: "
+                             "capture_touch_off()" % (what, CELL_NAME, CELL_MODE))
+    if capture_node.current_joints() is None:
+        raise CaptureRefused("%s: /joint_states are not arriving" % what)
+    if live_pose.snapshot() is None:
+        raise CaptureRefused("%s: no TF for probe_end" % what)
+    if CELL_MODE == "hardware":
+        if CAPTURE_AUTO_CONFIRM:
+            raise CaptureRefused("CAPTURE_AUTO_CONFIRM is set; it is refused on hardware")
+        if capture_node.program_running is False:
+            raise CaptureRefused(
+                "%s: the robot program is not running. Press play on the teach "
+                "pendant (the External Control program) and try again." % what)
+        if capture_node.program_running is None:
+            _capture_say("  WARNING: nothing on /io_and_status_controller/robot_program_running;"
+                         " cannot tell whether External Control is running")
+
+
+@contextlib.contextmanager
+def capture_scenario(scenario, sets=("core",), expect_s=120.0, params=None, laser=False,
+                     near_points=None, pipeline=False, uses=(), specimen=None,
+                     lighting=None, notes=None, motion=True, image_rate=None):
+    """One take around a block of scenario code, with every rule held.
+
+        with capture_scenario("keyence_ladder", sets=("core", "keyence"),
+                              laser=True, near_points=pts) as take:
+            ...
+
+    Preflight (work volume, joint states, TF, robot program), recorder
+    started, warning light held, laser held if asked, the gate told where the
+    part is, pipeline motions gated if asked, service calls logged. An operator
+    abort ends the block cleanly; anything else is re-raised after the take is
+    closed. The take is always closed and scenario.json always written."""
+    if motion:
+        _preflight_motion(scenario)
+    take = start_take(scenario, sets, expect_s, specimen, lighting, notes,
+                      image_rate=image_rate)
+    take.params = _cap_jsonable(params or {})
+    take.uses = list(uses)
+    err = None
+    try:
+        with contextlib.ExitStack() as stack:
+            if motion or pipeline:
+                stack.enter_context(_local_ik())
+            if motion:
+                stack.enter_context(_light_hold("capture: %s" % scenario))
+            if laser:
+                stack.enter_context(_laser_hold())
+            stack.enter_context(near_context(near_points))
+            stack.enter_context(logged_service_calls())
+            if pipeline:
+                stack.enter_context(gated_pipeline())
+            yield take
+    except CaptureAbort as e:
+        take.aborted = True
+        take.errors.append("aborted by the operator at: %s" % (e,))
+        _capture_say("  %s ABORTED by the operator (%s); the take is kept" % (scenario, e))
+    except BaseException as e:
+        take.errors.append(traceback.format_exc())
+        err = e
+    finally:
+        stop_take(take)
+    if err is not None:
+        raise err
+
+
+# ------------------------------------------------------------------------------
+# The work-volume override: what touch-off writes, and how a session uses it
+# ------------------------------------------------------------------------------
+
+def _override_dir():
+    return os.path.join(os.path.expanduser(CAPTURE_ROOT), "cell_override")
+
+
+def _manifest_with_volume(text, mode, lo, hi, comment=()):
+    """The manifest text with work_volume.<mode> replaced, comments elsewhere
+    untouched. Raises if the result does not parse to exactly that change."""
+    import yaml
+    lines = text.splitlines(True)
+    try:
+        i = next(k for k, l in enumerate(lines) if re.match(r"^work_volume:\s*(#.*)?$", l))
+    except StopIteration:
+        raise ValueError("the manifest has no top-level work_volume block")
+    end = len(lines)
+    for k in range(i + 1, len(lines)):
+        if re.match(r"^[A-Za-z_]", lines[k]):
+            end = k
+            break
+    fmt = lambda v: "[%.4f, %.4f, %.4f]" % tuple(float(x) for x in v)
+    block = ["    # %s\n" % c for c in comment] + ["    min: %s\n" % fmt(lo),
+                                                   "    max: %s\n" % fmt(hi)]
+    m = next((k for k in range(i + 1, end)
+              if re.match(r"^  %s:\s*(#.*)?$" % re.escape(mode), lines[k])), None)
+    if m is None:
+        ins = end
+        while ins > i + 1 and (not lines[ins - 1].strip() or lines[ins - 1].startswith("#")):
+            ins -= 1
+        lines[ins:ins] = ["\n  %s:\n" % mode] + block
+    else:
+        last = m
+        for k in range(m + 1, end):
+            l = lines[k]
+            if not l.strip():
+                continue
+            if len(l) - len(l.lstrip(" ")) >= 4:
+                last = k
+                continue
+            break
+        lines[m + 1:last + 1] = block
+    new = "".join(lines)
+    old_d, new_d = yaml.safe_load(text), yaml.safe_load(new)
+    want = {"min": [round(float(v), 4) for v in lo], "max": [round(float(v), 4) for v in hi]}
+    got = new_d["work_volume"][mode]
+    if [round(v, 4) for v in got["min"]] != want["min"] or \
+            [round(v, 4) for v in got["max"]] != want["max"]:
+        raise ValueError("rewritten manifest does not carry the new box: %s" % got)
+    for d in (old_d, new_d):
+        d["work_volume"].pop(mode, None)
+    if old_d != new_d:
+        raise ValueError("rewriting work_volume.%s changed something else in the "
+                         "manifest; not writing it" % mode)
+    return new
+
+
+def _original_manifest():
+    """The manifest as found WITHOUT the override, and its text."""
+    d = _override_dir()
+    saved = os.environ.get("TARI_CELL_PATH", "")
+    os.environ["TARI_CELL_PATH"] = os.pathsep.join(
+        p for p in saved.split(os.pathsep) if p and os.path.abspath(p) != os.path.abspath(d))
+    try:
+        found, real = manifest_file()
+    finally:
+        os.environ["TARI_CELL_PATH"] = saved
+    if not real:
+        raise RuntimeError("cannot find the %s manifest (TARI_CELL_PATH=%r)"
+                           % (CELL_NAME, saved))
+    with open(real) as f:
+        return real, f.read()
+
+
+def _override_box_file():
+    return os.path.join(_override_dir(), CELL_NAME + ".work_volume.json")
+
+
+def _same_box(a, b):
+    try:
+        return all(abs(float(x) - float(y)) < 5e-5
+                   for k in ("min", "max") for x, y in zip(a[k], b[k]))
+    except Exception:
+        return False
+
+
+def write_work_volume_proposal(lo, hi, comment=(), mode=None):
+    """Keep the measured box (CAPTURE_ROOT/cell_override/<cell>.work_volume.json),
+    write the proposed work_volume.<mode> block for the real manifest into the
+    session, and start using the box (activate_work_volume_override)."""
+    mode = mode or CELL_MODE
+    src, text = _original_manifest()
+    _manifest_with_volume(text, mode, lo, hi, comment)    # refuses a bad rewrite
+    d = _override_dir()
+    os.makedirs(d, exist_ok=True)
+    bf = _override_box_file()
+    boxes = {}
+    if os.path.exists(bf):
+        with open(bf) as f:
+            boxes = json.load(f)
+    boxes[mode] = {"min": [float(v) for v in lo], "max": [float(v) for v in hi],
+                   "comment": list(comment), "manifest": src,
+                   "measured": datetime.datetime.now().isoformat(timespec="seconds"),
+                   "session": _session()["dir"]}
+    with open(bf, "w") as f:
+        json.dump(boxes, f, indent=1)
+    proposal = os.path.join(_session()["dir"], "work_volume_%s.yaml" % mode)
+    with open(proposal, "w") as f:
+        f.write("# Proposed for %s (work_volume -> %s).\n" % (src, mode))
+        for c in comment:
+            f.write("# %s\n" % c)
+        f.write("work_volume:\n  %s:\n    min: [%.4f, %.4f, %.4f]\n    max: [%.4f, %.4f, %.4f]\n"
+                % ((mode,) + tuple(lo) + tuple(hi)))
+    override = activate_work_volume_override() if mode == CELL_MODE else None
+    return {"proposal": proposal, "override": override, "box_file": bf, "manifest": src}
+
+
+def activate_work_volume_override(quiet=False):
+    """Use the touch-off box for this cell and mode, if one was measured.
+
+    The override manifest is REGENERATED from the real manifest every time --
+    the real one with only work_volume.<mode> replaced -- so it never shadows
+    a later change to anything else in it. When the real manifest already
+    carries the measured box, no override is used at all."""
+    import yaml
+    d = _override_dir()
+    bf = _override_box_file()
+    box = None
+    if os.path.exists(bf):
+        try:
+            with open(bf) as f:
+                box = json.load(f).get(CELL_MODE)
+        except Exception as e:
+            _capture_say("  ignoring unreadable %s: %s" % (bf, e))
+    parts = [p for p in os.environ.get("TARI_CELL_PATH", "").split(os.pathsep)
+             if p and os.path.abspath(p) != os.path.abspath(d)]
+    if not box:
+        os.environ["TARI_CELL_PATH"] = os.pathsep.join(parts)
+        return None
+    src, text = _original_manifest()
+    cur = ((yaml.safe_load(text) or {}).get("work_volume") or {}).get(CELL_MODE) or {}
+    if cur.get("min") is not None and _same_box(cur, box):
+        os.environ["TARI_CELL_PATH"] = os.pathsep.join(parts)
+        work_volume_reload()
+        if not quiet:
+            _capture_say("  the manifest already carries the touch-off box; no override "
+                         "(clear_work_volume_override() retires %s)" % bf)
+        return None
+    new = _manifest_with_volume(text, CELL_MODE, box["min"], box["max"], box.get("comment", ()))
+    f = os.path.join(d, CELL_NAME + ".yaml")
+    with open(f, "w") as h:
+        h.write("# GENERATED by cell_capture from %s with work_volume.%s from the\n"
+                "# touch-off in %s. Rewritten at every load; edit neither -- fold the\n"
+                "# proposed block into the real manifest, then clear_work_volume_override().\n"
+                % (src, CELL_MODE, bf))
+        h.write(new)
+    os.environ["TARI_CELL_PATH"] = os.pathsep.join([d] + parts)
+    work_volume_reload()
+    if not quiet or cur.get("min") is not None:
+        _capture_say("  USING THE TOUCH-OFF WORK VOLUME (%s)%s" % (
+            bf, "" if cur.get("min") is None else
+            " -- it DIFFERS from the manifest's own box %s..%s" % (cur["min"], cur["max"])))
+        _capture_say(describe_work_volume())
+    return f
+
+
+def clear_work_volume_override():
+    """Stop using the touch-off box (the files are renamed, not deleted)."""
+    d = _override_dir()
+    os.environ["TARI_CELL_PATH"] = os.pathsep.join(
+        p for p in os.environ.get("TARI_CELL_PATH", "").split(os.pathsep)
+        if p and os.path.abspath(p) != os.path.abspath(d))
+    stamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    for f in (os.path.join(d, CELL_NAME + ".yaml"), _override_box_file()):
+        if os.path.exists(f):
+            os.rename(f, f + ".disabled-%s" % stamp)
+    work_volume_reload()
+    _capture_say(describe_work_volume())

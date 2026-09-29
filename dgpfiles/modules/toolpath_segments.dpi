@@ -219,7 +219,8 @@ def scanpath_from_pose_array(pose_array, segment_start_indices=None):
     return ScanPath(pos, quat, segment_start_indices, source=src)
 
 
-def scanpath_from_plane_grid(uu, vv, ww, rotation, serpentine=True):
+def scanpath_from_plane_grid(uu, vv, ww, rotation, serpentine=True,
+                             overtravel_pitches=0.0):
     """Build a ScanPath for the rectangular plane scan.
 
     uu/vv/ww are the (m,n) world coordinate grids from _plane_grid; rotation is
@@ -227,6 +228,16 @@ def scanpath_from_plane_grid(uu, vv, ww, rotation, serpentine=True):
     row, boundaries exact -- no mesh, no registration, no inference. This is the
     quick-look path and it produces the same ScanPath type as a Noether toolpath,
     so everything downstream is shared.
+
+    overtravel_pitches appends one waypoint to every row, that many column
+    pitches beyond its last column in the row's direction of travel. A
+    position-triggered raster needs it: the trigger for the last column fires
+    when progress reaches (m-1)*pitch, and a pass that STOPS there puts that
+    crossing on a coin flip against noise. The row must carry the probe past
+    the last column. It is the caller's job to have placed the columns so that
+    this point is still inside the taught rectangle -- _plane_grid's
+    end_margin, with the same value -- because a probe that may be in contact
+    with the part is not commanded beyond where a technician taught it.
     """
     m = uu.shape[0]
     n = uu.shape[1]
@@ -237,6 +248,10 @@ def scanpath_from_plane_grid(uu, vv, ww, rotation, serpentine=True):
         cols = range(m) if (not serpentine or j % 2 == 0) else range(m-1, -1, -1)
         for i in cols:
             pos.append((float(uu[i, j]), float(vv[i, j]), float(ww[i, j])))
+        if overtravel_pitches > 0.0 and m > 1:
+            last = np.array(pos[-1])
+            prev = np.array(pos[-2])
+            pos.append(tuple(last + (last - prev)*float(overtravel_pitches)))
     pos = np.array(pos, dtype=np.float64)
     q = np.tile(np.array([[rotation.x, rotation.y, rotation.z, rotation.w]], dtype=np.float64),
                 (pos.shape[0], 1))

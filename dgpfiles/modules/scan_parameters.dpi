@@ -6,7 +6,7 @@
 # known ceiling. Here they are not: the robot will happily sweep at whatever
 # velocity it is given, the digitizer will happily free-run at its PRF, and the
 # thing that actually falls over is the software pipeline in between -- which
-# says nothing when it does. Set a 0.5 mm step today and the arm keeps moving at
+# says nothing when it does. Set a 0.5 mm step and the arm keeps moving at
 # 50 mm/s, the trace rate goes up ten-fold, and the staging queue grows until the
 # scan is producing traces it cannot record.
 #
@@ -16,8 +16,9 @@
 # database -- it is arithmetic over measured constants, which is what lets
 # scan_parameters_test.py check it on the host with no cell running.
 #
-# The measured constants are all in DEFAULT_LIMITS below, each with the run it
-# came from. They are the part that goes stale: re-measure them when the pipeline
+# The measured constants are all in DEFAULT_LIMITS below, each with the
+# conditions it was measured under. They are the part that goes stale: re-measure
+# them when the pipeline
 # changes and the arithmetic follows. Every scan reports what it actually
 # achieved against what was planned (see check_scan_outcome), so drift is
 # visible rather than assumed.
@@ -34,6 +35,7 @@ global check_scan_outcome
 global auto_spot_radius
 global auto_projection_pixels
 global velocity_scaling_for
+global velocity_from_scaling
 
 
 class ScanLimitError(RuntimeError):
@@ -54,13 +56,13 @@ DEFAULT_LIMITS = {
 
     # Sustained trace rate of the staging pipeline, per projection mode, in Hz.
     #
-    # "live" is measured: the 30-pass timestamped mesh scan of 2026-08-14 staged
+    # "live" is measured: a 30-pass timestamped mesh scan staged
     # 61 traces per 6.1 s sweep -- 10 traces/s -- with the stager's queue sitting
     # at a depth of 5 and draining, i.e. marginally behind. That is the ceiling
     # with projection in the trace path.
     #
     # "deferred" and "off" share a per-trace path with no projection wait, and
-    # were measured together 2026-08-15 by deliberately over-driving one: a
+    # were measured together by deliberately over-driving one: a
     # 4-pass scan asking for 50 traces/s achieved 21.7, with the stager's queue
     # climbing to 175 and staying there. So ~22 -- and NOT the 50 that the
     # one-wait transaction floor suggests. The floor counts the ordering window
@@ -129,7 +131,7 @@ DEFAULT_LIMITS = {
     # pixels across the splat cannot be drawn whatever its radius says: 512 px
     # over 0.30 m is 1.7 px/mm, so a 1 mm spot is under 2 px.
     #
-    # 8 is the number that reproduces both points we have. At the 5.08 mm step
+    # 8 is the number that reproduces both measured points. At the 5.08 mm step
     # it asks for 512 -- the value the 96.6%-coverage image was actually made at
     # -- and at a 0.5 mm step it asks for 2048, which is the "0.5 mm needs
     # 2048+" the measurements led to. A manual choice giving under half of this
@@ -233,11 +235,10 @@ def velocity_scaling_for(velocity_mps, calibration):
 
     CartesianMove's vel is a fraction of the robot's JOINT limits, not a speed,
     so a technician-facing number in m/s has to be converted -- and the
-    conversion is a property of this cell, not of this code. It is also not a
-    single constant, which is what the first version of this assumed and what
-    measuring it disproved: in the simulated cell the mapping is close to linear
-    at 1.5 m/s full scale up to about 30 mm/s and then saturates hard, so one
-    ratio taken at 50 mm/s over-commands everything slower by half.
+    conversion is a property of this cell, not of this code. It is also NOT a
+    single constant: in the simulated cell the mapping is close to linear at
+    1.5 m/s full scale up to about 30 mm/s and then saturates hard, so one ratio
+    taken at 50 mm/s over-commands everything slower by half.
 
     The inverse of velocity_from_scaling, therefore, over the measured table.
     Returns the scaling clamped to the table's range; ask for more than the cell
@@ -307,7 +308,7 @@ def plan_scan(step_m, velocity_mps, path_length_m, passes,
             % (velocity_mps*1e3, over, max_velocity*1e3, step_m*1e3, rate_reason))
 
     # What the arm will ACTUALLY do with that command, which is a separate
-    # question from what we asked for and is the one the trace rate depends on.
+    # question from what was asked for and is the one the trace rate depends on.
     # Everything below is computed from the achieved speed, not the target,
     # because a cell that runs 50% fast at low scalings produces 50% more traces
     # per second than the plan would otherwise claim.
@@ -528,8 +529,8 @@ def check_scan_outcome(plan, report, limits=None):
 
     depth = report.get("stager_max_queue_depth")
     if depth is not None and depth > 0:
-        # A depth of a few is normal and drains. Sustained growth is not, and the
-        # 30-pass reference run peaked at 5.
+        # A depth of a few is normal and drains. Sustained growth is not; a
+        # 30-pass reference scan peaks at 5.
         if depth > 16:
             out.append("  the staging queue reached %d: the pipeline ran BEHIND the "
                        "trigger at %.1f traces/s. Lower the velocity or raise the "

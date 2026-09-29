@@ -1,13 +1,13 @@
 #########################################################################
 # AdaptiveNDE Project                                                   #
-# AFRL-ROS Package                                                      # 
+# ROS-Scanning Package                                                  #
 #########################################################################
 # Copyright 2023-2024 University of Dayton                              #
 #                                                                       #
-# Redistribution and use in source and binary forms, with or without    # 
+# Redistribution and use in source and binary forms, with or without    #
 # modification, are permitted provided that the following conditions    #
 # are met:                                                              #
-#                                                                       # 
+#                                                                       #
 # 1. Redistributions of source code must retain the above copyright     #
 #    notice, this list of conditions and the following disclaimer.      #
 # 2. Redistributions in binary form must reproduce the above copyright  #
@@ -35,17 +35,17 @@
 #                                                                       #
 # DISTRIBUTION A. Approved for public release: distribution unlimited.  #
 #########################################################################
-# File:  ECScan.dgp                                                     
-# Authors: Tyler Lesthaeghe, Essence Wallace                                             
-# Created: 2023-08-30                                                  
+# File:  ECScan.dgp
+# Authors: Tyler Lesthaeghe, Essence Wallace
+# Created: 2023-08-30
 # Description:
-#   Dataguzzler-Python Configuration for three-point plane scanning 
-# Derived From:                                                         
-#    scannertest.dgp demo in dgpython-ros2motion                                            
+#   Dataguzzler-Python Configuration for three-point plane scanning
+# Derived From:
+#    scannertest.dgp demo in dgpython-ros2motion
 #       under BSD 3-Clause license
 #########################################################################
-# Revision Log                                                          
-# 
+# Revision Log
+#
 # 2023-08-30:  Initial Commit
 # 2023-10-12:  Moved to New Repository
 # 2023-10-13:  Bugfix to 3 point plane scan
@@ -53,7 +53,7 @@
 # 2023-11-06:  Adding progress bar
 # 2023-11-07:  Adding rate limiting for troubleshooting
 # 2023-11-14:  Fixing real time plotting for small step size scans
-# 
+#
 #########################################################################
 # Development Notes
 #

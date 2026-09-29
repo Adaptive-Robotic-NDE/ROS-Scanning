@@ -1,0 +1,626 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  roi_select.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Interactive selection of the scan region on a measured surface.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# PICK THE REGION BY HAND
+# ==============================================================================
+# select_roi() pops up a 3D view of a measured surface and lets the operator
+# draw the area that is actually going to be scanned.
+#
+# WHY. The YOLO detector's box can be several times the size of the part: an
+# 83 x 165 mm plate has come back as a 135 x 287 mm box enclosing the optical
+# breadboard, the clamps and pins holding the plate down, and a stepped mount
+# block. Everything inside the box is then measured by the Keyence, meshed and
+# rastered -- a 198 k-triangle mesh only 30% of whose vertices are the plate, a
+# 412 k-pose eddy-current toolpath where about 45 000 poses over the plate alone
+# would have done, and tool poses 89.8 degrees off vertical where Noether runs
+# over the rim of the mount block.
+#
+# A detector that is wrong by that much is not fixable by tightening a
+# threshold, and it does not have to be: there is an operator standing there,
+# the surface is on screen, and drawing a box round a plate takes two seconds.
+#
+# WHERE IT GOES IN THE PIPELINE. After stage 2 of run_automated_scan(), the
+# Azure rough mesh -- the first 3D surface that exists, and only 40 s of the
+# run. The region it returns then constrains stage 3 (the 10-minute Keyence
+# raster) and stage 5 (the toolpath). Doing it after stage 3 would mean the
+# expensive measurement has already been paid for.
+#
+# ------------------------------------------------------------------------------
+# THE SELECTION IS DRAWN ON ONE SENSOR'S MESH AND APPLIED TO ANOTHER'S
+# ------------------------------------------------------------------------------
+# Which is the whole difficulty. The operator draws on the AZURE rough mesh at
+# stage 2; what gets cropped is the KEYENCE mesh at stage 5. So of the four
+# things this returns, only some of them travel:
+#
+#   mask       DOES NOT TRAVEL. One entry per AZURE vertex, and the Keyence mesh
+#              of the same part has a different vertex count and ordering
+#              entirely. Exact where it fits and unusable elsewhere.
+#   bounds3d   ITS z DOES NOT TRAVEL. The Azure reads this cell 11.6-13.6 mm too
+#              far, enough that the ROI's z floor lands ABOVE the top of the
+#              Keyence mesh of the same part -- no overlap at all, and a 3D-box
+#              crop then keeps zero faces. It is PROVENANCE only, reported and
+#              never applied.
+#   region     travels. A rectangle in world x-y.
+#   footprint  travels, and is the one to use: the DRAWN SHAPE rasterised onto a
+#              2 mm grid in world x-y, PLUS the height of the selected surface in
+#              each of those cells. It keeps what a rectangle throws away -- the
+#              corner of an L-shaped part is not in it, and a rectangle round an
+#              L-shaped part contains bench -- and its z is per cell rather than
+#              one global range, so a 1-3 mm sensor-to-sensor disagreement in
+#              surface height cannot empty a crop.
+#
+# noether_path.dpi's _gate_roi_shape() reads them in that order of preference,
+# and crop_mesh_to_roi() is what actually down-selects a mesh with one.
+#
+# ------------------------------------------------------------------------------
+# WHY THE FOOTPRINT CARRIES HEIGHTS AND NOT JUST A SHADOW
+# ------------------------------------------------------------------------------
+# Because z cannot be dropped from the decision altogether. A region selected on
+# top of a flat plate must not let the Keyence scan part of the table under it,
+# and the parts here will not stay flat: a curved specimen has to stay inside its
+# ROI in z as well, to within a sensible tolerance.
+#
+# So each footprint cell holds the z of the surface the operator selected there,
+# and a crop keeps a face when its cell is in the footprint AND its height is
+# within GATE_ROI_Z_TOLERANCE_M (6 mm, derived from the measured sensor
+# disagreement) of that cell's height. On a flat plate that band is a slab; on a
+# curved part it follows the curve. What it is never is one global z range for
+# the whole selection: a global range can miss the other sensor's surface
+# completely and keep no faces at all.
+#
+# ------------------------------------------------------------------------------
+# THE WINDOW IS A SEPARATE PROCESS, AND THAT IS THE WHOLE DESIGN
+# ------------------------------------------------------------------------------
+# Not a Qt widget in this interpreter. Four reasons, any one of which is
+# sufficient:
+#
+#   * ECAutomatedScan.dgp does include(dgpy, "Qt.dpi", prefer_pyqt=False) and
+#     runs spatialnde2's OpenSceneGraph viewer on the Qt main thread. A second
+#     binding in one process is a segfault looking for a reason.
+#   * The stage that calls this runs in a WORKER THREAD. A bare thread has no
+#     dgpy context, module print() from one never reaches the console, and any
+#     module-derived object crossing into it drags OpaqueWrappers that make
+#     censoring block forever. A Qt window opened from there hits all of those
+#     at once.
+#   * It must BLOCK until the operator decides. Blocking the Qt main thread is
+#     how the viewer stops repainting; blocking anything else while pumping a
+#     second event loop is worse.
+#   * VTK on a software GL stack over VNC does occasionally take a process
+#     down. A scan that has already flown an Azure sweep must not be one of
+#     them.
+#
+# So: a temp directory, a request JSON in, a result JSON plus a .npy mask and a
+# .ply sub-mesh out, and subprocess.run() with a timeout. Exit 0 accepted, 10
+# cancelled, anything else is a failure with the child's output attached. Same
+# trade noether_path.dpi's mesh_uv_blender.py already makes for Blender.
+#
+# The selection logic lives in roi_select_geom.py (numpy only, no Qt, no VTK)
+# and the window in roi_select_ui.py. That split is what lets roi_select_test.py
+# cover every tool -- rectangle, lasso, brush, and the deselect variant of each
+# -- on a headless box, testing the same functions the operator's mouse calls
+# rather than a second implementation of them.
+#
+# ------------------------------------------------------------------------------
+# WHAT THE OPERATOR SEES
+# ------------------------------------------------------------------------------
+# The surface shaded by height (blue low, red high), unselected dimmed,
+# selected in GREEN -- green because the height ramp has no green in it at any
+# height, and a red highlight would be indistinguishable from the tallest thing
+# in the scene.
+#
+#   1 Navigate   left drag orbits, middle pans, right/wheel zooms
+#   2 Rectangle  drag a box
+#   3 Lasso      drag freehand, or click corners and Enter/right-click to close
+#   4 Brush      drag to paint; [ and ] resize, Shift+wheel also
+#
+#   Ctrl+drag    DESELECT with whichever tool is active
+#   Shift+drag   add instead of replace
+#   Ctrl+A / Ctrl+D / Ctrl+I / Ctrl+Z   all / clear / invert / undo
+#   T F S I R    top, front, side, isometric, refit
+#   Enter        Accept        Esc   Cancel
+#
+# Middle and right drag always move the camera whatever tool is active, so
+# looking at something never costs a mode switch. It opens in TOP view, which
+# is the one a footprint is chosen in.
+#
+# "near surface only" (on by default) keeps, in each patch of screen, only what
+# is nearest the camera -- so a box drawn over the part does not also take its
+# underside or the bench straight behind it. It is plain numpy, not a z-buffer
+# read or vtkHardwareSelector, because those are the first things to misbehave
+# on the software GL stack the cell is driven through over VNC.
+#
+# ------------------------------------------------------------------------------
+# DEPENDENCIES
+# ------------------------------------------------------------------------------
+# python3-pyqt5 and python3-vtk9 in the interpreter that runs the CHILD, which
+# is sys.executable unless ROI_SELECT_PYTHON says otherwise. Both are packaged
+# on Ubuntu 22.04 and RViz usually pulls them in already. roi_select_available()
+# probes for them and says what is missing rather than failing at the moment the
+# operator is waiting.
+#
+# NOTE it is `import vtkmodules...`, never `import vtk`: the top-level shim
+# imports every module VTK was built with, and on an Arch host that dies on a
+# missing libopenvr_api.so despite VTK being perfectly usable.
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+import numpy as np
+
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+#: Master switch. False makes select_roi() refuse and
+#: refine_region_interactively() pass the region through untouched, which is
+#: the headless / unattended path.
+#:
+#: Seeded from ROI_SELECT if the config set one BEFORE including this file, so
+#: the switch can live up at the top of ECAutomatedScan.dgp with the other
+#: technician constants where somebody will actually find it, instead of two
+#: thirds of the way down next to an include.
+global ROI_SELECT_ENABLED
+ROI_SELECT_ENABLED = bool(globals().get("ROI_SELECT", True))
+
+#: How long the operator gets before the child is killed. Generous on purpose:
+#: this blocks a scan that has already flown a sweep, and an operator who walks
+#: away mid-selection should find the window still there. The timeout exists so
+#: a wedged child cannot hold the cell forever, not to hurry anybody.
+global ROI_SELECT_TIMEOUT
+ROI_SELECT_TIMEOUT = 3600.0
+
+#: Interpreter for the child. None means sys.executable. Set this if dgpy is
+#: running under a python that has no PyQt5 while another one does.
+global ROI_SELECT_PYTHON
+ROI_SELECT_PYTHON = None
+
+#: Keep the temp directory after a successful selection. The sub-mesh is
+#: written there, so anything that wants to hold on to it should copy it out --
+#: which is what save_roi() does.
+global ROI_SELECT_KEEP
+ROI_SELECT_KEEP = False
+
+#: Brush radius in SCREEN PIXELS, remembered between calls in a session.
+global ROI_SELECT_BRUSH_PX
+ROI_SELECT_BRUSH_PX = 40.0
+
+#: The last accepted selection, so a stage that failed after one can be retried
+#: without asking the operator to draw it again.
+global last_roi
+last_roi = None
+
+
+# ==============================================================================
+
+global roi_select_module_dir
+def roi_select_module_dir():
+    """Where the helper scripts are. Same directory as this .dpi."""
+    here = globals().get("SCAN_MODULE_DIR")
+    if here and os.path.exists(os.path.join(here, "roi_select_ui.py")):
+        return here
+    # The .dpi has no __file__ of its own, so fall back to a module that does.
+    # noether_path.dpi resolves its own directory the same way.
+    for probe in (globals().get("_noether_module_file", lambda: None)(),
+                  __file__ if "__file__" in globals() else None):
+        if probe:
+            d = os.path.dirname(os.path.abspath(probe))
+            if os.path.exists(os.path.join(d, "roi_select_ui.py")):
+                return d
+    raise IOError("cannot find roi_select_ui.py -- set SCAN_MODULE_DIR")
+
+
+#: Cached probe results, keyed by (interpreter, DISPLAY). A dict rather than a
+#: rebound name because a .dpi body is a function body and its top-level names
+#: are closure variables to the defs inside it -- mutating is fine, rebinding
+#: from in there would need a nonlocal.
+_roi_probe = {}
+
+
+global roi_select_available
+def roi_select_available(python=None, recheck=False):
+    """(True, why) if the window can actually be opened right now.
+
+    IT ACTUALLY BUILDS A QApplication in the child rather than looking at
+    environment variables, and the difference is not academic. A session with
+    WAYLAND_DISPLAY set and DISPLAY unset passes a "DISPLAY or WAYLAND_DISPLAY"
+    heuristic, and the child then dies on SIGABRT with no output at all, because
+    the PyQt5 packaged here has only the xcb platform plugin. A probe that
+    answers "yes" and is wrong is worse than no probe: the caller uses this to
+    decide whether an unattended run may carry on, and a false yes turns a
+    working headless scan into a crash.
+
+    Checked BEFORE a scan commits to anything, so "PyQt5 is not installed on
+    this machine" is read at the start of a run rather than 40 seconds in with
+    the arm parked over the part. The answer is cached per interpreter and
+    DISPLAY, so asking twice in one scan costs one launch.
+    """
+    if not ROI_SELECT_ENABLED:
+        return False, "ROI selection is switched off (ROI_SELECT_ENABLED)"
+    try:
+        d = roi_select_module_dir()
+    except IOError as e:
+        return False, str(e)
+
+    exe = python or ROI_SELECT_PYTHON or sys.executable
+    key = (exe, os.environ.get("DISPLAY"), os.environ.get("WAYLAND_DISPLAY"))
+    if not recheck and key in _roi_probe:
+        return _roi_probe[key]
+
+    probe = ("import sys, PyQt5.QtWidgets as W, "
+             "vtkmodules.vtkRenderingOpenGL2, "
+             "vtkmodules.qt.QVTKRenderWindowInteractor; "
+             "W.QApplication(sys.argv[:1])")
+    try:
+        out = subprocess.run([exe, "-c", probe], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, timeout=120,
+                             env=_child_env())
+    except Exception as e:
+        res = (False, "cannot run %s (%s)" % (exe, e))
+        _roi_probe[key] = res
+        return res
+
+    if out.returncode == 0:
+        res = (True, "ready (%s, %s)" % (exe, d))
+    else:
+        text = out.stdout.decode("utf-8", "replace").strip().splitlines()
+        if text:
+            why = text[-1]
+        else:
+            # Qt aborts SILENTLY when it cannot load a platform plugin, which
+            # on a headless or Wayland-only session is the usual reason, so
+            # there is nothing to quote and the guess has to be spelled out.
+            why = ("it aborted with no output (signal %d), which normally "
+                   "means no usable X display: DISPLAY=%r. Over VNC set "
+                   "DISPLAY to the VNC server's screen."
+                   % (-out.returncode, os.environ.get("DISPLAY")))
+        res = (False, "%s cannot open a window: %s. Needs python3-pyqt5 and "
+                      "python3-vtk9." % (exe, why))
+    _roi_probe[key] = res
+    return res
+
+
+def _child_env():
+    """The child's environment, with the PARENT'S Qt stripped out of it.
+
+    dgpy has already loaded PySide6 in this process, and PySide6 exports
+    QT_PLUGIN_PATH and friends pointing at ITS OWN plugin tree. Inherited by a
+    PyQt5 child those produce "could not load the Qt platform plugin xcb",
+    which reads like a missing package and is not one.
+    """
+    env = dict(os.environ)
+    for var in ("QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH",
+                "QML2_IMPORT_PATH", "QML_IMPORT_PATH", "QT_QPA_PLATFORM",
+                "QT_API", "PYQTGRAPH_QT_LIB"):
+        env.pop(var, None)
+    # The child imports roi_select_geom from its own directory; nothing else of
+    # the parent's PYTHONPATH should be able to shadow it.
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
+def _write_input(source, workdir):
+    """A PLY on disk for the child to read, and a note of what it was.
+
+    A path is used where it lies -- no copy of a 68 MB reconstruction. Arrays
+    are written out, which is what lets this be called on something held in
+    memory rather than on a file.
+    """
+    import roi_select_geom as geom
+
+    if isinstance(source, str):
+        if not os.path.exists(source):
+            raise IOError("no such mesh or point cloud: %s" % (source,))
+        return source, source
+
+    verts = tris = None
+    if isinstance(source, (tuple, list)) and len(source) == 2:
+        verts, tris = source
+    elif isinstance(source, np.ndarray):
+        verts = source
+    elif hasattr(source, "vertices") and hasattr(source, "triangles"):
+        verts, tris = np.asarray(source.vertices), np.asarray(source.triangles)
+    else:
+        raise TypeError(
+            "select_roi() takes a PLY path, an (N, 3) vertex array, or a "
+            "(vertices, triangles) pair -- not %s" % (type(source).__name__,))
+
+    verts = np.asarray(verts, dtype=np.float64)
+    if verts.ndim != 2 or verts.shape[1] != 3:
+        raise ValueError("vertices must be N x 3, got %s" % (verts.shape,))
+    path = os.path.join(workdir, "roi_input.ply")
+    geom.write_ply(path, verts, None if tris is None else np.asarray(tris))
+    return path, "<%d points in memory>" % (len(verts),)
+
+
+global select_roi
+def select_roi(mesh_or_points, title=None, initial=None, timeout=None,
+               front_only=True, brush_radius=None, python=None, keep=None):
+    """Ask the operator to draw the region to scan. Blocks. None if cancelled.
+
+    mesh_or_points   a PLY path (mesh OR point cloud), an (N, 3) vertex array,
+                     or a (vertices, triangles) pair.
+    initial          (xmin, ymin, xmax, ymax) in world metres, preselected --
+                     hand it the detector's region so the operator CORRECTS a
+                     selection instead of drawing one from nothing.
+
+    Returns a dict, every part of which some downstream stage wants:
+
+      region     (xmin, ymin, xmax, ymax) world metres. THE TUPLE THE PIPELINE
+                 ALREADY CONSUMES -- reconstruct_fine(region=),
+                 plan_ec_path(region=) -- in their order, which is NOT
+                 (xmin, xmax, ymin, ymax). Transposing the two has sent a sweep
+                 696 mm away from the part.
+      mask       bool ndarray over the INPUT vertices, in input order. Exact,
+                 and usable only on the surface it was drawn on.
+      footprint  THE DRAWN SHAPE IN WORLD x-y, on a 2 mm grid, AND THE HEIGHT OF
+                 THE SELECTED SURFACE IN EACH CELL -- the part of a selection
+                 that can be applied to a DIFFERENT mesh, which is what the
+                 pipeline needs (drawn on the Azure, applied to the Keyence).
+                 The heights are what put z back into the crop as a band that
+                 follows the surface rather than a global box. Packed;
+                 roi_select_geom.footprint_decode() and noether_path.dpi's
+                 crop_mesh_to_roi() both read it.
+      submesh    a PLY of just the selected surface, re-indexed. This is the
+                 one that lets us stop rastering the bench: a region is still a
+                 rectangle, and a rectangle around an L-shaped part still
+                 contains the bench in the corner.
+      bounds3d   (xmin, ymin, zmin, xmax, ymax, zmax). PROVENANCE ONLY -- where
+                 the surface the operator was looking at sat in z, on the sensor
+                 that measured it. Never a crop; see the note at the top. z DOES
+                 reach the crop, but per cell through `footprint`, not as this
+                 global range.
+      plus n_selected / n_total / submesh_triangles / footprint_cells / source.
+
+    Cancelling returns None and that means STOP, not "carry on with what you
+    had" -- the caller decides what to do about it. To run with no operator at
+    all, do not call this: ROI_SELECT_ENABLED = False, or pass
+    roi_select=False to run_automated_scan().
+    """
+    import roi_select_geom as geom
+
+    ok, why = roi_select_available(python=python)
+    if not ok:
+        raise RuntimeError("cannot open the region selector: %s" % (why,))
+
+    keep = ROI_SELECT_KEEP if keep is None else bool(keep)
+    timeout = ROI_SELECT_TIMEOUT if timeout is None else float(timeout)
+    if brush_radius is None:
+        brush_radius = ROI_SELECT_BRUSH_PX
+
+    if initial is not None:
+        initial = [float(v) for v in initial]
+        if len(initial) != 4:
+            raise ValueError("initial must be (xmin, ymin, xmax, ymax), got %s"
+                             % (initial,))
+
+    workdir = tempfile.mkdtemp(prefix="roi_select_")
+    try:
+        src, described = _write_input(mesh_or_points, workdir)
+        req = {"input": src,
+               "title": title or "Select the region to scan",
+               "initial": initial,
+               "output": os.path.join(workdir, "result.json"),
+               "mask": os.path.join(workdir, "mask.npy"),
+               "submesh": os.path.join(workdir, "roi_submesh.ply"),
+               "brush_radius": float(brush_radius),
+               "front_only": bool(front_only)}
+        reqfile = os.path.join(workdir, "request.json")
+        with open(reqfile, "w") as fh:
+            json.dump(req, fh, indent=1)
+
+        exe = python or ROI_SELECT_PYTHON or sys.executable
+        helper = os.path.join(roi_select_module_dir(), "roi_select_ui.py")
+        print("  waiting for the operator to pick a region (%s)" % (described,))
+        proc = subprocess.run([exe, helper, reqfile], stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=timeout,
+                              env=_child_env())
+        out = proc.stdout.decode("utf-8", "replace")
+
+        if proc.returncode == 10:
+            print("  the operator cancelled the region selection")
+            return None
+        if proc.returncode != 0 or not os.path.exists(req["output"]):
+            raise RuntimeError("the region selector failed (exit %d):\n%s"
+                               % (proc.returncode, out[-4000:]))
+
+        with open(req["output"]) as fh:
+            res = json.load(fh)
+        res["region"] = tuple(float(v) for v in res["region"])
+        res["bounds3d"] = tuple(float(v) for v in res["bounds3d"])
+        res["mask"] = np.load(req["mask"])
+
+        if keep:
+            res["workdir"] = workdir
+        else:
+            # The sub-mesh is the only thing worth surviving the temp dir, and
+            # a caller that never looks at it should not leak a directory per
+            # scan. Move it beside the input, which is a scan directory.
+            dest = os.path.join(os.path.dirname(os.path.abspath(src)),
+                                "roi_submesh.ply")
+            try:
+                shutil.move(res["submesh"], dest)
+                res["submesh"] = dest
+            except Exception as e:
+                print("  WARNING: could not keep the ROI sub-mesh (%s); it is "
+                      "at %s until this process exits" % (e, res["submesh"]))
+                res["workdir"] = workdir
+                keep = True
+
+        globals()["last_roi"] = res
+        print("  region: %s" % (describe_roi(res),))
+        return res
+    finally:
+        if not keep:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+global describe_roi
+def describe_roi(roi):
+    """One line for the console and the scan log."""
+    if roi is None:
+        return "no region selected"
+    x0, y0, x1, y1 = roi["region"]
+    line = ("%.1f x %.1f mm at x %.3f..%.3f y %.3f..%.3f -- %d of %d points "
+            "(%.1f%%)" % ((x1 - x0)*1e3, (y1 - y0)*1e3, x0, x1, y0, y1,
+                          roi["n_selected"], roi["n_total"],
+                          100.0*roi["n_selected"]/max(1, roi["n_total"])))
+    if roi.get("submesh_triangles"):
+        line += ", sub-mesh %d of %d triangles" % (
+            roi["submesh_triangles"], roi.get("triangles_total", 0))
+    # The footprint is the part of this that will be applied to ANOTHER mesh, so
+    # it is the part worth seeing in the log. Its absence matters too: without
+    # one the crop falls back to the rectangle above.
+    if roi.get("footprint_described"):
+        line += "; drawn shape %s" % (roi["footprint_described"],)
+    elif roi.get("footprint") is None:
+        line += ("; NO drawn footprint (%s) -- a crop will use the rectangle"
+                 % (roi.get("footprint_error", "not recorded"),))
+    fpe = roi.get("footprint")
+    if fpe is not None and fpe.get("zrows") is None:
+        line += ("; NO per-cell height map, so a crop will apply x-y alone")
+    b = roi.get("bounds3d")
+    if b:
+        line += ("; measured at z %.4f..%.4f on this sensor -- that GLOBAL range "
+                 "is provenance, not a crop; the crop's z is the footprint's "
+                 "per-cell band" % (min(b[2], b[5]), max(b[2], b[5])))
+    return line
+
+
+global refine_region_interactively
+def refine_region_interactively(region, surface, enabled=None, title=None,
+                                on_cancel="raise", **kwargs):
+    """The pipeline's entry point: correct `region` against `surface`, or don't.
+
+    Returns (region, roi) where roi is None if the operator was never asked.
+    The region always comes back usable, so the caller can pass it straight on
+    to the next stage whatever happened here.
+
+    CARRY THE `roi` ON, NOT JUST THE REGION. The region is a rectangle; the roi
+    carries the drawn SHAPE, and it is what crop_mesh_to_roi() down-selects the
+    measured mesh with at planning time -- plan_ec_path(roi=...) ->
+    plan_mesh_path -> require_plannable_mesh. Drop it and the planner is back to
+    rastering whatever the sensor saw inside a rectangle.
+
+    enabled=None consults ROI_SELECT_ENABLED. If the selector cannot run at all
+    -- no DISPLAY, no PyQt5 -- this SAYS SO AND CARRIES ON with the region it
+    was given rather than stopping an unattended run. An operator cancelling is
+    different: that is a deliberate "no", and on_cancel="raise" stops the scan.
+    """
+    enabled = ROI_SELECT_ENABLED if enabled is None else bool(enabled)
+    if not enabled:
+        print("  region selection skipped (ROI_SELECT_ENABLED is off); using "
+              "the region as given")
+        return region, None
+
+    ok, why = roi_select_available()
+    if not ok:
+        print("  region selection unavailable, using the region as given: %s"
+              % (why,))
+        return region, None
+
+    # initial=None: THE WINDOW OPENS WITH NOTHING SELECTED. Preselecting the
+    # detected region makes Accept live the instant the window appears, so a
+    # single stray keypress commits the whole part and starts the raster over it.
+    # roi_select_ui.py also closes that keyboard hole, and an empty Accept asks
+    # whether it means cancel, so the failure mode is a question rather than a
+    # 300 mm raster.
+    #
+    # `region` is still passed to select_roi() as the region to fall back to when
+    # the operator cancels (the return above), and is still what the pipeline
+    # uses if ROI selection is off entirely.
+    roi = select_roi(surface, title=title, initial=None, **kwargs)
+    if roi is None:
+        if on_cancel == "raise":
+            raise RuntimeError(
+                "the operator cancelled the region selection, so the scan is "
+                "stopped. Re-run with roi_select=False (or set "
+                "ROI_SELECT_ENABLED = False) to scan the detected region "
+                "without being asked.")
+        print("  region selection cancelled; using the region as given")
+        return region, None
+    return roi["region"], roi
+
+
+global save_roi
+def save_roi(roi, directory, name="roi"):
+    """Copy a selection's sub-mesh and mask into a scan directory, and say where.
+
+    The region tuple is in the scan's own log; the mask and the sub-mesh are
+    what let a later session reproduce the selection instead of re-drawing it.
+    """
+    if roi is None:
+        return None
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    out = {}
+    mesh = os.path.join(directory, "%s_submesh.ply" % (name,))
+    if roi.get("submesh") and os.path.exists(roi["submesh"]):
+        if os.path.abspath(roi["submesh"]) != os.path.abspath(mesh):
+            shutil.copyfile(roi["submesh"], mesh)
+        out["submesh"] = mesh
+    mask = os.path.join(directory, "%s_mask.npy" % (name,))
+    np.save(mask, roi["mask"])
+    out["mask"] = mask
+    meta = os.path.join(directory, "%s.json" % (name,))
+    with open(meta, "w") as fh:
+        json.dump({k: (list(v) if isinstance(v, tuple) else v)
+                   for k, v in roi.items() if k != "mask"}, fh, indent=1)
+    out["json"] = meta
+    return out

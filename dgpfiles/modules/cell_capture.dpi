@@ -1,0 +1,138 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  cell_capture.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Entry point for the cell data-capture tool: loads its parts and the
+#   taught cell state.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# CELL DATA CAPTURE -- representative real data from the cell, one bag per take
+# ==============================================================================
+# The automated eddy-current pipeline (YOLO -> Azure TSDF -> Keyence raster ->
+# Noether -> contact scan) is developed in Gazebo. This records what the REAL
+# sensors and the real arm do, in the scenarios below, so every stage can be
+# refined offline and the simulator made to behave like the hardware.
+#
+#   capture_session(specimen=, lighting=, notes=)     where the takes go
+#   teach_point(name)                                 record world -> probe_end
+#
+#   1 capture_touch_off()          work volume from the table's corners
+#   2 capture_keyence_ladder()     Keyence still over a flat: standoffs, tilts
+#   3 capture_keyence_timing()     passes across an edge at two speeds
+#   4 capture_azure_sweeps()       the pipeline's dome, tilted, a second height
+#   5 capture_keyence_sweeps()     the pipeline raster; passes round the cylinder
+#   6 capture_cable_envelope()     wrist 3 stepped until the cables are tight
+#   7 capture_contact()            probe passes between taught points, tilted
+#   8 capture_full_pipeline()      run_automated_scan(scan=False), recorded
+#   9 capture_robot_velocity()     a speed ladder in free space: what a
+#                                  commanded speed and a joint scaling do HERE
+#
+# Every motion is previewed in RViz and confirmed at this prompt, limited to
+# CAPTURE_SPEED_AWAY / CAPTURE_SPEED_NEAR, refused outside the work volume, and
+# made with the warning light on (cell_capture_motion.dpi). The recorder is
+# `ros2 run tari_bringup record` (ros_ws/src/tari_ros/tari_bringup), which also
+# expands and replays a take offline. The procedure is
+# ROS-Scanning/docs/cell-data-capture.md.
+#
+# Loaded into ECAutomatedScan.dgp's session, so the scenarios fly the pipeline's
+# own motions on the same motion stack, and the EC source is there when the DAQ
+# is.
+
+import os
+
+# The cable envelope model. Normally already loaded -- ECAutomatedScan.dgp
+# includes it with the other cell modules, because the cable guard it feeds is
+# on for the whole session and not only for a capture scenario -- but the motion
+# gate below cannot be compiled without it, so a config that loads the capture
+# tool without it gets it here.
+if "cable_envelope_model" not in globals():
+    include(None, os.path.join(SCAN_MODULE_DIR, "cable_envelope.dpi"))
+
+for _part in ("cell_capture_node.dpi", "cell_capture_motion.dpi",
+              "cell_capture_take.dpi", "cell_capture_scenarios.dpi",
+              "cell_capture_pipeline.dpi"):
+    include(None, os.path.join(SCAN_MODULE_DIR, _part))
+
+# A touch-off already made on this cell and mode is used from the start.
+try:
+    activate_work_volume_override(quiet=True)
+except Exception as _e:
+    print("  cell capture: could not check for a work-volume override (%s)" % (_e,))
+# So is the cable envelope -- from the file capture_cable_envelope() wrote here
+# if there is one, otherwise from the cell manifest, which is what a session on
+# a machine that never ran the test can see. PER TILT: the band at a -40 degree
+# x tilt is 75 degrees wide where the untilted band is 270, so one number
+# enforced at both tilts refuses poses that are nowhere near a cable.
+try:
+    _load_cable_limits(quiet=False)
+except Exception as _e:
+    print("  cell capture: could not read the cable envelope (%s)" % (_e,))
+
+print("")
+print("cell capture loaded -- docs/cell-data-capture.md")
+print("  session:   capture_session(specimen=, lighting=, notes=)   capture_status()")
+print("  teach:     teach_point(name)   list_taught()")
+print("  scenarios: capture_touch_off()  capture_keyence_ladder()  capture_keyence_timing()")
+print("             capture_azure_sweeps()  capture_keyence_sweeps()  capture_cable_envelope()")
+print("             capture_contact()  capture_full_pipeline()")
+print("             capture_robot_velocity()   -- what a commanded speed and a")
+print("                        joint scaling ACTUALLY do here. The numbers in")
+print("                        ROBOT_VELOCITY_CALIBRATION and JOINT_MOVE_SCALING")
+print("                        were measured in SIMULATION and never on an arm.")
+print("  limits: %.0f mm/s away, %.0f mm/s near; confirm every motion%s"
+      % (CAPTURE_SPEED_AWAY*1e3, CAPTURE_SPEED_NEAR*1e3,
+         " (AUTO-CONFIRM ON)" if CAPTURE_AUTO_CONFIRM else ""))
+try:
+    _found, _real = manifest_file()
+    print("  manifest: %s" % (_real or _found,))
+    print("  " + describe_work_volume().strip())
+except Exception as _e:
+    print("  work volume: %s" % (_e,))

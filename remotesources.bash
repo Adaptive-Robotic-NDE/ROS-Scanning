@@ -1,13 +1,13 @@
 #########################################################################
 # AdaptiveNDE Project                                                   #
-# AFRL-ROS Package                                                      # 
+# ROS-Scanning Package                                                  #
 #########################################################################
 # Copyright 2023-2024 University of Dayton                              #
 #                                                                       #
-# Redistribution and use in source and binary forms, with or without    # 
+# Redistribution and use in source and binary forms, with or without    #
 # modification, are permitted provided that the following conditions    #
 # are met:                                                              #
-#                                                                       # 
+#                                                                       #
 # 1. Redistributions of source code must retain the above copyright     #
 #    notice, this list of conditions and the following disclaimer.      #
 # 2. Redistributions in binary form must reproduce the above copyright  #
@@ -36,18 +36,18 @@
 # DISTRIBUTION A. Approved for public release: distribution unlimited.  #
 #########################################################################
 # File:  remotesources.bash
-# Authors: Tyler Lesthaeghe                                             
-# Created: 2023-10-12                                                  
+# Authors: Tyler Lesthaeghe
+# Created: 2023-10-12
 # Description:
 #   Bash Script for Sourcing ROS Environment
-# Derived From:                                                         
-#                                         
+# Derived From:
+#
 #########################################################################
-# Revision Log                                                          
-# 
+# Revision Log
+#
 # 2023-10-12:  Initial Commit
 # 2023-11-12:  Off-Loading UR Driver to Remote Computer
-# 
+#
 #########################################################################
 # Development Notes
 #

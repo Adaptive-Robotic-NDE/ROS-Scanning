@@ -136,9 +136,8 @@ SCAN_VELOCITY = 0.050
 #
 # CartesianMove's vel is a fraction of the robot's JOINT limits; what a
 # technician sets is a speed. The conversion is a property of the cell, and it
-# is NOT one constant -- which is what the first version of this assumed and
-# what measuring it disproved. Measured 2026-08-15 on the bowed test plate,
-# two passes each, pass-to-pass agreement about 1%:
+# is NOT one constant. Measured over a bowed plate, two passes each,
+# pass-to-pass agreement about 1%:
 #
 #     scaling   observed        implied full scale
 #     0.0050     7.9 mm/s         1.58 m/s
@@ -303,10 +302,10 @@ ASCAN_RATE_HZ = 50.0
 # coming out byte-identical. Use Scan2DPlaneTriggered / run_triggered_scan()
 # instead: it counts triggers, so trace k IS column k.
 #
-# Left on "timer" as the default only because that is the configuration every
-# measurement in HANDOFF-cscan-scanning.md was taken against, and because the
-# triggered path currently exposes a robot problem rather than a data one --
-# see the note on short rows in section 5.5 of that file.
+# Left on "timer" as the default only because it is the configuration the
+# recorded measurements were taken against, and because the triggered path
+# currently exposes a robot problem (rows that end short) rather than a data
+# one.
 #
 # "timestamped" is the third mode and the one a real card needs: the simulated
 # card free-runs at ASCAN_RATE_HZ knowing nothing about the scan, and a separate
@@ -316,8 +315,8 @@ ASCAN_RATE_HZ = 50.0
 #
 # *** run_mesh_scan() REQUIRES "position" or "timestamped". ***
 # A surface-following toolpath has no grid to bin a free-running digitizer into,
-# so the trigger is the only thing that can be the trace index. The full 29-pass
-# mesh scan on 2026-08-13 was run with this set to "position".
+# so the trigger is the only thing that can be the trace index. A full 29-pass
+# mesh scan has been run with this set to "position".
 # PRF of the free-running card in "timestamped" mode. A real externally
 # triggered card runs at its own rate and knows nothing about the scan; at
 # 0.05 m/s and a 5.08 mm pitch the trace rate is ~10 Hz, so 1 kHz gives ~100
@@ -325,18 +324,17 @@ ASCAN_RATE_HZ = 50.0
 # rate the correlation was verified at.
 ASCAN_FREERUN_RATE_HZ = 1000.0
 
-ASCAN_TRIGGER_MODE = "position"
+ASCAN_TRIGGER_MODE = "timestamped"
 
 # None means "SCAN_STEP_SIZE", which is the whole point of the technician
 # controls: the step size the operator set IS the trigger pitch.
 #
-# It used to default to 0.30/(SCAN_M-1) -- the plane scan's grid pitch. That is
-# a genuine constraint for a rectangular scan, where trigger k has to BE column
-# k, but it is meaningless for a mesh scan: it took a hardcoded 0.30 m and a
-# column count from a grid that does not exist on a surface-following toolpath,
-# and produced 5.08 mm for no reason anyone could name. The plane scans still
-# derive their pitch from their own grid, because there they must; everything
-# else uses the step size.
+# Do not derive it from the plane scan's grid pitch. That pitch is a genuine
+# constraint for a rectangular scan, where trigger k has to BE column k, but it
+# is meaningless for a mesh scan: there is no grid on a surface-following
+# toolpath to take a column count from. The plane scans still derive their pitch
+# from their own grid, because there they must; everything else uses the step
+# size.
 ASCAN_TRIGGER_PITCH = None
 
 # ==============================================================================
@@ -378,7 +376,13 @@ SCAN_N = None   # points along the v axis
 # outside the robot's reach. This default sits inside the UR10e's workspace in
 # the simulated cell.
 SCAN_ORIGIN = (0.75, -0.35)
-SCAN_STORAGE_DIR = "/home/user/scandata"
+# Where scans are written. A literal path is one machine's home and nobody
+# else's, so resolve the same way the capture tool does: what the site says,
+# then the mount the cell actually has, then this account's own home.
+SCAN_STORAGE_DIR = (os.environ.get("TARI_SCANDATA")
+                    or os.environ.get("SCANDATA_ROOT")
+                    or ("/data/scandata" if os.path.isdir("/data/scandata")
+                        else os.path.expanduser("~/scandata")))
 
 # WHICH CELL THIS CONFIG IS RUNNING IN, and in which mode. The cell manifest
 # under tari_bringup already describes the robot, the sensors and the topics;
@@ -469,10 +473,20 @@ SPECIMEN_SOURCE = "auto"
 SPECIMEN_REGION = (SCAN_ORIGIN[0], SCAN_ORIGIN[1],
                    SCAN_ORIGIN[0] + 0.30, SCAN_ORIGIN[1] + 0.30)
 
-# How high the camera flies over that region, and how many stops each way. More
-# stops means more views and a better closed surface, at a cost in time.
-SPECIMEN_SWEEP_HEIGHT = 1.35
-SPECIMEN_SWEEP_STOPS = (5, 5)
+# How the camera holds its range to that region. The depth mode has a minimum
+# RANGE, not a minimum height, and "pan" buys that range by standing off to the
+# side and aiming back -- which is what makes it reachable. See
+# SPECIMEN_DEPTH_MODE in ECAutomatedScan.dgp for the whole argument, and
+# AZURE_DEPTH_MODES in modules/mesh_reconstruction.dpi for the table.
+SPECIMEN_DEPTH_MODE = "NFOV_UNBINNED"
+SPECIMEN_SWEEP_STYLE = "pan"     # "pan" or "dome"
+SPECIMEN_ALLOW_DEAD_ZONE = False
+SPECIMEN_SWEEP_SLANT = None      # None = the depth mode's minimum + 30 mm
+SPECIMEN_SWEEP_CAMERA_HEIGHT = None  # None derives it from the work volume top
+SPECIMEN_SWEEP_DIRECTIONS = 4
+SPECIMEN_PAN_STOPS = (4, 2)
+SPECIMEN_SWEEP_HEIGHT = None     # "dome" only; derived from the depth mode
+SPECIMEN_SWEEP_STOPS = (5, 5)    # "dome" only
 
 # Which Keyence reconstruction backend this cell uses. A LOAD-TIME choice, not a
 # runtime argument, because it decides which services must be running -- and that
@@ -481,9 +495,9 @@ SPECIMEN_SWEEP_STOPS = (5, 5)
 #   "pc"   tari_pc_reconstruction  -- /start_recording, /stop_and_process (Open3D)
 #   "key"  tari_key_reconstruction -- /start_key_rec, /stop_key_rec (PCL)
 #
-# Both ship; neither has been exercised against real hardware here, because
-# keyence_experimental (the driver) is blocked on keyence_interfaces, which has
-# never been committed. See MISSING-DEPENDENCIES.md.
+# Both ship. Exercising either against real hardware needs the
+# keyence_experimental driver, which in turn needs keyence_interfaces; that
+# package is not published anywhere and must be copied in from a cell.
 KEYENCE_BACKEND = "pc"
 
 # Run the reconstruction through tari_mesh_filter before planning on it.
@@ -493,9 +507,9 @@ KEYENCE_BACKEND = "pc"
 #
 #   * the COLOUR filter is the eddy-current green tape, (0.0, 0.55, 0.44) at
 #     0.15, and would delete an untaped part entirely;
-#   * the VERTEX filter is a plane in world z. That was SPECIMEN_SUPPORT_Z,
-#     deleted 2026-08-16: it was documented as a property of the cell and is a
-#     property of the specimen. 0.98 is right for this test plate (top 1.03) and
+#   * the VERTEX filter is a plane in world z. There is no cell-wide value for
+#     it: the cut height is a property of the specimen, not of the cell.
+#     0.98 is right for this test plate (top 1.03) and
 #     deletes the calibration plate (top 0.948) in its entirety. Nor can it be
 #     derived -- this cell's bench is an optical breadboard that reconstructs
 #     across 34 mm of z, and the cal plate is 19.6 mm thick, so no plane keeps
@@ -527,12 +541,11 @@ TEST_PLATE_BOW = 0.03      # metres of rise at mid-span; 0 gives a flat plate
 TEST_PLATE_DIVISIONS = 61
 
 # The real specimen mesh, kept here because it is what scenario B is ultimately
-# for -- but see mesh_path_feasibility() before scanning it. Measured 2026-08-13
-# against this cell:
+# for -- but see mesh_path_feasibility() before scanning it. Measured against
+# this cell:
 #
 #   * every sampled pose is KINEMATICALLY reachable (IK with collision checking
-#     off: 10/10 at every standoff), so the old note that it "sits too low to
-#     plan" was measuring the wrong thing;
+#     off: 10/10 at every standoff), so reach is not what stops it;
 #   * what fails is collision, and not with the specimen -- the planning scene
 #     has no world objects at all. It is the ARM against `robot_environment`,
 #     the cell enclosure mesh, in every branch that reaches those poses;
@@ -642,12 +655,12 @@ RECORD_TRACE_LIST = True
 # This is the representation that survives arbitrary toolpaths; the rectangular
 # c-scan is not.
 #
-# This was off for a long time, because the projector has to be instantiated
-# mutable to accumulate and a producing mutable math channel used to wedge
-# globalrevision completion permanently -- after which the database retained
-# every globalrev, each holding open fds for its /dev/shm segments, and the
-# process died of "Too many open files" around row 12 of a 60x60. Fixed in
-# spatialnde2 976aa6b; measured over a full 60x60 with projection on:
+# The projector has to be instantiated MUTABLE in order to accumulate, which
+# requires spatialnde2 at 976aa6b or later: before that fix a producing mutable
+# math channel wedged globalrevision completion permanently, the database then
+# retained every globalrev with the fds for its /dev/shm segments open, and the
+# process died of "Too many open files" part way through a 60x60. A full 60x60
+# with projection on:
 #
 #     3600 points, 658.6 s, fds flat at 154, latest_defined == latest_ready
 #     throughout (37k globalrevs), all three holes in the projected image
@@ -888,11 +901,24 @@ def _scan_module_dir():
 global SCAN_MODULE_DIR
 SCAN_MODULE_DIR = _scan_module_dir()
 
+# FIRST, because everything else reports through it. progress.dpi is the shared
+# "say what is happening during the slow parts" helper: rate-limited plain
+# lines with elapsed time, a fraction, an honest ETA and a closing line that
+# prints even when the stage is killed. It depends on nothing, so it goes at
+# the top of the list; the mesh reconstruction, the Noether planning and the
+# specimen stages all call into it.
+include(None, os.path.join(SCAN_MODULE_DIR, "progress.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "toolpath_segments.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "trace_acquisition.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "surface_projection.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "triggered_acquisition.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "noether_path.dpi"))
+# The independent tooling-clearance check. Loaded next to noether_path.dpi
+# because it is the same kind of thing -- geometry over a planned path, no ROS
+# and no robot -- and because mesh_scan.dpi and mesh_reconstruction.dpi both
+# refuse to fly a sweep without it (they warn and continue if it is absent).
+include(None, os.path.join(SCAN_MODULE_DIR, "tooling_clearance.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "pitch_crossings.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "timestamped_trigger.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_parameters.dpi"))
 
@@ -945,6 +971,13 @@ if ASCAN_SOURCE == "simulated":
         # The card keeps free-running on ASCAN_CHANNEL_PATH; this becomes the
         # object the acquisition arms, and it hands back the A-scan that was
         # current at each crossing.
+        #
+        # Keep a name for the simulated card itself: ascan_source is about to be
+        # rebound to the trigger, and the card is the thing that counts shots the
+        # recording database refused (dropped_acquisitions). Without this the
+        # only evidence of a dropped sample is transmgr.late_transactions, which
+        # says how many but not which producer.
+        sim_ascan_card = ascan_source
         ascan_source = TimestampedTriggerSource(
             recdb, transaction_clock, ASCAN_CHANNEL_PATH,
             probe_position_relative_to_scan, _trigger_pitch,
@@ -1008,10 +1041,9 @@ else:
 # ==============================================================================
 # THE REUSABLE PIECES
 # ==============================================================================
-# Everything below this line used to be inline in this file.  It moved out
+# Everything below this line lives in .dpi includes rather than inline here,
 # because the reconstruction stage has to call the same code from
-# ClientScannerTest.dgp and from whatever comes next, and a .dgp is not
-# importable -- see HANDOFF-mesh-reconstruction.md section 3.
+# ClientScannerTest.dgp as well, and a .dgp is not importable.
 #
 # Order matters only in that a .dpi is executed where it is included, so
 # anything running at include time sees the config above it.  These define
@@ -1026,6 +1058,9 @@ include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_settings_panel.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "plane_scan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "mesh_scan.dpi"))
+# The Keyence's measuring window and the three checks that keep the sensor
+# inside it; mesh_reconstruction.dpi warns and continues without it.
+include(None, os.path.join(SCAN_MODULE_DIR, "keyence_standoff.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "mesh_reconstruction.dpi"))
 # Before mesh_reconstruction can be pointed at a part, something has to say
 # where the part IS. yolo_region() derives the region a sweep takes from a
@@ -1054,9 +1089,8 @@ def capture_point(label=None):
     identity -- and it is never None, so a bare capture cannot tell "the probe
     is here" from "this process has never heard from TF". Teaching three corners
     from that is silent: the corners are all identical, the plane is degenerate,
-    and the first sign of trouble is a scan somewhere else entirely. Seen
-    2026-08-18, on a dgpy that had come up against a cell whose DDS discovery
-    had gone stale after nine hours.
+    and the first sign of trouble is a scan somewhere else entirely. A dgpy that
+    comes up while DDS discovery is stale stays in exactly that state.
 
     Returns the TransformStamped, which is a snapshot: the TF thread rebinds
     ros.t on every poll rather than mutating it, so captures stay distinct while
@@ -1175,7 +1209,7 @@ print("  preview_scan_plan() what those settings would cost, without moving")
 print("  project_traces()    rebuild the projected image from the trace list")
 print("  run_default_scan()  point to point, stops at every point")
 print("  run_raster_scan()   continuous, one trajectory per row (needs /execute_raster)")
-print("  run_triggered_scan() continuous, one trace per trigger (needs ASCAN_TRIGGER_MODE='position')")
+print("  run_triggered_scan() continuous, one trace per trigger (ASCAN_TRIGGER_MODE 'timestamped' or 'position')")
 print("  or Scan2DPlane / Scan2DPlaneRaster / Scan2DPlaneTriggered with your own corners.")
 print("  run_mesh_scan()     surface-following scan of a mesh, via Noether")
 print("                      plan_mesh_path() then mesh_path_feasibility() first if")

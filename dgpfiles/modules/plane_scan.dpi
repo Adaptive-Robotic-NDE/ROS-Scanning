@@ -32,6 +32,14 @@ def Scan2DPlane(t1, t2, t3, m, n, max_points=None):
     is how you dry-run the geometry of a big scan, or resume-by-hand a scan that
     was interrupted.
     """
+    # Both are cell-wide shared state, not this file's to define:
+    #   scan_origin  -- also written by mesh_scan.dpi and surface_path_scan.dpi,
+    #                   read by UTPlaneScan.dgp's probe_position_relative_to_scan()
+    #                   and the simulated specimen. Whichever scan started last
+    #                   is the one whose origin those readers want.
+    #   scan_plan    -- OWNED by scan_plan.dpi (plan_current_scan() sets it).
+    #                   Cleared here on purpose; see below.
+    # Allowlisted in dpi_exports_test.py.
     global scan_origin, scan_plan
 
     # No plan here, and none inherited from a previous scan: the arm stops at
@@ -47,7 +55,7 @@ def Scan2DPlane(t1, t2, t3, m, n, max_points=None):
 
     # Need a temporary TransformStamped for moving
     target_pose = TransformStamped()
-    # We will preserve orientation of t1
+    # Preserve t1's orientation
     target_pose.transform.rotation.x = t1.transform.rotation.x
     target_pose.transform.rotation.y = t1.transform.rotation.y
     target_pose.transform.rotation.z = t1.transform.rotation.z
@@ -59,6 +67,11 @@ def Scan2DPlane(t1, t2, t3, m, n, max_points=None):
     accumulating = False
     _prepare_trace_accum(m*n)
     started = time.monotonic()
+    # Hold move_group's IK in local mode for the scan: it starts global for
+    # interactive work, and a global solver may change arm branch mid-path and
+    # truncate a row. See motion_profile() in scan_plan.dpi.
+    _ik_hold = motion_profile("scan")
+    _ik_hold.__enter__()
     try:
         for j in range(n):
             for i in range(m):
@@ -70,16 +83,44 @@ def Scan2DPlane(t1, t2, t3, m, n, max_points=None):
                 target_pose.transform.translation.y = vv[i,j]
                 target_pose.transform.translation.z = ww[i,j]
 
-                res = ros.Move(target_pose, vel=MOVE_VELOCITY, acc=MOVE_ACCEL)
-                if not res.result.success:
+                # ros.CartesianMove, NOT ros.Move, and the difference is which
+                # node time-parameterizes the move.
+                #
+                # ros.Move goes to dgpython_action_server, which asks
+                # move_group's /compute_cartesian_path service; that service
+                # runs MoveIt's TimeOptimalTrajectoryGeneration with its stock
+                # min_angle_change of 0.001 rad, a duplicate-waypoint filter
+                # that on this arm is about half a millimetre of tool travel.
+                # A step at or under that collapses the trajectory to a single
+                # point and the arm does not move at all -- reported as success.
+                # Measured on this arm: 1.0 mm commanded moves 0.97 mm, while
+                # 0.5 mm, 0.2 mm and 0.1 mm each move 0.003 mm.
+                #
+                # CartesianMove goes to mtc_node, whose CartesianWaypoints
+                # stage constructs that filter itself and sets it low enough to
+                # be irrelevant -- so the same 0.2 mm step moves. Nothing else
+                # about the motion changes: one waypoint, Cartesian
+                # interpolation, the same controller. min_fraction=1.0 because
+                # a point-to-point scan wants the whole move or an error.
+                poses = PoseArray()
+                poses.header.frame_id = "world"
+                _pt = Pose()
+                _pt.position.x = float(uu[i,j])
+                _pt.position.y = float(vv[i,j])
+                _pt.position.z = float(ww[i,j])
+                _pt.orientation = target_pose.transform.rotation
+                poses.poses.append(_pt)
+                ok, _frac = _move_outcome(ros.CartesianMove(
+                    poses, vel=MOVE_VELOCITY, acc=MOVE_ACCEL, min_fraction=1.0))
+                if not ok:
                     failed_moves += 1
                     print("Move to (%.5f, %.5f, %.5f) failed! Ensure point is reachable."
                           % (uu[i,j], vv[i,j], ww[i,j]))
                     continue
 
-                # No need to tell the simulator where we are: it reads the live
-                # pose itself, so it sees where the arm actually stopped rather
-                # than where it was asked to stop.
+                # The simulator does not need to be told the position: it reads
+                # the live pose itself, so it sees where the arm actually
+                # stopped rather than where it was asked to stop.
                 if not capturedata():
                     continue
                 captured += 1
@@ -100,19 +141,40 @@ def Scan2DPlane(t1, t2, t3, m, n, max_points=None):
         pass
     finally:
         ros.WaitUnPauseAcquisition()
+        _ik_hold.__exit__(None, None, None)
 
     print("Scan complete: %d/%d points captured (%d attempted), %d moves failed, %.1f s."
           % (captured, m*n, attempted, failed_moves, time.monotonic()-started))
     print("Volume is at /ut_scan_volume, c-scan at /ut_cscan.")
     return (uprime[1]-uprime[0] if m > 1 else 0.0, vprime[1]-vprime[0] if n > 1 else 0.0, uu[0,0], vv[0,0], m, n)
 
+# How far inside the taught far edge the LAST column of a triggered raster
+# sits, in column pitches. The trigger for column m-1 fires when progress
+# reaches (m-1)*pitch, and a pass that stops exactly there leaves that
+# crossing to a coin flip against noise -- measured on the UR7e cell as
+# "expected" flapping between 49 and 50. Every physical scanner solves this
+# with overtravel past the last sample; here the overtravel is taken INSIDE
+# the taught rectangle by placing the columns closer together, because a
+# probe that may be in contact with the part is never commanded beyond where
+# the technician taught it. Half a pitch: symmetric margin, ~0.6 mm at a
+# 1.2 mm step. The scan area shrinks by that much on one side.
+global TRIGGER_END_MARGIN
+TRIGGER_END_MARGIN = 0.5
+
 global _plane_grid
-def _plane_grid(t1, t2, t3, m, n):
+def _plane_grid(t1, t2, t3, m, n, end_margin=0.0):
     """Grid of probe positions over the plane through t1, t2, t3.
 
-    Shared by Scan2DPlane and Scan2DPlaneRaster so the two cannot drift apart:
-    they must produce identical geometry, or the volumes they build are not
-    comparable.
+    Shared by Scan2DPlane, Scan2DPlaneRaster and Scan2DPlaneTriggered so they
+    cannot drift apart: they must produce identical geometry, or the volumes
+    they build are not comparable.
+
+    end_margin, in column pitches, holds the last column that far short of
+    the far edge (t2's end of the row), so pitch = row/(m-1+end_margin). Zero
+    for the point-to-point and sampled scans, which have no reason to give up
+    the edge; TRIGGER_END_MARGIN for the triggered one, which needs the
+    overtravel. Rows (t3's direction) are unaffected: nothing triggers along
+    them.
     """
     p1 = np.array([t1.transform.translation.x, t1.transform.translation.y, t1.transform.translation.z])
     p2 = np.array([t2.transform.translation.x, t2.transform.translation.y, t2.transform.translation.z])
@@ -132,7 +194,7 @@ def _plane_grid(t1, t2, t3, m, n):
     maguprime = np.linalg.norm(u)
     magvprime = r
 
-    uprime = np.linspace(0, maguprime, m)
+    uprime = np.linspace(0, maguprime*(m-1)/(m-1+float(end_margin)) if m > 1 else 0.0, m)
     vprime = np.linspace(0, magvprime, n)
     u = u / maguprime
     uu, vv = np.meshgrid(uprime, vprime)
@@ -160,8 +222,8 @@ def _volume_metadata(uu, vv, uprime, vprime, m, n):
     # Axis 2 is the A-scan's own time axis, copied from the digitizer rather
     # than computed from a constant in this file -- the card's sample rate is
     # set on the card. Without these two, cscan_gate falls back to scale=1.0
-    # and offset=0.0 and silently gates on SAMPLE INDEX, which is what made the
-    # gate panel need index values.
+    # and offset=0.0 and silently gates on SAMPLE INDEX, which forces the gate
+    # panel to be driven in index values.
     _geom = ascan_geometry(timeout=10.0, require=False)
     _dt = _geom["dt"] if _geom else 0.0
     _t0 = _geom["t0"] if _geom else 0.0
@@ -197,9 +259,9 @@ def approach_row_start(t1, u0, v0, w0, u1, v1, w1):
     arm configuration that reaches that pose, and most of them cannot follow the
     row to the far end. Every pose on the row is individually reachable; what
     runs out is joint travel, partway along, in the configuration the row was
-    entered in. computeCartesianPath then truncates, and rows came out 65-88%
-    long. (Since CartesianWaypoints was made to enforce min_fraction, they now
-    fail outright instead, which is why this matters more than it used to.)
+    entered in. computeCartesianPath then truncates and the row comes out 65-88%
+    long -- and since CartesianWaypoints enforces min_fraction, such a row now
+    fails outright rather than quietly returning short.
 
     ros.ApproachInConfiguration() solves the row END first and seeds the START
     from it, so both ends are in the same branch. Falls back to an ordinary Move
@@ -242,7 +304,10 @@ def Scan2DPlaneRaster(t1, t2, t3, m, n, max_rows=None, force=False):
     column, and only then feeds the row into the accumulator in column order --
     which is the order nd_accumulate_once expects.
     """
-    global scan_origin, ndaccumulator
+    # scan_origin is cell-wide shared state -- see Scan2DPlane() above. The
+    # accumulator is not declared here: setup_accumulation() in
+    # scan_accumulation.dpi owns `ndaccumulator`.
+    global scan_origin
 
     uu, vv, ww, uprime, vprime = _plane_grid(t1, t2, t3, m, n)
     scan_origin = (uu[0,0], vv[0,0])
@@ -283,6 +348,11 @@ def Scan2DPlaneRaster(t1, t2, t3, m, n, max_rows=None, force=False):
     accumulating = False
     row_report = []
     started = time.monotonic()
+    # Hold move_group's IK in local mode for the scan: it starts global for
+    # interactive work, and a global solver may change arm branch mid-path and
+    # truncate a row. See motion_profile() in scan_plan.dpi.
+    _ik_hold = motion_profile("scan")
+    _ik_hold.__enter__()
     try:
         for j in range(rows):
             row_u = uu[:,j]
@@ -320,8 +390,12 @@ def Scan2DPlaneRaster(t1, t2, t3, m, n, max_rows=None, force=False):
             samples.start()
             sweep_started = time.monotonic()
             try:
-                res = ros.CartesianMove(poses, vel=raster_velocity(), acc=RASTER_ACCEL,
-                                        min_fraction=RASTER_MIN_FRACTION)
+                # cartesian_move(): a row of waypoints needs a looser IK
+                # threshold than the point-to-point steps above, or it
+                # truncates part way. scan_plan.dpi's motion_kind().
+                res = (globals().get("cartesian_move") or ros.CartesianMove)(
+                    poses, vel=raster_velocity(), acc=RASTER_ACCEL,
+                    min_fraction=RASTER_MIN_FRACTION)
             finally:
                 samples.stop()
             sweep_s = time.monotonic() - sweep_started
@@ -374,6 +448,7 @@ def Scan2DPlaneRaster(t1, t2, t3, m, n, max_rows=None, force=False):
                 print("    last sampler error: %r" % (samples.last_error,))
     finally:
         ros.WaitUnPauseAcquisition()
+        _ik_hold.__exit__(None, None, None)
 
     elapsed = time.monotonic()-started
     print("Raster scan complete: %d points (%d interpolated), %.1f s, %.3f s/point."
@@ -428,8 +503,9 @@ class _RowSampler(object):
         while not self._quit:
             try:
                 # New A-scan first, position second: the A-scan was triggered
-                # slightly before we noticed it, so the freshest pose available
-                # is the closest we can get to the pose it was taken at.
+                # slightly before it was noticed here, so the freshest pose
+                # available is the closest obtainable to the pose it was taken
+                # at.
                 ref = recdb.latest_globalrev().get_ndarray_ref(ASCAN_CHANNEL_PATH)
                 revision = ref.rec.info.revision
                 if revision == self._last_revision:
@@ -456,14 +532,14 @@ class _RowSampler(object):
                     # Keep the pose alongside the A-scan. Binding them here, at
                     # the moment the sample is chosen, is the only place they are
                     # known to belong together; recovering it later from a grid
-                    # index assumes the grid, which is what we are getting away
-                    # from.
+                    # index assumes the grid, which is exactly the assumption
+                    # the trace list exists to avoid.
                     pose7 = pose7_from_parts((x, y, _z), _quat)
                     self.best[i] = (dist, np.array(ref.data, copy=True),
                                     ref.rec.metadata, pose7)
             except Exception as e:
-                # Counted, not swallowed. A silent except here is what let the
-                # whole row come back empty without anything saying why.
+                # Counted, not swallowed. A silent except here lets a whole row
+                # come back empty with nothing saying why.
                 self.errors += 1
                 self.last_error = e
             time.sleep(self.poll)
@@ -503,6 +579,26 @@ def _row_entries(best):
         entries.append((entry[1], entry[2], entry[3]))
     return (entries, interpolated)
 
+global _check_overtravel_within_taught
+def _check_overtravel_within_taught(path, t1, t2, t3, m, n, tol=1e-9):
+    """Refuse a path whose rows end anywhere but ON the taught far edge.
+
+    end_margin in _plane_grid and overtravel_pitches in scanpath_from_plane_grid
+    are two numbers that must agree, and the consequence of them disagreeing is
+    a probe commanded past where the technician taught it. So it is checked
+    against the geometry rather than trusted: the far edge is where a
+    zero-margin grid puts its last column.
+    """
+    uu0, vv0, ww0, _, _ = _plane_grid(t1, t2, t3, m, n, end_margin=0.0)
+    for j, (start, end) in enumerate(path.segments[:n]):
+        edge = np.array([uu0[m-1, j], vv0[m-1, j], ww0[m-1, j]])
+        last = path.positions[end-1]
+        if np.linalg.norm(last - edge) > tol:
+            raise RuntimeError(
+                "row %d of the triggered path ends %.3g m from the taught far edge; "
+                "TRIGGER_END_MARGIN and the path's overtravel do not agree. Not "
+                "moving." % (j, float(np.linalg.norm(last - edge))))
+
 global Scan2DPlaneTriggered
 def Scan2DPlaneTriggered(t1, t2, t3, m, n, max_rows=None, force=False):
     """Same plane and grid as Scan2DPlaneRaster, but acquisition is driven by the
@@ -518,22 +614,31 @@ def Scan2DPlaneTriggered(t1, t2, t3, m, n, max_rows=None, force=False):
     that are specific to this cell: how to move, how to stage, and where a
     trigger at a given arc length along a pass actually was.
     """
-    global scan_origin, ndaccumulator
+    # scan_origin is cell-wide shared state -- see Scan2DPlane() above.
+    # `ndaccumulator` belongs to scan_accumulation.dpi's setup_accumulation(),
+    # which this function calls, and is not declared here.
+    global scan_origin
 
     if getattr(ascan_source, "trigger_mode", "timer") not in ("position", "timestamped"):
         raise RuntimeError("Scan2DPlaneTriggered needs ASCAN_TRIGGER_MODE = "
                            "'position' or 'timestamped'")
 
-    uu, vv, ww, uprime, vprime = _plane_grid(t1, t2, t3, m, n)
+    # Columns held half a pitch inside the far edge, and each row commanded to
+    # the far edge itself: the overtravel a triggered raster needs, taken from
+    # the scan area rather than added beyond it. See TRIGGER_END_MARGIN.
+    uu, vv, ww, uprime, vprime = _plane_grid(t1, t2, t3, m, n,
+                                             end_margin=TRIGGER_END_MARGIN)
     scan_origin = (uu[0, 0], vv[0, 0])
     _show_cscan_panel()
     chanmetadata = _volume_metadata(uu, vv, uprime, vprime, m, n)
 
     global scan_path
     scan_path = scanpath_from_plane_grid(uu, vv, ww, t1.transform.rotation,
-                                         serpentine=False)
+                                         serpentine=False,
+                                         overtravel_pitches=TRIGGER_END_MARGIN)
     rows = n if max_rows is None else min(n, max_rows)
     segs = scan_path.segments[:rows]
+    _check_overtravel_within_taught(scan_path, t1, t2, t3, m, n)
 
     # The trigger pitch is the GRID pitch here, and that is not negotiable: the
     # volume is indexed by column, so trigger k of a row has to be column k. The
@@ -543,15 +648,18 @@ def Scan2DPlaneTriggered(t1, t2, t3, m, n, max_rows=None, force=False):
     # rather than assumed.
     pitch = set_trigger_pitch(uprime[1] - uprime[0] if m > 1 else SCAN_STEP_SIZE)
     print("  %s" % scan_path.describe())
-    print("  trigger pitch %.3f mm -> %d traces expected"
-          % (pitch*1e3, scan_path.trace_count(pitch, segs)))
+    print("  trigger pitch %.3f mm, %d columns to %.1f mm short of the far edge "
+          "-> %d traces expected"
+          % (pitch*1e3, m, TRIGGER_END_MARGIN*pitch*1e3, m*rows))
 
-    row_length = float(uprime[-1] - uprime[0])
+    # Commanded per row, overtravel included: that is what the arm moves and
+    # what the plan's time estimate is for.
+    row_length = scan_path.segment_length_m(segs[0]) if segs else 0.0
     plan = plan_current_scan(path_length_m=row_length*rows, passes=rows,
                              step_m=pitch, projection_extent_m=row_length,
                              force=force)
 
-    _prepare_trace_accum(scan_path.trace_count(pitch, segs))
+    _prepare_trace_accum(m*rows)
 
     quat = t1.transform.rotation
     # Plain floats, taken here on the scan thread. t1 came from scan_corners(),
@@ -583,8 +691,9 @@ def Scan2DPlaneTriggered(t1, t2, t3, m, n, max_rows=None, force=False):
             p.position.z = float(scan_path.positions[k][2])
             p.orientation = quat
             poses.poses.append(p)
-        r = ros.CartesianMove(poses, vel=raster_velocity(), acc=RASTER_ACCEL,
-                              min_fraction=RASTER_MIN_FRACTION)
+        r = (globals().get("cartesian_move") or ros.CartesianMove)(
+            poses, vel=raster_velocity(), acc=RASTER_ACCEL,
+            min_fraction=RASTER_MIN_FRACTION)
         return _move_outcome(r)
 
     def _pose_at(seg, s_m, xy):
@@ -607,35 +716,64 @@ def Scan2DPlaneTriggered(t1, t2, t3, m, n, max_rows=None, force=False):
     def _progress(si, nseg, seg_report, elapsed):
         L = seg_report["length_m"]
         obs = seg_report["observed_m"]
+        over = seg_report.get("over_budget", 0)
         print("  pass %d/%d: %d traces (expected %d), commanded %.3f m / observed "
-              "%.3f m (%.0f%%), %.1f s elapsed"
+              "%.3f m (%.0f%%)%s, %.1f s elapsed"
               % (si+1, nseg, seg_report["staged"], seg_report["expected"], L, obs,
-                 100.0*obs/L if L else 0.0, elapsed))
+                 100.0*obs/L if L else 0.0,
+                 ", %d surplus crossing(s) not staged" % over if over else "",
+                 elapsed))
 
     def _setup():
         print(volume_size_note(m, n))
-        setup_accumulation(m, n, chanmetadata,
-                           num_traces=scan_path.trace_count(pitch, segs),
+        setup_accumulation(m, n, chanmetadata, num_traces=m*rows,
                            plane_grid=(uu, vv, ww))
 
+    # Hold move_group's IK in local mode for the scan: it starts global for
+    # interactive work, and a global solver may change arm branch mid-path and
+    # truncate a row. See motion_profile() in scan_plan.dpi.
+    _ik_hold = motion_profile("scan")
+    _ik_hold.__enter__()
     try:
+        # traces_per_segment=m: a row IS m columns. Not derived from the row
+        # length -- see run_triggered_path_scan.
         report = run_triggered_path_scan(scan_path, ascan_source, pitch,
                                          _approach, _sweep, _stage_ascan, _pose_at,
                                          setup_after_first=_setup, segments=segs,
-                                         progress=_progress)
+                                         progress=_progress,
+                                         traces_per_segment=m)
     finally:
         ascan_source.disarm()
         ros.WaitUnPauseAcquisition()
+        _ik_hold.__exit__(None, None, None)
 
     print("Triggered scan complete: %d traces (%d expected), %.1f s, %.3f s/trace."
           % (report["staged"], report["expected_traces"], report["elapsed"],
              report["elapsed"]/max(report["staged"], 1)))
     if report.get("short_passes"):
-        print("  %d pass(es) produced the wrong trace count -- the volume is "
-              "mislocated from there on; the trace list is still correct."
+        print("  %d pass(es) produced fewer traces than the grid has columns."
               % len(report["short_passes"]))
     if report.get("stopped_early"):
         print("  stopped early: %s" % report["stopped_early"])
+
+    # Rebuild the volume from where the traces actually were.
+    #
+    # The live volume was filled in arrival order, which is correct only while
+    # nothing went missing -- and a trace CAN go missing: a transaction the
+    # database refused as unorderable, a crossing the trigger never published, a
+    # pass that came up short. Arrival order turns one missing trace into a shear
+    # across everything after it. The poses say where each trace really was, so
+    # this puts them there and leaves a hole where a trace is absent. The trace
+    # list is untouched either way; this is about the quick look telling the
+    # truth.
+    try:
+        report["regrid"] = regrid_volume()
+    except Exception as e:
+        # Never lose a completed scan over the presentation step. The traces and
+        # their poses are already in the database and regrid_volume() can be
+        # re-run from the prompt.
+        print("  volume regrid FAILED (%s); the volume is still in arrival order, "
+              "so treat it as suspect and re-run regrid_volume()." % (e,))
     report_scan_outcome(report)
     finish_projection()
     return report

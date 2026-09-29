@@ -16,6 +16,17 @@
 # Identical for every scan type, which is why it is here rather than in a
 # config.  Reads the CSCAN_GATES / RECORD_TRACE_LIST / PROJECTION_* settings and
 # the /current_ascan staging channel from the including config.
+#
+# THIS FILE OWNS ndaccumulator / cscanfunction / cscan_gates / projector.
+# It is the only one that initialises them (here, at include time -- and it is
+# included before mesh_scan.dpi in both ECAutomatedScan.dgp and UTPlaneScan.dgp,
+# so nothing it writes at include time can clobber a live value). mesh_scan.dpi's
+# Scan2DMeshPath._setup() deliberately writes the same four: a mesh scan has to
+# tear down whatever a plane scan left on /ut_scan_volume and /ut_cscan before it
+# can build its own, and these names ARE that handle. They are shared state, not
+# rival definitions -- only one scan mode runs at a time, and whichever ran last
+# is the one holding the objects. dpi_exports_test.py allowlists the four.
+# Do not rename them apart: the teardown is the point.
 
 global ndaccumulator
 ndaccumulator = None
@@ -32,12 +43,29 @@ cscan_gates = None
 global projector
 projector = None
 
+# The rectangular grid the volume is indexed by, stashed when the volume is set
+# up so that regrid_volume() can place a trace from its pose. None means no
+# plane grid was supplied -- a mesh or surface-following scan, which has no
+# rectangular volume to regrid.
+global volume_grid
+volume_grid = None
+
+# Metadata for the volume channel, kept for the same reason.
+global volume_metadata
+volume_metadata = None
+
+# Set once regrid_volume() has taken ownership of the volume channel from
+# nd_accumulate_once. It has to be handed back before the next scan can
+# instantiate an accumulator on that path again.
+global volume_chan
+volume_chan = None
+
 global capturedata
 def capturedata(timeout=5.0):
     """Take the next A-scan the digitizer produces and stage it for accumulation.
 
-    Waits for a recording on ASCAN_CHANNEL_PATH strictly newer than the one we
-    consumed last time, so a stationary digitizer's stale buffer is never
+    Waits for a recording on ASCAN_CHANNEL_PATH strictly newer than the one
+    previously consumed, so a stationary digitizer's stale buffer is never
     accumulated twice.
 
     A plain bounded poll, deliberately. A globalrev monitor looks tidier but is
@@ -97,6 +125,7 @@ def setup_accumulation(m, n, chanmetadata, num_traces=None, plane_grid=None):
     extra small array per trace rather than a second acquisition.
     """
     global ndaccumulator, cscanfunction, trace_accum, cscan_gates, projector
+    global volume_grid, volume_metadata, volume_chan
 
     # Before the transaction below, because teardown_gated_cscan opens its own
     # and only one may be open at a time. It releases the gate's parameter
@@ -109,13 +138,13 @@ def setup_accumulation(m, n, chanmetadata, num_traces=None, plane_grid=None):
         cscan_gates = None
 
     transact = recdb.start_transaction()
-    # A second scan in the same session has to remove the first one's functions
+    # A second scan in the same process has to remove the first one's functions
     # and the channels they own, or /ut_scan_volume and /ut_cscan are already
     # taken and the new volume cannot be the right shape. The c-scan goes first
     # because it reads the volume.
     #
     # transact.delete_math_function(), not recdb.delete_math_function(): the
-    # recdb one opens a transaction of its own, and we are inside one. It also
+    # recdb one opens a transaction of its own, and this is inside one. It also
     # takes (channel paths, function) -- every result channel of the function
     # has to be listed, or it throws.
     if cscanfunction is not None:
@@ -124,6 +153,13 @@ def setup_accumulation(m, n, chanmetadata, num_traces=None, plane_grid=None):
     if ndaccumulator is not None:
         transact.delete_math_function(["/ut_scan_volume"], ndaccumulator)
         ndaccumulator = None
+    # A previous scan's regrid_volume() took /ut_scan_volume over from the
+    # accumulator and still holds it. Hand it back, or instantiating the new
+    # accumulator fails at end_transaction() with "provided reserved_channel for
+    # /ut_scan_volume by main is not current", naming neither scan.
+    if volume_chan is not None:
+        transact.release_channel(volume_chan)
+        volume_chan = None
 
     # The volume is (m, n, num_points): u along axis0, v along axis1, time along
     # axis2. That order is not cosmetic -- spatialnde2's renderer maps axis0 to
@@ -138,7 +174,7 @@ def setup_accumulation(m, n, chanmetadata, num_traces=None, plane_grid=None):
     # unravels assignmap[k] against accum_dimlen itself, so the destinations do
     # not have to be in increasing order.
     # Record length from the digitizer, not from a constant -- by the time this
-    # runs the first real A-scan has been staged, so the card has told us.
+    # runs the first real A-scan has been staged, so the card has said.
     nsamp = ascan_geometry(timeout=30.0)["num_points"]
 
     accummap = [int(np.ravel_multi_index((i, j, 0), (m, n, nsamp)))
@@ -165,16 +201,15 @@ def setup_accumulation(m, n, chanmetadata, num_traces=None, plane_grid=None):
     else:
         transact.add_math_function(ndaccumulator, False)
 
-    # The quick-look c-scan over the rectangular volume. This was compute_cscan,
-    # which was exactly this gate with the mode and the reference fixed; it has
-    # been removed in favour of the general one rather than maintaining two
-    # implementations of the same reduction. MODE_MAX between two absolute times
-    # reproduces it exactly (verified: maximum absolute difference 0.0).
+    # The quick-look c-scan over the rectangular volume. It is the general
+    # cscan_gate with the mode and the reference fixed: MODE_MAX between two
+    # absolute times, which reproduces a dedicated compute_cscan exactly
+    # (verified: maximum absolute difference 0.0).
     #
     # It reads /cscan_start and /cscan_end, the same channels the Qt panel
-    # drives, so the panel retunes this gate live exactly as before.
+    # drives, so the panel retunes this gate live.
     #
-    # Two outputs now, not one: every cscan_gate emits an amplitude AND a time
+    # Two outputs, not one: every cscan_gate emits an amplitude AND a time
     # of flight, so that a gate can serve as the reference for another. The
     # volume's time-of-flight output is not used by the quick look, but it has
     # to be named and it has to be deleted alongside the amplitude.
@@ -211,8 +246,170 @@ def setup_accumulation(m, n, chanmetadata, num_traces=None, plane_grid=None):
                                         " tracking %s" % g["track"] if g.get("track") else "")
                           for g in CSCAN_GATES))
 
+    # Keep what regrid_volume() needs: where cell (0,0) is and what one step
+    # along each axis does to a world position. A pose can then be turned into a
+    # cell without re-deriving the plane from the taught corners.
+    volume_metadata = chanmetadata
+    volume_grid = None
+    if plane_grid is not None:
+        uu, vv, ww = plane_grid
+        origin = np.array([uu[0, 0], vv[0, 0], ww[0, 0]], dtype=np.float64)
+        u_step = (np.array([uu[1, 0], vv[1, 0], ww[1, 0]], dtype=np.float64) - origin
+                  if m > 1 else None)
+        v_step = (np.array([uu[0, 1], vv[0, 1], ww[0, 1]], dtype=np.float64) - origin
+                  if n > 1 else None)
+        volume_grid = {"origin": origin, "u_step": u_step, "v_step": v_step,
+                       "m": int(m), "n": int(n)}
+
     if projection_enabled() and plane_grid is not None:
         _setup_projection(plane_grid)
+
+global volume_cell_indices
+def volume_cell_indices(grid, positions):
+    """Which cell of the rectangular grid each position belongs to.
+
+    Returns (ii, jj, residual): the cell indices, and how far each position sat
+    from the centre of the cell it was assigned to, in cells. A residual near
+    0.5 means positions are landing between cells, i.e. the grid does not
+    describe where the probe actually went.
+
+    Note what this does NOT take: the trace's index. A cell is a function of
+    position alone, so a missing trace cannot move the one after it. That is the
+    whole point of regridding from poses rather than accumulating in arrival
+    order.
+    """
+    positions = np.asarray(positions, dtype=np.float64).reshape(-1, 3)
+    origin = np.asarray(grid["origin"], dtype=np.float64)
+
+    def _axis(step, count):
+        if step is None or count < 2:
+            return (np.zeros(positions.shape[0], dtype=np.int64),
+                    np.zeros(positions.shape[0]))
+        step = np.asarray(step, dtype=np.float64)
+        length = float(np.linalg.norm(step))
+        along = (positions - origin) @ (step/length) / length
+        return (np.rint(along).astype(np.int64), along)
+
+    ii, along_u = _axis(grid["u_step"], grid["m"])
+    jj, along_v = _axis(grid["v_step"], grid["n"])
+    residual = np.maximum(np.abs(along_u - ii), np.abs(along_v - jj))
+    return ii, jj, residual
+
+
+global regrid_volume
+def regrid_volume(quiet=False):
+    """Rebuild the rectangular volume by putting every trace where its POSE says.
+
+    The live volume is filled by nd_accumulate_once, which assigns the k-th
+    recording it sees to the k-th cell of a map fixed when it was instantiated.
+    That is right only while nothing goes missing. Lose one trace -- a
+    transaction the database refused because its timestamp could no longer be
+    ordered, a crossing the trigger never got to publish, a pass that came up
+    short -- and every later trace lands one cell early. The image shears
+    progressively, and nothing in the volume says so: it is full, it is the right
+    shape, and it is wrong from the gap onwards.
+
+    The trace list does not have that failure mode. trace_poses[k] is where
+    traces[k] was actually taken, recorded at acquisition alongside the data, so
+    rebuilding from it places each trace by position. A missing trace then leaves
+    a HOLE, in the right place, and its neighbours do not move.
+
+    Cells no trace reached are NaN, or zero for integer traces, which have no
+    NaN -- either way they are counted and reported rather than left to look like
+    signal. Returns the report as a dict.
+
+    This takes the volume channel over from nd_accumulate_once; the c-scan gate
+    reads the same path and recomputes on the rebuilt volume. Running another
+    scan puts the accumulator back (see setup_accumulation).
+    """
+    global ndaccumulator, volume_chan
+
+    if trace_accum is None:
+        raise RuntimeError("regrid_volume() needs the trace list, and this scan "
+                           "did not record one (RECORD_TRACE_LIST is off). The "
+                           "volume is whatever arrival order made it.")
+    if volume_grid is None:
+        raise RuntimeError("regrid_volume() needs the rectangular grid, which is "
+                           "only set up for a plane scan. A surface-following "
+                           "scan has no rectangular volume to regrid -- its "
+                           "result is the trace list and the projection.")
+
+    m = volume_grid["m"]
+    n = volume_grid["n"]
+
+    traces_ref = recdb.latest.ref[trace_accum.traces_path]
+    poses_ref = recdb.latest.ref[trace_accum.poses_path]
+    traces = traces_ref.data
+    poses = np.array(poses_ref.data, copy=True)
+
+    K = int(traces.shape[0])
+    nsamp = int(traces.shape[1])
+    if poses.shape[0] < K:
+        raise RuntimeError("trace list and pose list disagree: %d traces, %d poses"
+                           % (K, poses.shape[0]))
+
+    # pose7 is [qw, qx, qy, qz, px, py, pz] -- see pose7_from_parts().
+    positions = poses[:K, 4:7].astype(np.float64)
+
+    ii, jj, resid = volume_cell_indices(volume_grid, positions)
+
+    inside = (ii >= 0) & (ii < m) & (jj >= 0) & (jj < n)
+    outside = int((~inside).sum())
+    worst_resid = float(resid[inside].max()) if inside.any() else 0.0
+
+    fill = np.nan if np.issubdtype(traces.dtype, np.floating) else 0
+
+    transact = recdb.start_transaction()
+    if ndaccumulator is not None:
+        # Take the channel over from the accumulator. Its map is the thing being
+        # corrected, so it cannot keep writing to this path.
+        transact.delete_math_function(["/ut_scan_volume"], ndaccumulator)
+        ndaccumulator = None
+    if volume_chan is None:
+        volume_chan = transact.define_channel("/ut_scan_volume", "main")
+    ref = snde.create_ndarray_ref(transact, volume_chan,
+                                  snde_typenum_for(np.empty(0, dtype=traces.dtype)))
+    if volume_metadata is not None:
+        ref.rec.metadata = volume_metadata
+    ref.rec.mark_metadata_done()
+    ref.allocate_storage([m, n, nsamp], False)
+    out = ref.data
+    out[:] = fill
+
+    seen = np.zeros((m, n), dtype=bool)
+    collisions = 0
+    for k in range(K):
+        if not inside[k]:
+            continue
+        i = int(ii[k]); j = int(jj[k])
+        if seen[i, j]:
+            collisions += 1
+        seen[i, j] = True
+        out[i, j, :] = traces[k]
+    ref.rec.mark_data_ready()
+    transact.end_transaction().globalrev_wait().wait_complete()
+
+    filled = int(seen.sum())
+    report = {"traces": K, "cells": m*n, "filled": filled, "empty": m*n - filled,
+              "outside_grid": outside, "collisions": collisions,
+              "worst_cell_residual": worst_resid}
+
+    if not quiet:
+        print("  volume regridded from trace poses: %d of %d cells filled from "
+              "%d traces" % (filled, m*n, K))
+        if report["empty"]:
+            print("    %d cell(s) NOT reached by any trace -- left empty rather "
+                  "than filled by shifting their neighbours" % report["empty"])
+        if outside:
+            print("    %d trace(s) landed outside the grid and were dropped" % outside)
+        if collisions:
+            print("    %d trace(s) landed on a cell another trace already filled "
+                  "(the later one wins)" % collisions)
+        if worst_resid > 0.25:
+            print("    worst trace sat %.2f cells from its cell centre; over 0.5 "
+                  "means the grid does not describe where the probe went"
+                  % worst_resid)
+    return report
 
 global _prepare_trace_accum
 def _prepare_trace_accum(num_traces):
@@ -221,8 +418,8 @@ def _prepare_trace_accum(num_traces):
     Split from setup_accumulation deliberately. nd_accumulate_once consumes
     whatever is on its input channel at the moment it is instantiated as entry
     zero, so the pose channel has to exist -- and hold the real first pose --
-    before setup() runs. Creating the accumulator lazily instead put a zeros
-    placeholder at pose 0 and offset the pose list from the trace list by one.
+    before setup() runs. Creating the accumulator lazily instead puts a zeros
+    placeholder at pose 0 and offsets the pose list from the trace list by one.
     """
     global trace_accum
     if trace_accum is not None:
@@ -263,7 +460,8 @@ def _setup_projection(plane_grid):
     if projector is not None and getattr(projector, "x3d_path", None) == x3d_path:
         # Same surface file, so empty the picture and reuse the loaded geometry.
         # A second SurfaceProjector on this prefix cannot be built: the channels
-        # x3d_load_geometry defines under the model tree are not ours to release.
+        # x3d_load_geometry defines under the model tree cannot be released from
+        # Python.
         # See SurfaceProjector.restart().
         #
         # The radius and the pixel count are constructor arguments of the
