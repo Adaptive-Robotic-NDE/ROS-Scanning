@@ -504,7 +504,7 @@ def describe_work_volume():
 # A MoveIt velocity scaling is a fraction of the arm's JOINT limits, not a speed.
 # The technician's control is in mm/s, so something has to convert, and the
 # conversion is a measured property of this cell -- not of this code and not of
-# the robot model. measure_robot_velocity() (cell_capture_scenarios.dpi) flies a
+# the robot model. capture_robot_velocity() (cell_capture_scenarios.dpi) flies a
 # ladder of speeds and records the pair.
 #
 # IT BELONGS IN THE CELL MANIFEST, for the same reason the work volume and the
@@ -545,7 +545,7 @@ def robot_velocity_calibration(cell=None, mode=None, quiet=False):
 
     # THE CAPTURE FILE FIRST, THE MANIFEST SECOND -- the same order the cable
     # envelope uses, and for the same reason. A session on the machine that just
-    # ran measure_robot_velocity() should use what it measured, with no edit and no
+    # ran capture_robot_velocity() should use what it measured, with no edit and no
     # restart; every other machine uses the manifest, which is what travels with
     # the cell. Without this the operator has to hand-edit a file before the
     # measurement they just took has any effect, which is the step that gets
@@ -696,7 +696,7 @@ def describe_robot_velocity(fallback=None, pass_length_m=None):
         n = len(fallback or ())
         return ("  velocity curve: NOT MEASURED for %s/%s -- using the config's "
                 "own %d-row table. Every commanded speed is only as right as "
-                "that. measure_robot_velocity() writes a manifest block."
+                "that. capture_robot_velocity() writes a manifest block."
                 % (CELL_NAME, CELL_MODE, n))
     table = cal["table"]
     # WHICH FILE, not just "measured". The capture file and the manifest can

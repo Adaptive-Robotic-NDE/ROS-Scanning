@@ -154,10 +154,15 @@ def joints(wrist3_deg):
 
 
 # ==============================================================================
-# THE MEASUREMENT: ex-ur10e-1 hardware, from capture_cable_envelope().
-# Copied verbatim from cable_limits_ex-ur10e-1_hardware.json, in SCHEMA 1
-# (labels, no tx_deg/ty_deg), because reading that file is a requirement: it is
-# the only measurement that exists and it is already on the cell PC.
+# A MEASUREMENT: ex-ur10e-1 hardware, from capture_cable_envelope().
+# ==============================================================================
+# The 2026-09-14 sweep of this cell, in SCHEMA 1 (labels, no tx_deg/ty_deg),
+# because reading a schema 1 file is a requirement -- a measurement written
+# before the schema carried tilt coordinates is still on the cell PC.
+#
+# It is the earlier of the two sweeps the manifest merges, and it is used here
+# for two things: as the fixture the band arithmetic is checked on, and as one of
+# the recorded measurements the merged manifest is graded against below.
 # ==============================================================================
 MEASURED = [
     {"tilt": "no tilt",         "lo_deg": 31.338424555636937, "hi_deg": 301.33842455563695},
@@ -452,10 +457,19 @@ if data is not None:
           and (hw_b or {}).get("home_quat") is None,
           "neither mode overrides home_quat")
 
-    # THE MANIFEST IS A TRANSCRIPTION OF A CAPTURE FILE, so it is checked against
-    # that file rather than against MEASURED above. MEASURED is an older take kept
-    # here as a fixture for the band arithmetic; pinning the manifest to it would
-    # mean every fresh measurement fails this suite for being fresh.
+    # THE MANIFEST IS A PER-TILT MERGE OF EVERY SWEEP RECORDED ON THIS CELL, so
+    # it is graded against all of them and pinned to none. The limit is judged by
+    # eye while the wrist is stepped round, two sweeps of cabling nobody touched
+    # come out about a step apart, and the merge keeps whichever end either sweep
+    # confirmed slack. So the manifest is DELIBERATELY WIDER than any single
+    # sweep, and what has to hold instead is that it softened nothing and
+    # invented nothing:
+    #
+    #   * at every tilt it declares, it is at least as permissive as every sweep
+    #     that visited that tilt -- otherwise the merge lost measured travel;
+    #   * and no more permissive than the widest of them -- otherwise it is
+    #     claiming slack nobody watched;
+    #   * every tilt any sweep visited is there, and no tilt nobody visited is.
     CAPTURE = os.path.join(
         HERE, "..", "..", "..", "scandata", "results14", "scandata", "capture",
         "cable_limits_ex-ur10e-1_hardware.json")
@@ -465,26 +479,86 @@ if data is not None:
     hw.setdefault("mode", "hardware")
     from_manifest = ns["_cable_envelope_from_doc"](hw, "the manifest")
 
+    def _by_tilt(samples):
+        """{(tx, ty): (lo_deg, hi_deg)} straight off the recorded rows.
+
+        The rows themselves, not band() -- the question here is what the merge
+        did with the numbers, and interpolation is checked above.
+        """
+        return {(round(s[0], 6), round(s[1], 6)):
+                (math.degrees(s[2]), math.degrees(s[3])) for s in samples}
+
+    #: Every sweep of this cell's cables that is on record, newest first. The
+    #: earlier one is MEASURED above; the later one is the file the capture tool
+    #: wrote, read here rather than transcribed.
+    RECORDED = []
+    taken = None
     if os.path.exists(os.path.normpath(CAPTURE)):
         import json as _json
         taken = ns["_cable_envelope_from_doc"](
             _json.load(open(os.path.normpath(CAPTURE))), "the capture file")
-        check(from_manifest.measured == taken.measured,
-              "the manifest carries the capture file's date (%s)"
-              % (from_manifest.measured,))
-        check(len(from_manifest.samples) == len(taken.samples),
-              "every measured tilt reached the manifest (%d of %d)"
-              % (len(from_manifest.samples), len(taken.samples)))
-        same = all(
-            abs(from_manifest.band_deg(tilt=(s[0], s[1]))[0]
-                - taken.band_deg(tilt=(s[0], s[1]))[0]) < 1e-3
-            and abs(from_manifest.band_deg(tilt=(s[0], s[1]))[1]
-                    - taken.band_deg(tilt=(s[0], s[1]))[1]) < 1e-3
-            for s in taken.samples)
-        check(same, "the manifest's numbers are the captured bands, to 0.001 deg")
-        # THE DATUM TOO. The band says how far the wrist may turn; the datum says
+        RECORDED.append((taken.measured, _by_tilt(taken.samples)))
+    else:
+        print("skip  one recorded sweep (%s is not here)"
+              % (os.path.normpath(CAPTURE),))
+    RECORDED.append(("2026-09-14T10:22:07", _by_tilt(env.samples)))
+
+    man = _by_tilt(from_manifest.samples)
+    check(len(RECORDED) > 1,
+          "more than one sweep is on record, so the merge has something to do "
+          "(%d)" % (len(RECORDED),))
+    # The block has to SAY it is a merge and which sweeps went in, or nobody
+    # reading it can tell a merged band from a mis-transcribed one.
+    named = hw.get("merged_from") or []
+    check(set(n for n, _r in RECORDED) <= set(named),
+          "the manifest names every sweep it merges (%s)" % (named,))
+
+    every_tilt = set()
+    for _name, rows in RECORDED:
+        every_tilt |= set(rows)
+    check(every_tilt <= set(man),
+          "every tilt any sweep visited reached the manifest (%d tilts)"
+          % (len(every_tilt),))
+    check(set(man) <= every_tilt,
+          "the manifest declares no tilt no sweep ever visited")
+    for tilt in sorted(man):
+        lo, hi = man[tilt]
+        los = [rows[tilt][0] for _n, rows in RECORDED if tilt in rows]
+        his = [rows[tilt][1] for _n, rows in RECORDED if tilt in rows]
+        if not los:
+            continue
+        check(lo <= min(los) + 1e-3 and hi >= max(his) - 1e-3,
+              "tilt (x %+.0f, y %+.0f): %.4f..%.4f is at least as permissive as "
+              "every sweep there (%s)"
+              % (tilt[0], tilt[1], lo, hi,
+                 ", ".join("%.4f..%.4f" % (a, b) for a, b in zip(los, his))))
+        check(abs(lo - min(los)) < 1e-3 and abs(hi - max(his)) < 1e-3,
+              "tilt (x %+.0f, y %+.0f): and no wider than the widest of them "
+              "(%.4f..%.4f)" % (tilt[0], tilt[1], min(los), max(his)))
+        # NOT RECONCILED BY A TURN. Sweeps of one tilt disagree by a step or so.
+        # A merged band wider than a full turn, or two recorded ends a turn
+        # apart, would mean two branches of the same orientation were treated as
+        # one continuous band -- which is the substitution this module exists to
+        # refuse, arriving through the merge instead of through a solver.
+        check(hi - lo <= 360.0 + 1e-6,
+              "tilt (x %+.0f, y %+.0f): the merged band is %.1f deg wide, within "
+              "one turn" % (tilt[0], tilt[1], hi - lo))
+        check(max(los) - min(los) < 180.0 and max(his) - min(his) < 180.0,
+              "tilt (x %+.0f, y %+.0f): the sweeps disagree by %.1f/%.1f deg, "
+              "not by a turn" % (tilt[0], tilt[1],
+                                 max(los) - min(los), max(his) - min(his)))
+    single = [t for t in man if sum(1 for _n, r in RECORDED if t in r) == 1]
+    check(bool(single),
+          "at least one tilt was visited by a single sweep and survived the "
+          "merge with that sweep's band (%d of %d)" % (len(single), len(man)))
+
+    if taken is not None:
+        # THE DATUM. The band says how far the wrist may turn; the datum says
         # where zero probe rotation sits inside it, and a manifest carrying one
-        # without the other cannot convert a requested rotation into a wrist angle.
+        # without the other cannot convert a requested rotation into a wrist
+        # angle. It is NOT merged -- it is a measurement of the joint state a
+        # sweep started from, not a bound -- so every row must carry one of the
+        # recorded datums for its own tilt, unchanged.
         datums = [(tx, ty) for tx, ty, _lo, _hi, _l in taken.samples]
         carried = all(from_manifest.wrist3_datum_deg(tilt=t) is not None
                       for t in datums)
@@ -493,10 +567,15 @@ if data is not None:
             close = all(abs(from_manifest.wrist3_datum_deg(tilt=t)
                             - taken.wrist3_datum_deg(tilt=t)) < 1e-3
                         for t in datums)
-            check(close, "...and matches the capture, to 0.001 deg")
-    else:
-        print("skip  the manifest-against-capture check (%s is not here)"
-              % (os.path.normpath(CAPTURE),))
+            check(close, "...unchanged from the sweep that recorded it, to "
+                         "0.001 deg")
+            inside = all(
+                from_manifest.band_deg(tilt=t)[0] - 1e-6
+                <= from_manifest.wrist3_datum_deg(tilt=t)
+                <= from_manifest.band_deg(tilt=t)[1] + 1e-6 for t in datums)
+            check(inside, "...and still sits inside the merged band at its own "
+                          "tilt, so a rotation is graded against a pair that "
+                          "belong together")
 
     lo0, hi0 = from_manifest.band_deg(tilt=(0.0, 0.0))
     check(hi0 > lo0 and (hi0 - lo0) > 180.0,
@@ -505,13 +584,14 @@ if data is not None:
     # THE SIX ANGLES AN UNGUARDED SCAN COMMANDED, graded against the band the
     # manifest NOW carries rather than against a remembered verdict.
     #
-    # Two of them moved. The 2026-09-14 sweep called the untilted low end 31.34
-    # and the 2026-09-16 sweep called it 16.09 -- one 15 degree step apart, on a
-    # limit a person judges by watching the loom go taut. +21.9 and +29.3 sit
-    # between the two, so the newer measurement admits them and the older one did
-    # not. That is a real consequence of trusting the newer take, not a weakened
-    # test: what must not change is that an angle OUTSIDE the recorded band is
-    # still refused, and that nothing is admitted by a +/-360 substitution.
+    # Two of them moved. The two sweeps put the untilted low end at 31.34 and at
+    # 16.09 -- one 15 degree step apart, on a limit a person judges by watching
+    # the loom go taut -- and the merge keeps the lower. +21.9 and +29.3 sit
+    # between the two, so the merged band admits them and the earlier sweep alone
+    # did not. That is a real consequence of taking the most permissive recorded
+    # end, not a weakened test: what must not change is that an angle outside
+    # everything recorded is still refused, and that nothing is admitted by a
+    # +/-360 substitution.
     refused_now = [d for d in FAILURE_ANGLES_DEG if not (lo0 <= d <= hi0)]
     inside_now = [d for d in FAILURE_ANGLES_DEG if lo0 <= d <= hi0]
     check(len(refused_now) >= 3,
@@ -529,7 +609,7 @@ if data is not None:
             check_wrist3([joints(deg)], "run_automated_scan", model=from_manifest)
         except Exception:                                         # noqa: BLE001
             ok = False
-        check(ok, "manifest: wrist 3 %+7.1f deg is inside the 2026-09-16 band "
+        check(ok, "manifest: wrist 3 %+7.1f deg is inside the merged band "
                   "%.2f..%.2f and is allowed" % (deg, lo0, hi0))
         check(not (lo0 <= deg + 360.0 <= hi0) or (lo0 <= deg <= hi0),
               "...on its own absolute angle, not a full turn away")

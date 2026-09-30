@@ -392,7 +392,7 @@ NEAR_PART_SPEED = 0.010          # m/s: the sweep, and every move onto or off th
 # pessimistic reading. It is the one speed here that could be raised without
 # new measurement.
 #
-# EVERYTHING ELSE NEEDS measure_robot_velocity() ON THE ARM FIRST, and the two
+# EVERYTHING ELSE NEEDS capture_robot_velocity() ON THE ARM FIRST, and the two
 # that matter most are JOINT_MOVE_SCALING and EC_AXIS_SPEED below. Do not raise
 # those from a guess: the numbers justifying them are simulated peak speeds, and
 # simulation says 0.020 joint scaling already peaks at 55 mm/s -- over the limit.
@@ -525,14 +525,14 @@ EC_PROBE_ROTATION_DEG = 0.0
 # from -- so the band and the datum are one self-consistent pair, and
 # check_probe_rotation() takes both from the envelope. It also takes the datum AT
 # EACH POSE'S TILT, which this constant cannot express: reaching a tilt turns the
-# wrist on the way, and across this cell's five samples the datum runs 147 to 179
+# wrist on the way, and across this cell's eight samples the datum runs 147 to 179
 # degrees.
 #
 # This value is for a cell whose envelope predates that field, or one measured
 # without it. It is the untilted number only, and being a transcription it goes
 # stale silently the moment the tooling is unbolted -- which is exactly why the
 # measurement wins. This cell's reads 166.09 deg against an untilted band of
-# +16.09..+301.09, so it holds -150..+135 deg of rotation with the probe vertical.
+# +16.09..+301.34, so it holds -150..+135 deg of rotation with the probe vertical.
 #
 # The rotation lands on this joint one degree for one degree, which is what lets
 # check_probe_rotation() refuse a rotation without solving any IK. None, with no

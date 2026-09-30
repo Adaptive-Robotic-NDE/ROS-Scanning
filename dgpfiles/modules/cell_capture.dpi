@@ -109,7 +109,7 @@ except Exception as _e:
 # So is the cable envelope -- from the file capture_cable_envelope() wrote here
 # if there is one, otherwise from the cell manifest, which is what a session on
 # a machine that never ran the test can see. PER TILT: the band at a -40 degree
-# x tilt is 75 degrees wide where the untilted band is 270, so one number
+# x tilt is 90 degrees wide where the untilted band is 285, so one number
 # enforced at both tilts refuses poses that are nowhere near a cable.
 try:
     _load_cable_limits(quiet=False)

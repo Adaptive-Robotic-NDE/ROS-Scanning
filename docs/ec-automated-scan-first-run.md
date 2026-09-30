@@ -41,6 +41,13 @@ with the recstatus placement-race fix before any timestamped eddy-current
 scan. Without it, the DAQ's acquisition thread can die mid-scan with "becomes
 fully ready with recording not found in instantiated or mdonly".
 
+**Budget time for two measurements the scan needs and does not have.** The
+contact preload is unknown (`EC_PRELOAD_M = 0`, section 3), and the cell's speed
+curve was measured over a 300 mm line in free space while an eddy-current pass is
+a few tens of millimetres — so the speeds that matter for a contact sweep have not
+been measured. Both are cell work with the arm, not settings to pick: steps 7 and
+12 below.
+
 **The settings to look at before starting** (top of `ECAutomatedScan.dgp`):
 
 | setting | value | why it matters on day one |
@@ -68,7 +75,7 @@ fully ready with recording not found in instantiated or mdonly".
 | `SPECIMEN_SWEEP_DIRECTIONS` | 4 | how many of the 8 candidate stand-off directions to fly; fewer than 2 reachable is a refusal |
 | `SPECIMEN_SWEEP_HEIGHT`, `SPECIMEN_SWEEP_STOPS` | `None`, 5x5 | `"dome"` only: the old straight-down raster |
 | `DETECT_POSE`, `PARK_POSE` | `"over_table"` | the named pose ClientScannerTest started and ended at |
-| `ROBOT_VELOCITY_CALIBRATION` | measured in sim | every m/s goes through it; see step 7 |
+| `ROBOT_VELOCITY_CALIBRATION` | the cell manifest's curve, measured over a 300 mm line | every m/s goes through it, and a pass is a tenth of that line — **re-measure it at pass length before the first scan**, step 7 |
 
 ---
 
@@ -143,10 +150,38 @@ confirming it.
    mode can measure. The tooling is rigid to the camera, so that does not change
    with the pose and no sweep can be planned around it.
 6. **Put the calibration plate in the work volume**, in view from `over_table`.
-7. **Velocity calibration.** `ROBOT_VELOCITY_CALIBRATION` was measured in
-   simulation. The dry run and every scan print the speed the probe was *seen*
-   to move. If that disagrees with the commanded 10 mm/s by more than 15%,
-   re-measure the table (technician-scan-controls skill) before scanning.
+7. **Velocity calibration — re-measure it over a line as short as a pass.**
+   The curve the cell manifest carries (`robot_velocity: hardware:`) was measured
+   over a **300 mm** line in free space. It records that span because the curve is
+   path-length dependent: a move much shorter than the span it was measured over
+   is mostly acceleration ramp and never reaches the speed the table promises. An
+   eddy-current pass is nothing like 300 mm — the regions this cell scans are
+   10–30 mm across (step 9), and a 30 × 30 mm region plans to passes about 25 mm
+   long — so **the curve that governs a contact scan has not been measured yet**,
+   and the speeds the plan quotes for one are an extrapolation off the end of the
+   measurement.
+
+   Measure it before the first scan, with the line set to the length of the passes
+   about to be flown: `capture_robot_velocity(length_mm=<pass length in mm>)`
+   (scenario 9 of the cell capture tool, which lists its scenarios when it
+   loads; the procedure is `docs/cell-data-capture.md`). It flies a
+   ladder of speeds in free space, nothing near the part, and prints a
+   `robot_velocity:` block to paste into
+   `ros_ws/src/tari_site/tari_cell_configs/config/cells/ex-ur10e-1.yaml`. Then
+   `robot_velocity_reload()` and `adopt_measured_velocity_curve()` put it in force
+   without restarting the config. The manifest holds one curve per mode, so a
+   short-line curve replaces the long-line one for every move, transits between
+   passes included; `span_m` in the block records which span it came from, and the
+   observed probe speed each scan prints is the check on it.
+
+   It **refuses** a line under 50 mm, on the grounds that such a line is all ramp.
+   For passes that short that refusal is the answer rather than an obstacle: no
+   table can promise a speed over that distance, and the `observed probe speed`
+   the dry run and every scan print is the only number that says what the arm did.
+
+   Either way, compare what was seen against what was commanded. If the observed
+   probe speed disagrees with the commanded 10 mm/s by more than 15%, re-measure
+   before scanning (technician-scan-controls skill).
 8. **Detect, measure, plan -- no scan.** `run_automated_scan(scan=False)`.
    Section 2 describes each stage's output. It holds the warning light for the
    whole run and parks at `over_table` at the end. If YOLO does not find the

@@ -470,7 +470,7 @@ def _cable_limits_file():
 
 
 def _robot_velocity_file():
-    """Where measure_robot_velocity() writes its measurement on THIS machine.
+    """Where capture_robot_velocity() writes its measurement on THIS machine.
 
     work_cell.dpi looks this up by name and prefers it over the manifest when it
     exists, exactly as the cable envelope is handled: a session on the machine

@@ -63,21 +63,29 @@
 #
 # THE THREE THINGS THIS MODULE EXISTS TO GET RIGHT:
 #
-# 1. THE BAND DEPENDS ON THE TILT. The measurement is five separate sweeps --
-#    no tilt, +/-40 deg about world x, +/-20 deg about world y -- and they do
-#    not agree:
+# 1. THE BAND DEPENDS ON THE TILT. The measurement is a separate sweep at each
+#    tilt, and they do not agree. This cell, as it stands:
 #
-#        no tilt      31.3 .. 301.3 deg      (270 deg of travel)
-#        tilt x +40   87.3 .. 327.3
-#        tilt x -40  179.6 .. 254.6          (75 deg -- the tightest by far)
-#        tilt y +20   63.6 .. 303.6
-#        tilt y -20   30.3 .. 255.3
+#        no tilt      16.1 .. 301.3 deg      (285 deg of travel)
+#        tilt x +20   38.1 .. 323.1          (285)
+#        tilt x +40   72.1 .. 327.3          (255)
+#        tilt x -20  127.7 .. 277.7          (150)
+#        tilt x -40  179.2 .. 269.2          (90 -- the tightest by far)
+#        tilt y +20   63.6 .. 303.6          (240)
+#        tilt y -20   30.3 .. 285.0          (255)
+#        tilt y -40   90.9 .. 300.9          (210)
 #
-#    Intersecting all five into ONE band -- 179.6..254.6 -- and enforcing that at
-#    every pose whatever the tilt refuses moves at 255, 257 and 168..250 deg that
-#    are well inside the band for the tilt actually commanded. An untilted pose
-#    has 270 degrees of legal travel and would be given 75. The band at a tilt is
-#    the band measured at that tilt.
+#    Intersecting them all into ONE band -- 179.2..269.2 -- and enforcing that at
+#    every pose whatever the tilt would give an untilted pose 90 degrees of legal
+#    travel where the sweep at no tilt found 285. The band at a tilt is the band
+#    measured at that tilt.
+#
+#    SEVERAL SWEEPS AT ONE TILT ARE MERGED, not replaced. The limit is a person
+#    watching the loom, so two sweeps of an unchanged cell come out about a step
+#    apart; that spread is in the judgement, not in the cables. Each tilt takes
+#    the lowest low end and the highest high end any sweep confirmed slack there,
+#    and a tilt only one sweep visited keeps that sweep's band.
+#    cable_envelope_merge() does it, and invents no tilt and no end.
 #
 # 2. ABSOLUTE ANGLE IS WHAT MATTERS. The cable physically wraps, so wrist_3 =
 #    +200 deg and wrist_3 = -160 deg are the same TOOL ORIENTATION and opposite
@@ -89,15 +97,16 @@
 # 3. IT HAS TO BE ENFORCED WHERE THE ARM ACTUALLY MOVES. A check that runs only
 #    inside a capture scenario leaves a normal run_automated_scan() unguarded,
 #    and an unguarded sweep will command wrist_3 = 29.3, 21.9, -32.3, -55.1 and
-#    -113.0 deg in sequence -- starting below the measured tight point of 31.3,
-#    walking through zero, and ending 113 deg the wrong side of it, with the
-#    emergency stop as the only thing left to stop it. install_cable_guard() in
+#    -113.0 deg in sequence -- walking down through the measured low end of 16.1,
+#    through zero, and ending 129 deg the wrong side of it, with the emergency
+#    stop as the only thing left to stop it. install_cable_guard() in
 #    cell_capture_motion.dpi is the enforcement; this module is the model it
 #    asks.
 #
-# WHAT IS *NOT* HERE. No envelope for a tilt nobody measured. Outside
-# |tx| <= 40 deg or |ty| <= 20 deg this raises rather than extrapolating: a
-# cable limit invented by running a line off the end of the data is an
+# WHAT IS *NOT* HERE. No envelope for a tilt nobody measured. Outside the tilts
+# the sweeps covered -- for this cell tx from -40 to +40 deg and ty from -40 to
+# +20 -- this raises rather than extrapolating: a cable limit invented by running
+# a line off the end of the data is an
 # unmeasured number, of the same kind as the blanket TOOLING_TWIST_LIMIT_DEG in
 # tooling_clearance.dpi.
 #
@@ -129,6 +138,7 @@ global check_wrist3
 global wrist3_branch_in_band
 global describe_cable_envelope
 global cable_envelope_from_rows
+global cable_envelope_merge
 global cable_envelope_document
 global cable_envelope_manifest_block
 global _cable_parse_label
@@ -327,9 +337,8 @@ def _cable_interp_scalar(row, t):
 class CableEnvelope(object):
     """The measured wrist-3 bands, and the rule for the tilts between them.
 
-    Built from the five-point cross capture_cable_envelope() flies: three
-    samples along x at ty = 0 and three along y at tx = 0, sharing the untilted
-    one at the middle.
+    Built from the cross capture_cable_envelope() flies: samples along x at
+    ty = 0 and samples along y at tx = 0, sharing the untilted one at the middle.
 
     THE INTERPOLATION RULE, and why it is this one. `lo` and `hi` are
     interpolated SEPARATELY and LINEARLY along x (using the ty = 0 row) and,
@@ -349,13 +358,13 @@ class CableEnvelope(object):
       * Separately for lo and hi, because they are two different cables
         reaching their limit in two different directions. They are not a centre
         and a width, and the measurement says so -- turning from no tilt to
-        x -40 moves lo UP by 148 deg and hi DOWN by only 47, while turning to
+        x -40 moves lo UP by 163 deg and hi DOWN by only 32, while turning to
         x +40 moves BOTH up.
-      * Linearly, because five points is what there is. Any smoother fit puts
-        curvature into the answer that nothing measured.
+      * Linearly, because a handful of samples per axis is what there is. Any
+        smoother fit puts curvature into the answer that nothing measured.
       * As deviations rather than as absolute bands, because the literal
         max-of-the-los / min-of-the-his over the two absolute bands is WRONG at
-        three of the five measured samples, in the over-restrictive direction.
+        most of the measured samples, in the over-restrictive direction.
         At tx = +40, ty = 0 the y row is being evaluated at ty = 0, where it
         returns the UNTILTED band -- a statement about the origin, not about
         (+40, 0) -- and intersecting with it cuts the measured 327.3 back to
@@ -366,9 +375,9 @@ class CableEnvelope(object):
       * The clamp, because a cross has no diagonal data and composing two
         widening deviations could otherwise claim an endpoint past anything
         ever observed. Inside the clamp, a diagonal is at least as tight as the
-        measurement: (-40, -20) comes out 178.5..208.5, tighter on both ends
-        than either row alone.
-      * On either measured row -- which is every one of the five samples, and
+        measurement: on this cell (-40, -20) comes out 193.4..252.9, tighter on
+        both ends than either row alone.
+      * On either measured row -- which is every one of the samples, and
         every tilt along the two axes -- this returns that row exactly. The
         model never softens what was actually observed, and never invents past
         it.
@@ -382,7 +391,7 @@ class CableEnvelope(object):
 
     def __init__(self, samples, home_quat=(0.0, 0.0, 0.0, 1.0), cell=None,
                  mode=None, measured=None, step_deg=None, source=None,
-                 notes=None):
+                 notes=None, merged_from=None):
         #: [(tx_deg, ty_deg, lo_rad, hi_rad, label)], as measured.
         self.samples = []
         #: (tx_deg, ty_deg) -> the wrist_3 angle the arm held at the REFERENCE
@@ -391,14 +400,18 @@ class CableEnvelope(object):
         #:
         #: WHY IT BELONGS WITH THE BAND. The band is in absolute wrist_3 degrees,
         #: and this is where zero rotation sits inside it -- 166.09 in a band of
-        #: 16.09..301.09, so this cell holds -150..+135 of rotation with the probe
+        #: 16.09..301.34, so this cell holds -150..+135 of rotation with the probe
         #: vertical. The two numbers were taken in the same breath from the same
         #: joint state, so they are only meaningful together; keeping the band and
         #: discarding this left the conversion from "turn the probe 90 degrees" to
         #: "wrist 3 goes to X" as a constant typed into a config.
         #:
-        #: It varies with tilt -- 147 to 179 degrees across this cell's five
+        #: It varies with tilt -- 147 to 179 degrees across this cell's eight
         #: samples -- because reaching a tilt turns the wrist on the way.
+        #:
+        #: IT IS NOT MERGED when several sweeps of one tilt are combined: it is
+        #: where the tooling put the wrist, not a bound, so an extreme of two of
+        #: them would be a claim nothing measured. See cable_envelope_merge().
         self.wrist3_start = {}
         for s in samples:
             tx, ty, lo, hi, label = s[:5]
@@ -421,6 +434,11 @@ class CableEnvelope(object):
         self.step_deg = None if step_deg is None else float(step_deg)
         self.source = source
         self.notes = notes
+        #: Which measurements this model's bands came from, when it is a merge of
+        #: more than one. Empty for a single measurement. See
+        #: cable_envelope_merge(); the order is the order the sources were given,
+        #: which is also the order the datum was taken in.
+        self.merged_from = [] if merged_from is None else [str(v) for v in merged_from]
         self._x = self._axis_row(0, 1)
         self._y = self._axis_row(1, 0)
         if not self._x or not self._y:
@@ -511,6 +529,12 @@ class CableEnvelope(object):
         rotation is checked by adding it to this and testing against the band at
         the same tilt; two different rules would put the datum and its band in
         different places.
+
+        WHERE SEVERAL SWEEPS OF ONE TILT WERE MERGED this is the datum of one of
+        them -- the datum is a measurement of the joint state, not a bound, so it
+        is never combined (cable_envelope_merge()). The datum and the band are
+        then both stated at the same tilt, which is what grading a rotation needs,
+        but the band's ends are no longer a whole number of sweep steps from it.
         """
         if not self.wrist3_start:
             return None
@@ -611,6 +635,10 @@ class CableEnvelope(object):
         out = ["cable envelope: %s/%s, measured %s%s"
                % (self.cell or "?", self.mode or "?", self.measured or "?",
                   "" if not self.source else " (%s)" % (self.source,))]
+        if self.merged_from:
+            out.append("  merged per tilt from %d measurements (%s), taking the "
+                       "widest band recorded at each tilt"
+                       % (len(self.merged_from), ", ".join(self.merged_from)))
         for tx, ty, lo, hi, label in self.samples:
             out.append("  %-18s wrist 3 %+7.1f .. %+7.1f deg  (%.0f deg of travel)"
                        % (label, math.degrees(lo), math.degrees(hi),
@@ -653,6 +681,11 @@ class CableEnvelope(object):
                    "hi_deg": math.degrees(hi_i) if hi_i > lo_i else None,
                    "why": "informational: the band common to every measured "
                           "tilt. NOT the limit -- each tilt has its own."}}
+        if self.merged_from:
+            # Which measurements the bands came from. Needed to check the merge:
+            # every band here must be at least as wide as the one each of these
+            # recorded at that tilt, and no wider than the widest of them.
+            doc["merged_from"] = list(self.merged_from)
         if self.notes:
             doc["notes"] = self.notes
         if extra:
@@ -665,7 +698,8 @@ class CableEnvelope(object):
 # ------------------------------------------------------------------------------
 
 def cable_envelope_from_rows(rows, step_deg=None, home_quat=(0.0, 0.0, 0.0, 1.0),
-                             cell=None, mode=None, measured=None, source=None):
+                             cell=None, mode=None, measured=None, source=None,
+                             merged_from=None):
     """A CableEnvelope from capture_cable_envelope()'s `per_tilt` rows.
 
     Understands both schemas. Schema 2 rows carry tx_deg/ty_deg outright;
@@ -695,7 +729,108 @@ def cable_envelope_from_rows(rows, step_deg=None, home_quat=(0.0, 0.0, 0.0, 1.0)
         samples.append((float(tx), float(ty), lo, hi, row.get("tilt"),
                         row.get("wrist3_start_deg")))
     return CableEnvelope(samples, home_quat=home_quat, cell=cell, mode=mode,
-                         measured=measured, step_deg=step_deg, source=source)
+                         measured=measured, step_deg=step_deg, source=source,
+                         merged_from=merged_from)
+
+
+def cable_envelope_merge(sources, cell=None, mode=None, measured=None,
+                         source=None):
+    """One model from several measurements of the same cell's cables: at each
+    tilt, the MOST PERMISSIVE band any of them recorded.
+
+    `sources` are measurements of the same cables, NEWEST FIRST. Each is a
+    CableEnvelope, a parsed document, or a path to one.
+
+    WHY MERGE INSTEAD OF KEEPING THE LATEST SWEEP. There is no sensor for this
+    limit: an operator steps the wrist round and says when the loom looks taut.
+    Two sweeps of a cell whose cabling has not been touched come out about a step
+    of the sweep apart, and that spread is in the judgement, not in the cables.
+    Neither sweep is the correction of the other, so keeping only the newer one
+    discards travel that was watched and found slack. At each tilt, `lo` is the
+    lowest and `hi` the highest angle any sweep confirmed slack there.
+
+    A tilt only one measurement visited keeps that measurement's band unchanged:
+    there is nothing to widen it with, and dropping it would lose the only band
+    known at that tilt.
+
+    NOTHING IS INVENTED AND NOTHING IS FOLDED. Every merged end is an end some
+    measurement recorded at that same tilt; no band is widened past the widest
+    observation, no tilt is created, and `lo`/`hi` stay ABSOLUTE wrist_3 angles
+    compared as recorded -- a measurement is never brought into agreement with
+    another by adding or subtracting a turn.
+
+    THE DATUM IS NOT MERGED. `wrist3_start_deg` is where zero rotation sat in the
+    joint state a band was swept from: a statement about how the tooling is
+    bolted on, not a bound. "Most permissive" has no meaning for it, and taking
+    an extreme of two datums would move where zero is believed to be, which is a
+    different and falsifiable claim. Each merged tilt therefore keeps ONE datum,
+    from the first source listed that recorded one -- which is why the sources are
+    given newest first. The cost is that a merged band's ends need no longer be a
+    whole number of sweep steps from that datum, because the two ends may come
+    from two different sweeps; a rotation is still graded against a datum and a
+    band that are both stated at the same tilt.
+    """
+    models = []
+    for s in sources or ():
+        if isinstance(s, CableEnvelope):
+            models.append(s)
+        elif isinstance(s, dict):
+            models.append(_cable_envelope_from_doc(s, "a document"))
+        else:
+            with open(s) as h:
+                models.append(_cable_envelope_from_doc(json.load(h), str(s)))
+    if not models:
+        raise ValueError("a cable envelope merge needs at least one measurement")
+
+    # THE TILTS HAVE TO MEAN THE SAME THING. A tilt is measured from home_quat,
+    # so two measurements taken from different reference orientations do not
+    # describe the same pose at the same (tx, ty) and merging them would combine
+    # bands from two different places.
+    homes = set(tuple(round(float(v), 9) for v in m.home_quat) for m in models)
+    if len(homes) > 1:
+        raise ValueError("these measurements were taken from different home "
+                         "orientations (%s), so their tilts are not the same "
+                         "poses and their bands cannot be merged"
+                         % (sorted(homes),))
+
+    order, bands, labels, datums = [], {}, {}, {}
+    for m in models:
+        for tx, ty, lo, hi, label in m.samples:
+            key = (round(tx, 6), round(ty, 6))
+            if key not in bands:
+                order.append(key)
+                bands[key] = [lo, hi]
+                labels[key] = label
+            else:
+                bands[key][0] = min(bands[key][0], lo)
+                bands[key][1] = max(bands[key][1], hi)
+            if key not in datums:
+                d = m.wrist3_start.get((tx, ty))
+                if d is not None:
+                    datums[key] = float(d)
+    samples = [(k[0], k[1], bands[k][0], bands[k][1], labels[k], datums.get(k))
+               for k in order]
+
+    # The step is a property of one sweep. Kept when every sweep that states one
+    # agrees -- then it still says what the rows are spaced by -- and dropped
+    # when they disagree, because a merged row has no single step.
+    steps = set(round(float(m.step_deg), 6) for m in models
+                if m.step_deg is not None)
+    taken = [m.measured for m in models if m.measured]
+    if measured is None:
+        if len(taken) > 1:
+            measured = ("per-tilt merge of %s and %s"
+                        % (", ".join(taken[:-1]), taken[-1]))
+        elif taken:
+            measured = taken[0]
+    return CableEnvelope(samples,
+                         home_quat=models[0].home_quat,
+                         cell=cell if cell is not None else models[0].cell,
+                         mode=mode if mode is not None else models[0].mode,
+                         measured=measured,
+                         step_deg=steps.pop() if len(steps) == 1 else None,
+                         source=source,
+                         merged_from=taken)
 
 
 def cable_envelope_document(rows, **kw):
@@ -722,6 +857,17 @@ def cable_envelope_manifest_block(model=None, mode=None):
            "    measured: \"%s\"" % (m.measured or "",)]
     if m.step_deg:
         out.append("    step_deg: %.1f" % (m.step_deg,))
+    if m.merged_from:
+        # Which measurements the rows below came from. Written out so the merge
+        # can be checked: every row must be at least as wide as what each of
+        # these recorded at that tilt, and no wider than the widest of them.
+        out.append("    merged_from: [%s]"
+                   % (", ".join("\"%s\"" % (v,) for v in m.merged_from),))
+    # The whole span the rows cover, in absolute wrist_3 angle: the lowest low
+    # end and the highest high end of any of them. Outside it nothing is known.
+    out.append("    swept_deg: [%.4f, %.4f]"
+               % (math.degrees(min(s[2] for s in m.samples)),
+                  math.degrees(max(s[3] for s in m.samples))))
     out.append("    per_tilt:")
     for tx, ty, lo, hi, label in m.samples:
         start = m.wrist3_start.get((tx, ty))
@@ -741,7 +887,8 @@ def _cable_envelope_from_doc(doc, source=None):
         rows, step_deg=doc.get("step_deg"),
         home_quat=doc.get("home_quat") or (0.0, 0.0, 0.0, 1.0),
         cell=doc.get("cell"), mode=doc.get("mode"),
-        measured=doc.get("measured"), source=source)
+        measured=doc.get("measured"), source=source,
+        merged_from=doc.get("merged_from"))
 
 
 def _cable_envelope_from_manifest(cell=None, mode=None):
