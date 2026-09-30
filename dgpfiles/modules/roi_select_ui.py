@@ -242,6 +242,17 @@ class RoiWindow(QtWidgets.QMainWindow):
         self.radius = float(req.get("brush_radius", 40.0))
         self.front_only = bool(req.get("front_only", True))
 
+        # THE TWO NUMBERS THAT DECIDE WHETHER A SELECTION IS SCANNABLE, both
+        # supplied by the caller because neither is a property of the surface on
+        # screen: the taught work area the region is clipped to, and the line
+        # spacing it has to be wide enough for. None for either leaves that
+        # check off -- no work area means no clip, and no spacing falls back to
+        # roi_select_geom's own default.
+        wa = req.get("work_area")
+        self.work_area = None if wa is None else [float(v) for v in wa]
+        ls = req.get("line_spacing")
+        self.line_spacing = None if ls is None else float(ls)
+
         # Projected screen coordinates, recomputed only when the camera moves.
         self._xy = None
         self._depth = None
@@ -699,10 +710,22 @@ class RoiWindow(QtWidgets.QMainWindow):
         if n:
             x0, y0, x1, y1 = G.bounding_region(self.verts, sel)
             z = self.verts[sel][:, 2]
-            txt = ("%d of %d points (%.1f%%)   region %.1f x %.1f mm   "
-                   "x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f m"
-                   % (n, self.n, 100.0*n/self.n, (x1 - x0)*1e3, (y1 - y0)*1e3,
-                      x0, x1, y0, y1, z.min(), z.max()))
+            region, why = self.scan_region()
+            if region is None:
+                # SHOWN WHILE THEY DRAW, not when they press Accept. The
+                # selection is still under the mouse at this point, so the
+                # refusal is one more drag to fix.
+                txt = ("%d of %d points (%.1f%%)   THIS CANNOT BE SCANNED: %s"
+                       % (n, self.n, 100.0*n/self.n, why))
+            else:
+                txt = ("%d of %d points (%.1f%%)   scan region %.1f x %.1f mm "
+                       "at x %.3f..%.3f y %.3f..%.3f   (points span "
+                       "%.1f x %.1f mm, z %.3f..%.3f m)"
+                       % (n, self.n, 100.0*n/self.n,
+                          (region[2] - region[0])*1e3,
+                          (region[3] - region[1])*1e3,
+                          region[0], region[2], region[1], region[3],
+                          (x1 - x0)*1e3, (y1 - y0)*1e3, z.min(), z.max()))
         else:
             txt = ("nothing selected -- draw a region with Rectangle, Lasso or "
                    "Brush. Accepting with nothing selected cancels the scan.")
@@ -745,6 +768,21 @@ class RoiWindow(QtWidgets.QMainWindow):
 
     # -- the decision ------------------------------------------------------
 
+    def scan_region(self):
+        """(the region that would be reported, None), or (None, why it is not).
+
+        Cheap -- a bounding box and some arithmetic, no rasterising -- so the
+        status bar can ask on every selection change.
+        """
+        if not self.mask.any():
+            return None, "nothing is selected"
+        try:
+            return G.selection_region(self.verts, self.mask,
+                                      work_area=self.work_area,
+                                      line_spacing=self.line_spacing), None
+        except G.SelectionRefused as exc:
+            return None, str(exc)
+
     def do_accept(self):
         """Accept the selection, or ask what an empty one means.
 
@@ -781,6 +819,24 @@ class RoiWindow(QtWidgets.QMainWindow):
                 self.accepted = False
                 self.close()
             return
+
+        # A SELECTION TOO SMALL TO SCAN IS REFUSED HERE, with the window still
+        # open and the selection still on screen. The alternative is what used to
+        # happen: it is accepted, the arm flies, and the reconstruction stops the
+        # run on a rectangle the operator can no longer see or change.
+        region, why = self.scan_region()
+        if region is None:
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Warning)
+            box.setWindowTitle("The region cannot be scanned")
+            box.setText(why)
+            box.setInformativeText(
+                "Nothing has been lost -- the selection is still there. Enlarge "
+                "it, or press Cancel to stop the scan.")
+            box.addButton("Go back and adjust", QtWidgets.QMessageBox.AcceptRole)
+            box.exec()
+            return
+
         self.accepted = True
         self.close()
 
@@ -797,8 +853,52 @@ class RoiWindow(QtWidgets.QMainWindow):
 
 def write_result(win, req):
     mask = win.mask
-    region = G.bounding_region(win.verts, mask)
+
+    # THE DRAWN SHAPE, in world x-y, AND ITS PER-CELL HEIGHTS, so it can be
+    # applied to a DIFFERENT mesh. The per-vertex mask below is exact but is
+    # indexed over this surface alone: the ROI is drawn on the Azure rough mesh
+    # and the mesh it has to crop is the Keyence one, with a different vertex
+    # count and ordering, so the indices cannot line up and never will. A
+    # footprint is in metres, and its height map is what lets the crop stay on
+    # the surface the operator picked instead of on its shadow.
+    #
+    # Built FIRST because the region below is widened to cover it: the region
+    # says what to measure and the footprint says what to plan on, and measuring
+    # less than will be planned on is not a saving.
+    fp = None
+    shape = {}
+    try:
+        fp = G.footprint(win.verts, mask, tris=win.tris)
+        shape["footprint"] = G.footprint_encode(fp)
+        shape["footprint_cells"] = int(fp["grid"].sum())
+        shape["footprint_area_cm2"] = G.footprint_area_m2(fp)*1e4
+        shape["footprint_bounds"] = list(G.footprint_bounds(fp))
+        shape["footprint_described"] = G.describe_footprint(fp)
+        shape["footprint_has_heights"] = bool(G.footprint_has_heights(fp))
+    except Exception as exc:
+        # Never lose a selection the operator has already made over this: the
+        # region and the mask still describe it, and a missing footprint makes
+        # the crop fall back to the region rectangle with a note.
+        fp = None
+        shape["footprint_error"] = "%s: %s" % (type(exc).__name__, exc)
+        sys.stderr.write("ROISELECT could not build a footprint (%s)\n" % (exc,))
+
+    # THE RECTANGLE THE PIPELINE SCANS: whole selection cells, clipped to the
+    # taught work area. NOT the raw span of the selected vertices -- on a 6 mm
+    # mesh that span is quantised far coarser than the 0.3 mm line spacing and
+    # has come back as zero on one axis for a region with obvious area. See
+    # roi_select_geom.selection_region(). do_accept() has already refused
+    # anything this would reject, so it does not raise here.
+    drawn = G.bounding_region(win.verts, mask)
+    region = G.selection_region(win.verts, mask, footprint=fp,
+                                work_area=win.work_area,
+                                line_spacing=win.line_spacing)
     out = {"region": list(region),
+           # What the selected VERTICES span, before that was rounded out to
+           # whole cells and clipped. Provenance: it is how far a reported region
+           # sits from the sampling it was measured on.
+           "region_drawn": list(drawn),
+           "region_described": G.describe_selection_region(region, drawn),
            # PROVENANCE ONLY. bounds3d says where the surface the operator was
            # LOOKING AT sat in z, on the sensor that measured it. It is not a
            # crop: an ROI's z floor taken from the Azure rough mesh can sit above
@@ -816,28 +916,7 @@ def write_result(win, req):
            "source": req["input"],
            "has_faces": win.tris is not None,
            "front_only": bool(win.front_only)}
-
-    # THE DRAWN SHAPE, in world x-y, AND ITS PER-CELL HEIGHTS, so it can be
-    # applied to a DIFFERENT mesh. The per-vertex mask below is exact but is
-    # indexed over this surface alone: the ROI is drawn on the Azure rough mesh
-    # and the mesh it has to crop is the Keyence one, with a different vertex
-    # count and ordering, so the indices cannot line up and never will. A
-    # footprint is in metres, and its height map is what lets the crop stay on
-    # the surface the operator picked instead of on its shadow.
-    try:
-        fp = G.footprint(win.verts, mask, tris=win.tris)
-        out["footprint"] = G.footprint_encode(fp)
-        out["footprint_cells"] = int(fp["grid"].sum())
-        out["footprint_area_cm2"] = G.footprint_area_m2(fp)*1e4
-        out["footprint_bounds"] = list(G.footprint_bounds(fp))
-        out["footprint_described"] = G.describe_footprint(fp)
-        out["footprint_has_heights"] = bool(G.footprint_has_heights(fp))
-    except Exception as exc:
-        # Never lose a selection the operator has already made over this: the
-        # region and the mask still describe it, and a missing footprint makes
-        # the crop fall back to the region rectangle with a note.
-        out["footprint_error"] = "%s: %s" % (type(exc).__name__, exc)
-        sys.stderr.write("ROISELECT could not build a footprint (%s)\n" % (exc,))
+    out.update(shape)
 
     np.save(req["mask"], mask)
     out["mask_file"] = req["mask"]

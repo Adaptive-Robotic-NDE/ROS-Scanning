@@ -447,14 +447,26 @@ def front_surface_mask(xy, depth, candidate, cell=6.0, tol=None):
 def bounding_region(verts, mask=None):
     """(xmin, ymin, xmax, ymax) in WORLD METRES over the selected vertices.
 
-    The tuple the rest of the pipeline takes -- reconstruct_fine(region=),
-    plan_ec_path(region=) -- in their order, which is NOT (xmin, xmax, ymin,
+    RAW, AND QUANTISED BY THE MESH: these are vertex coordinates, and the
+    surface a selection is drawn on is sampled every 6 mm. Use
+    selection_region() for the rectangle the pipeline is told to scan; this is
+    the measurement it is built from, and what the window shows the operator as
+    the span of the points they have picked.
+
+    The tuple order is (xmin, ymin, xmax, ymax), which is NOT (xmin, xmax, ymin,
     ymax). Transposing the two has sent a dome sweep 696 mm from the part. z is
     deliberately absent: every consumer of a region here treats it as a
     footprint.
     """
     verts = np.asarray(verts, dtype=np.float64)
     sel = verts if mask is None else verts[np.asarray(mask, dtype=bool)]
+    # A NON-FINITE VERTEX COSTS ITSELF AND NOT THE REGION. The reconstruction's
+    # own smoothing emits a handful of NaN vertices per mesh, and one of them
+    # inside a selection would otherwise make every number downstream NaN --
+    # including the cell index selection_region() floors, which is then an error
+    # rather than a wide region.
+    if len(sel):
+        sel = sel[np.isfinite(sel[:, :2]).all(axis=1)]
     if not len(sel):
         raise ValueError("nothing is selected, so there is no region")
     return (float(sel[:, 0].min()), float(sel[:, 1].min()),
@@ -483,6 +495,141 @@ def region_mask(verts, region):
     xmin, ymin, xmax, ymax = (float(v) for v in region)
     return ((verts[:, 0] >= xmin) & (verts[:, 0] <= xmax) &
             (verts[:, 1] >= ymin) & (verts[:, 1] <= ymax))
+
+
+# ------------------------------------------------------------------------------
+# WHAT THE PIPELINE IS TOLD TO SCAN, AND WHY IT IS NOT THE VERTEX BOUNDING BOX
+# ------------------------------------------------------------------------------
+# bounding_region() above is the minimum and maximum of the SELECTED VERTICES,
+# and a selection is drawn on a surface whose vertices are 6 mm apart. So the
+# rectangle it reports is quantised by the mesh's sampling rather than by what
+# the operator drew. A band a few eddy-current lines wide -- the line spacing is
+# 0.3 mm -- can catch one column of vertices and come back with xmin == xmax:
+# zero extent from a region that plainly had area. That has reached the Keyence
+# reconstruction and stopped a run.
+#
+# selection_region() is what the window reports instead. Three things happen to
+# the vertex box, in this order:
+#
+#   1 IT IS ROUNDED OUTWARD to whole footprint cells. Quantisation that can only
+#     grow a rectangle cannot collapse one: the smallest answer possible is a
+#     single cell on each axis, and the answer always covers every cell the
+#     selection touched. The lattice is the footprint's own (FOOTPRINT_CELL_M),
+#     so the rectangle and the drawn shape are expressed on one grid instead of
+#     two, and a footprint that overhangs the rectangle is pulled in rather than
+#     left to be planned on surface nobody measured.
+#   2 IT IS CLIPPED TO THE TAUGHT WORK AREA. Rounding outward grows commanded
+#     motion, and motion is never grown past what was taught. The clip is HERE,
+#     on the one rectangle an operator's drawing produces, rather than left to
+#     whatever plans the raster.
+#   3 IT IS CHECKED AGAINST THE LINE SPACING, not against the cell size. A
+#     rectangle too narrow to hold SELECTION_MIN_LINES passes is not a scan, and
+#     the operator hears that while the window is open and the selection is
+#     still theirs to redraw -- not from the reconstruction a minute and a half
+#     later.
+
+#: Line spacing a selection is measured against when the caller names none.
+#: 0.3 mm is SCAN_LINE_SPACING for the eddy-current scan.
+SELECTION_LINE_SPACING_M = 0.0003
+
+#: How many line spacings a region has to hold on each axis to be worth
+#: scanning. Two, because one pass measures a line and not an area.
+SELECTION_MIN_LINES = 2
+
+
+class SelectionRefused(ValueError):
+    """A selection the operator can fix by drawing a different one.
+
+    Raised while the window is still open, so the message reaches the person
+    holding the mouse instead of a stage that runs minutes later.
+    """
+
+
+def selection_region(verts, mask=None, footprint=None, cell=None,
+                     work_area=None, line_spacing=None, min_lines=None):
+    """(xmin, ymin, xmax, ymax) the pipeline scans, world metres.
+
+    The selected vertices' bounding box rounded OUTWARD to whole `cell` squares,
+    then clipped to `work_area`, then refused if either axis cannot hold
+    `min_lines` line spacings. See the note above for why each step is there.
+
+    `footprint`, when given, is folded in so the rectangle covers every cell of
+    the drawn shape as well -- the rectangle bounds the measurement and the
+    footprint bounds the plan, and measuring less than will be planned on is not
+    a saving.
+
+    `work_area` is (xmin, ymin, xmax, ymax) of the taught work area, or None for
+    "no clip". `line_spacing` and `min_lines` default to
+    SELECTION_LINE_SPACING_M and SELECTION_MIN_LINES; either set to zero turns
+    the floor off.
+
+    Raises SelectionRefused when nothing usable can be reported, and ValueError
+    when nothing is selected at all.
+    """
+    cell = FOOTPRINT_CELL_M if cell is None else float(cell)
+    if not cell > 0.0:
+        raise ValueError("the selection cell must be positive, got %r" % (cell,))
+
+    drawn = bounding_region(verts, mask)
+    # Whole cells, in the footprint's own world-anchored cell indices, so the
+    # rectangle and any footprint of the same selection share one lattice.
+    lo = [int(np.floor(drawn[0]/cell)), int(np.floor(drawn[1]/cell))]
+    hi = [int(np.floor(drawn[2]/cell)), int(np.floor(drawn[3]/cell))]
+    if footprint is not None:
+        fp = footprint_cell_range(footprint)
+        lo = [min(lo[0], fp[0]), min(lo[1], fp[1])]
+        hi = [max(hi[0], fp[2]), max(hi[1], fp[3])]
+    region = [lo[0]*cell, lo[1]*cell, (hi[0] + 1)*cell, (hi[1] + 1)*cell]
+
+    if work_area is not None:
+        wa = [float(v) for v in work_area]
+        if len(wa) != 4:
+            raise ValueError("work_area must be (xmin, ymin, xmax, ymax), got %s"
+                             % (work_area,))
+        wa = [min(wa[0], wa[2]), min(wa[1], wa[3]),
+              max(wa[0], wa[2]), max(wa[1], wa[3])]
+        region = [max(region[0], wa[0]), max(region[1], wa[1]),
+                  min(region[2], wa[2]), min(region[3], wa[3])]
+        for axis, name in ((0, "x"), (1, "y")):
+            if region[axis + 2] <= region[axis]:
+                raise SelectionRefused(
+                    "the selection is outside the taught work area on %s: it is "
+                    "drawn at %s %.4f..%.4f and the work area is %.4f..%.4f "
+                    "metres. Draw the region on the part, or have the work area "
+                    "re-taught if the part really is there."
+                    % (name, name, drawn[axis], drawn[axis + 2],
+                       wa[axis], wa[axis + 2]))
+
+    spacing = (SELECTION_LINE_SPACING_M if line_spacing is None
+               else abs(float(line_spacing)))
+    min_lines = SELECTION_MIN_LINES if min_lines is None else int(min_lines)
+    if spacing > 0.0 and min_lines > 0:
+        for axis, name in ((0, "x"), (1, "y")):
+            span = region[axis + 2] - region[axis]
+            lines = int(math.floor(span/spacing))
+            if lines < min_lines:
+                raise SelectionRefused(
+                    "the region is %.1f mm across on %s; the line spacing is "
+                    "%.1f mm, so this is %d line%s -- draw a larger region or "
+                    "reduce the spacing. %d lines is the least that can be "
+                    "scanned on an axis."
+                    % (span*1e3, name, spacing*1e3, lines,
+                       "" if lines == 1 else "s", min_lines))
+    return tuple(region)
+
+
+def describe_selection_region(region, drawn=None, cell=None):
+    """One line: the rectangle reported, and how it differs from what was drawn."""
+    cell = FOOTPRINT_CELL_M if cell is None else float(cell)
+    line = ("%.1f x %.1f mm at x %.4f..%.4f y %.4f..%.4f"
+            % ((region[2] - region[0])*1e3, (region[3] - region[1])*1e3,
+               region[0], region[2], region[1], region[3]))
+    if drawn is not None:
+        line += (", from points spanning %.1f x %.1f mm rounded out to whole "
+                 "%.1f mm cells"
+                 % ((drawn[2] - drawn[0])*1e3, (drawn[3] - drawn[1])*1e3,
+                    cell*1e3))
+    return line
 
 
 # ==============================================================================
@@ -930,15 +1077,31 @@ def footprint_mask(fp, points, margin_m=0.0):
     return out
 
 
-def footprint_bounds(fp):
-    """(xmin, ymin, xmax, ymax) of the occupied cells, world metres."""
+def footprint_cell_range(fp):
+    """(imin, jmin, imax, jmax) of the occupied cells, as WORLD CELL INDICES.
+
+    Inclusive at both ends. Integers rather than metres, so a caller combining
+    two footprints -- or a footprint and a rectangle -- does it on the lattice
+    instead of rounding metres back to cells and gaining a cell each time.
+    """
     fp = footprint_decode(fp)
     i, j = np.nonzero(fp["grid"])
     if not len(i):
         raise ValueError("the footprint is empty")
-    c = fp["cell"]
-    return (float((fp["i0"] + i.min())*c), float((fp["j0"] + j.min())*c),
-            float((fp["i0"] + i.max() + 1)*c), float((fp["j0"] + j.max() + 1)*c))
+    return (int(fp["i0"] + i.min()), int(fp["j0"] + j.min()),
+            int(fp["i0"] + i.max()), int(fp["j0"] + j.max()))
+
+
+def footprint_bounds(fp):
+    """(xmin, ymin, xmax, ymax) of the occupied cells, world metres.
+
+    The OUTER boundary of those cells, so it encloses every sample that set
+    them.
+    """
+    c = footprint_decode(fp)["cell"]
+    imin, jmin, imax, jmax = footprint_cell_range(fp)
+    return (float(imin*c), float(jmin*c),
+            float((imax + 1)*c), float((jmax + 1)*c))
 
 
 def footprint_area_m2(fp):

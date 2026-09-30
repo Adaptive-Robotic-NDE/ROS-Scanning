@@ -104,6 +104,7 @@ global roll_side_score
 global _crop_path_by_mask
 global _laser_line_angles
 global _clearance_available
+global _say_clearance_mesh
 # A .dpi body is compiled as a FUNCTION body (dgpy.include ->
 # modify_source_into_function_call), so a top-level `def` here binds a local of
 # that function unless it is declared global. Nothing outside this file needs
@@ -842,6 +843,13 @@ def check_region(region, what="this stage", quiet=False):
             "there, it is (xmin, ymin, xmax, ymax)."
             % (what, tuple(vals), REGION_MM_LIMIT, *[v/1000.0 for v in vals]))
 
+    # A REGION FROM THE SELECTION WINDOW CANNOT REACH THIS ANY MORE, and that is
+    # the point of keeping it: roi_select_geom.selection_region() rounds a drawn
+    # region outward to whole cells, so its narrowest possible answer is one cell
+    # on each axis, and it refuses anything too thin to scan while the operator
+    # is still looking at it. What is left here is the typed and computed
+    # regions -- a transposition, a detector reporting a line, a config
+    # constant -- where the message below is still the whole diagnosis.
     if xmax - xmin < REGION_MIN_SPAN or ymax - ymin < REGION_MIN_SPAN:
         alt = (xmin, xmax, ymin, ymax)          # the (xmin, xmax, ymin, ymax) reading
         hint = ""
@@ -2762,6 +2770,39 @@ def _clearance_available(what):
     return False
 
 
+def _say_clearance_mesh(mesh, clean_report=None):
+    """State which surface the clearance gate is grading, and that it can be.
+
+    TWO PROPERTIES DECIDE WHETHER A CLEARANCE ANSWER MEANS ANYTHING, and neither
+    is visible in the gate's own output:
+
+    THE MESH MUST COVER THE WHOLE PART. The gate asks where the tooling may go,
+    and the tooling reaches far outside the scanned region -- a Keyence head 75 mm
+    to the side, a camera 230 mm. A mesh cropped to the region being scanned
+    reports those links clear against specimen it simply does not contain. So the
+    gate is given the cleaned FULL mesh, never the region-cropped surface the tool
+    axis is constrained to.
+
+    EVERY FACE MUST POINT OUTWARD. The signed distance takes its sign from the
+    nearest face's own normal, so one face wound the other way makes a link
+    clear of the part read as inside it and its poses get dropped.
+    clean_mesh_for_planning() is what guarantees this, by turning such faces
+    round; the mesh does NOT have to be consistently wound as a manifold, only
+    outward-facing face by face.
+
+    Prints the mesh and, when the cleaning report is to hand, what it had to turn.
+    """
+    name = os.path.basename(str(mesh)) if mesh else "(no mesh)"
+    line = "    clearance is graded against %s -- the FULL part" % (name,)
+    if clean_report:
+        turned = (int(clean_report.get("faces_rewound", 0))
+                  + int(clean_report.get("faces_turned_up", 0)))
+        line += (", %d of %d face(s) turned outward so the signed distance is "
+                 "right" % (turned, int(clean_report.get("faces_out", 0))))
+    print(line)
+    return mesh
+
+
 def _fly_scanpath(path, vel, acc, min_fraction, approach=True, surface=None,
                   monitor=None):
     """One continuous CartesianMove per segment, reporting what each achieved.
@@ -3226,9 +3267,15 @@ def _offset_path_in_tool_frame(path, offset):
     out = ScanPath(pos, np.array(path.quats, copy=True),
                    list(path.segment_starts),
                    source=path.source + " +tool offset")
-    # Carried across because plan_mesh_path() and the sweep report read them.
-    out.noether_flipped = getattr(path, "noether_flipped", 0)
-    out.worst_roll_step_deg = getattr(path, "worst_roll_step_deg", 0.0)
+    # EVERY attribute a planned path means to keep, from the one list in
+    # noether_path.dpi. Hand-picking two of them meant a preloaded path lost
+    # `normal_constrained` and `normal_surface`, so the stages after this one --
+    # the flip check, the clearance gate, the resampler -- were told the path was
+    # not tied to a surface and stopped consulting it.
+    #
+    # `source` is deliberately NOT carried: it gains " +tool offset", which is how
+    # a log says the preload was applied.
+    _carry_path_attrs(path, out)
     return out
 
 
@@ -3285,7 +3332,12 @@ def _crop_path_by_mask(path, keep, what="path", min_points=4, why="excluded",
     if not quiet:
         print("    %d of %d waypoints of the %s are %s and were dropped; %s"
               % (int((~keep).sum()), len(path), what, why, how))
-    return ScanPath(positions, quats, starts, source=path.source)
+    # A crop removes waypoints; it does not change what the path IS. So every
+    # attribute survives it -- the surface it is constrained to, the roll mode,
+    # the probe rotation. Carrying only `source` meant a work-volume crop, an ROI
+    # or a tilt limit quietly turned a surface-constrained path into a plain one.
+    return _carry_path_attrs(path, ScanPath(positions, quats, starts,
+                                            source=path.source))
 
 
 def _crop_path_to_box(path, lo, hi, what="path", min_points=4,

@@ -121,6 +121,7 @@ global capture_approach
 global capture_transit
 global gated_pipeline
 global _cable_limits_file
+global _robot_velocity_file
 global install_cable_guard
 global remove_cable_guard
 global cable_guard_off
@@ -466,6 +467,18 @@ def _cable_limits_file():
     """
     return os.path.join(os.path.expanduser(CAPTURE_ROOT),
                         "cable_limits_%s_%s.json" % (CELL_NAME, CELL_MODE))
+
+
+def _robot_velocity_file():
+    """Where measure_robot_velocity() writes its measurement on THIS machine.
+
+    work_cell.dpi looks this up by name and prefers it over the manifest when it
+    exists, exactly as the cable envelope is handled: a session on the machine
+    that just ran the test uses the fresh numbers, and every other session uses
+    the manifest, which is what travels with the cell.
+    """
+    return os.path.join(os.path.expanduser(CAPTURE_ROOT),
+                        "robot_velocity_%s_%s.json" % (CELL_NAME, CELL_MODE))
 
 
 def _load_cable_limits(quiet=True):

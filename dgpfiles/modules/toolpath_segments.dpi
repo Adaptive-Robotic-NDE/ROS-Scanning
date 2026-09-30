@@ -22,6 +22,7 @@ from geometry_msgs.msg import PoseArray, Pose
 # A .dpi is compiled as a function body, so anything the including config
 # needs to see has to be declared global before it is assigned.
 global ScanPath
+global _carry_path_attrs
 global infer_segment_starts
 global scanpath_from_pose_array
 global scanpath_from_plane_grid
@@ -126,6 +127,25 @@ class ScanPath(object):
                 % (self.source, len(self), self.total_length_m(), len(segs),
                    "inferred" if self.segments_inferred else "from planner",
                    "", len(acq)))
+
+
+def _carry_path_attrs(src, dst):
+    """Carry the attributes a planned path means to keep across a rebuild.
+
+    ONE LIST, so a new stage cannot forget half of it. A path that loses
+    `normal_constrained` is averaged by the next stage; one that loses
+    `normal_offset` is checked against the mesh in the wrong frame; one that
+    loses `probe_rotation_deg` reports a rotation it is not holding.
+    """
+    for attr in ("noether_flipped", "worst_roll_step_deg", "roll_mode",
+                 "roll_reference", "roll_report", "orient_mode", "max_tilt_deg",
+                 "segments_reversed", "serpentine", "axis_smoothing",
+                 "axis_sanity", "resampled", "normal_constrained",
+                 "normal_report", "normal_surface", "normal_offset",
+                 "probe_rotation_deg"):
+        if hasattr(src, attr):
+            setattr(dst, attr, getattr(src, attr))
+    return dst
 
 
 def infer_segment_starts(positions, turn_cos=0.5, jump_factor=5.0):

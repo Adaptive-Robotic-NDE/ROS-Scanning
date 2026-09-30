@@ -1055,6 +1055,13 @@ include(None, os.path.join(SCAN_MODULE_DIR, "work_cell.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "digitizer.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
+
+# THE CELL'S MEASURED SPEED CURVE REPLACES THE ONE ABOVE, when the manifest has
+# one for this mode. After scan_plan.dpi because that is what consumes it, and
+# before anything plans. The config's own value stays as
+# ROBOT_VELOCITY_CALIBRATION_CONFIG.
+adopt_measured_velocity_curve()
+
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_settings_panel.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "plane_scan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "mesh_scan.dpi"))

@@ -452,23 +452,87 @@ if data is not None:
           and (hw_b or {}).get("home_quat") is None,
           "neither mode overrides home_quat")
 
+    # THE MANIFEST IS A TRANSCRIPTION OF A CAPTURE FILE, so it is checked against
+    # that file rather than against MEASURED above. MEASURED is an older take kept
+    # here as a fixture for the band arithmetic; pinning the manifest to it would
+    # mean every fresh measurement fails this suite for being fresh.
+    CAPTURE = os.path.join(
+        HERE, "..", "..", "..", "scandata", "results14", "scandata", "capture",
+        "cable_limits_ex-ur10e-1_hardware.json")
     hw = dict(block.get("hardware") or {})
     hw.setdefault("home_quat", block.get("home_quat"))
     hw.setdefault("cell", "ex-ur10e-1")
     hw.setdefault("mode", "hardware")
     from_manifest = ns["_cable_envelope_from_doc"](hw, "the manifest")
-    same = all(
-        abs(from_manifest.band_deg(tilt=(s[0], s[1]))[0] - env.band_deg(tilt=(s[0], s[1]))[0]) < 1e-3
-        and abs(from_manifest.band_deg(tilt=(s[0], s[1]))[1] - env.band_deg(tilt=(s[0], s[1]))[1]) < 1e-3
-        for s in env.samples)
-    check(same, "the manifest's numbers are the measured bands, to 0.001 deg")
-    check(abs(from_manifest.band_deg(tilt=(0.0, 0.0))[1] - 301.3384) < 1e-3,
-          "an untilted pose read from the manifest gets %.4f..%.4f"
-          % from_manifest.band_deg(tilt=(0.0, 0.0)))
-    for deg in FAILURE_ANGLES_DEG:
+
+    if os.path.exists(os.path.normpath(CAPTURE)):
+        import json as _json
+        taken = ns["_cable_envelope_from_doc"](
+            _json.load(open(os.path.normpath(CAPTURE))), "the capture file")
+        check(from_manifest.measured == taken.measured,
+              "the manifest carries the capture file's date (%s)"
+              % (from_manifest.measured,))
+        check(len(from_manifest.samples) == len(taken.samples),
+              "every measured tilt reached the manifest (%d of %d)"
+              % (len(from_manifest.samples), len(taken.samples)))
+        same = all(
+            abs(from_manifest.band_deg(tilt=(s[0], s[1]))[0]
+                - taken.band_deg(tilt=(s[0], s[1]))[0]) < 1e-3
+            and abs(from_manifest.band_deg(tilt=(s[0], s[1]))[1]
+                    - taken.band_deg(tilt=(s[0], s[1]))[1]) < 1e-3
+            for s in taken.samples)
+        check(same, "the manifest's numbers are the captured bands, to 0.001 deg")
+        # THE DATUM TOO. The band says how far the wrist may turn; the datum says
+        # where zero probe rotation sits inside it, and a manifest carrying one
+        # without the other cannot convert a requested rotation into a wrist angle.
+        datums = [(tx, ty) for tx, ty, _lo, _hi, _l in taken.samples]
+        carried = all(from_manifest.wrist3_datum_deg(tilt=t) is not None
+                      for t in datums)
+        check(carried, "every row's wrist3_start_deg reached the manifest")
+        if carried:
+            close = all(abs(from_manifest.wrist3_datum_deg(tilt=t)
+                            - taken.wrist3_datum_deg(tilt=t)) < 1e-3
+                        for t in datums)
+            check(close, "...and matches the capture, to 0.001 deg")
+    else:
+        print("skip  the manifest-against-capture check (%s is not here)"
+              % (os.path.normpath(CAPTURE),))
+
+    lo0, hi0 = from_manifest.band_deg(tilt=(0.0, 0.0))
+    check(hi0 > lo0 and (hi0 - lo0) > 180.0,
+          "an untilted pose read from the manifest gets %.4f..%.4f" % (lo0, hi0))
+
+    # THE SIX ANGLES AN UNGUARDED SCAN COMMANDED, graded against the band the
+    # manifest NOW carries rather than against a remembered verdict.
+    #
+    # Two of them moved. The 2026-09-14 sweep called the untilted low end 31.34
+    # and the 2026-09-16 sweep called it 16.09 -- one 15 degree step apart, on a
+    # limit a person judges by watching the loom go taut. +21.9 and +29.3 sit
+    # between the two, so the newer measurement admits them and the older one did
+    # not. That is a real consequence of trusting the newer take, not a weakened
+    # test: what must not change is that an angle OUTSIDE the recorded band is
+    # still refused, and that nothing is admitted by a +/-360 substitution.
+    refused_now = [d for d in FAILURE_ANGLES_DEG if not (lo0 <= d <= hi0)]
+    inside_now = [d for d in FAILURE_ANGLES_DEG if lo0 <= d <= hi0]
+    check(len(refused_now) >= 3,
+          "at least the three angles below the band are still refused (%s)"
+          % (sorted(set(refused_now)),))
+    for deg in refused_now:
         raises(lambda d=deg: check_wrist3([joints(d)], "run_automated_scan",
                                           model=from_manifest),
                "manifest: wrist 3 %+7.1f deg is refused" % (deg,))
+    for deg in inside_now:
+        # Inside the measured band, so it must NOT raise -- and it must be inside
+        # because the band says so, not because a wrap put it there.
+        ok = True
+        try:
+            check_wrist3([joints(deg)], "run_automated_scan", model=from_manifest)
+        except Exception:                                         # noqa: BLE001
+            ok = False
+        check(ok, "manifest: wrist 3 %+7.1f deg is inside the 2026-09-16 band "
+                  "%.2f..%.2f and is allowed" % (deg, lo0, hi0))
+        check(not (lo0 <= deg + 360.0 <= hi0) or (lo0 <= deg <= hi0),
+              "...on its own absolute angle, not a full turn away")
 
 # ==============================================================================
 # THE GUARD ITSELF

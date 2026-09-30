@@ -101,6 +101,7 @@ global contact_motion
 global contact_lift
 global contact_approach
 global contact_retract
+global first_touchdown_hook
 global MotionRecorder
 global path_motion_report
 global format_motion_report
@@ -187,11 +188,57 @@ def surface_scan_callables(path, segs, position_origin, contact=None, phase=None
     return approach, sweep, pose_at
 
 
+def first_touchdown_hook(approach, on_first_contact):
+    """`approach` wrapped so on_first_contact() runs once, at the first touchdown.
+
+    THE ONLY MOMENT THE PROBE IS ON THE PART AND NOTHING HAS BEEN MEASURED YET.
+    An instrument that has to be set up against the material -- an eddy-current
+    bridge balanced on unflawed metal, say -- has exactly one place to do it, and
+    the surrounding order leaves no other:
+
+        prepare(n)          the accumulators are sized. The probe is IN THE AIR
+        approach(pass 1)    lift / transit / descend -- the probe touches down
+        >>>  here  <<<
+        stage(trace 0)      the first reading, which must already be correct
+        setup_after_first   the math that consumes trace 0 is wired on it
+
+    prepare() is too early and setup_after_first() is too late: by then a reading
+    has been staged and it is entry zero of the trace list for the rest of the
+    scan.
+
+    ONCE PER SCAN, NOT ONCE PER PASS. The probe descends onto the part at the
+    start of every pass, so a per-pass hook would re-run instrument setup dozens
+    of times and step the baseline between passes -- which stripes the image by
+    line, exactly the fault EC_SERPENTINE exists to avoid. A pass that fails to
+    plan is not a touchdown either, so the hook waits for the first pass actually
+    entered.
+
+    It runs on the thread that called the scan -- the same one that calls
+    ros.Move() -- so it may call into a dgpy module. `stage` may not.
+
+    An exception from the hook propagates out of the scan, which happens before
+    any trace is staged and leaves run_surface_path_scan()'s own teardown to lift
+    the probe off the part. The attempt is marked before the call, so a hook that
+    raises is never retried on the next pass.
+    """
+    state = {"attempted": False}
+
+    def wrapped(idx, end_idx):
+        ok = approach(idx, end_idx)
+        if ok and not state["attempted"]:
+            state["attempted"] = True
+            on_first_contact()
+        return ok
+
+    wrapped.touchdown_state = state
+    return wrapped
+
+
 def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
                           max_passes=None, force=False, panel=None,
                           projector_prefix="/scan/proj", label="Surface path scan",
                           pitch_m=None, position_relative_to_origin=True,
-                          contact=None):
+                          contact=None, on_first_contact=None):
     """Acquire along a planned toolpath. No grid, no rectangular volume.
 
     Returns the report from run_triggered_path_scan(), after printing the plan,
@@ -201,6 +248,11 @@ def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
     scan. Noether segments are ragged -- 73 of them, 2 to 278 waypoints, on one
     real mesh -- and with a trace list a dropped pass costs coverage there and
     nothing anywhere else, which is not true of a grid.
+
+    `on_first_contact` is called once, the instant the probe first touches the
+    part and before any reading is staged: see first_touchdown_hook() for why
+    that is the only place instrument setup against the material can go. Only
+    meaningful with `contact`.
     """
     if getattr(source, "trigger_mode", "timer") not in (
             "position", "timestamped", "timestamped-ec"):
@@ -262,8 +314,8 @@ def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
     # measurement. plan_ec_path() puts the specimen mesh in the planning scene --
     # that is what makes MoveIt's collision check mean anything -- and with it
     # there, a pose whose probe tip is ON the surface is in collision BY
-    # CONSTRUCTION. EC_PRELOAD_M is None, so the tip is commanded exactly onto
-    # the measured surface: every pose of the scan.
+    # CONSTRUCTION -- at every pose of the scan, and deeper still by whatever
+    # contact preload the path was planned with.
     #
     # THIS IS WHAT A MISSING DECLARATION LOOKS LIKE. Nothing errors.
     # computeCartesianPath simply stops just short of the surface and reports the
@@ -306,6 +358,8 @@ def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
     prepare(path.trace_count(pitch, segs))
     approach, sweep, pose_at = surface_scan_callables(path, segs, position_origin,
                                                       contact=contact)
+    if on_first_contact is not None:
+        approach = first_touchdown_hook(approach, on_first_contact)
 
     def _setup():
         setup_after_first(plan, x3d, projector_prefix)

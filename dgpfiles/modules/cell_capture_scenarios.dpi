@@ -71,6 +71,7 @@ global capture_keyence_timing
 global capture_cable_envelope
 global capture_robot_velocity
 global velocity_table_from_rungs
+global velocity_manifest_block
 global describe_velocity_table
 global sim_teach
 global capture_to_middle
@@ -729,6 +730,42 @@ def _save_cable_limits(rows, step_deg, home_quat=(0.0, 0.0, 0.0, 1.0),
 #                         it depends on the arm's configuration -- so it cannot
 #                         be read off the curve and has to be flown.
 
+def _velocity_manifest_target():
+    """Which manifest file to paste into, when that can be worked out."""
+    finder = globals().get("manifest_file")
+    if callable(finder):
+        try:
+            _found, edit = finder()
+            if edit:
+                return edit
+        except Exception:                                         # noqa: BLE001
+            pass
+    return "tari_cell_configs/config/cells/<cell>.yaml"
+
+
+def velocity_manifest_block(result, mode=None):
+    """The `robot_velocity:` YAML for the cell manifest, ready to paste.
+
+    Carries `span_m` because the curve is path-length dependent -- a move much
+    shorter than the span it was measured over never reaches the speed the table
+    promises -- and `limit_mps` because the ladder stops climbing at the away
+    limit and the rows above it do not exist.
+    """
+    t = result.get("table") or []
+    which = mode or globals().get("CELL_MODE") or "hardware"
+    out = ["robot_velocity:", "", "  %s:" % (which,)]
+    if result.get("measured"):
+        out.append("    measured: \"%s\"" % (result["measured"],))
+    if result.get("span_m") is not None:
+        out.append("    span_m: %.3f" % (float(result["span_m"]),))
+    if result.get("limit_mps") is not None:
+        out.append("    limit_mps: %.3f" % (float(result["limit_mps"]),))
+    out.append("    table:")
+    for s, v in t:
+        out.append("      - [%.5f, %.5f]" % (s, v))
+    return out
+
+
 def velocity_table_from_rungs(rungs):
     """Rungs -> a ROBOT_VELOCITY_CALIBRATION table, or a reason there is none.
 
@@ -838,19 +875,26 @@ def describe_velocity_table(result):
     for s, v, why in result.get("dropped") or []:
         lines.append("      (dropped scaling %.4f at %.1f mm/s: %s)" % (s, v*1e3, why))
     lines.append("")
-    lines.append("  PASTE INTO THE CONFIG (ECAutomatedScan.dgp), replacing")
-    lines.append("  ROBOT_VELOCITY_CALIBRATION -- the values there were measured "
-                 "in SIMULATION:")
+    # THE MANIFEST, NOT A CONFIG. The manifest travels with the cell; a config
+    # constant has to be transcribed by every machine that runs the cell, and a
+    # transcription is eventually not made -- the pipeline then converts through a
+    # curve measured somewhere else. That has already cost a scan.
+    lines.append("  PUT THIS IN THE CELL MANIFEST, under robot_velocity, and the")
+    lines.append("  pipeline will load it by itself (%s):"
+                 % (_velocity_manifest_target(),))
     lines.append("")
-    lines.append("    ROBOT_VELOCITY_CALIBRATION = [")
-    for s, v in t:
-        lines.append("        (%.4f, %.4f)," % (s, v))
-    lines.append("    ]")
+    for line in velocity_manifest_block(result):
+        lines.append("    " + line)
     lines.append("")
-    lines.append("  To try it for the rest of THIS session without editing the "
-                 "file:")
+    lines.append("  Then, without restarting: robot_velocity_reload() and "
+                 "adopt_measured_velocity_curve().")
+    lines.append("")
+    lines.append("  To try it for the rest of THIS session without editing "
+                 "anything:")
     lines.append("    globals()['ROBOT_VELOCITY_CALIBRATION'] = [%s]"
                  % ", ".join("(%.4f, %.4f)" % (s, v) for s, v in t))
+    lines.append("    (a bare assignment does NOT persist and does not reach "
+                 "another session; the manifest is the fix)")
     jp = result.get("joint")
     if jp:
         lines.append("")
@@ -1117,6 +1161,10 @@ def capture_robot_velocity(speeds_mm_s=(5.0, 10.0, 20.0, 30.0, 40.0, 50.0),
         out["axis"] = "xy"[axis]
         out["limit_mps"] = vmax
         out["stopped_climbing"] = stop_why
+        # Stamped here rather than in the save, so the manifest block printed
+        # below carries the same date as the file beside it. An undated curve in a
+        # manifest cannot be told from one measured two tooling changes ago.
+        out["measured"] = datetime.datetime.now().isoformat(timespec="seconds")
         take.results["calibration"] = out
         take.results["file"] = _save_velocity_calibration(out, params)
         for line in describe_velocity_table(out):
@@ -1130,14 +1178,19 @@ def capture_robot_velocity(speeds_mm_s=(5.0, 10.0, 20.0, 30.0, 40.0, 50.0),
 
 
 def _save_velocity_calibration(out, params):
-    """Keep the measurement beside the cable limits, under a name that says
-    which cell and mode it is for. The table itself still has to be pasted into
-    the config by hand: ROBOT_VELOCITY_CALIBRATION lives in ECAutomatedScan.dgp,
-    not in the manifest, and a routine that silently changed how fast the arm
-    moves would be the wrong kind of helpful."""
+    """Keep the measurement beside the cable limits, named for its cell and mode.
+
+    The file is the record; the CELL MANIFEST is where the pipeline reads the
+    curve from (robot_velocity:, per mode -- see robot_velocity_calibration() in
+    work_cell.dpi). This does not write the manifest: a routine that silently
+    changed how fast the arm moves would be the wrong kind of helpful, and the
+    manifest is reviewed and version controlled. describe_velocity_table() prints
+    the block to paste.
+    """
     import json
     doc = {"cell": CELL_NAME, "mode": CELL_MODE,
-           "measured": datetime.datetime.now().isoformat(timespec="seconds"),
+           "measured": (out.get("measured")
+                        or datetime.datetime.now().isoformat(timespec="seconds")),
            "params": params, "table": [[float(s), float(v)] for s, v in
                                        (out.get("table") or [])],
            "dropped": [[float(s), float(v), w] for s, v, w in

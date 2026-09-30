@@ -31,6 +31,22 @@
 # recording so that an operator can turn the rotation and watch thousands of
 # traces re-render. This module wires that function up; it does not do the
 # arithmetic.
+#
+# TWO DIFFERENT THINGS ARE CALLED A NULL, and this module touches both.
+#
+#   the INSTRUMENT null    a hardware balance of the instrument's own bridge,
+#                          issued once with the probe ON unflawed material. It
+#                          decides where the operating point sits, and the gain
+#                          is applied about that point. ec_first_contact_null()
+#                          below is when it happens.
+#   the CONDITIONING null  /ec/cond/null: a complex number subtracted from the
+#                          recorded traces in software, set live by the operator
+#                          (null_here()) and re-runnable over traces already
+#                          acquired.
+#
+# The software one sits on top of the hardware one and does not replace it: an
+# instrument balanced in air has its operating point in the wrong place before
+# any trace is recorded, and subtracting a constant afterwards does not move it.
 
 import os
 
@@ -77,6 +93,13 @@ global ensure_ec_conditioning
 global ec_cond_pending
 global check_ec_conditioning
 global ec_conditioning_selftest_source
+global ec_first_contact_null
+global ec_instrument_null
+
+#: What the last scan's instrument null did, as
+#: {"nulled": bool, "why": str, "required": bool} -- None before any scan has
+#: reached the part. Also returned in the scan report as report["instrument_null"].
+ec_instrument_null = None
 
 
 class ECTimestampedSource(TimestampedTriggerSource):
@@ -576,8 +599,16 @@ def ec_null_from_traces(recdb, traces_path, first=0, count=None):
 global ec_trace_accum
 global ec_projector
 global ec_scan_component
+global ec_staging_chan
 ec_trace_accum = None
 ec_projector = None
+
+#: The reservation on the staging channel a reading is written to.
+#:
+#: Module level, not local to the scan, because it must outlive one scan in order
+#: to be handed back at the start of the next -- see _prepare() in
+#: run_ec_path_scan(). None means nobody holds it.
+ec_staging_chan = None
 
 # Which conditioned scalar gets projected onto the surface. "vertical" is the
 # usual answer: after the rotation is set, lift-off lies horizontal and what is
@@ -628,11 +659,67 @@ def stage_ec_reading(data, metadata, pose7=None):
             print("projection: %s" % (e,))
 
 
+def ec_first_contact_null(null_fn, required=True):
+    """The first-touchdown callable that balances the INSTRUMENT. -> callable
+
+    `null_fn` is the hardware null, with no arguments -- for the Uniwest that is
+    UniWest.null(), which sends the instrument's NULL command. It is called once
+    per scan, with the probe on the part and before any reading is staged; see
+    first_touchdown_hook() in surface_path_scan.dpi for why that is the only
+    place it can go.
+
+    NOT THE CONDITIONING NULL (/ec/cond/null, null_here()). That one is a complex
+    offset subtracted from the recorded traces in software; this one sets where
+    the instrument's own operating point sits, and no software offset repairs an
+    instrument balanced in air. Both are wanted; neither replaces the other.
+
+    required=True stops the scan when the null fails. That happens at the first
+    pass, before any trace is staged, so nothing measured is lost and the scan's
+    own teardown lifts the probe off the part on the way out -- against the
+    alternative of a finished scan whose every trace rides on an unknown offset.
+    required=False prints the same finding and carries on, which is the bench
+    case: no instrument to balance, and nothing being measured either way.
+
+    The outcome is left in ec_instrument_null and returned in the scan report.
+    """
+    def _null():
+        global ec_instrument_null
+        print("  nulling the INSTRUMENT: the probe is on the part and nothing "
+              "has been read yet. Hardware balance -- the conditioning null "
+              "(/ec/cond/null, null_here()) is a separate software offset on top "
+              "of it.")
+        try:
+            null_fn()
+        except Exception as e:                                    # noqa: BLE001
+            why = "%s: %s" % (type(e).__name__, e)
+            ec_instrument_null = {"nulled": False, "why": why,
+                                  "required": bool(required)}
+            if required:
+                raise RuntimeError(
+                    "the eddy-current instrument would not null with the probe "
+                    "on the part (%s). STOPPING at the first pass rather than "
+                    "acquiring un-nulled: an instrument balanced in air puts the "
+                    "operating point in the wrong place and every trace of the "
+                    "scan rides at an offset that no software null repairs. Fix "
+                    "the instrument, or set_ec_nulling(required=False) to accept "
+                    "an un-nulled scan deliberately." % (why,))
+            print("  WARNING: the instrument did NOT null (%s). The scan is "
+                  "going ahead UN-NULLED: every trace carries the instrument's "
+                  "own offset, the impedance plane is not centred on unflawed "
+                  "material, and that cannot be corrected afterwards." % (why,))
+            return
+        ec_instrument_null = {"nulled": True, "why": "", "required": bool(required)}
+        print("  instrument nulled on the part")
+
+    return _null
+
+
 global run_ec_path_scan
 def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
                      staging_path="/ec/current", component=None,
                      max_passes=None, force=False, pitch_m=None, contact=None,
-                     cond_prefix="/ec/cond"):
+                     cond_prefix="/ec/cond", null_instrument=None,
+                     null_required=True):
     """Scan a surface-following toolpath with an eddy-current instrument.
 
     The acquisition is shared with the ultrasound scan -- see
@@ -656,6 +743,12 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
     touches the part moves between passes: straight off along its own axis,
     across in the air, straight back down -- never a joint move with the tip on
     the surface. None is the standoff behaviour, for a probe that never touches.
+
+    `null_instrument` is the instrument's own hardware balance, with no arguments
+    (UniWest.null()). It is issued ONCE, at the first touchdown, before any trace
+    is staged; None skips it. `null_required` decides what a failed null means --
+    see ec_first_contact_null(). Not the conditioning null; that is
+    /ec/cond/null, wired below and set by null_here().
     """
     global ec_trace_accum, ec_projector, ec_staging_chan, ec_cond_paths
     global ec_scan_component, ec_cond
@@ -681,10 +774,28 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
         global ec_trace_accum, ec_staging_chan
         if ec_trace_accum is not None:
             # A second scan in one session, or the accumulator is sized for the
-            # previous toolpath's trace count.
+            # previous toolpath's trace count. Teardown first: its accumulator
+            # reads the staging channel, and a math function must go before its
+            # input can be handed back.
             ec_trace_accum.teardown()
             ec_trace_accum = None
         trans = recdb.start_transaction()
+        # HAND THE STAGING CHANNEL BACK BEFORE TAKING IT AGAIN. The accumulator
+        # is told to use this channel rather than making its own, so
+        # TraceAccumulator.teardown() leaves it alone -- it only releases what it
+        # owns. Nothing else released it either, so the second scan in a session
+        # used to redefine a channel it still held. define_channel() does not
+        # object; it returns a reserved_channel that is no longer the current
+        # owner, and the transaction fails later with
+        #
+        #     realize_transaction: provided reserved_channel for /ec/current by
+        #     main is not current (current owner is main)
+        #
+        # thrown on the transaction manager's own thread under the timed manager,
+        # where nothing catches it: SIGABRT, mid-scan, probe on the part.
+        if ec_staging_chan is not None:
+            trans.release_channel(ec_staging_chan)
+            ec_staging_chan = None
         ec_staging_chan = trans.define_channel(staging_path, "main")
         ref = snde.create_ndarray_ref(trans, ec_staging_chan,
                                       snde.SNDE_RTN_COMPLEXFLOAT64)
@@ -739,10 +850,10 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
         if projection_enabled() and x3d_path is not None:
             radius, pixels = projection_settings(plan)
             if ec_projector is not None and getattr(ec_projector, "x3d_path", None) == x3d_path:
-                # Same surface: empty the picture and reuse it. Rebuilding is not
-                # an option -- the channels x3d_load_geometry defines under the
-                # model tree cannot be handed back from Python, so a second
-                # SurfaceProjector on the same prefix fails.
+                # Same surface: empty the picture and reuse it. Rebuilding would
+                # work but would reload the mesh and recompute its projection
+                # geometry, which on a CPU-only build is the slow part, and would
+                # strand another model tree that cannot be reclaimed.
                 ec_projector.radius = radius
                 ec_projector.horizontal_pixels = pixels
                 ec_projector.vertical_pixels = pixels
@@ -759,8 +870,16 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
                 print("  projection surface: %s  (projecting %s)"
                       % (x3d_path, ec_scan_component))
 
-    return run_surface_path_scan(
+    global ec_instrument_null
+    ec_instrument_null = None
+    on_contact = (None if null_instrument is None
+                  else ec_first_contact_null(null_instrument,
+                                             required=null_required))
+    report = run_surface_path_scan(
         path, x3d, source, stage_ec_reading, _prepare, _setup,
         max_passes=max_passes, force=force,
         projector_prefix="/ec/proj", label="Eddy-current path scan",
-        pitch_m=pitch_m, position_relative_to_origin=False, contact=contact)
+        pitch_m=pitch_m, position_relative_to_origin=False, contact=contact,
+        on_first_contact=on_contact)
+    report["instrument_null"] = ec_instrument_null
+    return report

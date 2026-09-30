@@ -92,7 +92,12 @@
 #              Keyence mesh of the same part -- no overlap at all, and a 3D-box
 #              crop then keeps zero faces. It is PROVENANCE only, reported and
 #              never applied.
-#   region     travels. A rectangle in world x-y.
+#   region     travels. A rectangle in world x-y, on whole selection cells and
+#              clipped to the taught work area -- NOT the raw span of the
+#              selected vertices, which is quantised by the mesh's 6 mm sampling
+#              and has come back with zero extent on one axis for a band the
+#              operator drew several eddy-current lines wide. See
+#              roi_select_geom.selection_region().
 #   footprint  travels, and is the one to use: the DRAWN SHAPE rasterised onto a
 #              2 mm grid in world x-y, PLUS the height of the selected surface in
 #              each of those cells. It keeps what a rectangle throws away -- the
@@ -355,6 +360,34 @@ def _child_env():
     return env
 
 
+def _taught_work_area():
+    """The taught work volume's x-y as (xmin, ymin, xmax, ymax), or None.
+
+    THE CLIP THAT KEEPS ROUNDING FROM GROWING MOTION. select_roi() reports a
+    region rounded outward to whole selection cells, which is how a thin drawn
+    band stops collapsing to zero extent -- and outward is toward more motion, so
+    the result is held inside what was actually taught.
+
+    None when the cell declares no box (work_cell.dpi's documented state on
+    hardware that has not been touched off yet): no clip is better than a clip to
+    made-up numbers, and mesh_reconstruction.dpi checks the region against the
+    volume again before anything moves.
+    """
+    volume = globals().get("work_volume")
+    if not callable(volume):
+        return None
+    try:
+        got = volume(quiet=True)
+    except Exception as e:                                       # noqa: BLE001
+        print("  (no work area to clip the region to: %s: %s)"
+              % (type(e).__name__, e))
+        return None
+    if got is None:
+        return None
+    _frame, lo, hi = got
+    return (float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1]))
+
+
 def _write_input(source, workdir):
     """A PLY on disk for the child to read, and a note of what it was.
 
@@ -391,7 +424,8 @@ def _write_input(source, workdir):
 
 global select_roi
 def select_roi(mesh_or_points, title=None, initial=None, timeout=None,
-               front_only=True, brush_radius=None, python=None, keep=None):
+               front_only=True, brush_radius=None, python=None, keep=None,
+               work_area=None, line_spacing=None):
     """Ask the operator to draw the region to scan. Blocks. None if cancelled.
 
     mesh_or_points   a PLY path (mesh OR point cloud), an (N, 3) vertex array,
@@ -399,6 +433,13 @@ def select_roi(mesh_or_points, title=None, initial=None, timeout=None,
     initial          (xmin, ymin, xmax, ymax) in world metres, preselected --
                      hand it the detector's region so the operator CORRECTS a
                      selection instead of drawing one from nothing.
+    work_area        (xmin, ymin, xmax, ymax) the region is CLIPPED to. None
+                     takes the cell's taught work volume; False turns the clip
+                     off, which is for tests on made-up coordinates.
+    line_spacing     what the region has to be wide enough to scan at, metres.
+                     None takes SCAN_LINE_SPACING. A selection too narrow to
+                     hold two passes is refused in the window, where the operator
+                     can still redraw it.
 
     Returns a dict, every part of which some downstream stage wants:
 
@@ -406,7 +447,10 @@ def select_roi(mesh_or_points, title=None, initial=None, timeout=None,
                  ALREADY CONSUMES -- reconstruct_fine(region=),
                  plan_ec_path(region=) -- in their order, which is NOT
                  (xmin, xmax, ymin, ymax). Transposing the two has sent a sweep
-                 696 mm away from the part.
+                 696 mm away from the part. Whole selection cells, clipped to
+                 the work area: see roi_select_geom.selection_region() for why it
+                 is not the raw span of the selected vertices, which on a 6 mm
+                 mesh has come back with zero extent on one axis.
       mask       bool ndarray over the INPUT vertices, in input order. Exact,
                  and usable only on the surface it was drawn on.
       footprint  THE DRAWN SHAPE IN WORLD x-y, on a 2 mm grid, AND THE HEIGHT OF
@@ -450,6 +494,11 @@ def select_roi(mesh_or_points, title=None, initial=None, timeout=None,
             raise ValueError("initial must be (xmin, ymin, xmax, ymax), got %s"
                              % (initial,))
 
+    if work_area is None:
+        work_area = _taught_work_area()
+    if line_spacing is None:
+        line_spacing = globals().get("SCAN_LINE_SPACING")
+
     workdir = tempfile.mkdtemp(prefix="roi_select_")
     try:
         src, described = _write_input(mesh_or_points, workdir)
@@ -460,7 +509,14 @@ def select_roi(mesh_or_points, title=None, initial=None, timeout=None,
                "mask": os.path.join(workdir, "mask.npy"),
                "submesh": os.path.join(workdir, "roi_submesh.ply"),
                "brush_radius": float(brush_radius),
-               "front_only": bool(front_only)}
+               "front_only": bool(front_only),
+               # The two limits the window needs and cannot work out for itself.
+               # False rather than None is how a caller says "no clip"; the child
+               # reads None as "no clip" too, so False lands as null in the JSON.
+               "work_area": (None if not work_area
+                             else [float(v) for v in work_area]),
+               "line_spacing": (None if line_spacing is None
+                                else float(line_spacing))}
         reqfile = os.path.join(workdir, "request.json")
         with open(reqfile, "w") as fh:
             json.dump(req, fh, indent=1)
@@ -483,6 +539,8 @@ def select_roi(mesh_or_points, title=None, initial=None, timeout=None,
         with open(req["output"]) as fh:
             res = json.load(fh)
         res["region"] = tuple(float(v) for v in res["region"])
+        if res.get("region_drawn") is not None:
+            res["region_drawn"] = tuple(float(v) for v in res["region_drawn"])
         res["bounds3d"] = tuple(float(v) for v in res["bounds3d"])
         res["mask"] = np.load(req["mask"])
 
@@ -521,6 +579,16 @@ def describe_roi(roi):
             "(%.1f%%)" % ((x1 - x0)*1e3, (y1 - y0)*1e3, x0, x1, y0, y1,
                           roi["n_selected"], roi["n_total"],
                           100.0*roi["n_selected"]/max(1, roi["n_total"])))
+    # The rectangle above is whole selection cells; the points it was measured
+    # from span less. Worth a log line, because their difference is the entire
+    # reason a thin drawn band no longer comes back with zero extent.
+    rd = roi.get("region_drawn")
+    if rd is not None and (abs(rd[0] - x0) > 1e-12 or abs(rd[1] - y0) > 1e-12
+                           or abs(rd[2] - x1) > 1e-12
+                           or abs(rd[3] - y1) > 1e-12):
+        line += ("; the selected points themselves span %.1f x %.1f mm, rounded "
+                 "out to whole cells and clipped to the work area"
+                 % ((rd[2] - rd[0])*1e3, (rd[3] - rd[1])*1e3))
     if roi.get("submesh_triangles"):
         line += ", sub-mesh %d of %d triangles" % (
             roi["submesh_triangles"], roi.get("triangles_total", 0))

@@ -249,10 +249,54 @@ EC_SIM_BLOCK_HZ = 50.0
 # reports the smear in metres and as a fraction of the step -- check it.
 EC_BLOCK_REDUCE = "mean"
 
-# Impedance-plane conditioning. NONE OF THESE ARE MEANINGFUL DEFAULTS: the null
-# depends on the part and the probe, and the rotation is chosen during setup by
-# turning it until lift-off flattens onto the horizontal axis. Identity values
-# give a readable but unconditioned display. Use null_here() and set_rotation().
+# ------------------------------------------------------------------------------
+# THE INSTRUMENT NULL -- BALANCED ON THE PART, NEVER IN AIR
+# ------------------------------------------------------------------------------
+# An eddy-current bridge has to be nulled with the probe ON unflawed material.
+# Nulled in air the operating point is in the wrong place, the gain is applied
+# about that point, and the whole scan rides at an offset. The scan issues it
+# once, at the instant the probe first touches down, before any trace is read.
+#
+# NOT THE SAME THING AS EC_NULL / /ec/cond/null BELOW. That is a complex number
+# subtracted from the recorded traces by the conditioning math, set live with
+# null_here() and re-runnable over traces already acquired. This one is a
+# hardware operation on the instrument itself, done once, and it cannot be
+# re-done after the fact. The software offset sits on top of it and does not
+# replace it.
+#
+# Which instrument:
+#   "uniwest"  the Uniwest US-454A on a serial port. UniWest.null() sends its
+#              NULL command.
+#   "none"     no instrument to null -- bench work, or a simulated source.
+EC_INSTRUMENT = os.environ.get("EC_INSTRUMENT",
+                               "uniwest" if EC_SOURCE == "hardware" else "none")
+# The serial port the instrument answers on, and its baud rate. From
+# ClientScannerTest.dgp, where the same two were written by hand.
+EC_INSTRUMENT_PORT = int(os.environ.get("EC_INSTRUMENT_PORT", "33"))
+EC_INSTRUMENT_BAUD = 9600
+
+# Issue the null at the first touchdown of every scan. False is bench work:
+# nothing to balance and nothing being measured. set_ec_nulling() is how to
+# change either of these from the prompt.
+EC_NULL_ON_CONTACT = True
+
+# What a null that cannot be done means.
+#
+#   True   run_ec_scan() refuses before it moves when there is no instrument to
+#          null, and stops at the first pass if the null command fails. Both
+#          happen before any trace is acquired, so nothing measured is thrown
+#          away.
+#   False  the failure is printed and the scan goes ahead un-nulled.
+#
+# True whenever there is real hardware to measure with: an un-nulled scan is not
+# a scan that needs redoing, it is a scan whose data cannot be recovered.
+EC_NULL_REQUIRED = EC_SOURCE == "hardware"
+
+# Impedance-plane conditioning -- the SOFTWARE offset, rotation and gain, applied
+# to recorded traces. NONE OF THESE ARE MEANINGFUL DEFAULTS: the null depends on
+# the part and the probe, and the rotation is chosen during setup by turning it
+# until lift-off flattens onto the horizontal axis. Identity values give a
+# readable but unconditioned display. Use null_here() and set_rotation().
 EC_NULL = (0.0, 0.0)
 EC_ROTATION_DEG = 0.0
 EC_GAIN = (1.0, 1.0)
@@ -359,7 +403,9 @@ TRANSIT_SPEED = 0.040
 # A contact probe reaches and leaves the surface only along its own axis
 # (contact_motion() in surface_path_scan.dpi). Between passes that start within
 # EC_SHORT_HOP_M of where the probe is, it lifts EC_LIFT_M; otherwise
-# EC_APPROACH_M.
+# EC_APPROACH_M. With EC_SERPENTINE on, consecutive passes meet end to end, so
+# every move between passes is the short hop -- one line spacing across, and the
+# lift and descent are the shorter of the two.
 EC_LIFT_M = 0.010
 EC_APPROACH_M = 0.050
 EC_SHORT_HOP_M = 0.030
@@ -409,11 +455,10 @@ NOETHER_MESH_OFFSET = (0.0, 0.0, 0.0)
 # stay perpendicular to it. The spring fixture gives some compliance; tilt is a
 # known problem, not solved here.
 NOETHER_ORIENTATION = "surface"
-# ONE DIRECTION. A probe dragged in contact leans against its direction of
-# travel in the spring fixture, so a
-# serpentine alternates the lean line by line and the C-scan stripes. Every
-# pass is entered by lift / transit / descend anyway, so the return costs one
-# transit in the air.
+# Do not ask the planner to snake. It keeps no sign of its own, so the direction
+# of every pass has to be decided on this side regardless (EC_TRAVEL_DIRECTION
+# and EC_SERPENTINE below), and asking twice only makes it harder to tell what
+# ordered the path.
 NOETHER_SNAKE = False
 # Which way the passes run. With no offset principal_axis_noether's lines follow
 # the part's SECOND-longest dimension, and on a curved part that sweeps the
@@ -422,9 +467,24 @@ NOETHER_SNAKE = False
 # noether_path.dpi states the rule once, from the planner's own source;
 # noether_cut_axis_test.py pins it.
 NOETHER_ROTATION_OFFSET = np.pi/2
-# And the direction of travel along them, -x. The planner keeps no sign of its
-# own, so without this it changes from plan to plan.
+# And the direction of the FIRST pass along them, -x. The planner keeps no sign
+# of its own, so without this it changes from plan to plan.
 EC_TRAVEL_DIRECTION = (-1.0, 0.0, 0.0)
+# RASTER, NOT COMB. Every pass after the first starts at whichever of its ends is
+# nearer to where the previous pass finished, so the move between passes is one
+# line spacing sideways instead of the whole length of the part. The probe still
+# lifts, transits in the air and descends between passes, but over one line
+# spacing that is a short hop (EC_SHORT_HOP_M) rather than a full approach, and
+# the transit itself is millimetres. On an 81-pass plan the per-pass overhead was
+# 6.8 minutes of a 19.5 minute scan; nearly all of it was the return.
+#
+# Set this False for a comb -- every pass running along EC_TRAVEL_DIRECTION -- if
+# the reading depends on the direction of travel. A probe dragged in contact
+# leans against its travel in the spring fixture, so alternating the direction
+# alternates the lean, and therefore the lift-off, which stripes the image line
+# by line. A comb pays for the return in order to measure every line the same
+# way.
+EC_SERPENTINE = True
 # The probe's rotation about its own axis is LOCKED for the scan: every pose is
 # one reference orientation tilted onto the surface normal, never twisted.
 # "fixed" twists with diagonal tilt and
@@ -435,6 +495,49 @@ NOETHER_TOOL_ROLL = "locked"
 # from the cable-envelope test: the direction that leaves wrist_3 mid-range
 # with the Azure and Keyence cables slack.
 NOETHER_ROLL_REFERENCE = (1.0, 0.0, 0.0)
+# HOW FAR THE PROBE IS TURNED ABOUT ITS OWN AXIS, in degrees, held constant for
+# the whole scan.
+#
+# WHY IT IS A SETTING. The probe is a split-D differential coil, and a split-D is
+# DIRECTIONAL: it responds to a crack perpendicular to its split and is nearly
+# blind to one parallel to it. So the rotation is a measurement parameter the
+# technician chooses for the flaw being looked for, not something for the planner
+# to inherit from whichever way the raster happens to run.
+#
+# WHAT ZERO MEANS. At 0 the probe's SPLIT lies along NOETHER_ROLL_REFERENCE in
+# the PART's frame -- world +x in this cell -- with the probe axis vertical.
+# POSITIVE turns the split anticlockwise about the probe's own axis seen from
+# outside the part (right-hand rule about the outward surface normal). The same
+# number holds at every waypoint of every pass, in both serpentine directions:
+# the "locked" roll builds every pose by swinging ONE reference orientation onto
+# the surface normal, and a swing adds no rotation about the tool's own axis, so
+# the rotation is in the construction rather than applied to it.
+#
+# set_probe_rotation(degrees) changes it from the prompt, and refuses one the
+# cables cannot hold before anything moves.
+EC_PROBE_ROTATION_DEG = 0.0
+# A FALLBACK, and only that: the wrist_3 angle the arm holds at the zero datum
+# with the probe vertical, in degrees.
+#
+# THE MEASUREMENT IS PREFERRED AND IS USED WHEN IT EXISTS.
+# capture_cable_envelope() records this angle as `wrist3_start_deg` on every row
+# of the cable-envelope file, in the same joint state it measures that row's band
+# from -- so the band and the datum are one self-consistent pair, and
+# check_probe_rotation() takes both from the envelope. It also takes the datum AT
+# EACH POSE'S TILT, which this constant cannot express: reaching a tilt turns the
+# wrist on the way, and across this cell's five samples the datum runs 147 to 179
+# degrees.
+#
+# This value is for a cell whose envelope predates that field, or one measured
+# without it. It is the untilted number only, and being a transcription it goes
+# stale silently the moment the tooling is unbolted -- which is exactly why the
+# measurement wins. This cell's reads 166.09 deg against an untilted band of
+# +16.09..+301.09, so it holds -150..+135 deg of rotation with the probe vertical.
+#
+# The rotation lands on this joint one degree for one degree, which is what lets
+# check_probe_rotation() refuse a rotation without solving any IK. None, with no
+# measurement either, makes the check say UNCHECKED rather than pass silently.
+EC_PROBE_ROTATION_WRIST3_DEG = 166.09
 NOETHER_UV_METHOD = "planar"
 # THE PROBE TIP ON THE MEASURED SURFACE. probe_end on the ec tooling is the
 # tip: ec_probe -> probe_end is 68.07 mm along the probe axis and the probe mesh
@@ -442,12 +545,59 @@ NOETHER_UV_METHOD = "planar"
 # meshes/ec_probe.stl). A nonzero offset here is a standoff, which an
 # eddy-current scan does not want.
 NOETHER_Z_OFFSET = 0.0
-# How far PAST the measured surface the tip is commanded, along its own axis:
-# the spring fixture's preload. 0, because it is NOT KNOWN -- nothing in the
-# URDF models the spring. With 0 every error in the fine mesh becomes lift-off
-# (mesh high) or compression (mesh low), one for one. Measure the fixture's
-# travel and put the probe mid-travel.
+
+# ------------------------------------------------------------------------------
+# THE CONTACT PRELOAD -- how hard the probe is pressed into the part
+# ------------------------------------------------------------------------------
+# How far PAST the measured surface the tip is commanded, along its own axis, in
+# METRES. The spring fixture takes up the difference, so this is the number that
+# loads the spring and keeps the probe face on the part over the millimetre-scale
+# error in the measured mesh.
+#
+# CHANGE IT FROM THE PROMPT, NOT HERE:
+#
+#     set_ec_preload(0.0003)     # 0.30 mm into the part
+#     ec_preload()               # what is in force now
+#
+# A bare `EC_PRELOAD_M = 0.0003` typed at the prompt does NOT reach the shared
+# globals: it reads back unchanged and the next plan uses the old value.
+# set_ec_preload() is the only way in, it validates, and it prints what it set.
+#
+# METRES, ALWAYS. There is no millimetre setter, because one function that took
+# either unit could be handed 0.3 for "0.3 mm" and command 300. It prints the
+# millimetre equivalent instead, so the number can still be read back the way
+# the fixture is measured.
+#
+# 0 at startup: the right value is a property of this fixture and this part, and
+# nothing here has measured it. At 0 the tip is commanded exactly onto the
+# measured surface and every error in the mesh becomes lift-off (mesh high) or
+# compression (mesh low), one for one.
 EC_PRELOAD_M = 0.0
+
+# The hard ceiling on the preload, in metres. Refused above this, by
+# set_ec_preload() and by plan_ec_path(preload=) alike.
+#
+# TWO NUMBERS OUT OF THE TOOLING DESCRIPTION SET IT (tari_ur_description
+# urdf/ec/tooling_macro.xacro and the meshes it names):
+#
+#   * The compliance is probe_holder, a 12.5 mm radius plunger, sliding in
+#     bearing_tube, a 16.0 mm bore. Both joints are FIXED in the URDF, so the
+#     spring travel is not modelled at all. The one length in the description
+#     that bears on the slide is the overlap between the two at rest:
+#     probe_holder is mounted 20.0 mm up a 24.5 mm bearing tube, so 4.5 mm of
+#     plunger is inside it. A preload of the same order as that is one that
+#     changes the fixture's geometry rather than just loading its spring; 2 mm
+#     is under half of it.
+#   * probe_end, the commanded tip, is 68.07 mm along the probe and the probe
+#     mesh ends at 68.32 mm. Past 0.25 mm of preload the modelled probe body is
+#     already inside the part, so every clearance number the planner reports is
+#     optimistic by the preload. 2 mm is as far past that as is worth allowing.
+#
+# Beyond a couple of millimetres the arm stops pressing a spring and starts
+# pushing the part: the fixture bottoms out, the reading saturates, and the
+# probe or the specimen is what gives. To gain margin, shrink the scan area --
+# never press harder.
+EC_PRELOAD_CEILING_M = 0.002
 # Scan only this part of the toolpath: (xmin, ymin, xmax, ymax) in world
 # metres, or None for everything on the part. Waypoints outside are dropped and
 # passes split where they leave it: the scan area shrinks, the motion never
@@ -772,6 +922,13 @@ include(None, os.path.join(SCAN_MODULE_DIR, "ec_acquisition.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_parameters.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
+
+# THE CELL'S MEASURED SPEED CURVE REPLACES THE ONE ABOVE, when the manifest has
+# one. Here, after scan_parameters.dpi and scan_plan.dpi, because those are what
+# consume it -- and before anything plans, so nothing converts a speed through the
+# transcribed table first. The config's own value stays as
+# ROBOT_VELOCITY_CALIBRATION_CONFIG.
+adopt_measured_velocity_curve()
 # The Keyence's measuring window, and the three checks that keep the sensor
 # inside it. Same shape as tooling_clearance.dpi above -- geometry over a
 # planned path plus a cheap watch on the sensor's own returns -- and
@@ -783,6 +940,10 @@ include(None, os.path.join(SCAN_MODULE_DIR, "part_detection.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "specimen.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "mesh_scan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "surface_path_scan.dpi"))
+# Getting out of a state a previous run left the arm in. AFTER
+# surface_path_scan.dpi, because the retreat it flies is that file's
+# contact_lift()/contact_retract() -- the same tool-axis move a pass entry uses.
+include(None, os.path.join(SCAN_MODULE_DIR, "start_state_recovery.dpi"))
 # Reads ROI_SELECT, set above, for its default.
 include(None, os.path.join(SCAN_MODULE_DIR, "roi_select.dpi"))
 
@@ -843,6 +1004,131 @@ elif EC_SOURCE == "sim":
 elif EC_SOURCE != "none":
     raise ValueError("EC_SOURCE must be 'hardware', 'sim' or 'none', not %r"
                      % (EC_SOURCE,))
+
+# ------------------------------------------------------------------------------
+# THE INSTRUMENT ITSELF -- for the null, and only for the null
+# ------------------------------------------------------------------------------
+# The readings come from the DAQ above, not from here. This handle exists so the
+# scan can balance the instrument's bridge with the probe on the part; the
+# instrument's other settings (frequency, gain, probe drive) are set on its own
+# front panel.
+#
+# OPENING THE DRIVER CHANGES NOTHING ON THE INSTRUMENT. It reads the identity and
+# the current settings and stops there, so the instrument can be set up on its
+# front panel before or after this config starts, in either order. Nothing here
+# ever writes a setting -- the null is the only command this config sends.
+#
+# THAT DEPENDS ON THE INSTALLED DRIVER, NOT ON THIS FILE. An older
+# dgpython-uniwest switches all five instrument channels off as it opens, and the
+# instrument then looks correctly configured on its front panel while the DAQ
+# reads nothing. A flat scan with a healthy-looking instrument is that: check the
+# channel is on, and check the installed driver against the source (the startup
+# banner prints the version and the path of everything loaded).
+
+global ec_instrument
+ec_instrument = None
+
+
+global connect_ec_instrument
+def connect_ec_instrument(port=None, baud=None, name="uniwest"):
+    """Open the eddy-current instrument so its null can be issued. Not fatal.
+
+    Leaves the handle in `ec_instrument` and returns it, or None with a printed
+    reason. `name` is the dgpy module name: a retry after a failure that got as
+    far as registering needs a different one.
+    """
+    global ec_instrument
+    if EC_INSTRUMENT == "none":
+        print("  no eddy-current instrument (EC_INSTRUMENT='none'); nothing to "
+              "null")
+        return None
+    if EC_INSTRUMENT != "uniwest":
+        raise ValueError("EC_INSTRUMENT must be 'uniwest' or 'none', not %r"
+                         % (EC_INSTRUMENT,))
+    port = EC_INSTRUMENT_PORT if port is None else int(port)
+    baud = EC_INSTRUMENT_BAUD if baud is None else int(baud)
+    try:
+        from dgpython_uniwest import UniWest
+        ec_instrument = UniWest(name, comPort=port, baudRate=baud)
+        print("  eddy-current instrument: Uniwest on port %d at %d baud"
+              % (port, baud))
+        print("    its settings were not touched; the null is the only command "
+              "this config sends. Set it up on its front panel in either order.")
+    except Exception as _e:                                        # noqa: BLE001
+        # Not fatal at load: planning, reconstruction and a dry run need no
+        # instrument. run_ec_scan() is where the absence is decided, against
+        # EC_NULL_REQUIRED, before anything moves.
+        ec_instrument = None
+        print("  NO eddy-current instrument on port %d (%s: %s)"
+              % (port, type(_e).__name__, _e))
+        print("  the scan cannot null on the part; run_ec_scan() %s."
+              % ("will REFUSE (EC_NULL_REQUIRED)" if EC_NULL_REQUIRED
+                 else "will warn and go ahead un-nulled"))
+    return ec_instrument
+
+
+if EC_INSTRUMENT != "none":
+    connect_ec_instrument()
+
+
+global null_ec_instrument
+def null_ec_instrument():
+    """Balance the instrument's bridge. THE PROBE MUST BE ON THE PART.
+
+    The hardware null, not the software one: /ec/cond/null (null_here()) is a
+    complex offset subtracted from recorded traces and it does not move the
+    instrument's operating point.
+
+    The scan calls this by itself at the first touchdown. Called by hand it is
+    the manual step from ClientScannerTest ("Null Uniwest?") -- put the probe on
+    good material first with ec_touch_down(0).
+    """
+    if ec_instrument is None:
+        raise RuntimeError(
+            "there is no eddy-current instrument to null (EC_INSTRUMENT=%r). "
+            "connect_ec_instrument() opens one; set_ec_nulling(enabled=False) "
+            "tells the scan not to try." % (EC_INSTRUMENT,))
+    ec_instrument.null()
+
+
+global set_ec_nulling
+def set_ec_nulling(enabled=None, required=None):
+    """Turn the first-touchdown instrument null on or off, and say what a failure
+    means. The one way to change either from the prompt.
+
+        set_ec_nulling(enabled=False)     bench work: do not null at all
+        set_ec_nulling(required=False)    try, but scan anyway if it fails
+
+    `enabled` is EC_NULL_ON_CONTACT, `required` is EC_NULL_REQUIRED. Passing
+    neither just prints the state. A bare assignment to either name at the prompt
+    does not reach the shared globals, which is why this exists.
+    """
+    global EC_NULL_ON_CONTACT, EC_NULL_REQUIRED
+    if enabled is not None:
+        EC_NULL_ON_CONTACT = bool(enabled)
+    if required is not None:
+        EC_NULL_REQUIRED = bool(required)
+    print(describe_ec_nulling())
+    return {"enabled": EC_NULL_ON_CONTACT, "required": EC_NULL_REQUIRED}
+
+
+global describe_ec_nulling
+def describe_ec_nulling():
+    """One line stating what the scan will do about the instrument null."""
+    if not EC_NULL_ON_CONTACT:
+        return ("  instrument null: OFF (set_ec_nulling(enabled=True) to turn it "
+                "on). Every trace will carry whatever balance the instrument "
+                "happens to be in.")
+    if ec_instrument is None:
+        return ("  instrument null: requested but there is NO INSTRUMENT "
+                "(EC_INSTRUMENT=%r) -- the scan will %s"
+                % (EC_INSTRUMENT,
+                   "REFUSE to start (EC_NULL_REQUIRED)" if EC_NULL_REQUIRED
+                   else "warn and scan un-nulled"))
+    return ("  instrument null: at the first touchdown, on the part, before any "
+            "trace; a failure %s"
+            % ("stops the scan at the first pass" if EC_NULL_REQUIRED
+               else "is reported and the scan goes on"))
 
 
 global ec_ready
@@ -917,6 +1203,10 @@ def setup_ec(pitch_m=None, null=None, rotation_deg=None, gain=None):
                  + (held["rotation"],) + tuple(held["gain"])))
         print("    the math is wired when the scan stages its first trace -- "
               "%s does not exist before that" % (EC_TRACES_PATH,))
+    # The HARDWARE balance, which those parameters sit on top of. Said here so
+    # the two are never mistaken for one setting.
+    print(describe_ec_nulling())
+    print(describe_ec_preload())
     return held
 
 
@@ -939,11 +1229,19 @@ def teardown_ec():
 
 global null_here
 def null_here(count=20):
-    """Null on the traces just acquired, which should be over good material.
+    """Set the CONDITIONING null from traces just acquired over good material.
 
-    Nulling is done on good material by definition, so taking the value from
-    traces the operator watched being taken beats typing in a number from a
-    previous session on a different probe at a different temperature.
+    A software offset -- /ec/cond/null, subtracted from every recorded trace by
+    the conditioning math and re-runnable over traces already taken. NOT the
+    instrument null, which is a hardware balance of the instrument's own bridge,
+    issued once with the probe on the part (null_ec_instrument(), and the scan
+    does it at the first touchdown). This sits on top of that one; it cannot
+    stand in for it, because an instrument balanced in air has its operating
+    point in the wrong place before any trace exists.
+
+    Taking the value from traces the operator watched being taken beats typing in
+    a number from a previous session on a different probe at a different
+    temperature.
 
     NEEDS TRACES, so it needs a scan (or at least a pass) to have run. There is
     nothing to average before that, which is why it cannot be part of setup.
@@ -956,7 +1254,7 @@ def null_here(count=20):
             "setup_ec(null=(re, im))." % (EC_TRACES_PATH,))
     null = ec_null_from_traces(recdb, EC_TRACES_PATH, first=0, count=count)
     ec_conditioning_parameters(null=null, cond=ec_cond)
-    print("  null set to (%.5f, %.5f) from the first %d traces%s"
+    print("  conditioning null set to (%.5f, %.5f) from the first %d traces%s"
           % (null[0], null[1], count,
              "" if ec_cond is not None else " (held until the scan wires it)"))
     return null
@@ -1296,9 +1594,247 @@ def filter_mesh(mesh=None, cutoff=None, **kwargs):
 global ec_clearance_report
 ec_clearance_report = None
 
+#: What the last plan_ec_path() found and did about poses whose tool axis did not
+#: agree with the surface: see repair_tool_axis_to_surface().
+global ec_axis_flip_report
+ec_axis_flip_report = None
+
+
+# ==============================================================================
+# THE CONTACT PRELOAD
+# ==============================================================================
+# One gate, one setter, one line of output. See EC_PRELOAD_M above for what the
+# number is and EC_PRELOAD_CEILING_M for where the ceiling comes from.
+
+global check_ec_preload
+def check_ec_preload(metres):
+    """The preload, validated, in metres. Raises ValueError saying why not.
+
+    ONE GATE FOR BOTH WAYS IN -- set_ec_preload() from the prompt and
+    plan_ec_path(preload=) from a script -- so neither can command a push the
+    other would have refused.
+    """
+    try:
+        value = float(metres)
+    except (TypeError, ValueError):
+        raise ValueError("the preload is a distance in metres, not %r" % (metres,))
+    if not np.isfinite(value):
+        raise ValueError("the preload is a distance in metres, not %r" % (metres,))
+    if value < 0.0:
+        raise ValueError(
+            "a preload of %.3f mm is NEGATIVE, which is lift-off and not "
+            "preload: it commands the tip that far ABOVE the measured surface "
+            "and the probe leaves the part. The allowed range is 0 to %.2f mm "
+            "(EC_PRELOAD_CEILING_M)."
+            % (value*1e3, EC_PRELOAD_CEILING_M*1e3))
+    if value > EC_PRELOAD_CEILING_M:
+        raise ValueError(
+            "a preload of %.2f mm is over the %.2f mm ceiling "
+            "(EC_PRELOAD_CEILING_M). The fixture has 4.5 mm of plunger inside "
+            "its bearing tube and the probe mesh ends 0.25 mm past the "
+            "commanded tip, so past the ceiling the arm presses on the part "
+            "instead of on the spring: the spring bottoms out, the reading "
+            "saturates, and the probe or the specimen is what gives. For "
+            "margin, shrink the scan area -- never press harder."
+            % (value*1e3, EC_PRELOAD_CEILING_M*1e3))
+    return value
+
+
+global set_ec_preload
+def set_ec_preload(metres):
+    """Set the contact preload, IN METRES. The one way to change it.
+
+        set_ec_preload(0.0003)    0.30 mm past the measured surface
+        set_ec_preload(0)         the tip exactly on the measured surface
+
+    Metres, not millimetres -- see EC_PRELOAD_M. Refused below 0 (that is
+    lift-off) and above EC_PRELOAD_CEILING_M.
+
+    It takes effect at the NEXT plan_ec_path(). A toolpath already planned
+    carries the preload it was planned with, and run_ec_scan() prints that one
+    rather than this setting, so re-plan after changing it.
+    """
+    global EC_PRELOAD_M
+    EC_PRELOAD_M = check_ec_preload(metres)
+    print(describe_ec_preload())
+    return EC_PRELOAD_M
+
+
+global ec_preload
+def ec_preload():
+    """The preload in force now, in metres. Prints it in millimetres."""
+    print(describe_ec_preload())
+    return EC_PRELOAD_M
+
+
+global describe_ec_preload
+def describe_ec_preload(preload=None):
+    """One line stating the preload in millimetres. Never blank, zero included.
+
+    `preload` None means the current setting; pass a path's own recorded value to
+    say what that path was planned with.
+    """
+    value = EC_PRELOAD_M if preload is None else float(preload)
+    if value > 0.0:
+        return ("  preload: %.2f mm past the measured surface at every pose, "
+                "along the tool axis (set_ec_preload, ceiling %.2f mm)"
+                % (value*1e3, EC_PRELOAD_CEILING_M*1e3))
+    return ("  preload: 0.00 mm -- the tip is commanded exactly onto the "
+            "measured surface, so mesh error becomes lift-off or compression "
+            "1:1. set_ec_preload(metres) presses the probe into the part.")
+
+
+global ec_probe_rotation_reference
+def ec_probe_rotation_reference(degrees=None):
+    """The roll reference with the probe turned by EC_PROBE_ROTATION_DEG.
+
+    ONE PLACE BUILDS IT, so plan_ec_path() and every report agree about what the
+    probe is holding. Returns a reference ORIENTATION as (x, y, z, w), which is
+    what every roll-aware function takes in place of a direction.
+    """
+    deg = EC_PROBE_ROTATION_DEG if degrees is None else float(degrees)
+    return probe_rotation_reference(deg, NOETHER_ROLL_REFERENCE)
+
+
+global check_ec_probe_rotation
+def check_ec_probe_rotation(degrees, path=None, verbose=True):
+    """Validate a probe rotation against the measured cable band. -> the report.
+
+    ONE GATE FOR BOTH WAYS IN -- set_probe_rotation() from the prompt and
+    plan_ec_path(probe_rotation_deg=) from a script -- so neither can command a
+    rotation the other would have refused.
+    """
+    try:
+        value = float(degrees)
+    except (TypeError, ValueError):
+        raise ValueError("a probe rotation is an angle in degrees, not %r"
+                         % (degrees,))
+    if not np.isfinite(value):
+        raise ValueError("a probe rotation is an angle in degrees, not %r"
+                         % (degrees,))
+    if abs(value) > 360.0:
+        raise ValueError(
+            "a probe rotation of %+.1f deg is more than a full turn. The split of "
+            "a split-D coil is a LINE, so every distinct orientation is inside "
+            "-180..+180 -- and the cables care about the absolute wrist angle, so "
+            "a larger number is a different cable state rather than the same "
+            "measurement." % (value,))
+    return check_probe_rotation(
+        value, path=path, datum_deg=EC_PROBE_ROTATION_WRIST3_DEG,
+        reference=NOETHER_ROLL_REFERENCE, what="probe rotation", verbose=verbose)
+
+
+global set_probe_rotation
+def set_probe_rotation(degrees):
+    """Turn the eddy-current probe about its own axis, in DEGREES. Held for the
+    whole scan.
+
+        set_probe_rotation(0)      the split along world +x over the part
+        set_probe_rotation(90)     the split across it
+
+    A split-D coil answers to cracks PERPENDICULAR to its split and is nearly
+    blind to ones parallel to it, so this is which flaw direction the scan is
+    looking for. Zero is defined in the part's frame -- see EC_PROBE_ROTATION_DEG.
+
+    NOT set_rotation(), which is the instrument's impedance phase rotation and
+    changes no geometry at all. This one turns the arm's wrist.
+
+    Refused before anything moves when the cables cannot hold it, naming the
+    wrist_3 angle it implies and the measured band. It takes effect at the NEXT
+    plan_ec_path(); a toolpath already planned carries the rotation it was
+    planned with.
+    """
+    global EC_PROBE_ROTATION_DEG
+    check_ec_probe_rotation(degrees, verbose=False)
+    EC_PROBE_ROTATION_DEG = float(degrees)
+    print(describe_probe_rotation())
+    return EC_PROBE_ROTATION_DEG
+
+
+global probe_rotation
+def probe_rotation():
+    """The probe rotation in force now, in degrees. Prints it."""
+    print(describe_probe_rotation())
+    return EC_PROBE_ROTATION_DEG
+
+
+global describe_probe_rotation
+def describe_probe_rotation(degrees=None):
+    """One line stating the probe rotation and what zero means. Never blank.
+
+    `degrees` None means the current setting; pass a path's own recorded value to
+    say what that path was planned with.
+    """
+    value = EC_PROBE_ROTATION_DEG if degrees is None else float(degrees)
+    # The measured datum in preference to the config's, and SAY WHICH. The two can
+    # disagree -- the constant is a transcription and the tooling may have been
+    # unbolted since -- and an operator reading a wrist angle needs to know
+    # whether it came from a measurement of this cell or from a line in a file.
+    w3, source = None, ""
+    datum_fn = globals().get("wrist3_datum_deg")
+    if callable(datum_fn):
+        try:
+            w3 = datum_fn(tilt=(0.0, 0.0))
+        except Exception:                                         # noqa: BLE001
+            w3 = None
+        if w3 is not None:
+            source = ", measured"
+    if w3 is None:
+        w3 = globals().get("EC_PROBE_ROTATION_WRIST3_DEG")
+        if w3 is not None:
+            source = ", from the config not a measurement"
+    band = ""
+    if w3 is not None:
+        band = (", wrist 3 at %+.1f deg%s"
+                % (probe_rotation_wrist3_deg(value, w3), source))
+    return ("  probe rotation: %+.1f deg about the probe's own axis, the same at "
+            "every waypoint of every pass. Zero is the split along %s in the "
+            "part's frame%s (set_probe_rotation)."
+            % (value, tuple(float(c) for c in NOETHER_ROLL_REFERENCE), band))
+
+
+global say_path_probe_rotation
+def say_path_probe_rotation(path):
+    """Print the probe rotation THIS toolpath was planned with, and prove it.
+
+    From the path's own poses, not from the setting: a plan built before
+    set_probe_rotation() was called still commands the old rotation.
+    """
+    value = getattr(path, "probe_rotation_deg", None)
+    if value is None:
+        print("  probe rotation: UNKNOWN -- this toolpath records none, so which "
+              "way the coil is turned cannot be stated. Re-plan with "
+              "plan_ec_path().")
+        return None
+    held = probe_rotation_of(path.quats, NOETHER_ROLL_REFERENCE)
+    print(describe_probe_rotation(value))
+    print("    measured over the %d planned poses: %+.3f..%+.3f deg (spread "
+          "%.2e deg). Travel direction does not enter it."
+          % (len(held), held.min(), held.max(), held.max() - held.min()))
+    return value
+
+
+global say_path_preload
+def say_path_preload(path):
+    """Print the preload THIS toolpath was planned with, in millimetres.
+
+    From the path, not from the current setting: a plan built before
+    set_ec_preload() was called still commands the old push, and saying
+    otherwise would be worse than saying nothing.
+    """
+    value = getattr(path, "ec_preload_m", None)
+    if value is None:
+        print("  preload: UNKNOWN -- this toolpath records none, so what the tip "
+              "is commanded onto cannot be stated. Re-plan with plan_ec_path().")
+        return None
+    print(describe_ec_preload(value))
+    return float(value)
+
+
 global plan_ec_path
 def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
-                 max_tilt_deg=None, axis_smoothing_m=None, force=False, **kwargs):
+                 max_tilt_deg=None, axis_smoothing_m=None,
+                 probe_rotation_deg=None, force=False, **kwargs):
     """Plan the eddy-current toolpath over a mesh with Noether.
 
     line_spacing is the distance BETWEEN passes; SCAN_STEP_SIZE is the distance
@@ -1307,17 +1843,38 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
     footprint.
 
     The tip is planned ON the measured surface (NOETHER_Z_OFFSET 0; probe_end
-    is the tip on this tooling), pushed EC_PRELOAD_M further along its own
-    axis, locked in roll (NOETHER_TOOL_ROLL), and then cropped: to the cell's
+    is the tip on this tooling), pushed the contact preload further along its
+    own axis -- EC_PRELOAD_M, or `preload` here, both through check_ec_preload()
+    -- turned about its own axis by the set probe rotation
+    (EC_PROBE_ROTATION_DEG, or `probe_rotation_deg` here, both through
+    check_ec_probe_rotation()), locked in roll (NOETHER_TOOL_ROLL), and then
+    cropped: to the cell's
     work volume, which a contact probe must never leave -- on a cell that has
     not measured one this refuses -- and to EC_SCAN_REGION if it is set, which
     is how a 0.3 mm scan is kept to an area that fits in the hour the plan
     allows.
     """
-    global ec_scan_path, ec_scan_x3d, ec_clearance_report
+    global ec_scan_path, ec_scan_x3d, ec_clearance_report, ec_axis_flip_report
     mesh = (fine_mesh or rough_mesh) if mesh is None else mesh
     region = EC_SCAN_REGION if region is None else region
-    preload = EC_PRELOAD_M if preload is None else float(preload)
+    # Through the same gate the setter uses, so `preload=` cannot ask for a push
+    # set_ec_preload() would have refused.
+    preload = check_ec_preload(EC_PRELOAD_M if preload is None else preload)
+    # THE PROBE'S OWN ROTATION, REFUSED HERE IF THE CABLES CANNOT HOLD IT -- before
+    # the planner is asked for anything and long before the arm moves. The band
+    # depends on how far the tool is leaned, so this is the untilted check; the
+    # per-pass one runs on the finished path at the bottom of this function, where
+    # the tilts the path really needs are known.
+    rotation = (EC_PROBE_ROTATION_DEG if probe_rotation_deg is None
+                else float(probe_rotation_deg))
+    check_ec_probe_rotation(rotation, verbose=False)
+    print(describe_probe_rotation(rotation))
+    # ONE reference orientation with the rotation baked in. Every pose is that
+    # orientation swung onto the surface normal, and a swing adds no rotation
+    # about the tool's own axis -- so the rotation is constant over the whole
+    # path by construction, in both serpentine directions, and the direction of
+    # travel never enters it.
+    kwargs.setdefault("roll_reference", ec_probe_rotation_reference(rotation))
     max_tilt = EC_MAX_TILT_DEG if max_tilt_deg is None else max_tilt_deg
     smooth = EC_AXIS_SMOOTHING_M if axis_smoothing_m is None else axis_smoothing_m
     require_work_volume("the eddy-current toolpath")
@@ -1337,6 +1894,7 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
             "widen SCAN_LINE_SPACING, or plan_ec_path(force=True)."
             % ("; ".join(ec_plan_estimate["plan_errors"]),))
 
+    cr = None
     if EC_CLEAN_PLANNING_MESH and mesh and str(mesh).endswith(".ply"):
         cleaned = os.path.splitext(str(mesh))[0] + "_ecplan.ply"
         cr = clean_mesh_for_planning(str(mesh), cleaned)
@@ -1366,6 +1924,15 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
     path, x3d = plan_mesh_path(mesh=mesh, line_spacing=line_spacing, **kwargs)
     reference = getattr(path, "roll_reference", NOETHER_ROLL_REFERENCE)
     roll_mode = getattr(path, "roll_mode", NOETHER_TOOL_ROLL)
+    # AND THE SURFACE THE TOOL AXIS IS CONSTRAINED TO, for the same reason: every
+    # crop below builds a fresh ScanPath, and _crop_path_by_mask() carries only the
+    # source string. Held here so the orientation can be re-checked -- and
+    # re-derived -- on the path that will actually fly rather than only on the raw
+    # planner output. Without it the postcondition is verified before the tilt
+    # crop, the preload, the reordering and the resample, and never after them.
+    normal_surface = getattr(path, "normal_surface", None)
+    normal_offset = getattr(path, "normal_offset", (0.0, 0.0, 0.0))
+    normal_constrained = path_is_normal_constrained(path)
     uv = globals().get("last_uv_report") or {}
     if x3d is not None and uv.get("x3d") == x3d and uv.get("rejected"):
         # The projector would refuse this file when it is built at the scan's
@@ -1432,13 +1999,18 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
     elif smooth:
         print("  NOT averaging the tool axis: the roll is %r, and averaging "
               "re-locks it" % (roll_mode,))
+    # MINUS the preload along tool z, because tool z points AWAY from the part.
+    # Every pose here has its tool axis on the outward surface normal -- that is
+    # what orient="normal" builds and what tool_tilt_deg() measures against
+    # straight up -- so -z is into the material and +z would be lift-off.
+    # _offset_path_in_tool_frame() applies it in EACH POSE'S OWN FRAME, so on a
+    # curved part the push follows the normal instead of going down in world z.
+    #
+    # And it happens HERE, before the work-volume and region crops below, so a
+    # pose the preload pushes out of the work volume is cropped like any other.
     if preload:
         path = _offset_path_in_tool_frame(path, (0.0, 0.0, -float(preload)))
-        print("  preload: every pose %.2f mm past the measured surface, along "
-              "its own axis" % (preload*1e3,))
-    else:
-        print("  preload: NONE -- the tip is commanded exactly onto the measured "
-              "surface (EC_PRELOAD_M); mesh error is lift-off or compression 1:1")
+    print(describe_ec_preload(preload))
     path = _crop_path_to_work_volume(path, "eddy-current toolpath")
     if region:
         xmin, ymin, xmax, ymax = [float(v) for v in region]
@@ -1446,9 +2018,16 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
                                  "eddy-current toolpath", min_points=2,
                                  why="outside EC_SCAN_REGION")
     if EC_TRAVEL_DIRECTION is not None:
-        path = orient_segments_along(path, EC_TRAVEL_DIRECTION)
-        print("  every pass travels along %s (%d reversed)"
-              % (tuple(EC_TRAVEL_DIRECTION), path.segments_reversed))
+        path = orient_segments_along(path, EC_TRAVEL_DIRECTION,
+                                     serpentine=EC_SERPENTINE)
+        if EC_SERPENTINE:
+            print("  raster order: the first pass travels along %s and the rest "
+                  "alternate, so each starts where the last ended (%d reversed)"
+                  % (tuple(EC_TRAVEL_DIRECTION), path.segments_reversed))
+        else:
+            print("  comb order: every pass travels along %s, returning to the "
+                  "same side between passes (%d reversed)"
+                  % (tuple(EC_TRAVEL_DIRECTION), path.segments_reversed))
     path.roll_reference = reference
     path.roll_mode = roll_mode
     if EC_WAYPOINT_SPACING_M and roll_mode == "locked":
@@ -1459,6 +2038,29 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
         path.roll_reference = reference
         path.roll_mode = roll_mode
     path.axis_smoothing = sm         # the crops above make new paths; keep it
+    path.probe_rotation_deg = rotation
+    path.normal_constrained = normal_constrained
+    path.normal_surface = normal_surface
+    path.normal_offset = normal_offset
+
+    # THE ORIENTATION, RE-CHECKED ON THE PATH THAT WILL FLY. Everything above
+    # rebuilds the path: the tilt crop and the region crop drop waypoints, the
+    # preload moves every position along its own tool axis, the reordering
+    # reverses passes and the resample puts waypoints somewhere new. The
+    # postcondition inside plan_mesh_path() was measured before all of that.
+    #
+    # A turned-round pose is REPAIRED here, and one on surface facing away from
+    # the probe is DROPPED with a count -- never turned over, which would point
+    # the probe away from the part and drive the holder into it.
+    if normal_surface is not None and normal_constrained:
+        path, ec_axis_flip_report = repair_tool_axis_to_surface(
+            path, normal_surface, what="eddy-current toolpath")
+        path.probe_rotation_deg = rotation
+        path.roll_reference = reference
+        path.roll_mode = roll_mode
+        path.axis_smoothing = sm
+        path.normal_postcondition = assert_probe_normal_to_surface(
+            path, normal_surface, what="eddy-current toolpath", mode="warn")
 
     # The tooling gate, on the poses that will actually fly. Contact is allowed
     # for the probe by name -- contact is what this scan IS -- and every other
@@ -1469,6 +2071,26 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
     if EC_CHECK_CLEARANCE and _clearance_available("the eddy-current toolpath"):
         print("  contact is allowed for %s; every other link must clear the part"
               % (", ".join(TOOLING_CONTACT_LINKS) or "nothing",))
+        # `mesh`, NOT `normal_surface`, AND THAT IS DELIBERATE.
+        #
+        # normal_surface is the surface the TOOL AXIS is constrained to, and it is
+        # cropped to the region being scanned. The clearance gate is asking a
+        # different question: where may the rest of the tooling go. The Keyence
+        # head is 75 mm to the side of the probe and the Azure 230 mm, so they
+        # sweep well outside the scanned region -- over part that an ROI-cropped
+        # mesh does not contain. Grading them against it would report clear
+        # against specimen that is simply absent from the model. Measured on one
+        # run's meshes: the region crop takes the part from 56 mm wide to 43 mm
+        # and drops 3297 of 13450 faces.
+        #
+        # The sign is not a reason to prefer the repaired mesh either.
+        # clean_mesh_for_planning() turns every face outward -- that is what its
+        # rewinding pass is for -- and the signed distance takes its sign from
+        # each face's own normal, so it does not need the mesh to be consistently
+        # wound as a manifold. Verified on the real planning meshes: 0 faces
+        # pointing down, and points 0.2 mm above the worst-wound faces all read
+        # positive.
+        _say_clearance_mesh(mesh, cr if EC_CLEAN_PLANNING_MESH else None)
         path, ec_clearance_report = enforce_path_clearance(
             path, mesh, allow_links=TOOLING_CONTACT_LINKS,
             what="eddy-current toolpath")
@@ -1487,10 +2109,30 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
     rr = path.roll_report
     print("  eddy-current toolpath: %d passes, %.3f m in contact"
           % (len(segs), sum(path.segment_length_m(s) for s in segs)))
+    # The reference as a DIRECTION, whichever form it arrived in: the probe
+    # rotation makes it a whole orientation, and four quaternion components after
+    # "about x=" name the wrong thing.
+    _ref_x = quat_to_matrix(np.asarray(roll_reference_quat(reference),
+                                       dtype=np.float64))[:, 0]
     print("    roll %s about x=%s: %.2f deg across the path, %.2f within a pass; "
           "tilt up to %.1f deg (mean %.1f)"
-          % (roll_mode, tuple(reference), rr["twist_range_deg"],
+          % (roll_mode, tuple(round(float(v), 6) for v in _ref_x),
+             rr["twist_range_deg"],
              rr["twist_in_pass_deg"], rr["tilt_max_deg"], rr["tilt_mean_deg"]))
+    # WHAT THIS PATH WAS PLANNED WITH, carried on the path itself. Every crop
+    # above builds a new ScanPath, so this is set last, and run_ec_scan() reports
+    # it rather than the current setting -- changing the preload does not move a
+    # toolpath that is already planned.
+    path.ec_preload_m = preload
+    path.probe_rotation_deg = rotation
+    say_path_probe_rotation(path)
+    # AND THE CABLES, PER PASS, on the tilts this path really asks for. The check
+    # at the top of this function is the untilted band, which every pose has to
+    # pass; the band tightens as the tool leans, so a rotation can be holdable
+    # over the crown of a part and not over its flanks. Refused here -- with the
+    # pass named -- rather than when the scan reaches that pass with the probe on
+    # the part. Nothing has moved yet.
+    check_ec_probe_rotation(rotation, path=path)
     ec_scan_path, ec_scan_x3d = path, x3d
     return ec_scan_path, ec_scan_x3d
 
@@ -1680,6 +2322,8 @@ def preview_ec_scan(path=None):
     plan = plan_current_scan(length, len(segments),
                              step_m=SCAN_STEP_SIZE, velocity_mps=SCAN_VELOCITY,
                              num_samples=1, sample_bytes=16, force=True)
+    plan["preload_m"] = say_path_preload(path)
+    plan["probe_rotation_deg"] = say_path_probe_rotation(path)
     if plan["errors"]:
         print("  run_ec_scan() will REFUSE this plan as it stands. Scan a smaller "
               "area (EC_SCAN_REGION), widen SCAN_LINE_SPACING, or pass "
@@ -1779,6 +2423,14 @@ def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=Fals
     The probe is in contact: every pass is entered by lift / transit / descend
     along the tool axis, swept at no more than NEAR_PART_SPEED, and the probe is
     lifted clear at the end, error or not. The warning light is on throughout.
+    How far past the measured surface the tip is commanded is the path's own
+    contact preload -- set_ec_preload() -- and this prints it.
+
+    The INSTRUMENT is nulled once, at the first touchdown, before any trace is
+    read: an eddy-current bridge has to be balanced on the part. set_ec_nulling()
+    turns that off or makes a failure non-fatal, and the outcome comes back in
+    report["instrument_null"]. Not the same as the conditioning null
+    (/ec/cond/null, null_here()), which is a software offset on top of it.
 
     A pass that will not plan is dropped and reported. The traces taken are
     still correct, because each carries its own pose; the coverage is not.
@@ -1796,13 +2448,40 @@ def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=Fals
             "there are traces, null_here() and set_rotation() before trusting "
             "what it paints)")
     _check_contact_speed()
+    # WHAT THE TIP IS COMMANDED ONTO, from the path rather than from the current
+    # setting: a plan built before the preload was last changed still carries the
+    # older push.
+    say_path_preload(path)
+    # AND WHICH WAY THE COIL IS TURNED, for the same reason: a split-D answers to
+    # cracks perpendicular to its split, so this is what the scan is looking for,
+    # and a plan built before set_probe_rotation() was last called still carries
+    # the older rotation.
+    say_path_probe_rotation(path)
+    # AND WHAT WILL HAPPEN ABOUT THE INSTRUMENT NULL, before the arm moves. An
+    # absent instrument is knowable now, so a required null refuses here instead
+    # of a minute in with the probe on the part. A null command that fails is not
+    # knowable until it is issued, and that is caught at the first touchdown.
+    print(describe_ec_nulling())
+    if EC_NULL_ON_CONTACT and EC_NULL_REQUIRED and ec_instrument is None:
+        raise RuntimeError(
+            "there is no eddy-current instrument to null on the part "
+            "(EC_INSTRUMENT=%r) and a null is required, so this refuses before "
+            "the arm moves. An instrument balanced in air has its operating "
+            "point in the wrong place and every trace of the scan rides at an "
+            "offset that no software null repairs. connect_ec_instrument() opens "
+            "one; set_ec_nulling(required=False) accepts an un-nulled scan as a "
+            "decision; set_ec_nulling(enabled=False) is for bench work."
+            % (EC_INSTRUMENT,))
     with warning_light("eddy-current scan"):
         return run_ec_path_scan(path, x3d, ec_source, ec_cond,
                                 prefix="/ec", staging_path="/ec/current",
                                 cond_prefix=EC_COND_PREFIX,
                                 component=component, max_passes=max_passes,
                                 force=force, pitch_m=SCAN_STEP_SIZE,
-                                contact=_ec_contact())
+                                contact=_ec_contact(),
+                                null_instrument=(null_ec_instrument
+                                                 if EC_NULL_ON_CONTACT else None),
+                                null_required=EC_NULL_REQUIRED)
 
 
 global ec_dry_run_report
@@ -2122,6 +2801,20 @@ def run_automated_scan(index=0, scan=True, cutoff=None, line_spacing=None,
     # a hold at the next row boundary, and ScanAborted if it is not resumed.
     with supervised("the automated scan"), warning_light("automated scan"):
         try:
+            # BEFORE ANYTHING IS ASKED OF THE PLANNER. A contact scan that did not
+            # reach its own lift-off -- an exception, a killed process -- leaves
+            # the probe resting on the specimen, and the planner then refuses
+            # every goal because it validates the START state first. The refusal
+            # lands on the next run's first move, which is a move to a named pose
+            # that has nothing to do with the part, and says nothing about the
+            # part. This backs the probe off along its own axis, which is the one
+            # motion available from there; anything else in collision is reported
+            # and left alone. Costs one service call when there is nothing wrong.
+            out["start_state"] = recover_contact_start_state(
+                contact=_ec_contact(),
+                positions=(ec_scan_path.positions
+                           if ec_scan_path is not None else None))
+
             if region is None:
                 print("1/5  detecting the specimen")
                 region = detect_part(index=index)
@@ -2240,9 +2933,14 @@ def run_automated_scan(index=0, scan=True, cutoff=None, line_spacing=None,
             out["roi"] = None
             if roi_select is not False:
                 print("2b/5 region of interest -- draw what should be scanned")
+                # line_spacing reaches the window because it is what decides
+                # whether a drawn region is wide enough to scan at all, and this
+                # run's spacing is the one that matters -- not the config's,
+                # when the caller overrode it.
                 region, out["roi"] = refine_region_interactively(
                     region, out["rough"], enabled=roi_select,
-                    title="Region to scan -- Azure rough mesh")
+                    title="Region to scan -- Azure rough mesh",
+                    line_spacing=line_spacing)
                 out["region"] = region
 
             print("3/5  Keyence raster (the measurement)")
@@ -2391,6 +3089,16 @@ except Exception as _e:
           "(%s); IK will not reseed out-of-band solutions." % (_e,))
 
 print("ECAutomatedScan ready.")
+# WHAT IS ACTUALLY LOADED, with the path each component came from. The cell, the
+# container and a developer's host run different builds of this stack, and the
+# differences do not announce themselves: an install behind the workspace shows up
+# as a fault that was fixed long ago, and a compiled extension older than the
+# library it links against shows up as a segfault. Neither is diagnosable from a
+# log that does not say what was imported.
+try:
+    print(describe_software_versions())
+except Exception as _e:                                       # noqa: BLE001
+    print("  software versions: unavailable (%s)" % (_e,))
 print("  step %.3f mm along a pass, %.2f mm between passes, sweep %.1f mm/s"
       % (SCAN_STEP_SIZE*1e3, SCAN_LINE_SPACING*1e3, SCAN_VELOCITY*1e3))
 print("  near the part %.0f mm/s, away %.0f mm/s, joint moves at MoveIt scaling %s; "
@@ -2457,6 +3165,14 @@ print("           plan_ec_path()  preview_ec_scan()")
 print("  motion:  dry_run_ec_scan()  ec_joint_report()  ec_touch_down()  ec_lift()")
 print("           park_arm()")
 print("  setup:   setup_ec()  null_here()  set_rotation(deg)  set_gain(h, v)")
+# set_probe_rotation() TURNS THE ARM; set_rotation() turns a phase. Two very
+# different verbs one letter apart, so they are named on separate lines with what
+# each one moves.
+print("  probe:   set_probe_rotation(deg) turns the COIL about its own axis -- a")
+print("           split-D answers to cracks across its split, so this is which")
+print("           flaw direction is being looked for. set_ec_preload(m) is how")
+print("           hard it presses. set_rotation(deg) is the instrument's phase")
+print("           and moves nothing.")
 print("  all of it: run_automated_scan(scan=False)   region=(xmin,ymin,xmax,ymax) "
       "skips detection")
 print("             roi_select=False runs it with nobody there")

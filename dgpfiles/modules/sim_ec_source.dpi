@@ -165,8 +165,8 @@ class SimECSource(object):
 
     #: Peak-to-peak lift-off wander, volts. Stands in for surface finish and for
     #: the millimetre-scale mesh error the probe rides over: the scan commands
-    #: the tip onto the MEASURED surface, so with no preload (EC_PRELOAD_M = 0
-    #: in the config) mesh error is lift-off 1:1.
+    #: the tip onto the MEASURED surface, so with no contact preload
+    #: (set_ec_preload() in the config) mesh error is lift-off 1:1.
     LIFTOFF_V = 0.45
     LIFTOFF_PERIOD_M = 0.018
 

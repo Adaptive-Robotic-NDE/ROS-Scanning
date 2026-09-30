@@ -212,6 +212,45 @@ vertex_adjacency = NS["_vertex_adjacency"]
 geodesic_pairs = NS["_geodesic_pairs"]
 nearest_vertex = NS["_nearest_vertex"]
 MeshNotPlannable = NS["MeshNotPlannable"]
+tool_axis_flip_report = NS["tool_axis_flip_report"]
+repair_tool_axis_to_surface = NS["repair_tool_axis_to_surface"]
+describe_tool_axis_flips = NS["describe_tool_axis_flips"]
+non_degenerate_faces = NS["_non_degenerate_faces"]
+closest_surface_faces = NS["_closest_surface_faces"]
+slerp_along = NS["_slerp_along"]
+resample_segments = NS["resample_segments"]
+tool_twist_deg = NS["tool_twist_deg"]
+
+
+def _crop_by_mask(path, keep, what="path", min_points=4, why="excluded",
+                  detail="", quiet=True):
+    """Drop the waypoints `keep` marks False, splitting passes where they go.
+
+    mesh_reconstruction.dpi owns this, and repair_tool_axis_to_surface() looks it
+    up by name at call time the way enforce_path_clearance() does. Lifted out of
+    that file by its AST rather than reimplemented, so what these checks exercise
+    is the crop the cell runs -- a second copy of the splitting rule is exactly
+    how the two would drift apart.
+    """
+    return _CROP(path, keep, what, min_points, why, detail, quiet)
+
+
+def _lift_crop():
+    import ast as _ast
+    src = open(os.path.join(HERE, "mesh_reconstruction.dpi")).read()
+    src = "\n".join(l for l in src.splitlines() if not l.startswith("global "))
+    tree = _ast.parse(src)
+    lines = src.splitlines()
+    ns = dict(NS)
+    for node in tree.body:
+        if isinstance(node, _ast.FunctionDef) and node.name == "_crop_path_by_mask":
+            exec(compile("\n".join(lines[node.lineno-1:node.end_lineno]),
+                         "mesh_reconstruction.dpi", "exec"), ns)
+            return ns["_crop_path_by_mask"]
+    raise AssertionError("mesh_reconstruction.dpi has no _crop_path_by_mask()")
+
+
+_CROP = _lift_crop()
 
 
 # ------------------------------------------------------------------------------
@@ -1108,6 +1147,358 @@ def test_run1_the_stress_case():
           len(sane) == len(new))
 
 
+# ==============================================================================
+# TURNED-ROUND POSES: FOUND, COUNTED, REPAIRED OR DROPPED
+# ==============================================================================
+# WHY THIS BLOCK EXISTS ON TOP OF THE POSTCONDITION. On a normal-constrained path
+# assert_probe_normal_to_surface() compares the tool axis with the SAME
+# sample_mesh_normals() call that produced it, so any error in the sampler
+# cancels and the answer is 0.000 deg by arithmetic -- 0.000 on all five recorded
+# runs in this cell, at a line spacing where the sampler can pick a triangle
+# 1.47 mm from the waypoint. These checks measure the three things a
+# self-cancelling check cannot:
+#
+#   * a reversed axis, against the surface at the waypoint rather than against
+#     world up;
+#   * a TANGENTIAL axis, which reversing does not fix and a reversal test does
+#     not see;
+#   * a report that cannot say nothing was flipped when something was.
+
+
+def _turned(path, which, angle_deg=180.0):
+    """A copy of `path` with the poses in `which` turned about their OWN x axis.
+
+    Right-multiplied, so the turn is in the tool frame and the angle is exactly
+    the angle the tool AXIS moves through, whatever the pose was: 180 deg reverses
+    it and 90 leaves it lying along the surface. A world-frame rotation would not
+    -- on a pose already tilted on a flank it reflects the axis instead, which is
+    neither a clean reversal nor a clean tangent, and the ground truth these
+    checks need would not be a known number.
+
+    180 about tool x is the exact turn orient_tool_away_from_surface() applies,
+    so it is also the fault being reproduced rather than an invented one.
+    """
+    q = np.array(path.quats, dtype=np.float64, copy=True)
+    h = math.radians(angle_deg)/2.0
+    dq = (math.sin(h), 0.0, 0.0, math.cos(h))
+    for i in np.atleast_1d(np.asarray(which)):
+        q[i] = NS["quat_mul"](tuple(q[i]), dq)
+    out = ScanPath(np.array(path.positions, copy=True), q,
+                   list(path.segment_starts), source=path.source)
+    NS["_carry_path_attrs"](path, out)
+    return out
+
+
+@_checked
+def test_a_reversed_pose_is_found_and_repaired():
+    print("\nA REVERSED POSE IS FOUND AGAINST THE SURFACE, AND PUT BACK")
+    v, n, t, nu, nv = cylinder_crown()
+    rng = np.random.default_rng(11)
+    bad_n, _pick = inject_alternating(n, rng, 0.05)
+    rep = repair_mesh_normals((v, bad_n, t), verbose=False, write=False)
+    surf = (v, rep["normals"], rep["triangles"])
+    pos, starts, path = _constrained_path(v, None, None, nu, nv, surface=surf)
+    # GROUND TRUTH: a known number of poses, turned right over.
+    which = np.arange(7, len(path), max(1, len(path)//23))[:17]
+    broken = _turned(path, which, 180.0)
+    r = tool_axis_flip_report(broken, surf)
+    check("%d poses turned over are found as %d REVERSED, %d tangential, %d off"
+          % (len(which), r["reversed"], r["tangential"], r["off_normal"]),
+          r["reversed"] == len(which) and r["tangential"] == 0
+          and r["off_normal"] == 0,
+          "the count IS the ground truth; a global up test would miss the ones "
+          "on the crown's flanks and flag none of the rest")
+    said = "\n".join(describe_tool_axis_flips(r))
+    check("and the report cannot say nothing was flipped",
+          "TURNED-ROUND POSES FOUND" in said and "%d REVERSED" % (len(which),) in said,
+          said[:120])
+    fixed, fr = repair_tool_axis_to_surface(broken, surf, verbose=False,
+                                            crop=_crop_by_mask)
+    check("the repair puts back exactly those %d and drops nothing (%d -> %d)"
+          % (fr["repaired"], len(broken), len(fixed)),
+          fr["repaired"] == len(which) and fr["dropped"] == 0
+          and len(fixed) == len(broken))
+    after = tool_axis_flip_report(fixed, surf)
+    check("afterwards NO pose opposes the local outward normal (worst %.2e deg, "
+          "%d reversed)" % (after["max_deg"], after["reversed"]),
+          after["reversed"] == 0 and after["max_deg"] < 1e-6
+          and after["wrong"] == 0)
+    # The positions are the measurement; the repair may not move them.
+    check("and not one position moved",
+          bool(np.array_equal(np.asarray(fixed.positions),
+                              np.asarray(broken.positions))))
+    # The roll is a measurement parameter and the repair carries it.
+    ref37 = NS["probe_rotation_reference"](37.0, (1.0, 0.0, 0.0))
+    rolled = _constrained_path(v, None, None, nu, nv, surface=surf)[2]
+    rolled = ScanPath(np.asarray(rolled.positions),
+                      locked_quats_from_axes(tool_axes(rolled.quats), ref37),
+                      list(rolled.segment_starts), source=rolled.source)
+    NS["_carry_path_attrs"](path, rolled)
+    rolled.roll_reference = ref37
+    rolled.roll_mode = "locked"
+    rb = _turned(rolled, which, 180.0)
+    rf, _ = repair_tool_axis_to_surface(rb, surf, verbose=False,
+                                        crop=_crop_by_mask)
+    tw = tool_twist_deg(rf.quats, reference=NS["roll_reference_quat"]((1.0, 0.0, 0.0)))
+    check("a 37 deg probe rotation SURVIVES the repair at every pose "
+          "(%+.3f..%+.3f deg)" % (tw.min(), tw.max()),
+          abs(tw.min() - 37.0) < 1e-6 and abs(tw.max() - 37.0) < 1e-6,
+          "the repair swings the axis and carries the roll; it does not re-lock it")
+
+
+@_checked
+def test_a_tangential_pose_is_counted_apart_from_a_reversed_one():
+    print("\nA TANGENTIAL AXIS IS A DIFFERENT DEFECT, AND IS COUNTED AS ONE")
+    v, n, t, nu, nv = cylinder_crown()
+    surf = (v, n, t)
+    pos, starts, path = _constrained_path(v, n, t, nu, nv)
+    tang = np.arange(5, len(path), max(1, len(path)//13))[:11]
+    rev = np.arange(9, len(path), max(1, len(path)//17))[:7]
+    rev = np.array([i for i in rev if i not in set(tang.tolist())])
+    broken = _turned(_turned(path, tang, 90.0), rev, 180.0)
+    r = tool_axis_flip_report(broken, surf)
+    check("%d poses laid along the surface read as %d TANGENTIAL, not as reversed"
+          % (len(tang), r["tangential"]),
+          r["tangential"] == len(tang),
+          "a reversal test sees nothing here: turning a tangential axis over "
+          "leaves it just as tangential")
+    check("and the %d genuinely reversed ones are still counted as %d REVERSED"
+          % (len(rev), r["reversed"]), r["reversed"] == len(rev))
+    said = "\n".join(describe_tool_axis_flips(r))
+    check("the report names both classes separately",
+          "%d TANGENTIAL" % (len(tang),) in said
+          and "%d REVERSED" % (len(rev),) in said)
+    fixed, fr = repair_tool_axis_to_surface(broken, surf, verbose=False,
+                                            crop=_crop_by_mask)
+    check("both classes are repaired (%d poses) and nothing is dropped"
+          % (fr["repaired"],),
+          fr["repaired"] == len(tang) + len(rev) and fr["dropped"] == 0)
+    check("afterwards nothing is tangential or reversed (worst %.2e deg)"
+          % (fr["residual_max_deg"],), fr["residual_wrong"] == 0)
+
+
+@_checked
+def test_away_facing_surface_is_dropped_never_turned_over():
+    print("\nSURFACE FACING AWAY FROM THE PROBE IS DROPPED, NOT TURNED OVER")
+    # A height field with a lip that folds back: the underside of the lip faces
+    # DOWN, so a probe coming from above cannot touch it at any tilt.
+    nu, nv = 41, 21
+    x = np.linspace(0.75, 0.85, nu)
+    y = np.linspace(0.0, 0.05, nv)
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    Z = np.full_like(X, 0.930)
+    v, t, _, _ = grid_mesh(X, Y, Z)
+    # Normals: up everywhere except one strip, where the surface genuinely faces
+    # down. This is the draped-skirt underside, not a sign error.
+    n = np.tile(np.array([0.0, 0.0, 1.0]), (len(v), 1))
+    strip = np.flatnonzero(np.abs(v[:, 0] - 0.80) < 0.006)
+    # Down AND sideways, 135 deg from up: the underside of a lip, which is what a
+    # reconstruction of a draped part really contains. Straight down is refused by
+    # the constraint itself (LOCKED_ROLL_GUARD_DEG) and would test that instead.
+    n[strip] = np.array([math.sin(math.radians(135.0)), 0.0,
+                         math.cos(math.radians(135.0))])
+    pos, starts = edge_midpoint_raster(v, t, nu, nv)
+    q = np.tile(np.array([0.0, 0.0, 0.0, 1.0]), (len(pos), 1))
+    path = scanpath_from_noether(_Reply(pos, q, starts), orient="normal",
+                                 roll="locked", roll_reference=(1.0, 0.0, 0.0),
+                                 surface=(v, n, t))
+    r = tool_axis_flip_report(path, (v, n, t))
+    check("%d waypoint(s) sit on surface facing AWAY from the probe"
+          % (r["away_facing_surface"],), r["away_facing_surface"] > 0)
+    check("and NONE of them reads as reversed, because the POSE agrees with its "
+          "surface -- it is the surface that faces the wrong way (%d reversed)"
+          % (r["reversed"],), r["reversed"] == 0,
+          "this is the distinction the whole rule turns on")
+    down_before = int((tool_axes(path.quats)[:, 2] < 0.0).sum())
+    fixed, fr = repair_tool_axis_to_surface(path, (v, n, t), verbose=False,
+                                            crop=_crop_by_mask)
+    check("%d of them were DROPPED with a count and a bounding box"
+          % (fr["dropped"],),
+          fr["dropped"] >= r["away_facing_surface"] and fr["dropped"] > 0
+          and fr["dropped_bbox"] is not None)
+    check("NOT turned over: the path had %d poses with the axis pointing down "
+          "and now has %d" % (down_before, int((tool_axes(fixed.quats)[:, 2] < 0).sum())),
+          down_before > 0 and int((tool_axes(fixed.quats)[:, 2] < 0.0).sum()) == 0,
+          "turning one over points the probe away from the part and drives the "
+          "holder into the specimen")
+    check("and the surviving poses are untouched (%d of %d kept)"
+          % (len(fixed), len(path)), len(fixed) < len(path) and len(fixed) > 0)
+    said = "\n".join(describe_tool_axis_flips(fr))
+    check("the report says DROPPED and says why",
+          "DROPPED" in said and "Not turned over" in said)
+
+
+@_checked
+def test_the_sampler_finds_the_triangle_the_waypoint_is_on():
+    print("\nTHE SAMPLER LOOKS PAST THE NEAREST VERTEX, AND PAST SLIVERS")
+    # A flat plate with one SLIVER welded across it: three nearly collinear
+    # vertices, so its plane stands almost vertical while the plate is flat. This
+    # is what a reconstruction really produces -- 99 of them in 10 153 faces on
+    # one of this cell's planning meshes, with altitudes down to 14 picometres --
+    # and it is how a waypoint on flat surface comes back 80 degrees out.
+    v, n, t = flat(nu=21, nv=21)
+    a0, b0 = 0, 1
+    mid = 0.5*(v[a0] + v[b0]) + np.array([0.0, 0.0, 2e-6])
+    v2 = np.vstack([v, mid[None, :]])
+    n2 = np.vstack([n, np.array([[0.0, 0.0, 1.0]])])
+    t2 = np.vstack([t, np.array([[a0, b0, len(v)]])])
+    keep = non_degenerate_faces(v2, t2)
+    p0, p1, p2 = v2[t2[-1, 0]], v2[t2[-1, 1]], v2[t2[-1, 2]]
+    fn = np.cross(p1 - p0, p2 - p0)
+    fn = fn/np.linalg.norm(fn)
+    check("the sliver's own plane stands %.1f deg from the flat plate it lies in"
+          % (ang_between(fn, np.array([0.0, 0.0, 1.0]))[0],),
+          ang_between(fn, np.array([0.0, 0.0, 1.0]))[0] > 80.0)
+    check("it is recognised as a sliver and every honest face is kept "
+          "(%d of %d faces)" % (int(keep.sum()), len(t2)),
+          bool(keep[:-1].all()) and not bool(keep[-1]),
+          "an absolute area threshold does not separate these; the ratio of the "
+          "smallest altitude to the longest edge does")
+    # sample_mesh_normals must not read that face for a point on the plate.
+    probe = np.array([mid + np.array([0.0, 0.0002, -2e-6])])
+    got, dist = sample_mesh_normals((v2, n2, t2), probe)
+    check("a waypoint beside the sliver is still sampled on the plate (%.4f mm "
+          "away, normal %s)" % (dist[0]*1e3, np.round(got[0], 4)),
+          dist[0] < 1e-6 and got[0][2] > 0.999)
+    fa = NS["_tool_axis_against_faces"]((v2, n2, t2), probe,
+                                        np.array([[0.0, 0.0, 1.0]]))
+    check("and the independent face check does not read that sliver either "
+          "(%.3f deg)" % (fa[0],), fa[0] < 1.0)
+    # And the vertex-count bound: with only the nearest vertex's faces, a
+    # waypoint whose closest triangle is one vertex further off is missed.
+    v3, n3, t3, nu3, nv3 = cylinder_crown(nu=31, nv=21)
+    pts, _ = edge_midpoint_raster(v3, t3, nu3, nv3)
+    f1, _w1, d1, _h1 = closest_surface_faces(v3, t3, pts, vertices=1)
+    f8, _w8, d8, _h8 = closest_surface_faces(v3, t3, pts, vertices=8)
+    check("searching 8 nearest vertices is never worse than searching 1 "
+          "(worst improvement %.4f mm)" % ((d1 - d8).max()*1e3,),
+          bool((d8 <= d1 + 1e-12).all()))
+    # THE PAIR BLOCK IS A MEMORY BOUND AND NOTHING ELSE. It restricts how many
+    # (waypoint, triangle) pairs are evaluated at once and never which triangles a
+    # waypoint is compared with, so the answer must be bit-identical at any block
+    # size -- asserted rather than trusted, the same as the normal fit's.
+    saved = NS["NORMAL_SAMPLE_PAIR_BLOCK"]
+    try:
+        NS["NORMAL_SAMPLE_PAIR_BLOCK"] = 1000000
+        a, _d = sample_mesh_normals((v3, n3, t3), pts)
+        NS["NORMAL_SAMPLE_PAIR_BLOCK"] = 97
+        b, _d = sample_mesh_normals((v3, n3, t3), pts)
+    finally:
+        NS["NORMAL_SAMPLE_PAIR_BLOCK"] = saved
+    check("and the pair block changes not one bit (%d waypoints, block 1000000 "
+          "against 97)" % (len(pts),), bool(np.array_equal(a, b)))
+    # THE INDEPENDENT FACE CHECK SAMPLES, AND SAYS SO. It reports a distribution,
+    # and its search is the expensive half, so it is capped -- and the count it
+    # measured over has to be in the report or 50 000 reads as the whole path.
+    savedcap = NS["FACE_CHECK_MAX_WAYPOINTS"]
+    try:
+        NS["FACE_CHECK_MAX_WAYPOINTS"] = 200
+        pos3, starts3, path3 = _constrained_path(v3, n3, t3, nu3, nv3)
+        r3 = assert_probe_normal_to_surface(path3, (v3, n3, t3), verbose=False,
+                                           mode="off")
+    finally:
+        NS["FACE_CHECK_MAX_WAYPOINTS"] = savedcap
+    check("with the cap at 200 the face check measured %d of %d waypoints and "
+          "reports which" % (r3["face_waypoints"], r3["waypoints"]),
+          r3["face_waypoints"] == 200 and r3["waypoints"] > 200)
+
+
+def ripple(nu=61, nv=21, amp=0.005, waves=5.0):
+    """A rippled height field. -> (v, n_analytic, t, nu, nv)
+
+    A CYLINDER IS THE ONE SURFACE THIS TEST CANNOT USE. Its normal turns linearly
+    with arc length, so interpolating between two waypoints' axes lands exactly on
+    the true normal at the point between them and the fault under test does not
+    appear at all. A ripple's normal does not, which is the ordinary case on a
+    reconstructed part.
+    """
+    x = np.linspace(0.75, 0.85, nu)
+    y = np.linspace(0.0, 0.05, nv)
+    X, Y = np.meshgrid(x, y, indexing="ij")
+    k = 2.0*np.pi*waves/0.10
+    Z = 0.930 + amp*np.sin(k*(X - 0.75))
+    v, t, _, _ = grid_mesh(X, Y, Z)
+    # dz/dx = amp k cos(k dx); the outward normal is (-dz/dx, 0, 1) normalised.
+    slope = amp*k*np.cos(k*(v[:, 0] - 0.75))
+    n = np.column_stack([-slope, np.zeros(len(v)), np.ones(len(v))])
+    return v, n/np.linalg.norm(n, axis=1, keepdims=True), t, nu, nv
+
+
+@_checked
+def test_resampling_keeps_the_probe_on_the_normal():
+    print("\nRESAMPLING RE-READS THE SURFACE INSTEAD OF INTERPOLATING THE AXIS")
+    v, n, t, nu, nv = ripple()
+    surf = (v, n, t)
+    pos, starts, path = _constrained_path(v, n, t, nu, nv)
+    r0 = assert_probe_normal_to_surface(path, surf, verbose=False, mode="off")
+    # Without the surface the axis can only be interpolated, and the departure
+    # from the normal at the NEW position is the measurement.
+    bare = ScanPath(np.asarray(path.positions), np.asarray(path.quats),
+                    list(path.segment_starts), source=path.source)
+    bare.roll_mode = "locked"
+    lerped = resample_segments(bare, 0.006, reference=(1.0, 0.0, 0.0))
+    rl = assert_probe_normal_to_surface(lerped, surf, verbose=False, mode="off")
+    resampled = resample_segments(path, 0.006, reference=(1.0, 0.0, 0.0))
+    rr = assert_probe_normal_to_surface(resampled, surf, verbose=False, mode="off")
+    check("planned worst %.2e deg; resampled WITH the surface %.2e deg; "
+          "interpolated instead %.2f deg"
+          % (r0["max_deg"], rr["max_deg"], rl["max_deg"]),
+          r0["max_deg"] < 1e-6 and rr["max_deg"] < 1e-6 and rl["max_deg"] > 2.0,
+          "a resampled waypoint is a NEW place on the part, so the axis there is "
+          "a question for the surface and not for its neighbours")
+    check("the resample says which it did (axis_from_surface %s, %d -> %d "
+          "waypoints)" % (resampled.resampled["axis_from_surface"],
+                          resampled.resampled["waypoints_before"],
+                          resampled.resampled["waypoints_after"]),
+          resampled.resampled["axis_from_surface"] is True
+          and lerped.resampled["axis_from_surface"] is False)
+    # And the interpolation itself is a rotation, not a chord.
+    s = np.array([0.0, 1.0])
+    d = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    mid = slerp_along(s, d, np.array([0.5]))[0]
+    check("slerp_along() puts the halfway direction on the great circle "
+          "(%.4f deg from each end)" % (ang_between(mid, d[0])[0],),
+          abs(ang_between(mid, d[0])[0] - 45.0) < 1e-9
+          and abs(ang_between(mid, d[1])[0] - 45.0) < 1e-9)
+
+
+@_checked
+def test_the_postcondition_has_an_independent_half():
+    print("\nTHE POSTCONDITION NO LONGER CHECKS ITSELF")
+    v, n, t, nu, nv = cylinder_crown()
+    surf = (v, n, t)
+    pos, starts, path = _constrained_path(v, n, t, nu, nv)
+    r = assert_probe_normal_to_surface(path, surf, verbose=False, mode="off")
+    check("against the vertex normals it reads %.2e deg, which it must, because "
+          "that is where the axis came from" % (r["max_deg"],),
+          r["max_deg"] < 1e-6)
+    check("and INDEPENDENTLY, against the plane of each waypoint's own triangle, "
+          "%.3f deg with %d reversed -- a different quantity that cannot cancel"
+          % (r["face_max_deg"], r["face_reversed"]),
+          r["face_reversed"] == 0 and 0.0 < r["face_max_deg"] < 5.0,
+          "its floor is the mesh's faceting, so it is a diagnostic and not a "
+          "tolerance")
+    # Turn the mesh's vertex normals over without touching its triangles, and turn
+    # the path's axes over with them, so the two still agree. The self-cancelling
+    # half reads zero; the independent half does not. (scanpath_from_noether()
+    # refuses such a surface outright -- MeshNotPlannable, "inside out" -- which is
+    # why the path is built here by hand: the point is what the CHECK can see, not
+    # what the constraint lets through.)
+    surf2 = (v, -n, t)
+    path2 = ScanPath(np.asarray(path.positions),
+                     locked_quats_from_axes(-tool_axes(path.quats),
+                                            (1.0, 0.0, 0.0)),
+                     list(path.segment_starts), source=path.source)
+    path2.normal_constrained = True
+    r2 = assert_probe_normal_to_surface(path2, surf2, verbose=False, mode="off")
+    check("with the vertex normals inside out the old check still reads %.2e deg"
+          % (r2["max_deg"],), r2["max_deg"] < 1e-6,
+          "this is the tautology, demonstrated")
+    check("while the independent half reads %.1f deg with %d of %d reversed"
+          % (r2["face_max_deg"], r2["face_reversed"], r2["waypoints"]),
+          r2["face_reversed"] == r2["waypoints"] and r2["face_max_deg"] > 170.0)
+
+
 def main():
     for fn in (test_not_blind, test_neighbourhood_and_components,
                test_blocking_changes_no_number,
@@ -1119,7 +1510,13 @@ def main():
                test_surface_faults_are_refused_not_flipped,
                test_the_other_smoothers_stand_down,
                test_reachability_is_reported_not_deleted,
-               test_run2_the_expected_input, test_run1_the_stress_case):
+               test_run2_the_expected_input, test_run1_the_stress_case,
+               test_a_reversed_pose_is_found_and_repaired,
+               test_a_tangential_pose_is_counted_apart_from_a_reversed_one,
+               test_away_facing_surface_is_dropped_never_turned_over,
+               test_the_sampler_finds_the_triangle_the_waypoint_is_on,
+               test_resampling_keeps_the_probe_on_the_normal,
+               test_the_postcondition_has_an_independent_half):
         fn.__wrapped__()
     print("\n%d check(s) failed%s"
           % (len(fails), "; %d skipped" % (len(skips),) if skips else ""))

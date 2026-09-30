@@ -557,6 +557,296 @@ def tool_roll_report(quats, segments=None, reference=(1.0, 0.0, 0.0),
             "orientation_step_deg": float(ostep)}
 
 
+# ------------------------------------------------------------------------------
+# THE PROBE'S OWN ROTATION, SET BY THE OPERATOR AND HELD FOR THE WHOLE SCAN
+# ------------------------------------------------------------------------------
+# WHY THERE IS A SETTING AT ALL. A split-D differential coil is DIRECTIONAL: it
+# responds to a crack perpendicular to its split and is nearly blind to one
+# parallel to it. So which way the probe is turned about its own axis is a
+# measurement parameter, not a free choice the planner may make -- and the
+# planner was making it, because Noether takes the tool x from the raster's
+# direction of travel (see regularize_tool_roll()).
+#
+# WHAT ZERO MEANS, and it is stated here once because every other file points at
+# this comment: at a rotation of ZERO the probe's split lies along the roll
+# reference direction in the PART's frame -- NOETHER_ROLL_REFERENCE, which is
+# world +x in this cell -- with the probe axis vertical. A POSITIVE rotation
+# turns the split anticlockwise about the probe's own axis seen from outside the
+# part (the right-hand rule about tool +z, which points away from the surface).
+# The rotation is in DEGREES and it is the same number in the part frame at every
+# waypoint of every pass.
+#
+# HOW IT IS HELD CONSTANT, by construction rather than by checking afterwards.
+# The "locked" roll builds every pose as ONE reference orientation swung onto the
+# surface normal by the smallest rotation about a horizontal axis. A swing adds
+# no rotation about the tool's own axis, so if the rotation is baked into that
+# ONE reference orientation, every pose carries exactly it -- every pass, both
+# serpentine directions, every waypoint. The direction of travel never enters,
+# because nothing in the construction reads it.
+#
+# AND WHY IT HAS TO BE CHECKED BEFORE THE ARM MOVES. The rotation lands on wrist
+# 3 one degree for one degree, and wrist 3 is the joint the cable envelope
+# bounds. Nothing here may resolve a refusal by adding or subtracting 360: the
+# cables physically wrap, so -6 deg and +354 deg are the same tool orientation
+# and entirely different cable states, and the ABSOLUTE angle governs.
+
+global probe_rotation_reference
+def probe_rotation_reference(degrees, reference=(1.0, 0.0, 0.0),
+                             up=(0.0, 0.0, 1.0)):
+    """The roll reference with the probe turned `degrees` about its own axis.
+
+    -> a reference ORIENTATION as (x, y, z, w), which is what every roll-aware
+    function here already accepts in place of a direction. Hand it to
+    scanpath_from_noether(roll_reference=), regularize_tool_roll(),
+    locked_quats_from_axes() or smooth_tool_axis() and the rotation is in the
+    pose construction rather than applied to it afterwards.
+
+    Right-multiplied, because the turn is about the TOOL's own z and not about
+    the world's: q = q_datum * Rz(degrees).
+    """
+    q0 = roll_reference_quat(reference, up=up)
+    half = math.radians(float(degrees))*0.5
+    return tuple(quat_mul(q0, (0.0, 0.0, math.sin(half), math.cos(half))))
+
+
+global probe_rotation_of
+def probe_rotation_of(quats, reference=(1.0, 0.0, 0.0), up=(0.0, 0.0, 1.0)):
+    """How far each pose turns the probe about its own axis from the zero datum.
+
+    Degrees, in [-180, 180). This is tool_twist_deg() named for what it means
+    here: on a correctly built path it is the SET rotation at every waypoint, and
+    its spread is the evidence that travel direction did not leak into it.
+    """
+    return tool_twist_deg(quats, reference=roll_reference_quat(reference, up=up))
+
+
+global probe_rotation_wrist3_deg
+def probe_rotation_wrist3_deg(degrees, datum_deg):
+    """The absolute wrist_3 angle a probe rotation implies, in degrees.
+
+    `datum_deg` is the wrist_3 angle the arm holds at the ZERO datum with the
+    probe axis vertical -- a measured per-cell number, because it depends on how
+    the tooling is bolted on. The relation is exact and additive: rotating the
+    tool about its own axis IS wrist 3, one degree for one degree.
+
+    NOT REDUCED INTO ANY RANGE. That is the whole point: see check_probe_rotation().
+    """
+    return float(datum_deg) + float(degrees)
+
+
+global _tilt_coordinates
+def _tilt_coordinates(quats, home_quat=(0.0, 0.0, 0.0, 1.0)):
+    """(tx_deg, ty_deg) per pose, in the plane the cable envelope was measured in.
+
+    wrist3_tilt_of() for a whole array: the minimal rotation carrying the home
+    tool axis onto each pose's, as x and y components in degrees. Vectorised here
+    because a real toolpath has hundreds of thousands of poses and that function
+    takes one at a time.
+    """
+    q = _unit_quats(quats)
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    a = np.stack([2.0*(x*z + y*w), 2.0*(y*z - x*w), 1.0 - 2.0*(x*x + y*y)],
+                 axis=1)
+    a0 = quat_to_matrix(np.asarray(home_quat, dtype=np.float64))[:, 2]
+    a0 = a0/max(float(np.linalg.norm(a0)), 1e-300)
+    axis = np.cross(np.broadcast_to(a0, a.shape), a)
+    s = np.linalg.norm(axis, axis=1)
+    c = np.clip(a.dot(a0), -1.0, 1.0)
+    angle = np.arctan2(s, c)
+    scale = np.where(s > 1e-12, angle/np.maximum(s, 1e-300), 0.0)
+    v = axis*scale[:, None]
+    # Anti-parallel: the tool is upside down, a 180 degree tilt with no direction,
+    # and outside any measured hull. Reported as such rather than as no tilt.
+    flip = (s <= 1e-12) & (c < 0.0)
+    tx = np.degrees(v[:, 0])
+    ty = np.degrees(v[:, 1])
+    tx = np.where(flip, 180.0, tx)
+    ty = np.where(flip, 0.0, ty)
+    return tx, ty
+
+
+global check_probe_rotation
+def check_probe_rotation(degrees, path=None, datum_deg=None,
+                         reference=(1.0, 0.0, 0.0), up=(0.0, 0.0, 1.0),
+                         margin_deg=None, per_pass=True, what="probe rotation",
+                         verbose=True, indent="  "):
+    """Refuse a probe rotation the cables cannot hold, BEFORE anything moves.
+
+    -> a report dict. Raises (CableRefused where cable_envelope.dpi is loaded,
+    RuntimeError otherwise) naming the rotation, the wrist_3 angle it implies and
+    the band that was allowed.
+
+    With a `path`, the band is taken at the tilt of EACH pose rather than at a
+    single worst case, because the band the cables allow depends on how far the
+    tool is leaned -- so a rotation can be fine over one end of a part and
+    refused over the other. The passes that are outside are named.
+
+    NEVER RESOLVED BY +/-360. The cables wrap: -6.3 deg and +353.7 deg are one
+    tool orientation and two cable states, and the absolute angle is the one that
+    matters. A refusal here means choosing a different rotation or re-measuring
+    the envelope, not turning the wrist the other way round to the same place.
+    """
+    band_fn = globals().get("wrist3_band_deg")
+    refuse = globals().get("CableRefused") or RuntimeError
+    #: Where the datum came from, so a report can say whether it was measured.
+    datum_from = "the caller"
+    if datum_deg is None:
+        # THE MEASUREMENT FIRST, THE CONFIG SECOND. The envelope capture records
+        # the wrist_3 angle at the reference orientation in the same joint state
+        # it measures the band from, so the two belong together and the measured
+        # pair is self-consistent. A constant in a config is the same number
+        # transcribed by hand, and it goes stale the moment the tooling is
+        # unbolted -- silently, because it still looks like a measurement.
+        datum_fn = globals().get("wrist3_datum_deg")
+        if callable(datum_fn):
+            try:
+                datum_deg = datum_fn(tilt=(0.0, 0.0))
+            except Exception:                                     # noqa: BLE001
+                datum_deg = None
+            if datum_deg is not None:
+                datum_from = "the measured cable envelope"
+    if datum_deg is None:
+        datum_deg = globals().get("EC_PROBE_ROTATION_WRIST3_DEG")
+        if datum_deg is not None:
+            datum_from = "EC_PROBE_ROTATION_WRIST3_DEG in the config"
+    rep = {"rotation_deg": float(degrees), "datum_deg": datum_deg,
+           "datum_from": datum_from,
+           "checked": False, "wrist3_deg": None, "band_deg": None,
+           "passes_outside": [], "poses": 0}
+    if datum_deg is None or not callable(band_fn):
+        rep["why"] = ("no measured cable envelope for this cell"
+                      if callable(band_fn) else
+                      "cable_envelope.dpi is not loaded")
+        if datum_deg is None:
+            rep["why"] = ("EC_PROBE_ROTATION_WRIST3_DEG is not set: the wrist_3 "
+                          "angle at the zero datum is a measured property of how "
+                          "the tooling is bolted on")
+        if verbose:
+            print("%s%s: %+.1f deg is UNCHECKED against the cables (%s). Measure "
+                  "the envelope before scanning."
+                  % (indent, what, float(degrees), rep["why"]))
+        return rep
+
+    w3 = probe_rotation_wrist3_deg(degrees, datum_deg)
+    rep["wrist3_deg"] = w3
+    rep["checked"] = True
+
+    # The untilted band first: it is the one every pose has to pass whatever the
+    # surface does, and it is the one the operator can act on.
+    try:
+        lo, hi = band_fn(tilt=(0.0, 0.0), margin_deg=margin_deg)
+    except Exception as e:                                        # noqa: BLE001
+        rep["checked"] = False
+        rep["why"] = str(e).splitlines()[0][:120]
+        if verbose:
+            print("%s%s: %+.1f deg is UNCHECKED against the cables (%s)."
+                  % (indent, what, float(degrees), rep["why"]))
+        return rep
+    rep["band_deg"] = (lo, hi)
+    if w3 < lo - 1e-9 or w3 > hi + 1e-9:
+        raise refuse(
+            "a %s of %+.1f deg puts wrist 3 at %+.1f deg, and the cables allow "
+            "%+.1f..%+.1f deg with the probe held vertical. Nothing has moved.\n"
+            "  The rotation lands on wrist 3 one degree for one degree from the "
+            "zero datum (%+.1f deg, from %s), so the rotations this cell can hold "
+            "at no tilt are %+.1f..%+.1f deg.\n"
+            "  This is an ABSOLUTE joint angle. Turning the other way round to "
+            "the same probe orientation is a different cable state and is NOT a "
+            "fix: do not add or subtract 360."
+            % (what, float(degrees), w3, lo, hi, float(datum_deg), datum_from,
+               lo - float(datum_deg), hi - float(datum_deg)))
+
+    if path is not None and per_pass:
+        # Per pose, at the tilt each pose actually asks for. A pass whose band is
+        # tighter than the untilted one is named rather than being hidden behind
+        # an average.
+        #
+        # ONE BAND LOOKUP PER DISTINCT TILT, not per waypoint: the band is a
+        # function of the tilt alone, and a real path has hundreds of thousands
+        # of waypoints over a few dozen tilts once they are taken to the nearest
+        # degree. The rounding is OUTWARD, away from no tilt, so a pose is never
+        # graded against a band measured closer to vertical than it is.
+        home = getattr(globals().get("cable_envelope_model", lambda: None)(),
+                       "home_quat", (0.0, 0.0, 0.0, 1.0)) or (0.0, 0.0, 0.0, 1.0)
+        tx, ty = _tilt_coordinates(path.quats, home)
+        key = np.column_stack([np.sign(tx)*np.ceil(np.abs(tx)),
+                               np.sign(ty)*np.ceil(np.abs(ty))])
+        uniq, inv = np.unique(key, axis=0, return_inverse=True)
+        inv = np.asarray(inv).ravel()
+        # THE DATUM MOVES WITH THE TILT TOO, when it was measured. Reaching a tilt
+        # turns the wrist on the way, so the wrist_3 angle at zero rotation is not
+        # the untilted one -- across this cell's five samples it runs 147 to 179
+        # deg. Both ends of the comparison therefore have to be taken at the same
+        # tilt: the band AND the angle the rotation implies. Using the untilted
+        # datum against a tilted band compares two different places.
+        #
+        # With no measured datum this falls back to the single `w3` above at every
+        # tilt, which is what it did before the measurement was carried through.
+        datum_fn = globals().get("wrist3_datum_deg")
+        bands = {}
+        w3_at = {}
+        for j, (ux, uy) in enumerate(uniq):
+            tilt = (float(ux), float(uy))
+            try:
+                bands[j] = band_fn(tilt=tilt, margin_deg=margin_deg)
+            except Exception:
+                # A tilt outside the measured hull is not a band, and it is the
+                # tilt cap's business rather than the rotation's.
+                bands[j] = None
+            w3_at[j] = w3
+            if callable(datum_fn):
+                try:
+                    d = datum_fn(tilt=tilt)
+                except Exception:                                 # noqa: BLE001
+                    d = None
+                if d is not None:
+                    w3_at[j] = probe_rotation_wrist3_deg(degrees, d)
+        rep["poses"] = int(len(inv))
+        outside = []
+        for si, (a, b) in enumerate(path.segments):
+            if b <= a:
+                continue
+            worst = None
+            for j in np.unique(inv[a:b]):
+                band = bands[int(j)]
+                if band is None:
+                    continue
+                plo, phi = band
+                w3_here = w3_at[int(j)]
+                if w3_here < plo - 1e-9 or w3_here > phi + 1e-9:
+                    i = int(a + np.flatnonzero(inv[a:b] == j)[0])
+                    if worst is None or (phi - plo) < (worst[2] - worst[1]):
+                        worst = (i, plo, phi, w3_here)
+            if worst is not None:
+                outside.append({"segment": si, "waypoint": worst[0],
+                                "lo_deg": worst[1], "hi_deg": worst[2],
+                                "wrist3_deg": worst[3]})
+        rep["passes_outside"] = outside
+        if outside:
+            raise refuse(
+                "a %s of %+.1f deg puts wrist 3 at %+.1f deg, which is inside the "
+                "untilted band %+.1f..%+.1f deg but OUTSIDE the band at the tilt "
+                "%d of the %d pass(es) need. Nothing has moved.\n"
+                "  The first is pass %d at waypoint %d, where the cables allow "
+                "%+.1f..%+.1f deg. The band tightens as the tool leans, so this "
+                "rotation is holdable over part of the specimen and not over the "
+                "rest: choose a rotation inside every pass's band, shrink the "
+                "scan area to the part that can hold this one, or measure the "
+                "envelope at the tilts this path needs.\n"
+                "  Do not add or subtract 360 to get inside a band."
+                % (what, float(degrees), w3, lo, hi, len(outside),
+                   len(path.segments), outside[0]["segment"],
+                   outside[0]["waypoint"], outside[0]["lo_deg"],
+                   outside[0]["hi_deg"]))
+    if verbose:
+        print("%s%s: %+.1f deg puts wrist 3 at %+.1f deg, inside the measured "
+              "%+.1f..%+.1f deg%s"
+              % (indent, what, float(degrees), w3, lo, hi,
+                 " at every pose of every pass" if rep["poses"]
+                 else " with the probe vertical"))
+    return rep
+
+
 def orient_tool_away_from_surface(quats, up=(0.0, 0.0, 1.0)):
     """Make every tool z axis point away from the specimen, not into it.
 
@@ -1001,10 +1291,14 @@ def _quats_from_surface_normals(pos, quats, surface, up=(0.0, 0.0, 1.0)):
     postcondition, at exactly 180 degrees and nowhere else.
 
     A surface facing away from the probe is not a sign error. It is an
-    UNREACHABLE REGION: its tool axis comes out past 90 degrees from vertical,
-    tool_reachability_report() counts it and says where it is, and the scan
-    config's tilt limit excludes it. Reported, not flipped, and not silently
-    dropped either.
+    UNREACHABLE REGION, and repair_tool_axis_to_surface() is what DROPS it, with a
+    count and a bounding box, once the path is built. Nothing here turns one over.
+
+    THE COUNT THIS FUNCTION REPORTS IS AGAINST WORLD UP, and that is all it can
+    be: it is a statement about the direction the probe COMES FROM, which is
+    global. It is not a check on the poses -- a pose can be turned round with
+    respect to the surface it sits on and be perfectly vertical. That check is
+    tool_axis_flip_report(), and it is measured against the surface.
 
     Two refusals, both of them about the surface rather than the path:
       * MOST of the normals facing into the part means the mesh is INSIDE OUT, and
@@ -1276,24 +1570,59 @@ def mesh_uv_x3d(mesh_filename, x3d_filename, method="planar", timeout=900.0,
     return x3d_filename
 
 
-def orient_segments_along(path, direction):
-    """A copy of `path` with every segment ordered to travel along `direction`.
+def orient_segments_along(path, direction, serpentine=False):
+    """A copy of `path` with the direction of travel of every pass CHOSEN.
 
-    principal_axis_noether does not keep a sign -- its own check is commented
-    out -- so one plan's passes may run +x and the next plan's -x. For a probe
-    dragged in contact the direction of travel is part of the measurement: the
-    fixture leans against it. This makes it a choice. Segments shorter than two
-    waypoints, and ones square to `direction`, are left as they are.
+    THIS IS THE ONE PLACE THE ORDER OF A PASS IS DECIDED. principal_axis_noether
+    does not keep a sign -- its own check is commented out -- so one plan's
+    passes may run +x and the next plan's -x, and whatever the planner's own
+    snake modifier did is undone here. Nothing downstream re-orders a pass:
+    resample_segments() interpolates along each pass as it stands, and the crops
+    and the clearance gate only drop waypoints.
+
+    serpentine=False is a COMB: every pass runs along `direction`, so the probe
+    is carried the whole length of the part back to the same side between
+    passes. That is the honest choice for a reading that depends on the
+    direction of travel -- a probe dragged in contact leans against its travel
+    in the spring fixture, and alternating the lean alternates the lift-off,
+    which stripes the image line by line.
+
+    serpentine=True is a RASTER: the first pass runs along `direction` and each
+    one after it starts at whichever of its ends is nearer to where the previous
+    pass finished. On a raster that is strict alternation, and the move between
+    passes becomes one line spacing sideways instead of the length of the part --
+    most of the per-pass overhead of a many-pass scan. Taking the nearer end
+    rather than counting passes odd and even also keeps this sensible when a
+    crop has split a pass in two or the passes do not arrive in tidy order.
+
+    REVERSING A PASS MUST NOT TOUCH THE TOOL FRAME. Only the ORDER of the
+    waypoints changes; each waypoint's orientation travels with its position, so
+    the frame the tool holds at any given point on the surface is the same in
+    either direction. Nothing here recomputes an orientation from the direction
+    of travel -- doing that at a serpentine turn hands back a 180 degree flip,
+    which points the tool z into the part.
+
+    Segments shorter than two waypoints, and ones square to `direction`, are
+    left as they are.
     """
     d = np.asarray(direction, dtype=np.float64).reshape(3)
     d = d/np.linalg.norm(d)
     pos, qs, starts = [], [], []
     reversed_count = 0
+    prev_end = None
     for a, b in path.segments:
         idx = list(range(a, b))
-        if b - a >= 2 and float(np.dot(path.positions[b-1] - path.positions[a], d)) < 0.0:
-            idx = idx[::-1]
-            reversed_count += 1
+        if b - a >= 2:
+            head, tail = path.positions[a], path.positions[b-1]
+            if serpentine and prev_end is not None:
+                flip = (float(np.linalg.norm(head - prev_end))
+                        > float(np.linalg.norm(tail - prev_end)))
+            else:
+                flip = float(np.dot(tail - head, d)) < 0.0
+            if flip:
+                idx = idx[::-1]
+                reversed_count += 1
+        prev_end = path.positions[idx[-1]]
         starts.append(len(pos))
         pos.extend(path.positions[i] for i in idx)
         qs.extend(path.quats[i] for i in idx)
@@ -1304,6 +1633,7 @@ def orient_segments_along(path, direction):
         if hasattr(path, attr):
             setattr(out, attr, getattr(path, attr))
     out.segments_reversed = reversed_count
+    out.serpentine = bool(serpentine)
     return out
 
 
@@ -1537,18 +1867,14 @@ def smooth_tool_axis(path, window_m, reference=(1.0, 0.0, 0.0), force=False):
     moved = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", out, z), -1.0, 1.0)))
     smoothed = ScanPath(pos.copy(), locked_quats_from_axes(out, reference),
                         list(path.segment_starts), source=path.source)
-    for attr in ("noether_flipped", "worst_roll_step_deg", "roll_mode",
-                 "roll_reference", "segments_reversed", "normal_constrained",
-                 "normal_report", "normal_surface"):
-        if hasattr(path, attr):
-            setattr(smoothed, attr, getattr(path, attr))
+    _carry_path_attrs(path, smoothed)
     smoothed.axis_smoothing = {"window_m": float(window_m),
                                "moved_max_deg": float(moved.max()) if len(moved) else 0.0,
                                "moved_mean_deg": float(moved.mean()) if len(moved) else 0.0}
     return smoothed
 
 
-def resample_segments(path, spacing_m, reference=(1.0, 0.0, 0.0)):
+def resample_segments(path, spacing_m, reference=(1.0, 0.0, 0.0), surface=None):
     """A copy of a LOCKED `path` with every segment resampled to a uniform
     `spacing_m` along its length. Both ends of each segment are kept exactly;
     the roll stays locked to `reference`.
@@ -1561,10 +1887,22 @@ def resample_segments(path, spacing_m, reference=(1.0, 0.0, 0.0)):
     sweep's relative jump test (a step is a jump at more than jump_threshold
     times the mean step) a mean that is what a step actually is.
 
-    Positions are interpolated along the polyline, the tool axis is
-    interpolated and renormalised and the locked orientation rebuilt from it,
-    so nothing turns about the tool axis. Segments shorter than one spacing,
-    or of fewer than two points, are left as they are.
+    Positions are interpolated along the polyline and the locked orientation is
+    rebuilt from the tool axis at the new position, so nothing turns about the
+    tool axis. Segments shorter than one spacing, or of fewer than two points,
+    are left as they are.
+
+    THE AXIS AT A NEW POSITION IS THE SURFACE'S AT THAT POSITION, when the path
+    carries the surface it was constrained to (`surface`, or the path's own
+    normal_surface). It has to be re-read rather than interpolated: a resampled
+    waypoint is a NEW place on the part, and interpolating the axis between the
+    two waypoints it fell between leaves the probe off the normal there by
+    whatever the surface did in the gap -- measured at 5.7 deg on a recorded
+    eddy-current plan whose postcondition, checked before this stage and never
+    after it, read 0.000. With no surface the axis is interpolated on the SPHERE
+    between the bracketing waypoints (slerp, not a chord), which is at least a
+    rotation the whole way; the departure from the surface remains and is
+    reported as `axis_from_surface: False`.
     """
     if not spacing_m or float(spacing_m) <= 0.0:
         return path
@@ -1598,22 +1936,74 @@ def resample_segments(path, spacing_m, reference=(1.0, 0.0, 0.0)):
             t = np.linspace(0.0, sc[-1], n + 1)
             out_p.append(np.column_stack(
                 [np.interp(t, sc, P[:, k]) for k in range(3)]))
-            out_z.append(np.column_stack(
-                [np.interp(t, sc, Z[:, k]) for k in range(3)]))
+            out_z.append(_slerp_along(sc, Z, t))
         rs.result("%d -> %d waypoints"
                   % (len(pos), sum(len(v) for v in out_p)))
     P = np.vstack(out_p)
     Z = np.vstack(out_z)
     Z = Z/np.linalg.norm(Z, axis=1, keepdims=True)
+    # THE AXIS FROM THE SURFACE AT THE NEW POSITION, when there is a surface to
+    # ask. Interpolating it -- however carefully -- answers a question about the
+    # two old waypoints, and the pose is at neither of them.
+    surf = getattr(path, "normal_surface", None) if surface is None else surface
+    from_surface = False
+    moved = 0.0
+    if surf is not None and path_is_normal_constrained(path):
+        off = np.asarray(getattr(path, "normal_offset", (0.0, 0.0, 0.0)),
+                         dtype=np.float64).reshape(1, 3)
+        nrm, _d = sample_mesh_normals(surf, P - off)
+        moved = float(np.degrees(np.arccos(np.clip(
+            np.einsum("ij,ij->i", nrm, Z), -1.0, 1.0))).max()) if len(P) else 0.0
+        Z = nrm
+        from_surface = True
     res = ScanPath(P, locked_quats_from_axes(Z, reference), starts, source=path.source)
-    for attr in ("noether_flipped", "worst_roll_step_deg", "roll_mode",
-                 "roll_reference", "segments_reversed", "axis_smoothing",
-                 "normal_constrained", "normal_report", "normal_surface"):
-        if hasattr(path, attr):
-            setattr(res, attr, getattr(path, attr))
+    _carry_path_attrs(path, res)
     res.resampled = {"spacing_m": spacing, "waypoints_before": int(len(pos)),
-                     "waypoints_after": int(len(P))}
+                     "waypoints_after": int(len(P)),
+                     "axis_from_surface": bool(from_surface),
+                     "axis_moved_max_deg": float(moved)}
     return res
+
+
+global _slerp_along
+def _slerp_along(s, dirs, at):
+    """Unit directions interpolated ON THE SPHERE along arc length. -> (len(at), 3)
+
+    A chord between two unit vectors, renormalised, is not a rotation: it lags
+    the great circle in the middle and collapses altogether where the two are
+    opposite. Interpolating a direction along a path is a rotation from one to
+    the next, and this is that.
+
+    Where two bracketing directions are within a hair of each other the chord
+    IS the great circle to machine precision, and that branch is taken -- not as
+    an optimisation but because sin(theta) is what the general form divides by.
+    """
+    s = np.asarray(s, dtype=np.float64).ravel()
+    d = np.asarray(dirs, dtype=np.float64).reshape(-1, 3)
+    d = d/np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-300)
+    at = np.asarray(at, dtype=np.float64).ravel()
+    if len(s) < 2:
+        return np.tile(d[0] if len(d) else np.array([0.0, 0.0, 1.0]),
+                       (len(at), 1))
+    j = np.clip(np.searchsorted(s, at, side="right") - 1, 0, len(s) - 2)
+    span = np.maximum(s[j+1] - s[j], 1e-300)
+    u = np.clip((at - s[j])/span, 0.0, 1.0)
+    a, b = d[j], d[j+1]
+    c = np.clip(np.einsum("ij,ij->i", a, b), -1.0, 1.0)
+    th = np.arccos(c)
+    sn = np.sin(th)
+    near = sn < 1e-9
+    w0 = np.where(near, 1.0 - u, np.sin((1.0 - u)*th)/np.maximum(sn, 1e-300))
+    w1 = np.where(near, u, np.sin(u*th)/np.maximum(sn, 1e-300))
+    out = w0[:, None]*a + w1[:, None]*b
+    ln = np.linalg.norm(out, axis=1, keepdims=True)
+    # Exactly opposite: no great circle is defined, so the direction at the far
+    # waypoint is carried rather than a half-turn being invented. A step like that
+    # is a discontinuity the pass should have been cut at (sanitize_tool_axis()).
+    bad = ln.ravel() < 1e-9
+    out[bad] = b[bad]
+    ln = np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-300)
+    return out/ln
 
 
 def read_ply_mesh(filename):
@@ -2732,8 +3122,39 @@ def _nearest_vertex(v, p):
     return out
 
 
+#: How many nearest vertices' incident faces are searched for the closest point
+#: on the surface. NOT a tuning knob -- it is the difference between a sampler
+#: that answers the question and one that quietly answers a different one.
+#:
+#: THE CLOSEST TRIANGLE NEED NOT TOUCH THE CLOSEST VERTEX. Looking only at the
+#: faces around the nearest vertex is the obvious candidate set and it is wrong
+#: wherever a mesh carries thin triangles: a third vertex of some neighbouring
+#: sliver sits closer to the query point than either end of the edge the point
+#: actually lies on, and the sampler then reads the normal of a triangle the
+#: point is nowhere near. Measured on the eddy-current planning meshes in this
+#: cell, at the production 0.30 mm line spacing:
+#:
+#:   nearest vertices searched     waypoints given the wrong triangle
+#:   1  (the closest vertex alone)  491 of 33779 (1.45%), up to 1.47 mm away
+#:   2                              30
+#:   4                              19
+#:   8                               6 of 33779 (0.018%), up to 0.42 mm away
+#:
+#: Those 491 waypoints carried orientation errors up to 11.5 deg while the
+#: postcondition read 0.000 deg, because it sampled the same way.
+global NORMAL_SAMPLE_VERTICES
+NORMAL_SAMPLE_VERTICES = 8
+
+#: Candidate (point, triangle) pairs evaluated at a time. MEMORY, and nothing
+#: else: _closest_point_bary() holds about forty float64 per pair, so a
+#: 911 511-waypoint plan searched eight vertices deep is 44 million pairs and
+#: 16 GB in one go. A million pairs is about 350 MB and the answer is identical.
+global NORMAL_SAMPLE_PAIR_BLOCK
+NORMAL_SAMPLE_PAIR_BLOCK = 1000000
+
+
 global sample_mesh_normals
-def sample_mesh_normals(surface, points, up=(0.0, 0.0, 1.0)):
+def sample_mesh_normals(surface, points, up=(0.0, 0.0, 1.0), vertices=None):
     """The surface normal at each point, interpolated. -> (normals, distance)
 
     `surface` is a PLY path or (vertices, normals, triangles). A surface with no
@@ -2742,7 +3163,13 @@ def sample_mesh_normals(surface, points, up=(0.0, 0.0, 1.0)):
 
     The returned normals are unit; `distance` is how far each point was from the
     surface, which is the honesty check on the answer -- a waypoint is supposed to
-    be ON the mesh, and one that is not was not sampled where it was asked.
+    be ON the mesh, and one that is not was not sampled where it was asked. That
+    check only means anything if the closest point is really found, which is what
+    `vertices` (NORMAL_SAMPLE_VERTICES) is for: the closest triangle does not
+    have to touch the closest vertex. Degenerate triangles are excluded from the
+    search -- a sliver's own plane is an artefact and its corners' normals are
+    not, so reading a normal off one is how a waypoint on flat surface comes back
+    80 degrees out.
     """
     if isinstance(surface, str):
         v, n, t = read_ply_mesh(surface)
@@ -2755,35 +3182,539 @@ def sample_mesh_normals(surface, points, up=(0.0, 0.0, 1.0)):
         n, _ = mesh_reference_normals(v, t, up=up)
     n = n/np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-300)
     p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
-    iv = _nearest_vertex(v, p)
     if not len(t):
+        iv = _nearest_vertex(v, p)
         return n[iv], np.linalg.norm(p - v[iv], axis=1)
-    # Every face incident on the nearest vertex, as a (query, face) pair list --
-    # the same CSR trick as the 1-ring, over the vertex-to-face map.
-    fi = np.repeat(np.arange(len(t), dtype=np.int64), 3)
-    vi = t.ravel()
+    face, w, dist, has = _closest_surface_faces(v, t, p, vertices=vertices)
+    iv = _nearest_vertex(v, p)
+    out = n[iv].copy()
+    tri = t[face]
+    interp = (w[:, 0:1]*n[tri[:, 0]] + w[:, 1:2]*n[tri[:, 1]]
+              + w[:, 2:3]*n[tri[:, 2]])
+    ln = np.linalg.norm(interp, axis=1)
+    good = has & (ln > 1e-9)
+    out[good] = interp[good]/ln[good, None]
+    dist = np.where(has, dist, np.linalg.norm(p - v[iv], axis=1))
+    return out/np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-300), dist
+
+
+global _closest_surface_faces
+def _closest_surface_faces(v, t, p, vertices=None):
+    """The closest non-degenerate triangle to each point. -> (face, w, dist, has)
+
+    `face` indexes into `t`, `w` are the barycentrics of the closest point on it,
+    `dist` how far that point is, and `has` marks the points a candidate was
+    found for at all. ONE search, used both by the normal sampler and by the
+    independent face-plane check, so the two cannot disagree about which triangle
+    a waypoint is on.
+    """
+    v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+    t = np.asarray(t, dtype=np.int64).reshape(-1, 3)
+    p = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+    k = int(NORMAL_SAMPLE_VERTICES if vertices is None else vertices)
+    k = max(1, min(k, max(len(v), 1)))
+    face = np.zeros(len(p), dtype=np.int64)
+    w = np.tile(np.array([1.0, 0.0, 0.0]), (len(p), 1))
+    dist = np.zeros(len(p))
+    has = np.zeros(len(p), dtype=bool)
+    if not len(t) or not len(p):
+        return face, w, dist, has
+    # A face is a candidate only if it has an interior to be closest to: a
+    # sliver's plane says nothing about which way the part faces, and reading a
+    # normal off one is how a waypoint on flat surface comes back 80 degrees out.
+    keep = np.flatnonzero(_non_degenerate_faces(v, t))
+    if not len(keep):
+        keep = np.arange(len(t), dtype=np.int64)
+    tk = t[keep]
+    iv = _nearest_vertices(v, p, k)
+    # Every face incident on any of the k nearest vertices, as a (query, face)
+    # pair list -- the same CSR trick as the 1-ring, over the vertex-to-face map.
+    fi = np.repeat(np.arange(len(tk), dtype=np.int64), 3)
+    vi = tk.ravel()
     order = np.argsort(vi, kind="stable")
     vptr = np.searchsorted(vi[order], np.arange(len(v) + 1, dtype=np.int64))
-    row, cand = _gather_neighbours(vptr.astype(np.int64), fi[order], iv)
-    out = n[iv].copy()
-    dist = np.linalg.norm(p - v[iv], axis=1)
-    if len(cand):
-        tri = t[cand]
-        q, w = _closest_point_bary(p[row], v[tri[:, 0]], v[tri[:, 1]], v[tri[:, 2]])
+    faces = fi[order]
+    counts = vptr[iv + 1] - vptr[iv]                 # (points, k)
+    # Blocked over POINTS so a block's pair count stays inside the budget; every
+    # candidate of a point is always in the same block, so the answer does not
+    # depend on the block size.
+    for lo, hi in _block_edges(counts.sum(axis=1), int(NORMAL_SAMPLE_PAIR_BLOCK)):
+        cnt = counts[lo:hi]
+        if not int(cnt.sum()):
+            continue
+        row = np.repeat(np.arange(lo, hi, dtype=np.int64), cnt.sum(axis=1))
+        cand = faces[_ranges(vptr[iv[lo:hi]].ravel(), cnt.ravel())]
+        tri = tk[cand]
+        q, ww = _closest_point_bary(p[row], v[tri[:, 0]], v[tri[:, 1]],
+                                    v[tri[:, 2]])
         dd = np.linalg.norm(q - p[row], axis=1)
         o = np.lexsort((dd, row))
-        rows = row[o]
-        first = np.searchsorted(rows, np.arange(len(p), dtype=np.int64), side="left")
-        has = np.bincount(row, minlength=len(p)) > 0
+        first = np.searchsorted(row[o], np.arange(lo, hi, dtype=np.int64),
+                                side="left")
+        blk = np.bincount(row - lo, minlength=hi - lo) > 0
         pick = o[np.clip(first, 0, max(len(o) - 1, 0))]
-        wk, trik = w[pick], tri[pick]
-        interp = (wk[:, 0:1]*n[trik[:, 0]] + wk[:, 1:2]*n[trik[:, 1]]
-                  + wk[:, 2:3]*n[trik[:, 2]])
-        ln = np.linalg.norm(interp, axis=1)
-        good = has & (ln > 1e-9)
-        out[good] = interp[good]/ln[good, None]
-        dist[has] = dd[pick][has]
-    return out/np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-300), dist
+        sl = slice(lo, hi)
+        face[sl][blk] = keep[cand[pick]][blk]
+        w[sl][blk] = ww[pick][blk]
+        dist[sl][blk] = dd[pick][blk]
+        has[sl][blk] = True
+    return face, w, dist, has
+
+
+global _ranges
+def _ranges(starts, lengths):
+    """Concatenated arange(start, start+length) for every (start, length) pair.
+
+    The flat index list that gathers a CSR row set without a Python loop over
+    rows; a real plan has hundreds of thousands of them.
+    """
+    starts = np.asarray(starts, dtype=np.int64).ravel()
+    lengths = np.asarray(lengths, dtype=np.int64).ravel()
+    total = int(lengths.sum())
+    if not total:
+        return np.zeros(0, dtype=np.int64)
+    keep = lengths > 0
+    s, L = starts[keep], lengths[keep]
+    off = np.concatenate([[0], np.cumsum(L)[:-1]])
+    idx = np.arange(total, dtype=np.int64)
+    which = np.repeat(np.arange(len(L), dtype=np.int64), L)
+    return s[which] + (idx - off[which])
+
+
+global _block_edges
+def _block_edges(per_item, budget):
+    """[(lo, hi)] splitting a run of items so each block's total stays in budget.
+
+    An item is never split, so a single item larger than the budget gets a block
+    of its own rather than being silently truncated.
+    """
+    per = np.asarray(per_item, dtype=np.int64).ravel()
+    out = []
+    lo = 0
+    run = 0
+    for i, c in enumerate(per):
+        if run and run + int(c) > int(budget):
+            out.append((lo, i))
+            lo, run = i, 0
+        run += int(c)
+    if lo < len(per):
+        out.append((lo, len(per)))
+    return out
+
+
+#: A triangle is a SLIVER when its smallest altitude is under this fraction of
+#: its longest edge. A sliver's own plane is numerical noise, and reading a
+#: surface normal off one is how a waypoint on flat surface comes back 80 degrees
+#: from vertical.
+#:
+#: RELATIVE, NOT A LENGTH, because the meshes differ in resolution by an order of
+#: magnitude and a sliver is a SHAPE. Measured over every eddy-current planning
+#: mesh in this cell, the ratio for honest triangles runs 0.011 to 0.28 at the
+#: 1st percentile and 0.61 at the median, while the slivers sit below 0.01 -- and
+#: on one 10 153-face mesh there are 99 of them. The two faces that stand more
+#: than 60 degrees from horizontal on an otherwise 13.5 degree plate are both
+#: slivers, with altitudes of 0.065 and 1.96 micrometres; an exact-zero-area test
+#: (clean_mesh_for_planning()) catches neither, and an absolute micron threshold
+#: catches only the first.
+#:
+#: IT DOES NOT TOUCH REAL STEEP GEOMETRY. On the reconstruction that carries the
+#: bench and a draped skirt, the steepest surviving face is 89.9 degrees -- the
+#: 28 mm cliff, which is real and must stay.
+global FACE_MIN_ASPECT
+FACE_MIN_ASPECT = 0.01
+
+#: And a floor in metres, for a triangle so small that the ratio itself is noise.
+global FACE_MIN_ALTITUDE_M
+FACE_MIN_ALTITUDE_M = 1e-9
+
+
+global _non_degenerate_faces
+def _non_degenerate_faces(v, t):
+    """Which faces have an interior worth reading a normal off. -> bool per face
+
+    Smallest altitude over FACE_MIN_ASPECT of the longest edge, and over
+    FACE_MIN_ALTITUDE_M outright.
+    """
+    v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+    t = np.asarray(t, dtype=np.int64).reshape(-1, 3)
+    if not len(t):
+        return np.zeros(0, dtype=bool)
+    p0, p1, p2 = v[t[:, 0]], v[t[:, 1]], v[t[:, 2]]
+    twice_area = np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+    longest = np.maximum.reduce([np.linalg.norm(p1 - p0, axis=1),
+                                 np.linalg.norm(p2 - p1, axis=1),
+                                 np.linalg.norm(p0 - p2, axis=1)])
+    alt = twice_area/np.maximum(longest, 1e-300)
+    return ((alt > float(FACE_MIN_ALTITUDE_M))
+            & (alt > float(FACE_MIN_ASPECT)*longest))
+
+
+global _nearest_vertices
+def _nearest_vertices(v, p, k):
+    """Indices of the k nearest vertices to each point, nearest first. (n, k)
+
+    cKDTree where it is available, blocked brute force otherwise, matching
+    _nearest_vertex() -- which is this at k = 1 and is kept because several
+    callers want only the one index.
+    """
+    v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+    p = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+    k = max(1, min(int(k), len(v)))
+    if k == 1:
+        return _nearest_vertex(v, p).reshape(-1, 1)
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        cKDTree = None
+    if cKDTree is not None:
+        idx = cKDTree(v).query(p, k=k)[1]
+        return np.asarray(idx, dtype=np.int64).reshape(len(p), k)
+    if len(v)*len(p) > 100000000:
+        raise RuntimeError(
+            "sampling %d points against %d vertices needs scipy.spatial.cKDTree; "
+            "install scipy or sample fewer points" % (len(p), len(v)))
+    out = np.zeros((len(p), k), dtype=np.int64)
+    step = max(1, int(2000000//max(len(v), 1)))
+    for lo in range(0, len(p), step):
+        blk = p[lo:lo+step]
+        d2 = ((blk[:, None, :] - v[None, :, :])**2).sum(axis=2)
+        out[lo:lo+step] = np.argsort(d2, axis=1)[:, :k]
+    return out
+
+
+# ------------------------------------------------------------------------------
+# TURNED-ROUND POSES: FOUND AGAINST THE LOCAL SURFACE, REPAIRED OR DROPPED
+# ------------------------------------------------------------------------------
+# WHY THIS EXISTS WHEN THE CONSTRAINT ALREADY "GUARANTEES" IT. Two reasons, both
+# measured on the recorded eddy-current runs in this cell:
+#
+#   1. THE POSTCONDITION ALONE CANNOT FAIL ON SUCH A PATH.
+#      scanpath_from_noether(orient="normal") sets the tool axis from
+#      sample_mesh_normals(), and assert_probe_normal_to_surface() compares it
+#      with sample_mesh_normals() at the same position. Any error in the sampler
+#      cancels exactly, so that half of it reads 0.000 deg however wrong the axis
+#      is -- measured at 0.000 on all five recorded runs in this cell. A claim
+#      that nothing is flipped, resting on that number, has not looked.
+#   2. THE COUNTS THAT WERE PRINTED WERE AGAINST WORLD UP, NOT AGAINST THE
+#      SURFACE. _quats_from_surface_normals()'s "facing_down" and
+#      tool_reachability_report()'s "facing_away" both compare with world +z. A
+#      pose can be turned round with respect to the surface it sits on and pass
+#      both, and a pose on legitimately steep surface can fail both while being
+#      exactly right.
+#
+# So the check here measures against the surface at the waypoint, classifies what
+# it finds, and says which of the three different faults it is:
+#
+#   REVERSED    the tool axis points INTO the part. On the mesh one of these runs
+#               planned over before it was cropped and repaired, 14 waypoints of
+#               43 586, worst 130.9 deg, 13 of them with the axis below horizontal.
+#   TANGENTIAL  the axis lies along the surface, not across it -- within
+#               TANGENTIAL_AXIS_DEG of 90. 126 waypoints on the same mesh. NOT a
+#               sign error: reversing one leaves it just as tangential, which is
+#               why a reversal test does not see it and why it is counted apart.
+#   OFF         past the tolerance but not turned round. 11.3 deg at worst on the
+#               mesh this run really planned over.
+#
+# And the repair is conservative in exactly one way that matters: a waypoint on
+# surface that FACES AWAY from where the probe comes from is UNREACHABLE and is
+# DROPPED with a count. Turning it over would point the probe away from the part
+# and drive the holder into the specimen.
+
+#: How near 90 degrees an axis has to be before it is called TANGENTIAL rather
+#: than merely off or reversed. A tangential axis is a different defect with a
+#: different cause -- a sliver face, or a normal fitted across a seam -- and a
+#: reversal test cannot see it, so it is classified and counted separately.
+global TANGENTIAL_AXIS_DEG
+TANGENTIAL_AXIS_DEG = 10.0
+
+
+global _surface_arrays
+def _surface_arrays(surface, up=(0.0, 0.0, 1.0)):
+    """(vertices, normals, triangles) from a PLY path or a tuple of arrays."""
+    if isinstance(surface, str):
+        v, n, t = read_ply_mesh(surface)
+    else:
+        v, n, t = surface
+        v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+        t = np.asarray(t, dtype=np.int64).reshape(-1, 3)
+        n = None if n is None else np.asarray(n, dtype=np.float64).reshape(-1, 3)
+    if n is None:
+        n, _ = mesh_reference_normals(v, t, up=up)
+    return v, n/np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-300), t
+
+
+#: Most waypoints the independent face-plane check measures. It reports a
+#: DISTRIBUTION, not a per-waypoint verdict, so a bounded even sample answers the
+#: same question -- and the search behind it costs about 19 microseconds a
+#: waypoint, which is 17 s on a 911 511-waypoint plan that a planning stage pays
+#: for several times over. Evenly spaced and deterministic, so two runs of the
+#: same plan report the same number.
+global FACE_CHECK_MAX_WAYPOINTS
+FACE_CHECK_MAX_WAYPOINTS = 50000
+
+
+global _tool_axis_against_faces
+def _tool_axis_against_faces(surface, points, axes):
+    """angle(tool axis, the WINDING normal of the triangle each point is on), deg.
+
+    THE CHECK THAT CANNOT CANCEL. No vertex normal appears in it, so a path whose
+    axis came from the vertex normals is being compared with something else --
+    which is the half a vertex-normal comparison cannot supply. Its floor is the
+    mesh's own faceting, so read it as a diagnostic, not as a tolerance; what it
+    detects is the vertex normals and the triangles disagreeing, which is also
+    what makes a clearance check read the tool as inside the part.
+    """
+    v, _n, t = _surface_arrays(surface)
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    z = np.asarray(axes, dtype=np.float64).reshape(-1, 3)
+    if not len(t) or not len(p):
+        return np.zeros(0)
+    cap = int(FACE_CHECK_MAX_WAYPOINTS)
+    if cap > 0 and len(p) > cap:
+        take = np.linspace(0, len(p) - 1, cap).astype(np.int64)
+        p, z = p[take], z[take]
+    face, _w, _d, has = _closest_surface_faces(v, t, p)
+    tri = t[face]
+    fn = np.cross(v[tri[:, 1]] - v[tri[:, 0]], v[tri[:, 2]] - v[tri[:, 0]])
+    fn = fn/np.maximum(np.linalg.norm(fn, axis=1, keepdims=True), 1e-300)
+    ang = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", z, fn), -1.0, 1.0)))
+    return ang[has]
+
+
+global tool_axis_flip_report
+def tool_axis_flip_report(path, surface, tol_deg=None, tangential_deg=None,
+                          up=(0.0, 0.0, 1.0), offset=None, arrays=False):
+    """Classify every pose's tool axis against the surface AT that waypoint.
+
+    -> dict of per-class counts. Measures; changes nothing.
+
+    `up` is the direction the probe comes FROM -- world +z for a part on a
+    bench. It is used for one thing only, and it is the one thing a global
+    direction is right for: deciding whether the SURFACE faces the probe at all.
+    Whether the POSE is right is judged against that surface's own normal.
+
+    `arrays` adds the per-waypoint normals, angles and masks, which is what the
+    repair needs and what a REPORT must not carry: a plan at the production line
+    spacing has 911 511 waypoints, so those arrays are 30 MB that would then be
+    held on the path for the rest of the session, twice over. Off by default.
+    """
+    tol = PROBE_NORMAL_TOL_DEG if tol_deg is None else float(tol_deg)
+    tang = (TANGENTIAL_AXIS_DEG if tangential_deg is None
+            else float(tangential_deg))
+    if offset is None:
+        offset = getattr(path, "normal_offset", (0.0, 0.0, 0.0))
+    off = np.asarray(offset, dtype=np.float64).reshape(1, 3)
+    pos = np.asarray(path.positions, dtype=np.float64).reshape(-1, 3) - off
+    q = _unit_quats(path.quats)
+    x, y, zc, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    z = np.stack([2.0*(x*zc + y*w), 2.0*(y*zc - x*w), 1.0 - 2.0*(x*x + y*y)],
+                 axis=1)
+    nrm, dist = sample_mesh_normals(surface, pos, up=up)
+    ang = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", z, nrm), -1.0, 1.0)))
+    upv = np.asarray(up, dtype=np.float64).reshape(3)
+    upv = upv/max(float(np.linalg.norm(upv)), 1e-300)
+    away = nrm.dot(upv) < 0.0
+    reversed_ = ang >= 90.0 + tang
+    tangential = (ang >= 90.0 - tang) & (ang < 90.0 + tang)
+    off_normal = (ang > tol) & (ang < 90.0 - tang)
+    rep = {"waypoints": int(len(ang)), "tol_deg": tol, "tangential_deg": tang,
+           "normals": nrm, "angles": ang,
+           "surface_distance_max_m": float(dist.max()) if len(dist) else 0.0,
+           "reversed": int(reversed_.sum()), "tangential": int(tangential.sum()),
+           "off_normal": int(off_normal.sum()),
+           "away_facing_surface": int(away.sum()),
+           "max_deg": float(ang.max()) if len(ang) else 0.0,
+           "p999_deg": float(np.percentile(ang, 99.9)) if len(ang) else 0.0,
+           "worst_index": int(np.argmax(ang)) if len(ang) else -1,
+           "reversed_mask": reversed_, "tangential_mask": tangential,
+           "off_normal_mask": off_normal, "away_mask": away}
+    wrong = reversed_ | tangential | off_normal
+    rep["wrong"] = int(wrong.sum())
+    rep["wrong_mask"] = wrong
+    rep["worst_position"] = (None if rep["worst_index"] < 0 else
+                             tuple(float(c) for c in
+                                   np.asarray(path.positions)[rep["worst_index"]]))
+    rep["orient_mode"] = getattr(path, "orient_mode", None)
+    if not arrays:
+        for k in ("normals", "angles", "reversed_mask", "tangential_mask",
+                  "off_normal_mask", "away_mask", "wrong_mask"):
+            rep.pop(k, None)
+    return rep
+
+
+global repair_tool_axis_to_surface
+def repair_tool_axis_to_surface(path, surface, tol_deg=None,
+                                tangential_deg=None, up=(0.0, 0.0, 1.0),
+                                offset=None, crop=None, what="toolpath",
+                                min_points=2, reference=None, verbose=True,
+                                indent="  "):
+    """Put every pose's tool axis back on the surface normal, or drop it.
+
+    -> (path, report). PREVENTION AND REPAIR, NEVER A RUN-ENDING ERROR.
+
+      * a pose whose axis is reversed, tangential or merely off the surface
+        normal has its axis RE-SET to that normal.
+
+        ON A LOCKED PATH THE WHOLE POSE IS REBUILT from that normal and the roll
+        reference (locked_quats_from_axes()), which puts the SET PROBE ROTATION
+        back exactly. It has to be rebuilt rather than swung: whatever turned the
+        axis round turned the tool frame with it, so the roll of a broken pose is
+        no more trustworthy than its axis -- a pose reversed about its own x comes
+        back 180 deg out in roll if the roll is merely carried, and the rotation
+        of a split-D coil is a measurement parameter, not a detail.
+
+        On any other roll mode the roll is CARRIED instead (_swing_tool_axis_onto()),
+        because re-locking one would silently replace a roll the caller chose;
+        the report says which was done.
+      * a pose on surface that faces AWAY from the probe is DROPPED, with a
+        count and a bounding box. It is not turned over. Turning it over points
+        the probe away from the part, which on a contact probe drives the holder
+        into the specimen -- so the pose is unreachable from this direction and
+        the honest answer is to give up that coverage and say so.
+
+    A turned-round pose is never an error here; it is repaired and counted. The
+    one thing that does raise is a CONFIGURATION fault: waypoints that have to be
+    dropped and no crop to drop them with.
+
+    Positions are never moved. `crop` is the waypoint-dropping split, defaulting
+    to mesh_reconstruction.dpi's _crop_path_by_mask() -- the one place that
+    decides how a dropped run splits a pass. With nothing to drop it is not
+    needed at all, which is the ordinary case.
+    """
+    rep = tool_axis_flip_report(path, surface, tol_deg=tol_deg,
+                               tangential_deg=tangential_deg, up=up,
+                               offset=offset, arrays=True)
+    rep["what"] = what
+    out = path
+    if reference is None:
+        reference = getattr(path, "roll_reference", (1.0, 0.0, 0.0))
+    locked = getattr(path, "roll_mode", None) == "locked"
+    rep["roll"] = "rebuilt from the reference" if locked else "carried"
+    if rep["wrong"] or rep["away_facing_surface"]:
+        fix = rep["wrong_mask"] & ~rep["away_mask"]
+        quats = _unit_quats(path.quats)
+        if fix.any():
+            quats = np.array(quats, copy=True)
+            quats[fix] = (locked_quats_from_axes(rep["normals"][fix], reference)
+                          if locked
+                          else _swing_tool_axis_onto(quats[fix],
+                                                     rep["normals"][fix]))
+        rep["repaired"] = int(fix.sum())
+        out = ScanPath(np.array(path.positions, copy=True), quats,
+                       list(path.segment_starts), source=path.source)
+        _carry_path_attrs(path, out)
+    else:
+        rep["repaired"] = 0
+
+    rep["dropped"] = 0
+    rep["dropped_bbox"] = None
+    if rep["away_facing_surface"]:
+        keep = ~rep["away_mask"]
+        lo = np.asarray(path.positions)[rep["away_mask"]].min(axis=0)
+        hi = np.asarray(path.positions)[rep["away_mask"]].max(axis=0)
+        rep["dropped_bbox"] = (tuple(float(c) for c in lo),
+                               tuple(float(c) for c in hi))
+        fn = globals().get("_crop_path_by_mask") if crop is None else crop
+        if fn is None:
+            raise RuntimeError(
+                "%d waypoint(s) of the %s sit on surface facing AWAY from the "
+                "probe and must be dropped, but the waypoint crop is not "
+                "available: add modules/mesh_reconstruction.dpi to the config, "
+                "which is where _crop_path_by_mask() lives. They are NOT going "
+                "to be turned over -- that points the probe away from the part."
+                % (rep["away_facing_surface"], what))
+        before = len(out)
+        out = fn(out, keep, what, min_points,
+                 "on surface facing away from the probe")
+        rep["dropped"] = int(before - len(out))
+        _carry_path_attrs(path, out)
+
+    if rep["repaired"] or rep["dropped"]:
+        after = tool_axis_flip_report(out, surface, tol_deg=tol_deg,
+                                      tangential_deg=tangential_deg, up=up,
+                                      offset=offset)
+        rep["residual_max_deg"] = after["max_deg"]
+        rep["residual_wrong"] = after["wrong"]
+    else:
+        rep["residual_max_deg"] = rep["max_deg"]
+        rep["residual_wrong"] = 0
+    if verbose:
+        for line in describe_tool_axis_flips(rep, indent=indent):
+            print(line)
+    # THE ARRAYS GO NO FURTHER. The caller keeps this report on the path, and a
+    # production plan's normals, angles and five masks are 30 MB of it.
+    for k in ("normals", "angles", "reversed_mask", "tangential_mask",
+              "off_normal_mask", "away_mask", "wrong_mask"):
+        rep.pop(k, None)
+    return out, rep
+
+
+# _carry_path_attrs() lives in toolpath_segments.dpi, beside the ScanPath whose
+# attributes it carries -- every file that rebuilds a path already has that one
+# loaded, which noether_path.dpi is not always.
+
+global describe_tool_axis_flips
+def describe_tool_axis_flips(rep, indent="  "):
+    """The flip report as the lines a scan log should carry.
+
+    IT NEVER SAYS NOTHING WAS FLIPPED UNLESS NOTHING WAS. "This code does not
+    turn poses over" is a statement about policy; "nothing is flipped" is a
+    measurement of the path, and on a run whose mesh repair has replaced 23
+    backwards normals the two do not agree.
+    """
+    if rep is None:
+        return []
+    n = rep["waypoints"]
+    if not (rep["wrong"] or rep["away_facing_surface"]):
+        return ["%stool axis against the surface AT each waypoint: none of the "
+                "%d is reversed, tangential or off it by more than %.2f deg "
+                "(worst %.3f). Checked against the closest triangle, not assumed."
+                % (indent, n, rep["tol_deg"], rep["max_deg"])]
+    head = ("TURNED-ROUND POSES FOUND" if rep["reversed"] or rep["tangential"]
+            else "POSES OFF THE SURFACE NORMAL" if rep["off_normal"]
+            else "SURFACE FACING AWAY FROM THE PROBE")
+    out = ["%s%s. Of %d waypoint(s), measured against the "
+           "surface normal at each one: %d REVERSED (axis into the part), %d "
+           "TANGENTIAL (within %.0f deg of along the surface, which a reversal "
+           "test cannot see), %d merely off it. Worst %.2f deg at %s."
+           % (indent, head, n, rep["reversed"], rep["tangential"],
+              rep["tangential_deg"], rep["off_normal"], rep["max_deg"],
+              rep["worst_position"])]
+    if rep.get("repaired"):
+        out.append("%s  REPAIRED: %d pose(s) had the axis put back on the "
+                   "surface normal there, roll %s, positions untouched. A locked "
+                   "path's poses are rebuilt from the roll reference, which puts "
+                   "the set probe rotation back exactly -- whatever turned an "
+                   "axis round turned that pose's roll with it."
+                   % (indent, rep["repaired"], rep.get("roll", "carried")))
+    if rep.get("dropped"):
+        lo, hi = rep["dropped_bbox"]
+        out.append("%s  DROPPED: %d waypoint(s) sit on surface FACING AWAY from "
+                   "the probe, and %d waypoint(s) went with them once the runs "
+                   "left behind were too short to fly. Not turned over -- turning "
+                   "one over points the probe away from the part and pushes the "
+                   "holder into it. WHERE x %.3f..%.3f y %.3f..%.3f z "
+                   "%.3f..%.3f m. That coverage is lost; crop the region or "
+                   "approach from another direction."
+                   % (indent, rep["away_facing_surface"], rep["dropped"],
+                      lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+    elif rep.get("away_facing_surface"):
+        out.append("%s  %d waypoint(s) sit on surface facing AWAY from the probe "
+                   "and are unreachable from this direction."
+                   % (indent, rep["away_facing_surface"]))
+    if "residual_wrong" in rep:
+        out.append("%s  after the repair: %d still wrong, worst %.3f deg"
+                   % (indent, rep["residual_wrong"], rep["residual_max_deg"]))
+    else:
+        out.append("%s  NOT repaired: this path's tool axis is not constrained to "
+                   "the surface normal (%s), so putting it back on the normal "
+                   "would change what the path IS. Measured, and left alone."
+                   % (indent, rep.get("orient_mode") or "orient is not 'normal'"))
+    out.append("%s  THIS IS NOT A TILT LIMIT'S JOB. EC_MAX_TILT_DEG bounds tilt "
+               "from VERTICAL; every pose above was wrong with respect to the "
+               "SURFACE, and dropping them for tilt would have deleted coverage "
+               "and left the survivors just as wrong." % (indent,))
+    return out
 
 
 global assert_probe_normal_to_surface
@@ -2805,13 +3736,35 @@ def assert_probe_normal_to_surface(path, surface, tol_deg=None, mode=None,
     can reach it is EC_MAX_TILT_DEG's question and is reported separately by
     tool_reachability_report().
 
+    WHAT IT CANNOT DO ON ITS OWN, AND WHY tool_axis_flip_report() EXISTS. On a
+    path built by scanpath_from_noether(orient="normal") the first quantity below
+    compares the axis with the same sample_mesh_normals() call that produced it,
+    so any error in the sampler cancels and the answer is 0.000 deg by arithmetic
+    rather than by measurement -- 0.000 on all five recorded runs in this cell, at
+    a line spacing where the sampler could pick a triangle 1.47 mm from the
+    waypoint. Two things break that tautology, and both are reported here:
+
+      face_max_deg              the axis against the PLANE of the non-degenerate
+                                triangle the waypoint lies on, which uses no
+                                vertex normal at all and so cannot cancel. It is
+                                a DIAGNOSTIC and not a tolerance -- its floor is
+                                the mesh's own faceting, measured at 1.2 to 11.3
+                                deg on this cell's planning meshes -- but a value
+                                far above that floor means the vertex normals and
+                                the triangles disagree, which no amount of
+                                resampling the vertex normals will show.
+      surface_distance_max_m    now a real honesty check: how far the closest
+                                point found was, against a waypoint that is
+                                supposed to be ON the mesh (2 micrometres in
+                                truth on these meshes).
+
     mode: "raise" (default) makes a violation a MeshNotPlannable, "warn" prints
     it, "off" measures and says nothing. MESH_NORMAL_POSTCONDITION overrides the
     default from a config.
 
     Returns the report even when it raises nothing: max_deg, p99_deg, p999_deg,
-    mean_deg, over_tol, worst_index, worst_position, facing_into_surface and
-    surface_distance_max_m.
+    mean_deg, over_tol, worst_index, worst_position, facing_into_surface,
+    tangential, face_max_deg, face_p999_deg and surface_distance_max_m.
     """
     tol = PROBE_NORMAL_TOL_DEG if tol_deg is None else float(tol_deg)
     mode = globals().get("MESH_NORMAL_POSTCONDITION", "raise") if mode is None else mode
@@ -2842,14 +3795,31 @@ def assert_probe_normal_to_surface(path, surface, tol_deg=None, mode=None,
            "worst_position": (None if worst < 0
                               else tuple(float(c) for c in pos_world[worst])),
            "surface_distance_max_m": float(dist.max()) if len(dist) else 0.0,
+           "tangential": int(((ang > 90.0 - TANGENTIAL_AXIS_DEG)
+                              & (ang < 90.0 + TANGENTIAL_AXIS_DEG)).sum()),
            "ok": bool(len(ang) and ang.max() <= tol) or not len(ang)}
     rep["over_tol_fraction"] = (rep["over_tol"]/float(len(ang))) if len(ang) else 0.0
+    # THE INDEPENDENT HALF. No vertex normal appears in it, so it cannot cancel
+    # against the axis the way the quantity above can.
+    fang = _tool_axis_against_faces(surface, pos, z)
+    rep["face_max_deg"] = float(fang.max()) if len(fang) else 0.0
+    rep["face_p999_deg"] = (float(np.percentile(fang, 99.9)) if len(fang)
+                            else 0.0)
+    rep["face_reversed"] = int((fang > 90.0).sum())
+    rep["face_waypoints"] = int(len(fang))
     msg = ("probe axis against the surface normal over %d waypoint(s) of the %s: "
            "worst %.3f deg, p99.9 %.3f, mean %.4f (tolerance %.2f); %d over it, "
-           "%d facing into the part. Sampled at most %.3f mm off the surface."
+           "%d facing into the part, %d within %.0f deg of tangential. Sampled at "
+           "most %.3f mm off the surface. INDEPENDENTLY, against the plane of the "
+           "triangle each waypoint lies on (no vertex normal in it, so it cannot "
+           "cancel), over %d of them: worst %.2f deg, p99.9 %.2f, %d reversed -- "
+           "that number's floor is the mesh's own faceting, so read it beside the "
+           "mesh rather than against the tolerance."
            % (rep["waypoints"], what, rep["max_deg"], rep["p999_deg"],
               rep["mean_deg"], tol, rep["over_tol"], rep["facing_into_surface"],
-              rep["surface_distance_max_m"]*1e3))
+              rep["tangential"], TANGENTIAL_AXIS_DEG,
+              rep["surface_distance_max_m"]*1e3, rep["face_waypoints"],
+              rep["face_max_deg"], rep["face_p999_deg"], rep["face_reversed"]))
     if rep["ok"]:
         if verbose and mode != "off":
             print("%sPOSTCONDITION HOLDS -- %s" % (indent, msg))

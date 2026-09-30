@@ -124,7 +124,11 @@ exec(compile(_strip_globals("scan_parameters.dpi"), "scan_parameters.dpi", "exec
 #: and the motion gate), so lift the two functions under test by AST -- the same
 #: trick keyence_standoff_test.py uses for _crop_path_by_mask.
 _tree = ast.parse(_strip_globals("cell_capture_scenarios.dpi"))
-_want = {"velocity_table_from_rungs", "describe_velocity_table"}
+# describe_velocity_table() now prints the manifest block to paste, so the two
+# helpers that build it come along. Lifted by name, so a rename there is a failure
+# here rather than a report that quietly loses its most useful half.
+_want = {"velocity_table_from_rungs", "describe_velocity_table",
+         "velocity_manifest_block", "_velocity_manifest_target"}
 _fns = [n for n in _tree.body
         if isinstance(n, ast.FunctionDef) and n.name in _want]
 missing = _want - {f.name for f in _fns}
@@ -137,6 +141,7 @@ exec(compile(ast.Module(body=_fns, type_ignores=[]), "cell_capture_scenarios.dpi
 
 table_from_rungs = ns["velocity_table_from_rungs"]
 describe = ns["describe_velocity_table"]
+manifest_block = ns["velocity_manifest_block"]
 velocity_from_scaling = ns["velocity_from_scaling"]
 velocity_scaling_for = ns["velocity_scaling_for"]
 ns["JOINT_MOVE_SCALING"] = 0.015
@@ -307,25 +312,45 @@ out["joint"] = [{"scaling": 0.010, "observed_mps": 0.031, "ok": True,
 lines = describe(out)
 text = "\n".join(lines)
 
-check("ROBOT_VELOCITY_CALIBRATION" in text,
-      "it names the constant to replace")
-check("SIMULATION" in text,
-      "...and says the values being replaced were simulated, which is the whole "
-      "reason to run this")
+check("robot_velocity" in text and "MANIFEST" in text.upper(),
+      "it points at the CELL MANIFEST, which is where the pipeline reads the "
+      "curve from -- a config constant has to be transcribed by every machine "
+      "and eventually is not")
 
-# THE PASTED BLOCK MUST BE VALID PYTHON THAT EQUALS THE TABLE. A formatting slip
-# here is pasted into a config and read as gospel.
-block = text.split("ROBOT_VELOCITY_CALIBRATION = [")[1].split("]")[0]
-pasted = ast.literal_eval("[" + block + "]")
-check(len(pasted) == len(out["table"]),
-      "the pasted block parses as Python and has one row per measurement")
+# THE BLOCK MUST BE VALID YAML THAT ROUND-TRIPS TO THE MEASURED TABLE. A
+# formatting slip here is pasted into a manifest and read as gospel.
+import yaml as _yaml
+block_lines = manifest_block(out)
+doc = _yaml.safe_load("\n".join(block_lines))
+check(list(doc.keys()) == ["robot_velocity"],
+      "the block is a single robot_velocity: mapping, ready to paste")
+modes = doc["robot_velocity"]
+check(len(modes) == 1, "and declares exactly one mode, not both")
+rows = list(modes.values())[0]["table"]
+check(len(rows) == len(out["table"]),
+      "the block parses as YAML and has one row per measurement")
 check(all(abs(a - c) < 1e-9 and abs(b - d) < 1e-9
-          for (a, b), (c, d) in zip(pasted, out["table"])),
+          for (a, b), (c, d) in zip([tuple(r) for r in rows], out["table"])),
       "...and its numbers are the measured ones, to full precision")
 # And it must survive being fed straight back in.
+pasted = [tuple(r) for r in rows]
 check(abs(velocity_from_scaling(0.0200, pasted)
           - velocity_from_scaling(0.0200, out["table"])) < 1e-12,
-      "...and the pasted table behaves identically to the measured one")
+      "...and the loaded table behaves identically to the measured one")
+# THE SPAN TRAVELS WITH IT. The curve is path-length dependent, and without the
+# span nothing downstream can tell whether it was measured over a distance like
+# the one it is being applied to.
+out_with_span = dict(out)
+out_with_span["span_m"] = 0.3
+spanned = _yaml.safe_load("\n".join(manifest_block(out_with_span)))
+check(list(spanned["robot_velocity"].values())[0].get("span_m") == 0.3,
+      "the span the curve was measured over is written into the block")
+
+check("globals()['ROBOT_VELOCITY_CALIBRATION']" in text,
+      "the session-only override is still offered, for trying it without an edit")
+check("does NOT persist" in text,
+      "...and is marked as not persisting, because pasting it at the prompt in "
+      "five separate sessions is what this replaces")
 
 check(any("joint move's tip speed depends on the arm's configuration" in l
           for l in lines),

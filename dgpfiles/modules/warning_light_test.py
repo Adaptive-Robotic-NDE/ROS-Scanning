@@ -104,12 +104,25 @@ def _checked(fn):
     return wrapper
 
 
-def load(mode="sim", pin=0, fail_on=False, fail_off=False, required=None):
-    calls = []
+def load(mode="sim", pin=0, fail_on=False, fail_off=False, required=None,
+         fail_on_times=None, attempts=None):
+    """The module with set_digital_out stubbed, and the calls it made.
 
-    def set_digital_out(p, state):
-        calls.append((p, bool(state)))
-        if (state and fail_on) or (not state and fail_off):
+    `fail_on_times` fails the first N switch-ON attempts and then succeeds, which
+    is what a transient set_io looks like. `fail_on` fails all of them.
+    """
+    calls = []
+    state = {"on_failures": 0}
+
+    def set_digital_out(p, state_):
+        calls.append((p, bool(state_)))
+        if state_ and fail_on_times is not None:
+            state["on_failures"] += 1
+            if state["on_failures"] <= fail_on_times:
+                raise RuntimeError("/io_and_status_controller/set_io did not "
+                                   "answer within 15 s")
+            return True
+        if (state_ and fail_on) or (not state_ and fail_off):
             raise RuntimeError("no /io_and_status_controller/set_io service")
         return True
 
@@ -119,6 +132,11 @@ def load(mode="sim", pin=0, fail_on=False, fail_off=False, required=None):
     if required is not None:
         ns["WARNING_LIGHT_REQUIRED"] = required
     exec(compile(SRC, "work_cell.dpi", "exec"), ns)
+    # No real waiting in a test; the retry COUNT is what is under test, not the
+    # gap between attempts.
+    ns["WARNING_LIGHT_RETRY_S"] = 0.0
+    if attempts is not None:
+        ns["WARNING_LIGHT_ATTEMPTS"] = attempts
     return ns, calls
 
 
@@ -225,6 +243,116 @@ def test_a_failed_switch_off_warns_rather_than_raising():
         ok = False
     check(ok and calls == [(0, True), (0, False)],
           "a failed switch-off warns rather than raising over the stage's own result")
+
+
+@_checked
+def test_a_transient_set_io_does_not_cost_the_run():
+    """Two of set_io's failures mean "nobody could ask", not "the lamp is off".
+
+    The service missing its discovery window, or being found and not answering,
+    both raise from set_digital_out and both used to refuse the whole run before
+    the arm moved. Neither is evidence the light is dark.
+    """
+    ns, calls = load(mode="hardware", fail_on_times=2)
+    ran = []
+    with ns["warning_light"]("transient set_io"):
+        ran.append(True)
+    on_calls = [c for c in calls if c[1]]
+    check(ran == [True],
+          "a set_io that fails twice and then works does not refuse the run")
+    check(len(on_calls) == 3,
+          "the switch-on was attempted 3 times, not %d: %s" % (len(on_calls), calls))
+    check(calls[-1] == (0, False), "the light was still switched off afterwards")
+
+
+@_checked
+def test_a_light_that_never_answers_still_refuses():
+    """The retry must not become a way to move with the light dark.
+
+    Retrying is only allowed to change how long it takes to decide; the decision
+    itself is unchanged.
+    """
+    ns, calls = load(mode="hardware", fail_on=True, attempts=3)
+    ran = []
+    try:
+        with ns["warning_light"]("never answers"):
+            ran.append(True)
+        refused = False
+    except RuntimeError as e:
+        refused = "Refusing to move the arm" in str(e)
+    on_calls = [c for c in calls if c[1]]
+    check(refused and not ran,
+          "a light that never switches on still stops the stage: %s" % (calls,))
+    check(len(on_calls) == 3,
+          "it gave up after %d attempts rather than 3: %s" % (len(on_calls), calls))
+
+
+@_checked
+def test_the_switch_off_path_is_not_retried():
+    """Switching off cannot save a run, and the operator is told to use the pendant.
+
+    Retrying it would add a delay to the end of every stage for nothing.
+    """
+    ns, calls = load(mode="hardware", fail_off=True, attempts=3)
+    with ns["warning_light"]("off fails"):
+        pass
+    off_calls = [c for c in calls if not c[1]]
+    check(len(off_calls) == 1,
+          "the switch-off was retried %d times; it should be attempted once: %s"
+          % (len(off_calls), calls))
+
+
+@_checked
+def test_simulation_is_not_retried():
+    """Simulation has no I/O controller at all, and already stops asking.
+
+    Three attempts per hold would add the full service wait to every stage of
+    every simulated run.
+    """
+    ns, calls = load(mode="sim", fail_on=True, attempts=3)
+    with ns["warning_light"]("sim stage"):
+        pass
+    check([c for c in calls if c[1]] == [(0, True)],
+          "simulation asked set_io more than once to switch on: %s" % (calls,))
+
+
+@_checked
+def test_the_version_report_names_versions_and_paths():
+    """A log that does not say what was loaded cannot answer "why did it do that".
+
+    Two of this stack's expensive failures are version skew rather than logic: an
+    install behind the workspace, and a compiled extension older than the library
+    it links against. Both are invisible in a traceback and obvious in one startup
+    line, so the line has to carry the version AND the path -- on a machine with a
+    system install and a workspace checkout, the path is the part that decides it.
+    """
+    ns, _calls = load()
+    text = ns["describe_software_versions"]()
+    facts = ns["software_versions"]()
+
+    check("python" in text and sys.version.split()[0] in text,
+          "the report names the Python actually running")
+    for module_name, label in ns["SOFTWARE_OF_INTEREST"]:
+        check(label in text,
+              "%r is missing from the report, so its version would be unknown"
+              % (label,))
+        check(module_name in facts,
+              "software_versions() does not carry %r" % (module_name,))
+
+    # An absent component has to SAY it is absent. Left out silently, a
+    # reconstruction that cannot run looks like a reconstruction that was not
+    # asked to.
+    missing = [m for m, f in facts.items() if f["version"] is None]
+    for m in missing:
+        label = dict(ns["SOFTWARE_OF_INTEREST"])[m]
+        check("NOT IMPORTABLE" in text and label in text,
+              "%r is not importable and the report does not say so" % (label,))
+
+    present = [f for f in facts.values() if f["version"] is not None]
+    check(present, "nothing at all was importable, so this test proved nothing")
+    check(all(f["path"] for f in present),
+          "a component was reported with no path: %s"
+          % ([f for f in present if not f["path"]],))
 
 
 @_checked

@@ -52,7 +52,8 @@ fully ready with recording not found in instantiated or mdonly".
 | `SCAN_VELOCITY` | 0.010 m/s | in contact for the whole sweep, so it must not exceed `NEAR_PART_SPEED` |
 | `SCAN_LINE_SPACING` | 0.0003 m | ClientScannerTest's value; makes a whole part hours long -- see `EC_SCAN_REGION` |
 | `EC_SCAN_REGION` | `None` | set it to the area to scan |
-| `EC_PRELOAD_M` | `0.0` | **not known**: the spring fixture's preload (section 5) |
+| `EC_PRELOAD_M` | `0.0` | the contact preload, in metres. **Not known**: measure the fixture. `set_ec_preload()` is how it is changed; ceiling `EC_PRELOAD_CEILING_M` = 2 mm (section 3) |
+| `EC_INSTRUMENT` | `"uniwest"` on hardware | the instrument the scan nulls on the part, at port `EC_INSTRUMENT_PORT` (33). `EC_NULL_ON_CONTACT`, `EC_NULL_REQUIRED` and `set_ec_nulling()` decide what a failure means (section 3) |
 | `NOETHER_ROLL_REFERENCE` | `(1, 0, 0)` | the locked probe roll; set it from the cable-envelope test |
 | `NOETHER_ROTATION_OFFSET`, `EC_TRAVEL_DIRECTION` | pi/2, `(-1, 0, 0)` | passes along the part's longest side, travelling -x, as ClientScannerTest ran them |
 | `EC_MAX_TILT_DEG` | 45 | **a placeholder**: the steepest pose the probe is planned onto; the fixture's real limit is unknown |
@@ -169,11 +170,12 @@ confirming it.
     lift, transit, descend, sweep, lift. Watch it in RViz and on the arm. The
     report prints tracking, tilt, roll, speeds, clearance and wrist_3; read
     them against section 2.
-12. **Dry run in contact.** `plan_ec_path()` (preload back to
-    `EC_PRELOAD_M`), then `dry_run_ec_scan(passes=[0])`. This is the first time
-    the probe touches the part. Watch the spring fixture: it should compress
-    visibly and stay compressed along the whole pass. If it lifts off anywhere,
-    the fine mesh is high there, or the preload is too small.
+12. **Dry run in contact.** `set_ec_preload(<metres>)`, `plan_ec_path()`, then
+    `dry_run_ec_scan(passes=[0])`. This is the first time the probe touches the
+    part. Watch the spring fixture: it should compress visibly and stay
+    compressed along the whole pass. If it lifts off anywhere, the fine mesh is
+    high there, or the preload is too small. Section 3 has the whole preload
+    procedure and its limits.
 13. **Eddy-current setup** -- section 3.
 14. **Scan.** `run_ec_scan()`. A pass that cannot be entered is skipped and
     reported; the probe is lifted clear at the end even on error.
@@ -378,7 +380,8 @@ Noether over the fine mesh, at 0.3 mm between passes. Then:
   so a wall's normals are never averaged into the passes beside it;
 - the tool axis is averaged along each pass over `EC_AXIS_SMOOTHING_M` (6 mm,
   the probe face) and the roll re-locked. Positions are untouched;
-- the tip is put on the measured surface, plus `EC_PRELOAD_M` along its axis;
+- the tip is put on the measured surface, plus the contact preload along its own
+  axis -- into the material, following each pose's normal (section 3);
 - the path is cropped to the work volume and to `EC_SCAN_REGION`;
 - every pass is resampled to `EC_WAYPOINT_SPACING_M` (1 mm), ends kept.
 
@@ -545,7 +548,10 @@ Puts the probe on the start of pass `index` the way every pass is entered:
 lift, transit in the air, descend 50 mm along the tool axis at 6 mm/s
 (`EC_AXIS_SPEED`). Then it
 stops there, in contact. `ec_lift()` backs it off 50 mm along the axis. This
-is the pause ClientScannerTest had at its first point ("Null Uniwest?").
+is the pause ClientScannerTest had at its first point ("Null Uniwest?") -- the
+scan now issues that null itself at its own first touchdown, so this is where the
+fixture and the preload get looked at, and `null_ec_instrument()` is the manual
+null if it is wanted here.
 
 ### run_ec_scan()
 
@@ -559,12 +565,20 @@ the observed speed against the commanded one. A pass that cannot be entered is
 instrument), so the first run of this is on the cell: start with
 `max_passes=1` over good material.
 
+Before it moves it states the preload the path was planned with and what it will
+do about the instrument null, and it refuses there if a null is required and
+there is no instrument. The instrument is nulled at the first touchdown; see
+section 3 for both.
+
 | message | meaning | do |
 |---|---|---|
 | `eddy current is not set up -- call setup_ec() first` | as it says | section 3 |
 | `SCAN_VELOCITY is N mm/s, and the probe is in contact...` | above 10 mm/s | lower `SCAN_VELOCITY` |
 | `this scan cannot be run as requested: estimated scan time ... exceeds the 1:00:00 limit` | the plan is too long | `EC_SCAN_REGION`, or `force=True` as a decision |
 | `source fault after pass k` | the DAQ stopped producing new data | check the card; the traces up to there are good |
+| `there is no eddy-current instrument to null on the part` | refused before moving | section 3, The instrument null |
+| `the eddy-current instrument would not null with the probe on the part` | stopped at pass 1, nothing acquired | section 3, The instrument null |
+| `preload: UNKNOWN -- this toolpath records none` | the path predates the preload | `plan_ec_path()` again |
 | `WARNING: could not lift the probe off the part` | the retract was refused | E-stop, jog clear by hand |
 
 ### park_arm()
@@ -579,18 +593,31 @@ Rises straight up at the current x/y: the first 50 mm at 10 mm/s, the rest at
 
 The instrument's settings (frequency, gain, probe drive) are set on the
 Uniwest itself; ClientScannerTest had them commented out and set by hand. Its
-X and Y outputs go to `PXI1Slot2/ai0` and `ai1`.
+X and Y outputs go to `PXI1Slot2/ai0` and `ai1`, and its serial port is opened at
+startup so the scan can null it — see **The contact preload** and **The
+instrument null** below, which are the two settings that decide what the probe
+does to the part.
 
 1. **At startup** the banner should read
    `eddy-current DAQ on /PXI1Slot2/ai0 and /PXI1Slot2/ai1`, and a moment
    later `ec_ready()` returns `(True, 'ready')`. If it says
    `the DAQ is open but /PXI1Slot2/ai0 has no data yet`, the card is not
-   acquiring.
-2. **Touch down on good material.** `ec_touch_down(0)` puts the probe on the
-   first pass's start. Check the spring fixture is compressed. **Null the
-   instrument there**, as ClientScannerTest's "Null Uniwest?" step did. Then run
-   `ec_lift()`.
-3. **Build the source.** `setup_ec()`. It prints the sample pitch, the
+   acquiring. A second line reads
+   `eddy-current instrument: Uniwest on port 33 at 9600 baud`; if it says
+   `NO eddy-current instrument on port 33`, read **The instrument null**.
+   Opening the Uniwest driver changes nothing on the instrument: it reads the
+   identity and the current settings and stops. Set the instrument up on its
+   front panel in whichever order suits you. The null is the only command this
+   config ever sends to it.
+2. **Set the preload**, in metres: `set_ec_preload(0.0003)`. Do it before
+   `plan_ec_path()` — the toolpath carries the preload it was planned with. See
+   **The contact preload**.
+3. **Touch down on good material.** `ec_touch_down(0)` puts the probe on the
+   first pass's start. Check the spring fixture is compressed. `ec_lift()` backs
+   it off again. The scan nulls the instrument at this point by itself, so this
+   step is a check that the fixture and the preload are right, not the null —
+   `null_ec_instrument()` does the null by hand if you want it here.
+4. **Build the source.** `setup_ec()`. It prints the sample pitch, the
    conditioning parameters it is HOLDING, and runs a self-test of the compiled
    conditioning. It is idempotent; `teardown_ec()` releases everything before a
    second setup.
@@ -629,19 +656,145 @@ X and Y outputs go to `PXI1Slot2/ai0` and `ai1`.
    `site-packages/`; if the library is newer, the extension is stale and the
    scan will die. `ls -la` on both is the whole check, and `setup_ec()` does the
    definitive version of it in two seconds.
-4. **One pass over good material**, painting the rotation-independent value:
-   `run_ec_scan(max_passes=1, component="magnitude")`. Read the pass line: the
-   traces should match the expected count and the observed length should
-   match the commanded one.
-5. **Software null** from those traces: `null_here()`. It prints the
-   `(x, y)` it used.
-6. **Rotation.** Lift-off should lie along the horizontal axis. The live place
+5. **One pass over good material**, painting the rotation-independent value:
+   `run_ec_scan(max_passes=1, component="magnitude")`. It prints the preload the
+   path carries and what it will do about the instrument null before it moves,
+   then nulls the instrument the moment the probe touches down. Read the pass
+   line: the traces should match the expected count and the observed length
+   should match the commanded one.
+6. **Conditioning null** from those traces: `null_here()`. A software offset on
+   top of the instrument's own balance — see **The instrument null** for why both
+   exist. It prints the `(x, y)` it used.
+7. **Rotation.** Lift-off should lie along the horizontal axis. The live place
    to see lift-off is the instrument's own impedance display while touching
    down and lifting (`ec_touch_down()` / `ec_lift()`). `set_rotation(deg)`
    re-renders every trace already acquired, so it can be trimmed against the
    recorded pass: the notch signal should end up vertical. `set_gain(h, v)` if
    the axes need different gains.
-7. **Scan**, painting the defect axis: `run_ec_scan(component="vertical")`.
+8. **Scan**, painting the defect axis: `run_ec_scan(component="vertical")`.
+
+### The contact preload
+
+Eddy-current inspection needs the probe pressed into the sample. The **preload**
+is how far past the measured surface the tip is commanded, along the probe's own
+axis; the spring fixture takes up the difference. It is the one number in this
+config that decides how hard the arm pushes on the part, so it is set in one
+place, by one function, in metres.
+
+```
+set_ec_preload(0.0003)     # 0.30 mm into the part; prints it back in mm
+ec_preload()               # what is in force now
+set_ec_preload(0)          # tip exactly on the measured surface
+```
+
+**Metres, always.** There is no millimetre form: one function that took either
+could be handed `0.3` meaning 0.3 mm and command 300. It prints the millimetre
+equivalent so the number can still be read the way the fixture is measured.
+
+**Do not type `EC_PRELOAD_M = ...` at the prompt.** A bare assignment at the dgpy
+prompt does not reach the shared globals: it reads back unchanged and the next
+plan uses the old value. `set_ec_preload()` is the only way in, and
+`plan_ec_path(preload=...)` goes through the same check.
+
+**Set it before `plan_ec_path()`.** The preload is baked into the toolpath's
+positions, so a path already planned carries the value it was planned with.
+`plan_ec_path()`, `preview_ec_scan()` and `run_ec_scan()` all state it in
+millimetres every run, zero included; `run_ec_scan()` reports the *path's* value,
+not the current setting, and says `preload: UNKNOWN` for a path that predates it.
+
+**What it does to the poses.** Each pose moves `preload` along **minus its own
+tool z**, and on this tooling tool z is the outward surface normal — so the push
+is into the material and it follows the surface on a curved part, rather than
+going straight down in world z. It is applied before the work-volume and region
+crops, so a pose the preload pushes outside the work volume is dropped like any
+other. The scan area shrinks for margin; the motion never grows.
+
+**Too small (or zero).** The tip is commanded onto the *measured* surface, so
+every error in the reconstructed mesh becomes lift-off where the mesh reads high
+and compression where it reads low, one for one. Lift-off is the largest signal
+an eddy-current probe sees; a millimetre of mesh error is a millimetre of
+lift-off, and it swamps the flaw. This is why the preload exists.
+
+**Too large.** The arm stops pressing a spring and starts pushing the part: the
+fixture bottoms out, the reading saturates, and the probe or the specimen is what
+gives. There is also nothing left for the fixture to absorb where the mesh reads
+low, so the push there is the preload *plus* the mesh error.
+
+**The ceiling** is `EC_PRELOAD_CEILING_M`, 2 mm, and anything above it is refused
+with the reason. It comes out of the tooling description
+(`tari_ur_description urdf/ec/tooling_macro.xacro` and the meshes it names): the
+compliance is `probe_holder`, a 12.5 mm radius plunger, sliding in
+`bearing_tube`, a 16.0 mm bore, and both joints are **fixed** in the URDF, so the
+spring travel is not modelled at all. The only length in the description that
+bears on the slide is the 4.5 mm of plunger inside the tube at rest
+(`probe_holder` is mounted 20.0 mm up a 24.5 mm tube); 2 mm is under half of it.
+And `probe_end`, the commanded tip, is 68.07 mm along the probe while the probe
+mesh ends at 68.32 mm — past 0.25 mm of preload the modelled probe body is
+already inside the part, so every clearance number the planner reports is
+optimistic by the preload.
+
+**Measure the fixture** and put the probe near the middle of its travel. Until
+that is done, a fraction of a millimetre is the defensible setting: enough to
+cover the mesh error, far from the ceiling.
+
+| message | meaning | do |
+|---|---|---|
+| `a preload of -0.300 mm is NEGATIVE, which is LIFT-OFF` | the sign is wrong | it is a distance into the part; pass a positive number |
+| `a preload of 3.00 mm is over the 2.00 mm ceiling` | past what the fixture can absorb | measure the fixture's travel; do not raise the ceiling to get a scan out |
+| `preload: UNKNOWN -- this toolpath records none` | the path was planned before this existed | `plan_ec_path()` again |
+
+### The instrument null
+
+An eddy-current bridge has to be **balanced with the probe on unflawed
+material**. Balanced in air, the operating point is in the wrong place, the gain
+is applied about that point, and every trace of the scan rides at an offset. This
+is not a scan to repeat — it is data that cannot be recovered.
+
+The scan does it by itself, **once**, at the instant the probe first touches
+down, before any trace is read. It is `UniWest.null()`, which sends the
+instrument's `NULL` command, and it replaces ClientScannerTest's
+`Null Uniwest? (yes=1/n=0)` prompt. It does not repeat per pass: the probe
+descends onto the part at the start of every pass, and re-balancing there would
+step the baseline between passes and stripe the image.
+
+**This is not `/ec/cond/null`.** Two different things are called a null:
+
+| | what it is | when |
+|---|---|---|
+| instrument null | a hardware balance of the instrument's own bridge; it sets where the operating point sits | once, at the first touchdown |
+| conditioning null | `/ec/cond/null`, a complex number subtracted from recorded traces by the conditioning math | any time, live, re-runnable over traces already acquired (`null_here()`) |
+
+The software one sits **on top of** the hardware one and does not replace it: an
+instrument balanced in air has its operating point wrong before any trace exists,
+and subtracting a constant afterwards does not move it.
+
+**Turning it off**, for bench work or a simulated source:
+
+```
+set_ec_nulling(enabled=False)     # do not null at all
+set_ec_nulling(required=False)    # try, but scan anyway if it fails
+set_ec_nulling()                  # just print the current state
+```
+
+As with the preload, a bare assignment to `EC_NULL_ON_CONTACT` or
+`EC_NULL_REQUIRED` at the prompt does not reach the shared globals.
+`EC_INSTRUMENT="none"` in the config means there is no instrument at all, which
+is the default whenever `EC_SOURCE` is not `hardware`.
+
+**It fails honestly.** With a null required — the default on hardware — an absent
+instrument makes `run_ec_scan()` refuse **before the arm moves**, and a `NULL`
+command that fails stops the scan at the first pass, before any trace, with the
+probe lifted off the part by the scan's own teardown. With `required=False`
+the same failure is printed as a warning saying the scan is going ahead
+un-nulled, and the scan continues. Either way the outcome comes back in
+`report["instrument_null"]`.
+
+| message | meaning | do |
+|---|---|---|
+| `NO eddy-current instrument on port 33` (at startup) | the serial port did not open | check the cable and `EC_INSTRUMENT_PORT`; `connect_ec_instrument()` retries |
+| `there is no eddy-current instrument to null on the part ... and a null is required` | refused before moving | fix the instrument, or `set_ec_nulling(required=False)` as a decision |
+| `the eddy-current instrument would not null with the probe on the part` | the `NULL` command failed; stopped at pass 1 | as above |
+| `WARNING: the instrument did NOT null` | `required=False`; the scan is running un-nulled | decide whether the data is worth keeping |
 
 ---
 
@@ -776,7 +929,7 @@ TBD-SIM-2-CYL
   more. On the cell the fixture absorbs the mesh error, the tracking error and
   the preload together. **The preload is unknown** (`EC_PRELOAD_M = 0`): with
   no preload, a fine mesh 1 mm high is 1 mm of lift-off. Measure the fixture's
-  travel and put the probe mid-travel.
+  travel, put the probe mid-travel, and `set_ec_preload()` it (section 3).
 - **The fine mesh.** The simulated Keyence is a `gpu_ray` whose outer rays
   read long (on the cylinder, -2.7 mm mean radial error). The real sensor is
   cleaner but has edge error of its own. Either way, the error goes straight
@@ -871,7 +1024,8 @@ match the cell, or **kept**, with the evidence for keeping it.
 |---|---|---|---|---|
 | line spacing | 0.0003 m (0.0001 "higher resolution") | 0.010 (UT's) | **0.0003** | changed |
 | z offset | 0.0 | -0.05 (UT's 50 mm standoff) | **0.0**: probe_end is the tip on the ec tooling | changed |
-| preload | none | none | `EC_PRELOAD_M = 0`, flagged | not known (section 5) |
+| preload | none, set by hand at the pendant | none | 0 at startup, `set_ec_preload()` in metres, refused above 2 mm, stated in mm every run | changed: the value is still not known (section 5), but it is now one owned, bounded control |
+| instrument null | operator prompt at the first point ("Null Uniwest?") | none at all | issued once by the scan at the first touchdown, before any trace | changed: an un-nulled scan is data that cannot be recovered |
 | snake | no | yes | **no** | changed: a probe dragged in contact leans against its travel, so alternating passes stripe |
 | roll | one commanded orientation | `"fixed"`: twists with diagonal tilt | **`"locked"`**: tilt follows the normal, never twists | changed |
 | line direction | fixed axis: along x, travelling -x | principal axis: along the part's second-longest side (y on the plate, measured) | principal axis turned pi/2: along the longest side (x on both specimens), travelling -x | changed to match: along y, every pass on the cylinder would tilt the probe through +-60 degrees |

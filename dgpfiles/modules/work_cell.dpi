@@ -26,6 +26,7 @@
 
 import contextlib
 import os
+import sys
 import threading
 import time
 
@@ -46,6 +47,16 @@ global describe_motion_volume_check
 global _MOTION_VOLUME
 global manifest_file
 global warning_light
+global software_versions
+global describe_software_versions
+global robot_velocity_calibration
+global robot_velocity_reload
+global describe_robot_velocity
+global adopt_measured_velocity_curve
+global _robot_velocity_from_block
+global SOFTWARE_OF_INTEREST
+global WARNING_LIGHT_ATTEMPTS
+global WARNING_LIGHT_RETRY_S
 global sensor_topics
 global sensor_topic
 
@@ -488,6 +499,313 @@ def describe_work_volume():
 
 
 # ==============================================================================
+# THE CELL'S OWN SPEED CURVE
+# ==============================================================================
+# A MoveIt velocity scaling is a fraction of the arm's JOINT limits, not a speed.
+# The technician's control is in mm/s, so something has to convert, and the
+# conversion is a measured property of this cell -- not of this code and not of
+# the robot model. measure_robot_velocity() (cell_capture_scenarios.dpi) flies a
+# ladder of speeds and records the pair.
+#
+# IT BELONGS IN THE CELL MANIFEST, for the same reason the work volume and the
+# cable envelope do: the manifest travels with the cell and the capture file does
+# not. A number that lives only in a config is transcribed by hand every time,
+# and a number transcribed by hand is a number that is eventually not
+# transcribed -- the pipeline then converts through a curve measured somewhere
+# else, commands the wrong scaling, and the arm sweeps at a speed nobody asked
+# for. That has already cost a scan.
+#
+# PER MODE, and never substituted across modes. A simulated curve applied to real
+# hardware is exactly the failure above; a mode that declares none gets None here
+# and the caller says so rather than borrowing the other mode's.
+#
+# WHAT THE TABLE IS: [(scaling, measured m/s), ...] ascending, as
+# velocity_from_scaling() and velocity_scaling_for() consume it
+# (scan_parameters.dpi). It also carries the SPAN it was measured over, because
+# the curve is path-length dependent -- a move much shorter than the span is
+# mostly acceleration ramp and never reaches the speed the table promises.
+
+_ROBOT_VELOCITY = []          # one-element cache; empty means "not looked yet"
+
+
+def robot_velocity_calibration(cell=None, mode=None, quiet=False):
+    """This cell's measured speed curve, or None.
+
+    -> {"table": [(scaling, mps), ...], "measured", "span_m", "limit_mps",
+        "source"} or None when the manifest declares none for this mode.
+
+    Cached like the work volume: every planned scan asks, and the answer is a
+    file that does not change while a config runs.
+    """
+    if _ROBOT_VELOCITY:
+        return _ROBOT_VELOCITY[0]
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    got = why = None
+
+    # THE CAPTURE FILE FIRST, THE MANIFEST SECOND -- the same order the cable
+    # envelope uses, and for the same reason. A session on the machine that just
+    # ran measure_robot_velocity() should use what it measured, with no edit and no
+    # restart; every other machine uses the manifest, which is what travels with
+    # the cell. Without this the operator has to hand-edit a file before the
+    # measurement they just took has any effect, which is the step that gets
+    # skipped.
+    locate = globals().get("_robot_velocity_file")
+    path = locate() if callable(locate) else None
+    if path and os.path.exists(path):
+        try:
+            import json
+            with open(path) as handle:
+                doc = json.load(handle)
+            got = _robot_velocity_from_block(doc, name, which, source=path)
+        except Exception as e:                                    # noqa: BLE001
+            why = "%s is unreadable (%s)" % (
+                path, (str(e).splitlines() or [repr(e)])[0][:60])
+            got = None
+
+    if got is None:
+        try:
+            from tari_bringup.cells import find_manifest
+            import yaml
+            found = find_manifest(name)
+            with open(found) as handle:
+                block = (yaml.safe_load(handle) or {}).get("robot_velocity") or {}
+            raw = block.get(which)
+            if raw:
+                got = _robot_velocity_from_block(raw, name, which, source=found)
+            elif why is None:
+                why = "the manifest declares no robot_velocity.%s" % (which,)
+        except Exception as e:                                    # noqa: BLE001
+            if why is None:
+                why = (str(e).splitlines() or [repr(e)])[0][:70]
+            got = None
+
+    if got is None and not quiet:
+        print("  no measured velocity curve for %s/%s (%s); the config's "
+              "ROBOT_VELOCITY_CALIBRATION is used instead" % (name, which, why))
+    _ROBOT_VELOCITY.append(got)
+    return got
+
+
+def _robot_velocity_from_block(raw, cell, mode, source=None):
+    """Validate and normalise one mode's `robot_velocity:` block.
+
+    REFUSES A TABLE THAT WOULD SILENTLY MISLEAD, rather than passing it on.
+    velocity_from_scaling() and velocity_scaling_for() interpolate between
+    consecutive rows and neither raises on a degenerate table -- they return a
+    number that is simply wrong. The shapes that matter:
+
+      * fewer than two rows: nothing to interpolate between.
+      * a scaling that does not increase: two speeds claimed for one command.
+      * a speed that FALLS as the scaling rises: false about any real arm, and it
+        makes the inverse ambiguous -- every speed inside the dip has two
+        scalings, and the inverse silently returns the lower one, so the cell is
+        commanded slower than asked for ever after.
+    """
+    rows = raw.get("table")
+    if not rows:
+        raise ValueError("robot_velocity.%s has no `table`" % (mode,))
+    table = []
+    for row in rows:
+        if len(row) != 2:
+            raise ValueError("robot_velocity.%s row %r is not [scaling, mps]"
+                             % (mode, row))
+        table.append((float(row[0]), float(row[1])))
+    table.sort()
+    if len(table) < 2:
+        raise ValueError(
+            "robot_velocity.%s has one row, so there is nothing to interpolate "
+            "between; measure at least two speeds" % (mode,))
+    for (s0, v0), (s1, v1) in zip(table, table[1:]):
+        if s1 <= s0:
+            raise ValueError(
+                "robot_velocity.%s repeats the scaling %.5f, which asserts two "
+                "speeds for one command" % (mode, s0))
+        if v1 <= v0:
+            raise ValueError(
+                "robot_velocity.%s says scaling %.5f gives %.4f m/s and the "
+                "larger scaling %.5f gives %.4f m/s. A speed that falls as the "
+                "scaling rises is false about any arm, and it makes the inverse "
+                "ambiguous -- every speed in the dip has two scalings and the "
+                "pipeline would take the slower one for good."
+                % (mode, s0, v0, s1, v1))
+    return {"table": table,
+            "measured": raw.get("measured"),
+            "span_m": None if raw.get("span_m") is None else float(raw["span_m"]),
+            "limit_mps": (None if raw.get("limit_mps") is None
+                          else float(raw["limit_mps"])),
+            "cell": cell, "mode": mode, "source": source}
+
+
+def adopt_measured_velocity_curve(name="ROBOT_VELOCITY_CALIBRATION", quiet=False):
+    """Replace a config's transcribed speed curve with this cell's measured one.
+
+    Call once, AFTER the includes: it writes into the config's own global so every
+    existing consumer -- velocity_from_scaling(), velocity_scaling_for(),
+    plan_scan() -- picks it up with no change.
+
+    -> the table now in force, and True if it came from the manifest.
+
+    WHY REPLACE RATHER THAN ASK. Those three functions are called from a dozen
+    places and take the table as an argument sourced from this one global. Adding a
+    manifest lookup to each is a dozen chances to miss one, and a missed one
+    converts through the stale curve while the report says the new one is in force.
+    One assignment cannot be half done.
+
+    The config's own value stays reachable as <name>_CONFIG, so a run can say what
+    it would have used and a bench session can put it back deliberately.
+    """
+    g = globals()
+    cal = robot_velocity_calibration(quiet=quiet)
+    config_table = list(g.get(name) or ())
+    g[name + "_CONFIG"] = config_table
+    if cal is None:
+        if not quiet:
+            print(describe_robot_velocity(fallback=config_table))
+        return config_table, False
+    g[name] = [tuple(row) for row in cal["table"]]
+    if not quiet:
+        print(describe_robot_velocity(fallback=config_table))
+        if config_table and config_table != g[name]:
+            # The two disagreeing is the normal case and worth one line: it is the
+            # difference between the curve somebody typed and the curve this arm
+            # has, and it is what decides every commanded speed.
+            print("    the config's own %d-row table is NOT in force (kept as "
+                  "%s_CONFIG); the manifest's measurement is"
+                  % (len(config_table), name))
+    return g[name], True
+
+
+def robot_velocity_reload():
+    """Drop the cache, so an edited manifest is picked up without a restart."""
+    del _ROBOT_VELOCITY[:]
+    return robot_velocity_calibration()
+
+
+def describe_robot_velocity(fallback=None, pass_length_m=None):
+    """One line on which speed curve is in force, and whether it fits the scan.
+
+    `fallback` is the config's own table, so the line can say plainly that a
+    transcribed curve is being used. `pass_length_m` is how long the moves this
+    curve is about to be applied to actually are: the curve is path-length
+    dependent, and applying one measured over 300 mm to a 50 mm pass is the
+    known way to get a speed nobody asked for.
+    """
+    cal = robot_velocity_calibration(quiet=True)
+    if cal is None:
+        n = len(fallback or ())
+        return ("  velocity curve: NOT MEASURED for %s/%s -- using the config's "
+                "own %d-row table. Every commanded speed is only as right as "
+                "that. measure_robot_velocity() writes a manifest block."
+                % (CELL_NAME, CELL_MODE, n))
+    table = cal["table"]
+    # WHICH FILE, not just "measured". The capture file and the manifest can
+    # disagree -- the capture is fresher on the machine that made it, the manifest
+    # is what every other machine sees -- and an operator reading a speed needs to
+    # know which one is in force before re-measuring or editing either.
+    where = cal.get("source") or "an unnamed source"
+    line = ("  velocity curve: measured, %d rows, scaling %.5f..%.5f -> "
+            "%.1f..%.1f mm/s (%s)\n    from %s"
+            % (len(table), table[0][0], table[-1][0],
+               table[0][1]*1e3, table[-1][1]*1e3,
+               cal["measured"] or "undated", where))
+    if cal["span_m"] and pass_length_m:
+        ratio = float(pass_length_m)/cal["span_m"]
+        if ratio < 0.5:
+            line += ("\n    MEASURED OVER %.0f mm, APPLIED TO %.0f mm passes. A "
+                     "move this much shorter is mostly acceleration ramp and "
+                     "will not reach the speed this table promises -- read the "
+                     "observed probe speed in the scan report, not the plan."
+                     % (cal["span_m"]*1e3, float(pass_length_m)*1e3))
+    return line
+
+
+# ==============================================================================
+# WHAT SOFTWARE IS ACTUALLY RUNNING
+# ==============================================================================
+# The cell, the container and a developer's host run different builds of the same
+# stack, and the differences are invisible until they cost a run. A dataguzzler
+# install eighteen months behind the workspace produced a KeyError inside the
+# Ctrl-C handler -- a fault that had been fixed long before, in a traceback that
+# named none of this. A compiled extension older than the library it links
+# against produces a segfault instead.
+#
+# None of that is diagnosable after the fact from a log that does not say what was
+# loaded. So a config prints this at startup: the version of each thing that
+# matters and WHERE it was imported from, because on a machine with a system
+# install and a workspace checkout the path is the part that resolves the
+# argument.
+
+SOFTWARE_OF_INTEREST = (
+    ("dataguzzler_python", "dataguzzler-python"),
+    ("spatialnde2", "spatialnde2"),
+    ("spatialnde2_ec_functions", "the compiled EC conditioning"),
+    ("numpy", "numpy"),
+    ("open3d", "open3d"),
+)
+
+
+def _module_facts(module_name):
+    """(version, path) for an importable module, without importing it fresh.
+
+    Already-imported modules are read as they are: the question is what THIS
+    process is running, not what a fresh import would find.
+    """
+    import importlib
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception as e:                                # noqa: BLE001
+            return (None, (str(e).splitlines() or [repr(e)])[0])
+    version = None
+    for attr in ("__version__", "version", "VERSION"):
+        got = getattr(mod, attr, None)
+        if isinstance(got, str):
+            version = got
+            break
+    if version is None:
+        try:
+            from importlib.metadata import version as _dist_version
+            version = _dist_version(module_name.replace("_", "-"))
+        except Exception:                                    # noqa: BLE001
+            version = "unknown"
+    return (version, getattr(mod, "__file__", None) or "(built in)")
+
+
+def software_versions():
+    """{module: {"version", "path", "label"}} for the stack this process loaded."""
+    out = {}
+    for module_name, label in SOFTWARE_OF_INTEREST:
+        version, path = _module_facts(module_name)
+        out[module_name] = {"version": version, "path": path, "label": label}
+    return out
+
+
+def describe_software_versions():
+    """The startup lines saying what is loaded. One per component.
+
+    A component that is absent says so rather than being left out: "open3d is not
+    importable" is the answer to a reconstruction that will not run, and a silent
+    omission is not.
+    """
+    lines = ["  software loaded by this process:",
+             "    python                       %s"
+             % (sys.version.split()[0],)]
+    ros_distro = os.environ.get("ROS_DISTRO")
+    if ros_distro:
+        lines.append("    ROS                          %s" % (ros_distro,))
+    for module_name, label in SOFTWARE_OF_INTEREST:
+        version, path = _module_facts(module_name)
+        if version is None:
+            lines.append("    %-28s NOT IMPORTABLE (%s)" % (label, path))
+            continue
+        lines.append("    %-28s %s" % (label, version))
+        lines.append("    %-28s   from %s" % ("", path))
+    return "\n".join(lines)
+
+
+# ==============================================================================
 # THE WARNING LIGHT
 # ==============================================================================
 # A UR digital output drives the work cell's warning light: output 0 on
@@ -500,6 +818,49 @@ def describe_work_volume():
 _LIGHT = {"depth": 0, "state": None, "unavailable": None, "log": []}
 _LIGHT_LOCK = threading.Lock()
 
+#: Attempts at switching the light ON before a run is refused.
+#:
+#: The light is a safety interlock and a dark light still refuses to move -- that
+#: does not change. What changes is how quickly it gives up. Two of the ways
+#: set_io fails are transient and cost a whole run apiece:
+#:
+#:   "no /io_and_status_controller/set_io service"  the service did not appear
+#:       within the discovery window, which a busy or freshly restarted graph can
+#:       miss even though the controller is running.
+#:   "set_io did not answer within 15 s"            it was found and then did not
+#:       reply, which is the same graph being busy rather than a dark light.
+#:
+#: Neither says the lamp is off; both say nobody could ask. A retry distinguishes
+#: them, and the second attempt costs seconds against a twenty-minute scan.
+WARNING_LIGHT_ATTEMPTS = 3
+
+#: Seconds between those attempts.
+WARNING_LIGHT_RETRY_S = 2.0
+
+
+def _switch_with_retry(pin, on, attempts):
+    """set_digital_out, retried. -> (ok, reason_of_last_failure).
+
+    Only worth retrying while it keeps failing for a reason that is about
+    reaching the service rather than about the output itself, and the two are not
+    distinguishable from here -- so it simply tries again, a bounded number of
+    times, and reports the last reason if none of them worked.
+    """
+    reason = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            set_digital_out(pin, on)
+            return (True, None)
+        except Exception as e:                                # noqa: BLE001
+            reason = (str(e).splitlines() or [repr(e)])[0]
+            if attempt < attempts:
+                print("  warning light: %s did not answer (%s); retrying "
+                      "(%d of %d)"
+                      % ("switch ON" if on else "switch off", reason,
+                         attempt + 1, attempts))
+                time.sleep(WARNING_LIGHT_RETRY_S)
+    return (False, reason)
+
 
 def _light_switch(pin, on, what):
     """Switch the light and say so. Raises only when it may not stay dark."""
@@ -510,10 +871,14 @@ def _light_switch(pin, on, what):
         # Simulation, already found wanting once: every further set_io would
         # cost its full service wait for nothing.
         return False
-    try:
-        set_digital_out(pin, on)
-    except Exception as e:
-        reason = (str(e).splitlines() or [repr(e)])[0]
+    # Retried only where a retry can save something: switching ON before the arm
+    # moves, and only when the light is required, which is the case that refuses
+    # the run. A single attempt everywhere else keeps simulation and the switch-off
+    # path as quick as they were.
+    attempts = (globals().get("WARNING_LIGHT_ATTEMPTS", 1)
+                if (on and required) else 1)
+    ok, reason = _switch_with_retry(pin, on, attempts)
+    if not ok:
         _LIGHT["log"].append((time.monotonic(),
                               bool(on), False, what))
         if on and required:

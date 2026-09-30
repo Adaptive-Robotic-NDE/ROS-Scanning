@@ -412,6 +412,199 @@ def test_region():
           int(G.region_mask(v, None).sum()) == 0)
 
 
+def _sampled_surface(pitch=0.006, x0=0.800, y0=0.050, size=0.042, z=0.9420):
+    """A flat triangulated surface sampled every `pitch` metres. -> (verts, tris).
+
+    The Azure rough mesh's 6 mm sampling by default, which is the quantisation
+    every region measured off vertex coordinates inherits.
+    """
+    a = np.arange(0.0, size + 1e-9, pitch) + x0
+    b = np.arange(0.0, size + 1e-9, pitch) + y0
+    gx, gy = np.meshgrid(a, b, indexing="ij")
+    verts = np.column_stack([gx.ravel(), gy.ravel(), np.full(gx.size, z)])
+    n = len(a)
+    idx = np.arange(n*n).reshape(n, n)
+    tris = np.vstack([
+        np.column_stack([idx[:-1, :-1].ravel(), idx[1:, :-1].ravel(),
+                         idx[1:, 1:].ravel()]),
+        np.column_stack([idx[:-1, :-1].ravel(), idx[1:, 1:].ravel(),
+                         idx[:-1, 1:].ravel()])])
+    return verts, tris
+
+
+@_checked
+def test_selection_region():
+    print("=== the region the pipeline is told to scan ===")
+    # THE FAILURE THIS SECTION EXISTS FOR. A region measured as the minimum and
+    # maximum of the SELECTED VERTICES is quantised by the mesh's sampling, not
+    # by what the operator drew. On a 6 mm surface a band a few eddy-current
+    # lines wide (0.3 mm apiece) catches one column of vertices, and the
+    # rectangle comes back with xmin == xmax -- which reached the Keyence
+    # reconstruction and stopped the run with "no extent" ninety seconds later.
+    cell = G.FOOTPRINT_CELL_M
+    v = np.array([[0.8070, 0.0270, 0.9420],
+                  [0.8070, 0.0570, 0.9420],
+                  [0.8070, 0.0870, 0.9420]])
+    m = np.ones(3, dtype=bool)
+
+    raw = G.bounding_region(v, m)
+    check("one column of vertices spans zero in x -- the raw box that stopped "
+          "a run", raw[2] - raw[0] == 0.0, "%s" % (raw,))
+
+    r = G.selection_region(v, m)
+    check("the reported region has a whole cell of extent on x instead",
+          abs((r[2] - r[0]) - cell) < 1e-12,
+          "%.3f mm" % ((r[2] - r[0])*1e3,))
+    check("and it contains the points it was measured from",
+          r[0] <= raw[0] and r[1] <= raw[1] and r[2] >= raw[2] and r[3] >= raw[3],
+          "%s against %s" % (r, raw))
+    check("it lands on the selection lattice, so the rectangle and the drawn "
+          "shape share one grid",
+          all(abs(a/cell - round(a/cell)) < 1e-6 for a in r), "%s" % (r,))
+
+    # A band the operator can see and the lattice cannot: narrower than one cell,
+    # and not zero.
+    thin = np.array([[0.5000, 0.1000, 0.0], [0.5009, 0.1400, 0.0]])
+    rt = G.selection_region(thin, np.ones(2, dtype=bool))
+    check("a band 0.9 mm wide -- under one cell -- still reports a cell",
+          rt[2] - rt[0] >= cell - 1e-12, "%.3f mm" % ((rt[2] - rt[0])*1e3,))
+    check("...and that cell is the one the band is in",
+          rt[0] <= 0.5000 and rt[2] >= 0.5009, "%s" % (rt,))
+
+    # EVERY selection with a point in it, whatever shape, over a range of sizes
+    # from one point to a patch. Zero extent on either axis is the failure.
+    rng = np.random.default_rng(7)
+    worst = 1.0
+    for _ in range(400):
+        k = int(rng.integers(1, 9))
+        p = rng.uniform([0.70, -0.05], [0.90, 0.15], size=(k, 2))
+        pv = np.column_stack([p, np.zeros(k)])
+        rr = G.selection_region(pv, np.ones(k, dtype=bool))
+        worst = min(worst, rr[2] - rr[0], rr[3] - rr[1])
+    check("no selection of any shape or size reports a zero extent",
+          worst >= cell - 1e-12, "the narrowest was %.4f mm" % (worst*1e3,))
+
+    raises(lambda: G.selection_region(v, np.zeros(3, dtype=bool)),
+           "an empty selection still has no region at all",
+           ("nothing is selected",))
+
+    # The reconstruction emits a few NaN vertices per mesh. One inside the
+    # selection must cost itself and not the region -- a NaN cell index is an
+    # error, not a wide region.
+    nan_v = np.vstack([v, [[np.nan, np.nan, 0.9420]]])
+    rn = G.selection_region(nan_v, np.ones(4, dtype=bool))
+    check("a NaN vertex in the selection costs itself and not the region",
+          all(np.isfinite(rn)) and abs((rn[2] - rn[0]) - cell) < 1e-12,
+          "%s" % (rn,))
+    raises(lambda: G.selection_region(np.array([[np.nan, np.nan, 0.0]]),
+                                      np.ones(1, dtype=bool)),
+           "a selection of nothing but NaN has no region",
+           ("nothing is selected",))
+
+
+@_checked
+def test_selection_region_covers_the_drawn_shape():
+    print("=== the region covers every cell the operator hit ===")
+    verts, tris = _sampled_surface()
+    # A strip one mesh row wide: the case where the drawn shape reaches past the
+    # vertices that carry it, because a strip has no strict triangle interior.
+    strip = (verts[:, 0] >= 0.806) & (verts[:, 0] <= 0.812)
+    fp = G.footprint(verts, strip, tris=tris)
+    r = G.selection_region(verts, strip, footprint=fp)
+    fb = G.footprint_bounds(fp)
+    check("the region contains the drawn footprint's whole bounding box",
+          r[0] <= fb[0] + 1e-12 and r[1] <= fb[1] + 1e-12
+          and r[2] >= fb[2] - 1e-12 and r[3] >= fb[3] - 1e-12,
+          "region %s against footprint %s" % (r, fb))
+
+    i, j = np.nonzero(fp["grid"])
+    cx = (fp["i0"] + i + 0.5)*fp["cell"]
+    cy = (fp["j0"] + j + 0.5)*fp["cell"]
+    check("and every one of its %d occupied cells is inside the region" % (len(i),),
+          bool(((cx >= r[0]) & (cx <= r[2]) & (cy >= r[1])
+                & (cy <= r[3])).all()),
+          "%d cells fell outside"
+          % (int((~((cx >= r[0]) & (cx <= r[2]) & (cy >= r[1])
+                    & (cy <= r[3]))).sum()),))
+
+    without = G.selection_region(verts, strip)
+    check("folding the footprint in can only widen the region, never narrow it",
+          r[0] <= without[0] and r[1] <= without[1]
+          and r[2] >= without[2] and r[3] >= without[3],
+          "%s against %s" % (r, without))
+
+    # A footprint's bounds are ALREADY on the lattice. Rounding them a second
+    # time would hand back a spare cell on every side, every time.
+    box = G.footprint_from_region((0.806, 0.026, 0.812, 0.032))
+    bb = G.footprint_bounds(box)
+    inside = np.array([[0.8065, 0.0265, 0.0]])
+    rb = G.selection_region(inside, np.ones(1, dtype=bool), footprint=box)
+    check("a cell-aligned footprint is not rounded a second time",
+          all(abs(a - b) < 1e-12 for a, b in zip(rb, bb)),
+          "%s against %s" % (rb, bb))
+
+    imin, jmin, imax, jmax = G.footprint_cell_range(fp)
+    check("footprint_cell_range describes the same rectangle as "
+          "footprint_bounds",
+          abs(imin*fp["cell"] - fb[0]) < 1e-12
+          and abs((imax + 1)*fp["cell"] - fb[2]) < 1e-12
+          and abs(jmin*fp["cell"] - fb[1]) < 1e-12
+          and abs((jmax + 1)*fp["cell"] - fb[3]) < 1e-12)
+
+
+@_checked
+def test_selection_region_refusals():
+    print("=== what is refused while the operator can still fix it ===")
+    v = np.array([[0.8070, 0.0270, 0.9420], [0.8070, 0.0870, 0.9420]])
+    m = np.ones(2, dtype=bool)
+
+    # THE FLOOR IS IN LINE SPACINGS, NOT IN CELLS. One 2 mm cell is six passes
+    # at the eddy-current 0.3 mm and one pass at 1.5 mm, and only the second is
+    # a region not worth scanning.
+    check("at the 0.3 mm eddy-current spacing one cell is six passes, so a "
+          "drawn selection is never refused for width",
+          int(G.SELECTION_LINE_SPACING_M*1e6) == 300
+          and G.selection_region(v, m)[2] > 0.0)
+
+    raises(lambda: G.selection_region(v, m, line_spacing=0.0015),
+           "a region too narrow for two passes is refused, naming the size, "
+           "the spacing and how many lines that is",
+           ("2.0 mm across on x", "line spacing is 1.5 mm", "this is 1 line"))
+    try:
+        G.selection_region(v, m, line_spacing=0.0015)
+        check("the refusal is SelectionRefused", False, "did not raise")
+    except G.SelectionRefused as exc:
+        check("the refusal is SelectionRefused, and still a ValueError",
+              isinstance(exc, ValueError), "%s" % (type(exc).__name__,))
+    check("line_spacing=0 turns the floor off for a caller that has no scan "
+          "to size it against",
+          G.selection_region(v, m, line_spacing=0.0)[2] > 0.0)
+
+    # THE TAUGHT WORK AREA IS THE CEILING. Rounding outward grows commanded
+    # motion, so the result is held inside what was taught.
+    area = (0.8065, 0.0300, 0.9000, 0.0800)
+    rc = G.selection_region(v, m, work_area=area)
+    check("the region is clipped to the taught work area, never grown past it",
+          rc[0] >= area[0] - 1e-12 and rc[1] >= area[1] - 1e-12
+          and rc[2] <= area[2] + 1e-12 and rc[3] <= area[3] + 1e-12,
+          "%s against %s" % (rc, area))
+    check("the clip is the only thing that takes it off the lattice, and it "
+          "still has extent",
+          rc[2] - rc[0] > 0.0 and rc[3] - rc[1] > 0.0, "%s" % (rc,))
+    check("without a work area nothing is clipped",
+          G.selection_region(v, m)[3] > area[3])
+
+    far = np.array([[2.0, 2.0, 0.0], [2.01, 2.01, 0.0]])
+    raises(lambda: G.selection_region(far, np.ones(2, dtype=bool),
+                                      work_area=area),
+           "a selection outside the work area is refused, naming both boxes",
+           ("outside the taught work area", "the work area is"))
+
+    check("describe_selection_region says what was reported and what was drawn",
+          "rounded out to whole" in G.describe_selection_region(
+              rc, G.bounding_region(v, m)))
+
+
 @_checked
 def test_submesh():
     print("=== the sub-mesh handed downstream ===")
@@ -891,18 +1084,7 @@ def test_what_the_window_writes():
                  "exec"), ns)
 
     # A 6 mm-pitch surface, as the Azure rough mesh is, with the middle selected.
-    a = np.arange(0.0, 0.0421, 0.006) + 0.800
-    b = np.arange(0.0, 0.0421, 0.006) + 0.050
-    gx, gy = np.meshgrid(a, b, indexing="ij")
-    v = np.column_stack([gx.ravel(), gy.ravel(),
-                         np.full(gx.size, 0.9420)])
-    n = len(a)
-    idx = np.arange(n*n).reshape(n, n)
-    t = np.vstack([
-        np.column_stack([idx[:-1, :-1].ravel(), idx[1:, :-1].ravel(),
-                         idx[1:, 1:].ravel()]),
-        np.column_stack([idx[:-1, :-1].ravel(), idx[1:, 1:].ravel(),
-                         idx[:-1, 1:].ravel()])])
+    v, t = _sampled_surface()
     mask = ((v[:, 0] >= 0.806) & (v[:, 0] <= 0.836) &
             (v[:, 1] >= 0.056) & (v[:, 1] <= 0.086))
 
@@ -911,6 +1093,7 @@ def test_what_the_window_writes():
     win = _Win()
     win.verts, win.tris, win.normals, win.mask = v, t, None, mask
     win.n, win.front_only = len(v), True
+    win.work_area, win.line_spacing = (0.60, -0.20, 1.00, 0.30), 0.0003
     d = tempfile.mkdtemp(prefix="roi_ui_test_")
     req = {"input": "stub.ply", "output": os.path.join(d, "result.json"),
            "mask": os.path.join(d, "mask.npy"),
@@ -943,6 +1126,36 @@ def test_what_the_window_writes():
           len(np.load(req["mask"])) == len(v))
     check("and the sub-mesh is a mesh", os.path.exists(req["submesh"])
           and G.read_ply(req["submesh"])[2] is not None)
+
+    # THE REGION IN THE FILE IS THE ROUNDED, CLIPPED ONE, and the raw span of the
+    # selected vertices is beside it as provenance.
+    reg = onfile["region"]
+    drawn = onfile["region_drawn"]
+    check("the region written out has extent on both axes",
+          reg[2] - reg[0] > 0.0 and reg[3] - reg[1] > 0.0, "%s" % (reg,))
+    check("it contains the raw span of the selected vertices",
+          reg[0] <= drawn[0] and reg[1] <= drawn[1]
+          and reg[2] >= drawn[2] and reg[3] >= drawn[3],
+          "%s against %s" % (reg, drawn))
+    check("it contains the footprint it will be planned on",
+          reg[0] <= x0 + 1e-12 and reg[1] <= y0 + 1e-12
+          and reg[2] >= x1 - 1e-12 and reg[3] >= y1 - 1e-12,
+          "%s against %s" % (reg, [x0, y0, x1, y1]))
+    check("and a line of it goes in the file for the scan log",
+          "rounded out to whole" in onfile["region_described"])
+
+    # THE SELECTION THAT KILLED A RUN, through the whole of write_result: a band
+    # on a 6 mm surface that catches one column of vertices.
+    win.mask = np.isclose(v[:, 0], 0.806) | np.isclose(v[:, 0], 0.8061)
+    req3 = dict(req, output=os.path.join(d, "r3.json"),
+                mask=os.path.join(d, "m3.npy"),
+                submesh=os.path.join(d, "s3.ply"))
+    out3 = ns["write_result"](win, req3)
+    check("a one-column selection that used to report zero extent reports a cell",
+          out3["region_drawn"][2] - out3["region_drawn"][0] == 0.0
+          and out3["region"][2] - out3["region"][0] >= G.FOOTPRINT_CELL_M - 1e-12,
+          "drawn %s, reported %s" % (out3["region_drawn"], out3["region"]))
+    win.mask = mask
 
     # A POINT CLOUD has no faces, and must still produce a footprint.
     win.tris = None
@@ -1074,7 +1287,10 @@ def test_real_mesh():
 
 def main():
     for fn in (test_box, test_polygon, test_brush, test_combine,
-               test_front_surface, test_region, test_submesh, test_footprint,
+               test_front_surface, test_region, test_selection_region,
+               test_selection_region_covers_the_drawn_shape,
+               test_selection_region_refusals,
+               test_submesh, test_footprint,
                test_footprint_heights,
                test_the_roi_that_cropped_nothing, test_what_the_window_writes,
                test_projection, test_ply_roundtrip, test_real_mesh):

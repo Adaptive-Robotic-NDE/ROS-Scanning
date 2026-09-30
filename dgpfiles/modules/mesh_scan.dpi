@@ -249,12 +249,19 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
     if orient in ("surface", "normal"):
         if orient == "normal":
             nr = path.normal_report or {}
+            # WHAT THIS LINE MAY AND MAY NOT CLAIM. It says where the axis came
+            # from, which is a fact about the construction. It may NOT say that
+            # nothing is flipped: that this code does not turn poses over is a
+            # statement about its policy, not a measurement of the path, and a
+            # mesh repair that has just replaced 23 backwards normals is exactly
+            # the run on which the two read differently. Whether anything is
+            # actually turned round is measured below, against the surface at each
+            # waypoint, by repair_tool_axis_to_surface(); nothing here pre-empts it.
             print("  orientation: the tool axis IS the repaired surface normal, "
                   "sampled from %s at every one of %d waypoints (%s; sampled at "
-                  "most %.3f mm off the surface). NOTHING was flipped: %d "
-                  "waypoint(s) sit on surface facing AWAY from the probe, which is "
-                  "an unreachable region and is reported as one below, not turned "
-                  "over."
+                  "most %.3f mm off the surface). %d waypoint(s) sit on surface "
+                  "facing AWAY from world up, which is an unreachable region and "
+                  "is reported as one below rather than turned over."
                   % (os.path.basename(str(surface)), len(path),
                      "a height field" if nr.get("height_field")
                      else "%.1f%% of it faces up" % (100.0*nr.get(
@@ -291,12 +298,18 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
         path.roll_report = tool_roll_report(
             path.quats, path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M),
             reference=roll_reference)
+        # ALWAYS AS A DIRECTION. A roll reference may be a direction or a whole
+        # orientation -- an operator-set probe rotation arrives as the latter --
+        # and printing four quaternion components after "reference x =" names the
+        # wrong thing. This is that reference's own x axis either way.
+        _ref_x = quat_to_matrix(np.asarray(
+            roll_reference_quat(roll_reference), dtype=np.float64))[:, 0]
         print("  rotation about the tool's own axis: %.2f deg across the path, "
               "%.2f deg within one pass at most (reference x = %s); tilt from "
               "vertical up to %.1f deg, mean %.1f"
               % (path.roll_report["twist_range_deg"],
                  path.roll_report["twist_in_pass_deg"],
-                 tuple(float(v) for v in np.asarray(roll_reference).reshape(-1)),
+                 tuple(round(float(v), 6) for v in _ref_x),
                  path.roll_report["tilt_max_deg"],
                  path.roll_report["tilt_mean_deg"]))
         # Within a pass and between passes SEPARATELY, and again over only the
@@ -321,6 +334,31 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
         #                                       EC_MAX_TILT_DEG's question, and the
         #                                       answer is REPORTED -- what, where,
         #                                       how much -- never silently dropped.
+        #
+        # AND THE TURNED-ROUND POSES, BEFORE EITHER, because the postcondition
+        # cannot see them: on a normal-constrained path it compares the axis with
+        # the same sampler that built it, so it reads 0.000 deg whatever happened.
+        # This one classifies each pose against the surface AT that waypoint,
+        # puts back the ones that can be put back, and DROPS the ones on surface
+        # facing away from the probe -- never turns one over, which would point
+        # the probe away from the part and push the holder into it.
+        #
+        # ONLY A NORMAL-CONSTRAINED PATH IS REPAIRED. orient="capped" leans the
+        # tool back on purpose and orient="surface" keeps the planner's own
+        # estimate; putting either back on the normal would quietly turn it into
+        # orient="normal" and, on a cylinder flank, undo the cap that is the only
+        # reason that path can be entered at all. Those modes get the measurement
+        # and no change.
+        if surface is not None:
+            if path_is_normal_constrained(path):
+                _fixed, _flips = repair_tool_axis_to_surface(
+                    path, surface, what="planned toolpath")
+                path = _fixed
+            else:
+                _flips = tool_axis_flip_report(path, surface)
+                for _line in describe_tool_axis_flips(_flips):
+                    print(_line)
+            path.axis_flips = _flips
         if surface is not None and path_is_normal_constrained(path):
             path.normal_postcondition = assert_probe_normal_to_surface(
                 path, surface, what="planned toolpath")

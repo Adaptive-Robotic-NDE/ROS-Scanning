@@ -120,6 +120,7 @@ global cable_envelope_model
 global cable_envelope_reload
 global wrist3_band
 global wrist3_band_deg
+global wrist3_datum_deg
 global wrist3_tilt_of
 global check_wrist3
 # A DIAGNOSTIC, not a substitution -- see its docstring. Exported because the fix
@@ -301,6 +302,28 @@ def wrist3_tilt_of(quat, home_quat=None):
 # The model
 # ------------------------------------------------------------------------------
 
+def _cable_interp_scalar(row, t):
+    """One measured scalar interpolated linearly along a sorted axis row.
+
+    Clamped at both ends rather than extrapolated: outside the measured tilts
+    there is nothing to extend from, and band_with_reason() has already refused
+    such a tilt by the time this is reached.
+    """
+    if not row:
+        return None
+    if t <= row[0][0]:
+        return float(row[0][1])
+    if t >= row[-1][0]:
+        return float(row[-1][1])
+    for (ta, va), (tb, vb) in zip(row, row[1:]):
+        if ta - 1e-9 <= t <= tb + 1e-9:
+            if tb - ta < 1e-9:
+                return float(va)
+            f = (t - ta)/(tb - ta)
+            return float(va + f*(vb - va))
+    return float(row[-1][1])
+
+
 class CableEnvelope(object):
     """The measured wrist-3 bands, and the rule for the tilts between them.
 
@@ -362,8 +385,24 @@ class CableEnvelope(object):
                  notes=None):
         #: [(tx_deg, ty_deg, lo_rad, hi_rad, label)], as measured.
         self.samples = []
+        #: (tx_deg, ty_deg) -> the wrist_3 angle the arm held at the REFERENCE
+        #: orientation for that tilt, in degrees, as measured. Empty when the
+        #: measurement did not record it.
+        #:
+        #: WHY IT BELONGS WITH THE BAND. The band is in absolute wrist_3 degrees,
+        #: and this is where zero rotation sits inside it -- 166.09 in a band of
+        #: 16.09..301.09, so this cell holds -150..+135 of rotation with the probe
+        #: vertical. The two numbers were taken in the same breath from the same
+        #: joint state, so they are only meaningful together; keeping the band and
+        #: discarding this left the conversion from "turn the probe 90 degrees" to
+        #: "wrist 3 goes to X" as a constant typed into a config.
+        #:
+        #: It varies with tilt -- 147 to 179 degrees across this cell's five
+        #: samples -- because reaching a tilt turns the wrist on the way.
+        self.wrist3_start = {}
         for s in samples:
-            tx, ty, lo, hi, label = s
+            tx, ty, lo, hi, label = s[:5]
+            start = s[5] if len(s) > 5 else None
             lo, hi = float(lo), float(hi)
             if hi <= lo:
                 raise ValueError("cable envelope sample %r is empty or inside "
@@ -371,6 +410,8 @@ class CableEnvelope(object):
                                  % (label, math.degrees(lo), math.degrees(hi)))
             self.samples.append((float(tx), float(ty), lo, hi,
                                  label or _cable_tilt_label(tx, ty)))
+            if start is not None:
+                self.wrist3_start[(float(tx), float(ty))] = float(start)
         if not self.samples:
             raise ValueError("a cable envelope needs at least the untilted sample")
         self.home_quat = tuple(float(v) for v in home_quat)
@@ -457,6 +498,49 @@ class CableEnvelope(object):
                                              allow_outside=allow_outside)
         return lo, hi
 
+    def wrist3_datum_deg(self, tilt=None, quat=None, allow_outside=False):
+        """The measured wrist_3 angle at ZERO rotation for this tilt, or None.
+
+        None means the measurement did not record it, and None is the honest
+        answer: the alternative is a number typed into a config, which is a fact
+        about how the tooling is bolted on and cannot be guessed.
+
+        Interpolated the same way the band is -- linearly along each axis as a
+        DEVIATION from the untilted value, so a tilt on both axes pays for both --
+        and exact on any measured sample. It has to be the same rule, because a
+        rotation is checked by adding it to this and testing against the band at
+        the same tilt; two different rules would put the datum and its band in
+        different places.
+        """
+        if not self.wrist3_start:
+            return None
+        tx, ty = self.tilt_of(tilt=tilt, quat=quat)
+        if allow_outside:
+            tx = min(max(tx, self.tx_range[0]), self.tx_range[1])
+            ty = min(max(ty, self.ty_range[0]), self.ty_range[1])
+        row_x = self._datum_row(0, 1)
+        row_y = self._datum_row(1, 0)
+        if not row_x or not row_y:
+            return None
+        zero = self.wrist3_start.get((0.0, 0.0))
+        if zero is None:
+            # No untilted sample to take deviations from; the best available
+            # answer is the row value, and only when one axis is untilted.
+            if abs(ty) <= CABLE_TILT_TOL_DEG:
+                return _cable_interp_scalar(row_x, tx)
+            if abs(tx) <= CABLE_TILT_TOL_DEG:
+                return _cable_interp_scalar(row_y, ty)
+            return None
+        dx = _cable_interp_scalar(row_x, tx) - zero
+        dy = _cable_interp_scalar(row_y, ty) - zero
+        return zero + dx + dy
+
+    def _datum_row(self, which, other):
+        """[(tilt_deg, wrist3_start_deg)] along one axis, sorted."""
+        row = [(k[which], v) for k, v in self.wrist3_start.items()
+               if abs(k[other]) <= CABLE_TILT_TOL_DEG]
+        return sorted(row)
+
     def band_with_reason(self, tilt=None, quat=None, margin_deg=None,
                          allow_outside=False):
         """(lo_rad, hi_rad, why) -- `why` names the tilt and the samples used,
@@ -541,9 +625,17 @@ class CableEnvelope(object):
         """The JSON/YAML form: schema 2, per-tilt, no enforced global band."""
         per = []
         for tx, ty, lo, hi, label in self.samples:
-            per.append({"tilt": label, "tx_deg": tx, "ty_deg": ty,
-                        "lo_deg": math.degrees(lo), "hi_deg": math.degrees(hi),
-                        "lo_rad": lo, "hi_rad": hi})
+            row = {"tilt": label, "tx_deg": tx, "ty_deg": ty,
+                   "lo_deg": math.degrees(lo), "hi_deg": math.degrees(hi),
+                   "lo_rad": lo, "hi_rad": hi}
+            # The band says how far the wrist may turn; this says where zero
+            # rotation sits inside it. Written out because a file that carries one
+            # without the other cannot answer "what wrist angle does a 90 degree
+            # probe rotation ask for".
+            start = self.wrist3_start.get((tx, ty))
+            if start is not None:
+                row["wrist3_start_deg"] = float(start)
+            per.append(row)
         lo_i = max(s[2] for s in self.samples)
         hi_i = min(s[3] for s in self.samples)
         doc = {"schema": CABLE_ENVELOPE_SCHEMA,
@@ -597,7 +689,11 @@ def cable_envelope_from_rows(rows, step_deg=None, home_quat=(0.0, 0.0, 0.0, 1.0)
         hi = row.get("hi_rad")
         lo = math.radians(float(row["lo_deg"])) if lo is None else float(lo)
         hi = math.radians(float(row["hi_deg"])) if hi is None else float(hi)
-        samples.append((float(tx), float(ty), lo, hi, row.get("tilt")))
+        # wrist3_start_deg comes along: it is measured in the same joint state
+        # as the band and is the only thing that says where zero rotation sits
+        # inside it. Absent in a schema 1 file, and None is then the answer.
+        samples.append((float(tx), float(ty), lo, hi, row.get("tilt"),
+                        row.get("wrist3_start_deg")))
     return CableEnvelope(samples, home_quat=home_quat, cell=cell, mode=mode,
                          measured=measured, step_deg=step_deg, source=source)
 
@@ -628,9 +724,12 @@ def cable_envelope_manifest_block(model=None, mode=None):
         out.append("    step_deg: %.1f" % (m.step_deg,))
     out.append("    per_tilt:")
     for tx, ty, lo, hi, label in m.samples:
+        start = m.wrist3_start.get((tx, ty))
+        tail = ("" if start is None
+                else ", wrist3_start_deg: %.4f" % (float(start),))
         out.append("      - {tilt: \"%s\", tx_deg: %.1f, ty_deg: %.1f, "
-                   "lo_deg: %.4f, hi_deg: %.4f}"
-                   % (label, tx, ty, math.degrees(lo), math.degrees(hi)))
+                   "lo_deg: %.4f, hi_deg: %.4f%s}"
+                   % (label, tx, ty, math.degrees(lo), math.degrees(hi), tail))
     return "\n".join(out)
 
 
@@ -803,6 +902,26 @@ def wrist3_band_deg(tilt=None, quat=None, **kw):
     """wrist3_band() in degrees."""
     lo, hi = wrist3_band(tilt=tilt, quat=quat, **kw)
     return math.degrees(lo), math.degrees(hi)
+
+
+def wrist3_datum_deg(tilt=None, quat=None, allow_outside=False, model=None):
+    """The measured wrist_3 angle at ZERO probe rotation, in degrees, or None.
+
+    None means no cable envelope has been measured for this cell, or the one that
+    was does not record the datum -- a schema 1 file, or a capture from before it
+    was written out. None is the answer rather than a fallback, because where zero
+    sits inside the band is a property of how the tooling is bolted on and cannot
+    be derived from anything else here.
+
+    This is the other half of wrist3_band(): the band says how far the wrist may
+    turn, this says where a rotation of zero starts from. Both come from the same
+    joint state in the same measurement, so a rotation is checked by adding it to
+    this and testing the sum against the band AT THE SAME TILT.
+    """
+    m = cable_envelope_model() if model is None else model
+    if m is None:
+        return None
+    return m.wrist3_datum_deg(tilt=tilt, quat=quat, allow_outside=allow_outside)
 
 
 def _cable_wrist3_values(qs):

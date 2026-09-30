@@ -19,6 +19,7 @@
 # with the real-mesh case.
 
 import os
+import sys
 import numpy as np
 import spatialnde2 as snde
 
@@ -26,6 +27,7 @@ import spatialnde2 as snde
 # needs to see has to be declared global before it is assigned.
 global ORIENT_DTYPE
 global SurfaceProjector
+global loadable_projection_surface
 
 
 ORIENT_DTYPE = [('quat', '<f4', (4,)), ('offset', '<f4', (4,))]
@@ -94,6 +96,52 @@ def plane_x3d_from_scanpath(path, uu, vv, ww, margin=0.0):
     return write_plane_x3d(path, o, u, v), o, u, v
 
 
+def loadable_projection_surface(x3d_path):
+    """The surface to hand to the loader, repaired first if it needs it.
+
+    x3d_load_geometry() sorts the edges around each vertex using the triangle
+    winding, and ONE interior edge wound the same way round by both of its
+    triangles makes that sort impossible. It does not return an error: it fails an
+    assertion, which is SIGABRT for the whole process -- mid-scan, with the probe
+    on the part and the recording database lost. So the surface is checked, and
+    repaired where it can be, before the loader ever sees it.
+
+    Inconsistent winding is normal here rather than exotic: making each face's
+    normal agree with a measured surface is done face by face, and every face
+    turned that way disagrees with its neighbours afterwards. The repair reverses
+    those faces back, which changes no geometry -- see x3d_winding.py.
+    """
+    try:
+        import x3d_winding
+    except ImportError:
+        # A live config includes this file before anything adds the module
+        # directory to sys.path; the config knows where that is.
+        module_dir = globals().get("SCAN_MODULE_DIR")
+        if module_dir and module_dir not in sys.path:
+            sys.path.insert(0, module_dir)
+        import x3d_winding
+    return x3d_winding.loadable_x3d(x3d_path)
+
+
+#: How many surfaces have been loaded under each projection prefix.
+#:
+#: x3d_load_geometry() reserves the channels of the model tree it loads into --
+#: the group itself plus meshed, uv, trinormals, boxes2d, boxes3d, projinfo and
+#: inplanemat -- and keeps those reservations to itself. The recording it returns
+#: does not expose them, so there is no call that hands them back, and loading a
+#: second surface into the same tree fails the whole transaction:
+#:
+#:     realize_transaction: provided reserved_channel for
+#:     /ec/proj/graphics/specimen/ by main is not current
+#:
+#: So each load gets its OWN tree, numbered from here. Everything the operator
+#: and the viewer refer to keeps a fixed name; only the tree moves. The cost is
+#: eight channels per surface, held for the life of the process, which is why
+#: restart() exists: rescanning the SAME surface reuses one tree and costs
+#: nothing.
+_surface_generation = {}
+
+
 class SurfaceProjector(object):
     """Loads a parameterized surface and projects scalar probe data onto it.
 
@@ -111,7 +159,13 @@ class SurfaceProjector(object):
         self.recdb = recdb
         self.offset = tuple(float(v) for v in offset)
         self.prefix = prefix.rstrip("/")
-        self.model_tree = self.prefix + "/graphics/specimen/"
+        # A fresh model tree for this load -- see _surface_generation above.
+        # Numbered per prefix so the ultrasound and eddy-current projectors count
+        # independently and one does not renumber the other.
+        gen = _surface_generation.get(self.prefix, 0)
+        _surface_generation[self.prefix] = gen + 1
+        self.generation = gen
+        self.model_tree = self.prefix + "/graphics/specimen%d/" % gen
         self.specimen_pose_channel = self.prefix + "/specimen_pose"
         self.probe_pose_channel = self.prefix + "/probe_pose"
         self.data_channel = self.prefix + "/probe_value"
@@ -126,6 +180,10 @@ class SurfaceProjector(object):
         self.use_surface_normal = use_surface_normal
         self.create_textured_part = create_textured_part
 
+        # Before anything is allocated or reserved: a surface the loader would
+        # abort on is either repaired into a sibling file or refused outright.
+        load_path = loadable_projection_surface(x3d_path)
+
         self.graphman = snde.graphics_storage_manager(
             self.prefix + "/graphics/", recdb.lowlevel_alloc,
             recdb.alignment_requirements, recdb.lockmgr, 1e-8, 2000000000)
@@ -137,8 +195,13 @@ class SurfaceProjector(object):
         # project_onto_parameterization_processing_tags is what builds the
         # boxes3d / projinfo / inplanemat arrays the projector needs; without
         # them the ray tracer has nothing to intersect against.
+        #
+        # load_path, not x3d_path: an inconsistently wound surface aborts the
+        # process inside the loader, so it is repaired first. self.x3d_path stays
+        # the surface that was ASKED for, because that is what callers compare
+        # against to decide whether they can reuse this projector.
         self.specimen_recording = snde.x3d_load_geometry(
-            trans, self.graphman, x3d_path, 0, "main", self.model_tree,
+            trans, self.graphman, load_path, 0, "main", self.model_tree,
             texture_scaling,
             ["reindex_vertices", "reindex_tex_vertices"]
             + snde.project_onto_parameterization_processing_tags)
@@ -172,6 +235,7 @@ class SurfaceProjector(object):
 
         self.x3d_path = x3d_path
         self.projection = None
+        self.proj_specimen_chan = None
         self._instantiate_projection()
 
         # The textured part is what lets the viewer draw the projection on the
@@ -233,22 +297,14 @@ class SurfaceProjector(object):
     def restart(self):
         """Empty the projected image, keeping the loaded surface.
 
-        This is how a second scan in one session gets a clean picture. Building a
-        whole new SurfaceProjector cannot do it: x3d_load_geometry defines a
-        subtree of channels under the model tree that this object never holds a
-        handle to, so nothing here can hand them back, and the next construction
-        dies with
+        This is how RESCANNING THE SAME SURFACE gets a clean picture, and it is
+        the cheap path: the surface stays loaded, so none of the projection
+        geometry -- boxes3d, projinfo, inplanemat -- has to be recomputed, which
+        on a CPU-only build is the slowest part of building a projector.
 
-            realize_transaction: provided reserved_channel for
-            /ut/proj/graphics/specimen/ by main is not current
-
-        The math function, by contrast, owns its own output channel and gives it
-        back when deleted -- so the picture can be replaced even though the
-        surface underneath it cannot.
-
-        A DIFFERENT surface in the same session is therefore not supported;
-        restart the config for that. Reusing one is the common case by a wide
-        margin, because it is what re-running a scan does.
+        A different surface needs a new SurfaceProjector instead. That works, but
+        it costs a fresh model tree whose channels are never reclaimed, so prefer
+        this when the surface has not changed.
 
         ONE transaction for the delete and the re-create, and that is not
         tidiness. add_textured_part() published a textured_part_recording whose
@@ -277,23 +333,23 @@ class SurfaceProjector(object):
     def teardown(self):
         """Delete the projection and hand back every channel this took.
 
-        Needed before a second projector can be built in the same session:
+        Required before a second projector can be built in the same session:
         define_channel() does not complain about a channel someone still owns, it
         returns a reserved_channel that is no longer current, and the transaction
-        fails at end_transaction() naming a channel rather than the object still
+        fails at end_transaction() naming the channel rather than the object still
         holding it. That is a long way from "the second scan crashed".
 
-        The graphics tree goes back too. x3d_load_geometry built a subtree of
-        arrays under it, but those are the loaded recording's channels, not this
-        object's; what has to be handed back is the reservation on the tree
-        itself, or the next projector cannot define it.
+        Every channel whose name is FIXED has to go back, which is all of them
+        here. The model tree is the exception and is handled the other way round:
+        its channels belong to x3d_load_geometry and cannot be released at all,
+        so each load gets a fresh tree instead -- see _surface_generation.
         """
         trans = self.recdb.start_transaction()
         if self.projection is not None:
             trans.delete_math_function([self.projection_channel], self.projection)
             self.projection = None
         for attr in ("specimen_pose_chan", "probe_pose_chan", "data_chan",
-                     "graphics_chan"):
+                     "proj_specimen_chan", "graphics_chan"):
             chan = getattr(self, attr, None)
             if chan is not None:
                 trans.release_channel(chan)
@@ -301,11 +357,17 @@ class SurfaceProjector(object):
         trans.end_transaction().globalrev_wait().wait_complete()
 
     def add_textured_part(self):
-        """Attach the projection to the model so the viewer can draw it."""
+        """Attach the projection to the model so the viewer can draw it.
+
+        The channel is kept on the instance because teardown() has to hand it
+        back: its name does NOT carry the model-tree generation, so a projector
+        built after this one would find it still reserved and fail.
+        """
         trans = self.recdb.start_transaction()
-        proj_specimen_chan = trans.define_channel(self.projection_specimen_channel, "main")
+        self.proj_specimen_chan = trans.define_channel(
+            self.projection_specimen_channel, "main")
         snde.create_textured_part_recording(
-            trans, proj_specimen_chan,
+            trans, self.proj_specimen_chan,
             snde.recdb_path_join(self.model_tree, "meshed"),
             snde.shared_string(snde.recdb_path_join(self.model_tree, "uv")),
             [(0, snde.image_reference(self.projection_channel, 0, 1, []))]
