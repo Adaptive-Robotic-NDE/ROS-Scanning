@@ -28,6 +28,7 @@ import spatialnde2 as snde
 global ORIENT_DTYPE
 global SurfaceProjector
 global loadable_projection_surface
+global describe_projection_status
 
 
 ORIENT_DTYPE = [('quat', '<f4', (4,)), ('offset', '<f4', (4,))]
@@ -142,6 +143,55 @@ def loadable_projection_surface(x3d_path):
 _surface_generation = {}
 
 
+def describe_projection_status(status):
+    """SurfaceProjector.projection_status() as one readable block. -> str
+
+    Separate from the method so a caller that collected the dict earlier -- a
+    scan report, a saved run -- can render it the same way.
+    """
+    lines = []
+    offered = status.get("offered") or 0
+    landed = status.get("landed")
+    cells = status.get("cells")
+    if status.get("error"):
+        lines.append("  projection: %d trace(s) offered; COULD NOT READ THE IMAGE "
+                     "(%s)" % (offered, status["error"]))
+        lines.append("    the channel %s did not answer, so whether anything "
+                     "landed is unknown" % status.get("channel"))
+    elif offered == 0:
+        lines.append("  projection: NOTHING WAS OFFERED -- project() was never "
+                     "called")
+        lines.append("    so this is not a projection fault: either the scan is "
+                     "not in live mode, or every pose it had was None. An empty "
+                     "image here is correct.")
+    elif landed == 0:
+        lines.append("  projection: %d trace(s) offered and NONE LANDED" % offered)
+        lines.append("    every ray missed the surface, which the projector "
+                     "cannot report on its own -- the image is empty and no "
+                     "error was raised anywhere.")
+        lines.append("    surface %s" % status.get("surface"))
+        if status.get("pose_bbox"):
+            lo, hi = status["pose_bbox"]
+            lines.append("    the poses span x %.4f..%.4f  y %.4f..%.4f  "
+                         "z %.4f..%.4f m -- compare that against the surface's "
+                         "own world extent. A pose bbox sitting away from the "
+                         "part is the answer; one on top of it means the "
+                         "standoff or the probe direction is wrong instead."
+                         % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+    else:
+        pct = (100.0 * landed / cells) if cells else float("nan")
+        lines.append("  projection: %d trace(s) offered, %d of %d image cell(s) "
+                     "have data (%.1f%%)" % (offered, landed, cells, pct))
+        lines.append("    points ARE going onto the part, so an empty viewer is "
+                     "a DISPLAY fault and not a projection one.")
+    if status.get("pose_nonfinite"):
+        lines.append("    %d pose(s) carried a NaN or an inf and cannot project"
+                     % status["pose_nonfinite"])
+    if status.get("value_nonfinite"):
+        lines.append("    %d value(s) were not finite" % status["value_nonfinite"])
+    return "\n".join(lines)
+
+
 class SurfaceProjector(object):
     """Loads a parameterized surface and projects scalar probe data onto it.
 
@@ -236,6 +286,7 @@ class SurfaceProjector(object):
         self.x3d_path = x3d_path
         self.projection = None
         self.proj_specimen_chan = None
+        self._reset_projection_counters()
         self._instantiate_projection()
 
         # The textured part is what lets the viewer draw the projection on the
@@ -294,6 +345,67 @@ class SurfaceProjector(object):
         if own:
             trans.end_transaction().globalrev_wait().wait_complete()
 
+    def _reset_projection_counters(self):
+        """Zero what projection_status() reports. Called on build and restart."""
+        self.projected = 0            # project() calls that staged a pose
+        self.pose_nonfinite = 0       # ... of which carried a NaN or an inf
+        self.value_nonfinite = 0
+        self._pose_lo = None          # world bbox of every pose projected
+        self._pose_hi = None
+
+    def projection_status(self, quiet=False):
+        """Did the traces actually LAND on the surface? -> dict
+
+        THE PROJECTOR CANNOT FAIL OUT LOUD. project() stages a pose and a value
+        and returns; the splat happens later, inside the
+        project_point_onto_parameterization math function, and a pose whose ray
+        misses the surface is dropped there silently -- raytrace_sensor_evaluate
+        returns inf and the point is simply not accumulated. So a scan can offer
+        every one of its traces, raise nothing, print nothing, and still produce
+        a completely empty image. That is indistinguishable, from the outside,
+        from the projection never having been wired at all.
+
+        This reads the accumulator instead of trusting the call count. `landed`
+        counts parameterization cells that have received at least one
+        contribution, straight out of the fusion recording's `totals` array, so:
+
+            offered > 0 and landed == 0   the poses are missing the surface --
+                                          compare pose_bbox against the surface
+                                          extent the mesh was written with
+            offered == 0                  nothing ever called project(): the
+                                          scan is not projecting, live mode is
+                                          off, or pose7 was None
+            landed > 0                    points are going onto the part, and an
+                                          empty VIEWER is a display fault rather
+                                          than a projection one
+
+        Cheap enough to call mid-scan from the dgpy prompt.
+        """
+        landed = None
+        cells = None
+        err = None
+        try:
+            ref = self.recdb.latest.ref[self.projection_channel]
+            totals = np.asarray(ref.rec.reference_ndarray("totals").data)
+            cells = int(totals.size)
+            landed = int(np.count_nonzero(totals > 0))
+        except Exception as e:
+            err = "%s: %s" % (type(e).__name__, e)
+
+        status = {"offered": self.projected,
+                  "landed": landed,
+                  "cells": cells,
+                  "pose_nonfinite": self.pose_nonfinite,
+                  "value_nonfinite": self.value_nonfinite,
+                  "pose_bbox": (None if self._pose_lo is None
+                                else (tuple(self._pose_lo), tuple(self._pose_hi))),
+                  "channel": self.projection_channel,
+                  "surface": self.x3d_path,
+                  "error": err}
+        if not quiet:
+            print(describe_projection_status(status))
+        return status
+
     def restart(self):
         """Empty the projected image, keeping the loaded surface.
 
@@ -329,6 +441,8 @@ class SurfaceProjector(object):
             self.projection = None
         self._instantiate_projection(trans)
         trans.end_transaction().globalrev_wait().wait_complete()
+        # The picture is empty again, so the counts that describe it must be too.
+        self._reset_projection_counters()
 
     def teardown(self):
         """Delete the projection and hand back every channel this took.
@@ -404,6 +518,24 @@ class SurfaceProjector(object):
         orientation = np.array(((pose7[0], pose7[1], pose7[2], pose7[3]),
                                 (pose7[4], pose7[5], pose7[6], 1.0)),
                                dtype=ORIENT_DTYPE)
+
+        # Bookkeeping for projection_status(). A missed splat leaves no trace
+        # anywhere, so the count of what was OFFERED has to be kept here -- it is
+        # the only half of "offered vs landed" that the projector can see.
+        self.projected += 1
+        xyz = np.array((pose7[4], pose7[5], pose7[6]), dtype=float)
+        if not np.all(np.isfinite(np.asarray(pose7, dtype=float))):
+            self.pose_nonfinite += 1
+        if not np.isfinite(value):
+            self.value_nonfinite += 1
+        if np.all(np.isfinite(xyz)):
+            if self._pose_lo is None:
+                self._pose_lo = xyz.copy()
+                self._pose_hi = xyz.copy()
+            else:
+                np.minimum(self._pose_lo, xyz, out=self._pose_lo)
+                np.maximum(self._pose_hi, xyz, out=self._pose_hi)
+
         trans = self.recdb.start_transaction()
         self._probe_pose_in_transaction(trans, orientation)
         self._value_in_transaction(trans, value)

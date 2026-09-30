@@ -600,8 +600,23 @@ global ec_trace_accum
 global ec_projector
 global ec_scan_component
 global ec_staging_chan
+global ec_projection_errors
+global ec_projection_last_error
+global ec_projection_status
 ec_trace_accum = None
 ec_projector = None
+
+#: Projection failures counted rather than only printed.
+#:
+#: stage_ec_reading() runs on the DIGITIZER'S ACQUISITION THREAD, where a print()
+#: goes to process stdout through a block-buffered pipe and, if the scan is
+#: interrupted, is never flushed at all. Every projection error in a 6000-trace
+#: scan can therefore vanish, leaving an empty image and a clean-looking log --
+#: which is exactly the state that is impossible to troubleshoot afterwards. The
+#: count and the last message are cheap, survive the thread, and are readable
+#: from the prompt at any time with ec_projection_status().
+ec_projection_errors = 0
+ec_projection_last_error = None
 
 #: The reservation on the staging channel a reading is written to.
 #:
@@ -656,7 +671,48 @@ def stage_ec_reading(data, metadata, pose7=None):
             if 0 <= k < len(flat):
                 ec_projector.project(pose7, float(flat[k]))
         except Exception as e:
-            print("projection: %s" % (e,))
+            # Counted as well as printed: see ec_projection_errors above. Only
+            # the first few are printed, because one recurring fault at the trace
+            # rate buries everything else in the log.
+            global ec_projection_errors, ec_projection_last_error
+            ec_projection_errors += 1
+            ec_projection_last_error = "%s: %s" % (type(e).__name__, e)
+            if ec_projection_errors <= 5:
+                print("projection: %s" % (e,))
+                if ec_projection_errors == 5:
+                    print("projection: further errors counted, not printed "
+                          "-- ec_projection_status()")
+
+
+def ec_projection_status(quiet=False):
+    """Is the eddy-current data actually reaching the projected image? -> dict
+
+    The one call to make when the projection looks empty. It separates the three
+    states that look identical from the viewer:
+
+      * nothing was offered            -- not projecting (live mode off, or no pose)
+      * offered but nothing landed     -- the poses are missing the surface
+      * landed                         -- the image has data and the VIEWER is
+                                          the thing that is broken
+
+    None of that is visible otherwise: a ray that misses the surface is dropped
+    inside the math function without raising, and the errors that DO raise are
+    printed on the acquisition thread where the buffer may never be flushed.
+    """
+    status = {"errors": ec_projection_errors,
+              "last_error": ec_projection_last_error,
+              "projector": None}
+    if ec_projector is None:
+        status["projector"] = "no projector -- ec_projector is None"
+        if not quiet:
+            print("  projection: NO PROJECTOR. Either the scan has not built one "
+                  "yet or this config does not project.")
+    else:
+        status["projector"] = ec_projector.projection_status(quiet=quiet)
+    if not quiet and ec_projection_errors:
+        print("    %d projection error(s) during the scan; last was %s"
+              % (ec_projection_errors, ec_projection_last_error))
+    return status
 
 
 def ec_first_contact_null(null_fn, required=True):
@@ -882,4 +938,16 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
         pitch_m=pitch_m, position_relative_to_origin=False, contact=contact,
         on_first_contact=on_contact)
     report["instrument_null"] = ec_instrument_null
+
+    # WHETHER THE TRACES REACHED THE IMAGE, printed with the rest of the report
+    # rather than left to be asked for. An empty projection is silent -- missed
+    # rays are dropped inside the math function and the errors that do raise are
+    # printed on a thread whose buffer may never flush -- so the one run where
+    # nobody thought to check is the run that cannot be diagnosed afterwards.
+    report["projection"] = ec_projection_status(quiet=True)
+    if ec_projector is not None and report["projection"]["projector"]:
+        print(describe_projection_status(report["projection"]["projector"]))
+    if ec_projection_errors:
+        print("    %d projection error(s) during the scan; last was %s"
+              % (ec_projection_errors, ec_projection_last_error))
     return report
