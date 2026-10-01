@@ -198,7 +198,12 @@ def _dpi_tree(name):
 #   x     toward the robot past the world origin and on behind it, out to the
 #         arm's reach. The far side does NOT move: there is a wall behind the
 #         table.
-#   y     unchanged. "It is also not safe to extend it left or right either."
+#   y     IDENTICAL TO THE MOTION VOLUME. "It is also not safe to extend it
+#         left or right either" means not beyond what is already allowed there,
+#         and what was already allowed there is the motion volume -- the box
+#         that bounded every non-contact sweep before this one existed. Taking
+#         y from the WORK volume instead made this box tighter sideways than
+#         the one it replaces, which would start refusing sweeps that flew.
 #   z     floor unchanged (the table, touched off); ceiling to the arm's reach.
 #
 # THE TOUCHED-OFF BOX, from results16's startup banner and
@@ -213,6 +218,9 @@ WORK_MANIFEST = ((0.5596, -0.5093, 0.9248), (1.1450, 0.4539, 1.2448))
 #: environment.urdf.xacro (world -> robot_base at the origin, robot_base -> the
 #: arm at "0 0 0.766996"). Read, not measured.
 BASE_XYZ = (0.0, 0.0, 0.766996)
+#: The motion volume: the work volume plus the tooling pad. y, x_max and z_min
+#: come from here, not from the work volume -- see the note above.
+MOTION_HARDWARE = ((0.4370, -0.6593, 0.9230), (1.2950, 0.6039, 1.3930))
 #: The UR10e's reach: a2 + a3 + d5 from ur_description's ur10e
 #: default_kinematics.yaml (0.6127 + 0.57155 + 0.11985), which is the 1300 mm
 #: Universal Robots publishes.
@@ -263,18 +271,47 @@ def test_safe_volume_arithmetic():
           all(a <= b + 1e-12 for a, b in zip(mlo, WORK_MANIFEST[0]))
           and all(a >= b - 1e-12 for a, b in zip(mhi, WORK_MANIFEST[1])),
           "%s..%s" % (mlo, mhi))
-    check("deriving it from the manifest's box does not widen y either",
+    # --- y is the MOTION volume's, on the nose ------------------------------
+    ylo, yhi = derive(WORK_TOUCHED, BASE_XYZ, ARM_REACH, motion=MOTION_HARDWARE)
+    check("y is identical to the motion volume's y",
+          abs(ylo[1] - MOTION_HARDWARE[0][1]) < 1e-12
+          and abs(yhi[1] - MOTION_HARDWARE[1][1]) < 1e-12,
+          "y came back %.4f..%.4f, motion volume is %.4f..%.4f"
+          % (ylo[1], yhi[1], MOTION_HARDWARE[0][1], MOTION_HARDWARE[1][1]))
+    # THE REGRESSION THIS EXISTS TO PREVENT. A volume introduced to give tilted
+    # poses more room must not take room away on another axis, so it must not be
+    # tighter than the motion volume on ANY face.
+    check("it is no tighter than the motion volume on any of the six faces",
+          all(a <= b + 1e-12 for a, b in zip(ylo, MOTION_HARDWARE[0]))
+          and all(a >= b - 1e-12 for a, b in zip(yhi, MOTION_HARDWARE[1])),
+          "%s..%s against motion %s..%s"
+          % (ylo, yhi, MOTION_HARDWARE[0], MOTION_HARDWARE[1]))
+    check("the far x face does not move past the motion volume -- "
+          "there is a wall behind the table",
+          abs(yhi[0] - MOTION_HARDWARE[1][0]) < 1e-12,
+          "x_max came back %.4f, motion volume is %.4f"
+          % (yhi[0], MOTION_HARDWARE[1][0]))
+    # A manifest that declares a motion volume TIGHTER than the measured work
+    # volume must not shrink this box: the work volume is touched off and the
+    # motion volume is not.
+    tight = ((0.70, -0.10, 1.00), (0.90, 0.10, 1.10))
+    glo, ghi = derive(WORK_TOUCHED, BASE_XYZ, ARM_REACH, motion=tight)
+    check("a motion volume tighter than the work volume cannot shrink it",
+          all(a <= b + 1e-12 for a, b in zip(glo, WORK_TOUCHED[0]))
+          and all(a >= b - 1e-12 for a, b in zip(ghi, WORK_TOUCHED[1])),
+          "%s..%s" % (glo, ghi))
+    check("deriving with no motion volume at all falls back to the work volume",
           abs(mlo[1] - WORK_MANIFEST[0][1]) < 1e-12
           and abs(mhi[1] - WORK_MANIFEST[1][1]) < 1e-12,
           "y came back %.4f..%.4f" % (mlo[1], mhi[1]))
 
     # --- the numbers themselves, so a changed constant is visible ------------
-    check("the derived box is x -1.3041..1.1210 y -0.4650..0.4010 "
-          "z 0.9230..2.0711",
+    check("with the motion volume, the derived box is "
+          "x -1.3041..1.2950 y -0.6593..0.6039 z 0.9230..2.0711",
           all(abs(a - b) < 1e-4 for a, b in
-              zip(lo + hi, (-1.3041, -0.4650, 0.9230,
-                            1.1210, 0.4010, 2.0711))),
-          "%s..%s" % (lo, hi))
+              zip(ylo + yhi, (-1.3041, -0.6593, 0.9230,
+                              1.2950, 0.6039, 2.0711))),
+          "%s..%s" % (ylo, yhi))
 
     # --- a (frame, lo, hi) triple, which is what work_volume() hands back ----
     tlo, thi = derive(("world",) + WORK_TOUCHED, BASE_XYZ, ARM_REACH)

@@ -409,24 +409,37 @@ def describe_motion_volume_check(rep):
 # invisible to check_motion_volume().
 
 
-def derive_safe_motion_volume(work, base_xyz, reach):
+def derive_safe_motion_volume(work, base_xyz, reach, motion=None):
     """(lo, hi) of the safe motion volume, from the work volume and the arm.
 
     PURE ARITHMETIC AND NOTHING ELSE, so it can be checked on the host with no
     cell and no manifest -- see safe_motion_volume_test.py, which is where the
-    "y was not widened" and "the wall side did not move" assertions live.
+    "y matches the motion volume" and "the wall side did not move" assertions
+    live.
 
     `work` is (lo, hi) or (frame, lo, hi); `base_xyz` is where base_link sits in
     the work volume's frame; `reach` is the arm's reach radius about base_link,
-    in metres.
+    in metres. `motion` is the motion volume in the same forms, and it is where
+    y comes from.
 
-    THE RESULT ALWAYS CONTAINS `work`. Four of its six faces ARE the work
-    volume's, and the other two only ever move outward -- x_min below base_x
-    (which is inside the work volume's x span on this bench, and in any case
-    reach > 0 pushes it further out) and z_max above base_z. A reach small enough
-    to put either face inside the work volume is refused rather than returned,
-    because a "safe motion volume" that forbids a pose the work volume allows is
-    the one failure here that would not announce itself.
+    Y COMES FROM THE MOTION VOLUME, NOT THE WORK VOLUME. The work volume bounds
+    the contact probe TIP; the motion volume is that plus the tooling pad, and
+    it is what already bounded every non-contact sensor sweep. Taking y from the
+    work volume instead would make this box TIGHTER sideways than the one it
+    replaces -- y +-0.659/0.604 down to -0.465/0.401 on this bench -- and a
+    sweep over a part at the y edge that flew last week would start being
+    refused. A volume introduced to give tilted poses more room must not take
+    room away on another axis.
+
+    The operator's "not safe to extend it left or right" is about not going
+    BEYOND what is already allowed there, which is the motion volume's y.
+
+    THE RESULT ALWAYS CONTAINS `work` AND `motion`. x_max and z_min are the
+    motion volume's, y is the motion volume's, and the other two faces only ever
+    move outward -- x_min below base_x and z_max above base_z. A reach small
+    enough to put either face inside what it must contain is refused rather than
+    returned, because a "safe motion volume" that forbids a pose an existing
+    volume allows is the one failure here that would not announce itself.
     """
     if work is None:
         return None
@@ -444,14 +457,31 @@ def derive_safe_motion_volume(work, base_xyz, reach):
     if not np.isfinite(reach) or reach <= 0.0:
         raise ValueError("the arm's reach is a positive distance in metres, "
                          "not %r" % (reach,))
-    out_lo = (float(base[0] - reach), float(lo[1]), float(lo[2]))
-    out_hi = (float(hi[0]), float(hi[1]), float(base[2] + reach))
+    # The box this one supersedes for non-contact motion. Every face it
+    # contributes is taken from here rather than from the work volume, so this
+    # can only ever be as permissive or more. None falls back to the work
+    # volume, which is only right for a cell that declares no motion volume.
+    if motion is None:
+        m_lo, m_hi = lo, hi
+    else:
+        if len(motion) == 3 and isinstance(motion[0], str):
+            m_lo, m_hi = motion[1], motion[2]
+        else:
+            m_lo, m_hi = motion[0], motion[1]
+        m_lo = np.asarray(m_lo, dtype=np.float64).reshape(3)
+        m_hi = np.asarray(m_hi, dtype=np.float64).reshape(3)
+        # Never tighter than the work volume on any face, whatever the manifest
+        # says: the work volume is measured and this is not.
+        m_lo = np.minimum(m_lo, lo)
+        m_hi = np.maximum(m_hi, hi)
+    out_lo = (float(base[0] - reach), float(m_lo[1]), float(m_lo[2]))
+    out_hi = (float(m_hi[0]), float(m_hi[1]), float(base[2] + reach))
     # THE CONTAINMENT CHECK, and it is not ceremony. The two derived faces come
     # from a base position and a reach that are read out of a description; a
     # description that moved the arm, or a reach typed in millimetres, would
     # otherwise hand back a box SMALLER than the work volume on one face and
     # every legal part position would become unreachable with no message.
-    if out_lo[0] > lo[0] + 1e-9 or out_hi[2] < hi[2] - 1e-9:
+    if out_lo[0] > min(lo[0], m_lo[0]) + 1e-9 or out_hi[2] < max(hi[2], m_hi[2]) - 1e-9:
         raise ValueError(
             "the derived safe motion volume x %.4f..%.4f z %.4f..%.4f does not "
             "contain the work volume x %.4f..%.4f z %.4f..%.4f. base_xyz %s and "
@@ -536,8 +566,12 @@ def safe_motion_volume(cell=None, mode=None, quiet=False):
                     raise ValueError(
                         "the derivation needs a work volume and this cell/mode "
                         "declares none")
+                # The motion volume, because that is where y, x_max and z_min
+                # come from -- it is the box that already bounded non-contact
+                # motion, and this one must not be tighter than it anywhere.
                 lo, hi = derive_safe_motion_volume(
-                    work, spec["base_xyz"], spec["arm_reach"])
+                    work, spec["base_xyz"], spec["arm_reach"],
+                    motion=motion_volume(cell=name, mode=which, quiet=True))
                 volume = (frame, lo, hi)
         except Exception as e:                                    # noqa: BLE001
             # REFUSE THE BOX, NOT THE RUN. A malformed safe volume must not take
@@ -618,16 +652,15 @@ def describe_safe_motion_volume():
                         float(spec.get("arm_reach", float("nan")))))
     lines.append("    the CONTACT probe tip is still held to the work volume; "
                  "this box is for sensor stages and transit only")
-    # WHICH FACES THIS BOX IS TIGHTER THAN THE OLD ONE ON, SAID OUT LOUD.
+    # IT MUST NEVER BE TIGHTER THAN THE BOX IT REPLACES, AND THIS CHECKS.
     # The safe volume is enormously larger than the motion volume toward and
-    # behind the robot and overhead, and on two faces it is SMALLER: the
-    # motion volume was derived as the work volume plus 150 mm of pad in x AND
-    # y, and the operator's specification pads neither the wall side nor
-    # either y face. So a sensor sweep over a part at the y edge of the work
-    # volume can now be refused where it previously flew, and the reason is
-    # the operator's own statement that the cell is not clear left or right.
-    # Finding that out from a refused first pose is the failure this line
-    # exists to prevent.
+    # behind the robot and overhead; y, x_max and z_min are taken from the
+    # motion volume precisely so it cannot be smaller anywhere. An earlier
+    # version took y from the WORK volume, which padded nothing, and that made
+    # the box 194 mm narrower on each y face than the one it replaced -- a
+    # sweep over a part at the y edge would have started being refused by a
+    # volume introduced to give poses MORE room. If that ever comes back, this
+    # says so at startup rather than letting it arrive as a refused pose.
     mv = globals().get("motion_volume")
     mv = mv(quiet=True) if callable(mv) else None
     if mv is not None:
@@ -638,14 +671,17 @@ def describe_safe_motion_volume():
             if hi[i] < mv[2][i] - 1e-9:
                 tight.append("%s_max %+.3f -> %+.3f" % (axis, mv[2][i], hi[i]))
         if tight:
-            lines.append("    TIGHTER than the motion volume it replaces on: %s"
-                         % ("; ".join(tight),))
-            lines.append("      the motion volume padded the work volume by "
-                         "150 mm in x AND y; this box pads neither the wall "
-                         "side nor either y face, because the operator says "
-                         "the cell is not clear there. A sweep over a part at "
-                         "the y edge of the work volume may be refused where "
-                         "it used to fly.")
+            lines.append("    BUG -- this box is TIGHTER than the motion volume "
+                         "it replaces on: %s" % ("; ".join(tight),))
+            lines.append("      that is never intended. y, x_max and z_min are "
+                         "supposed to come straight from the motion volume, so "
+                         "a sweep that flew before cannot be refused by this. "
+                         "Treat a refused sensor pose as this, not as reach.")
+        else:
+            lines.append("    y %+.3f..%+.3f and the wall side x_max %+.3f are "
+                         "the motion volume's own, so nothing that flew before "
+                         "is refused by this box"
+                         % (lo[1], hi[1], hi[0]))
     return "\n".join(lines)
 
 
