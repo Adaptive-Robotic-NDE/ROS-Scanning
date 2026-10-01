@@ -1759,8 +1759,18 @@ def test_the_speed_limit_is_converted_and_not_handed_through():
     vels = sorted(set(round(c["vel"], 6) for c in cell.cartesian))
     check("the scaling came from the path, not from the 50 mm/s limit",
           vels == [0.025], str(vels))     # path_motion_scaling = 0.5*v
-    check("acceleration is tied to velocity near the part",
-          all(abs(c["acc"] - c["vel"]) < 1e-12 for c in cell.cartesian))
+    # Acceleration is NOT tied to velocity. It used to be, and that is a
+    # different mistake from handing a speed through as a scaling: the units
+    # are right and the limit is wrong. acc == vel makes the ramp TIME the
+    # constant v_max/a_max -- 0.42-0.63 s on this arm whatever the speed -- so
+    # a 56-60 mm descent at the 10 mm/s class spends over a second ramping and
+    # never settles. See _gauge_accel() for what bounds the replacement.
+    check("acceleration is NOT the velocity scaling",
+          all(c["acc"] > c["vel"] + 1e-9 for c in cell.cartesian),
+          str([(c["vel"], c["acc"]) for c in cell.cartesian]))
+    check("it is the pipeline's near-the-part acceleration",
+          all(abs(c["acc"] - 0.05) < 1e-12 for c in cell.cartesian),
+          str(sorted(set(c["acc"] for c in cell.cartesian))))
     # With no path-aware bound, the cell-wide curve decides.
     ns2 = fresh()
     c2 = Cell(ns2, truth=0.9218, delta=BIAS_M)
@@ -1779,6 +1789,44 @@ def test_the_speed_limit_is_converted_and_not_handed_through():
     check("and with no calibration at all, the limit itself",
           sorted(set(round(c["vel"], 6) for c in c3.cartesian)) == [0.05],
           str([c["vel"] for c in c3.cartesian]))
+
+
+@_checked
+def test_the_acceleration_scaling_is_not_the_velocity_scaling():
+    """_gauge_accel(): what the approach asks for, and what bounds it.
+
+    THE POINT OF THE NUMBER. Velocity scaling and acceleration scaling are
+    fractions of two different joint limits, so tying them together fixes the
+    RAMP TIME at v_max/a_max regardless of speed -- 0.42-0.63 s on this arm --
+    and at the gauge's own 0.0032 the descent is nearly all ramp. Raising the
+    acceleration cannot raise the peak speed (the velocity scaling bounds joint
+    speed and tari_cpp_mtc's checkTrajectory() enforces max_tip_speed in m/s),
+    and it SHORTENS the travel after a stop is commanded, v^2/(2a): 3.1 mm at
+    scaling 0.0032 against 0.2 mm at 0.05, at the 10 mm/s near-the-part class.
+    """
+    ns = fresh()
+    accel = ns["_gauge_accel"]
+    floor = ns["AZURE_GAUGE_ACC_SCALING"]
+    check("the near-the-part acceleration is the one the EC raster already "
+          "flies in contact", abs(floor - 0.05) < 1e-12, str(floor))
+    check("a tiny velocity scaling does not drag the acceleration down with it",
+          abs(accel(0.0032) - floor) < 1e-12, str(accel(0.0032)))
+    check("nor does the eddy-current scaling",
+          abs(accel(0.0047) - floor) < 1e-12, str(accel(0.0047)))
+    # A fast away-from-the-part leg keeps at least its own velocity scaling:
+    # handing such a move LESS acceleration than velocity is what puts the long
+    # ramp back.
+    check("a faster move is never given less acceleration than velocity",
+          accel(0.2) >= 0.2 - 1e-12, str(accel(0.2)))
+    # The ramp arithmetic the number exists for, at the arm's own limits:
+    # 5.0 rad/s^2 and 180 deg/s (tari_ur_description/config/joint_limits.yaml).
+    v_max, a_max = math.radians(180.0), 5.0
+    tied = (0.0032 * v_max) / (0.0032 * a_max)
+    fixed = (0.0032 * v_max) / (accel(0.0032) * a_max)
+    check("tying them leaves a ramp of v_max/a_max however slow the move is",
+          abs(tied - v_max/a_max) < 1e-9, "%.3f s" % tied)
+    check("decoupling them shortens that ramp by more than an order of "
+          "magnitude", fixed < tied / 10.0, "%.4f s vs %.4f s" % (fixed, tied))
 
 
 @_checked

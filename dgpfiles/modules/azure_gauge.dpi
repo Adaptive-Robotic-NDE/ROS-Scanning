@@ -321,6 +321,7 @@ global AZURE_GAUGE_EDGE_INSET_M
 global AZURE_GAUGE_MIN_SPREAD_M
 global AZURE_GAUGE_TF_TOL_M
 global AZURE_GAUGE_ARRIVE_TOL_M
+global AZURE_GAUGE_ACC_SCALING
 global gauge_mesh_against_keyence
 global gauge_standoff_rungs
 global gauge_sample_points
@@ -337,6 +338,7 @@ global _gauge_move
 global _gauge_stops
 global _gauge_fly_unattended
 global _gauge_scaling
+global _gauge_accel
 global _gauge_flew
 global _gauge_joint_path_ok
 global _GaugePath
@@ -411,6 +413,14 @@ AZURE_GAUGE_TF_TOL_M = 0.001
 #: planner residual. The 1 mm agreement between the two readings of delta above
 #: is the precision test, and it stays a note rather than a refusal.
 AZURE_GAUGE_ARRIVE_TOL_M = 0.005
+
+#: MoveIt ACCELERATION scaling floor for a gauge approach. NOT the velocity
+#: scaling, which is what this used to be; see _gauge_accel() for the ramp-time
+#: arithmetic that makes acc == vel wrong at any speed, and for the three
+#: things that bound the replacement. 0.05 is RASTER_ACCEL, what the
+#: eddy-current raster already flies while the probe is in contact with the
+#: specimen, and half the 0.1 the reconstruction sweep flies in free space.
+AZURE_GAUGE_ACC_SCALING = 0.05
 
 #: The last result, for an operator who did not keep the return value.
 last_gauge_result = None
@@ -539,6 +549,61 @@ def _gauge_scaling(poses, v_limit):
         except Exception:                                     # noqa: BLE001
             pass
     return float(v_limit), "the limit itself (this cell has no velocity curve)"
+
+
+def _gauge_accel(vel):
+    """MoveIt ACCELERATION scaling for a gauge approach, given its velocity scaling.
+
+    NOT `vel`. Passing the velocity scaling through as the acceleration scaling
+    is what this used to do, and it is a different mistake from passing a speed
+    through as a scaling -- it is not wrong about the units, it is wrong about
+    which limit the number belongs to. Velocity scaling and acceleration scaling
+    are independent fractions of two different joint limits (120-180 deg/s and
+    5.0 rad/s^2 on this arm, tari_ur_description/config/joint_limits.yaml), and
+    tying them together makes the RAMP TIME a constant:
+
+        t_ramp = (vel * v_max) / (acc * a_max) = v_max / a_max  when acc == vel
+
+    which on this arm is 0.42-0.63 s no matter how slow the move is. At the
+    gauge's own scaling -- about 0.0032 for the 10 mm/s near-the-part class --
+    a 56-60 mm descent therefore spends over a second of its ~7 s ramping, and
+    it is the only class in the pipeline whose worst joint velocity reaches only
+    11-16% of its scaled limit: it never settles at cruise. The three gauge
+    points in results16 took 192.1 s, 36.5 s and 65.5 s, with the SHORTER of
+    two moves (56.6 mm against 60.0 mm) taking 1.8x longer -- the signature of
+    a profile that is all ramp, where duration goes as sqrt(length) rather than
+    as length. (Most of that 192 s was the planner's unconditional time-stretch,
+    which divided accelerations by k^2; that is fixed in tari_cpp_mtc and only
+    the fallback path pays it now. The ramp is what is left, and it is this
+    number's.)
+
+    WHAT BOUNDS IT, since this is a probe approaching a part and 0.1 is not a
+    number to copy from somewhere else:
+
+    1. It cannot raise the peak speed, so it is not what the near-the-part speed
+       rule constrains. The velocity scaling bounds joint speed directly and
+       tari_cpp_mtc's checkTrajectory() enforces both that and max_tip_speed in
+       metres per second at the tool. Whatever this is, the descent still runs
+       at the speed class _speed_class() computed for it.
+    2. Higher is SAFER on the only measure that matters close to a surface.
+       Travel after a stop is commanded is v^2/(2a): at the 10 mm/s class that
+       is 3.1 mm at acceleration scaling 0.0032 and 0.2 mm at 0.05. Tying
+       acceleration to a small velocity does not make the approach gentle, it
+       makes it unable to stop.
+    3. The ceiling is evidence rather than arithmetic. 0.05 is RASTER_ACCEL,
+       what the eddy-current raster flies while the probe is IN CONTACT with the
+       specimen, and it is half the 0.1 the reconstruction sweep flies in free
+       space. A non-contact descent to a 100 mm standoff is strictly less
+       hazardous than a contact pass, so 0.05 is a value already flown near this
+       part rather than one borrowed from free space. 0.1 would shorten the ramp
+       by a further 0.02 s and has evidence only in free space, so it is not
+       taken.
+
+    max() rather than a plain constant: a fast away-from-the-part leg may be
+    authorised a velocity scaling above this, and giving such a move LESS
+    acceleration than velocity would put the long ramp straight back.
+    """
+    return max(float(vel), float(AZURE_GAUGE_ACC_SCALING))
 
 
 def _gauge_flew(res, xyz, label):
@@ -715,7 +780,8 @@ def _gauge_fly_unattended(xyz, quat, label):
     # a second time on the motion itself.
     vel, how = _gauge_scaling([(x0, q0), (x1, q1)], vmax)
     move = globals().get("cartesian_move") or ros.CartesianMove
-    res = move([_cap_pose(x1, q1)], vel=vel, acc=vel, min_fraction=1.0)
+    res = move([_cap_pose(x1, q1)], vel=vel, acc=_gauge_accel(vel),
+               min_fraction=1.0)
     ok, why = _gauge_flew(res, x1, label)
     if ok:
         return {"ok": True, "route": "cartesian", "why": None, "tried": tried,
