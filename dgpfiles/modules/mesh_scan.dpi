@@ -19,6 +19,7 @@
 # carries a latent NameError: it works under every config that happens to import
 # the same names and raises deep inside a scan under one that does not. Import
 # what this file uses, here.
+import hashlib
 import math
 import os
 
@@ -32,6 +33,40 @@ mesh_scan_x3d = None
 global _scan_work_dir
 def _scan_work_dir():
     return SCAN_STORAGE_DIR if scan_storage_manager is not None else "/tmp"
+
+global mesh_projection_x3d
+def mesh_projection_x3d(mesh):
+    """Where to write the parameterized projection surface for `mesh`.
+
+    BESIDE THE MESH, which is the only place the name cannot collide. The
+    mesh itself lives in a per-run session directory; the shared work directory
+    does not, so deriving the .x3d name there from the mesh's BASENAME gives
+    every run of the pipeline the same filename and each one silently overwrites
+    the last. That is defect (1) of results16: run C's curved patch was written
+    over run B's flat plate at
+    /data/scandata/specimen_..._ecplan_roi_uv.x3d, the reuse test compared only
+    the string, and the process went on projecting onto run B's geometry 31 mm
+    away. Zero traces landed and every pass reported 100%.
+
+    Same convention as mesh_reconstruction.dpi's parameterize_mesh(): the mesh's
+    own path with the extension replaced by _uv.x3d. Two meshes in two session
+    directories therefore get two surfaces, and nothing has to remember to clean
+    up between runs.
+
+    THE FALLBACK IS STILL UNIQUE. A mesh may sit somewhere unwritable -- a
+    package's meshes/ directory, a read-only dataset -- and the parameterization
+    has to go somewhere. It goes in the work directory under a name carrying a
+    digest of the mesh's ABSOLUTE path, so it is still one surface per mesh and
+    the collision this function exists to remove cannot come back through the
+    fallback.
+    """
+    base = os.path.splitext(os.path.abspath(mesh))[0]
+    mesh_dir = os.path.dirname(base) or "."
+    if os.access(mesh_dir, os.W_OK):
+        return base + "_uv.x3d"
+    tag = hashlib.sha1(os.path.abspath(mesh).encode("utf-8")).hexdigest()[:10]
+    return os.path.join(_scan_work_dir(),
+                        "%s_%s_uv.x3d" % (os.path.basename(base), tag))
 
 global make_test_plate
 def make_test_plate(size=None, height=None, bow=None, divisions=None,
@@ -367,8 +402,11 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
             print(_line)
 
     if x3d is None:
-        x3d = os.path.join(_scan_work_dir(),
-                           os.path.splitext(os.path.basename(mesh))[0] + "_uv.x3d")
+        # Beside the mesh, so two runs cannot write one file. The FULL path is
+        # printed, not the basename: the operator's only way to tell run C's
+        # surface from run B's is where it is, and results16's log shows the two
+        # runs reporting the identical name. See mesh_projection_x3d().
+        x3d = mesh_projection_x3d(mesh)
         print("  parameterizing %s -> %s" % (os.path.basename(mesh), x3d))
         mesh_uv_x3d(mesh, x3d, method=uv_method)
 
@@ -398,6 +436,22 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
             path, mesh, limit=clearance, allow_links=allow_contact_links,
             what="toolpath")
         twist_within_limit(path)
+
+    # ARE THE TWO THINGS THIS FUNCTION RETURNS ABOUT THE SAME PART? Asked last,
+    # after the clearance gate has dropped whatever it is going to drop, and
+    # before anything moves. The toolpath and the projection surface come from
+    # one mesh here, so they agree by construction -- unless the .x3d was handed
+    # in by the caller, or the parameterization wrote somewhere a previous run
+    # had already written. Both of those are how results16 happened, and the
+    # consequence is an empty image with every pass at 100%. One bbox comparison
+    # at planning time costs nothing and refuses on disjoint.
+    #
+    # offset= because the surface is placed by the registration offset that the
+    # projector will put on the specimen pose channel, while the toolpath
+    # already has it baked in: comparing the raw file box against the path would
+    # make a correctly offset mesh look disjoint.
+    if x3d is not None:
+        check_projection_covers_path(x3d, path, what="toolpath", offset=offset)
 
     mesh_scan_path = path
     mesh_scan_x3d = x3d
@@ -1714,7 +1768,10 @@ def Scan2DMeshPath(path=None, x3d=None, max_passes=None, force=False):
             # dpi_exports_test.py.
             global projector
             radius, pixels = projection_settings(scan_plan)
-            if projector is not None and getattr(projector, "x3d_path", None) == x3d:
+            # PATH AND CONTENTS, not the path alone. The same filename may hold
+            # a different surface -- see projection_surface_reusable().
+            reuse, why = projection_surface_reusable(projector, x3d)
+            if reuse:
                 # Same surface: empty the picture and reuse it. Rebuilding is not
                 # an option -- the channels x3d_load_geometry defines under the
                 # model tree cannot be handed back from Python, so a second
@@ -1730,6 +1787,7 @@ def Scan2DMeshPath(path=None, x3d=None, max_passes=None, force=False):
                 if projector is not None:
                     projector.teardown()
                     projector = None
+                    print("  rebuilding the projection surface -- %s" % (why,))
                 projector = SurfaceProjector(recdb, x3d, prefix="/ut/proj",
                                              radius=radius,
                                              horizontal_pixels=pixels,
@@ -1737,6 +1795,11 @@ def Scan2DMeshPath(path=None, x3d=None, max_passes=None, force=False):
                                              create_textured_part=PROJECTION_TEXTURED_PART,
                                              offset=NOETHER_MESH_OFFSET)
                 print("  projection surface: %s" % x3d)
+            # BEFORE ANY TRACE IS STAGED: is that surface under this toolpath at
+            # all? Raises on disjoint. The passes have not started here -- this
+            # hook runs after the first reading, at the first touchdown -- so a
+            # refusal costs one pose and not a whole scan onto an empty image.
+            check_projection_covers_path(projector, path, what="toolpath")
 
     def _progress(si, nseg, seg_report, elapsed):
         if seg_report.get("skipped"):

@@ -457,7 +457,15 @@ def _setup_projection(plane_grid):
     x3d_dir = SCAN_STORAGE_DIR if scan_storage_manager is not None else "/tmp"
     x3d_path = os.path.join(x3d_dir, "scan_plane_uv.x3d")
     plane_x3d_from_scanpath(x3d_path, uu, vv, ww, margin=radius*2)
-    if projector is not None and getattr(projector, "x3d_path", None) == x3d_path:
+    # SAME FILENAME IS NOT THE SAME SURFACE. Here the name really is fixed --
+    # one plane patch per process, rewritten from the scan's own corners every
+    # time -- so a second scan over a DIFFERENT rectangle writes a different
+    # surface to this exact path. Comparing the path alone reused the first
+    # rectangle's loaded geometry and projected the second scan onto it; the
+    # content fingerprint is what tells the two apart. See
+    # projection_surface_reusable() in surface_projection.dpi.
+    reuse, why = projection_surface_reusable(projector, x3d_path)
+    if reuse:
         # Same surface file, so empty the picture and reuse the loaded geometry.
         # A second SurfaceProjector on this prefix cannot be built: the channels
         # x3d_load_geometry defines under the model tree cannot be released from
@@ -474,16 +482,23 @@ def _setup_projection(plane_grid):
         projector.vertical_pixels = pixels
         projector.restart()
         print("  projection surface reused (image cleared): %s" % x3d_path)
+        check_projection_covers_path(projector, (uu, vv, ww), what="scan grid")
         return
     if projector is not None:
         projector.teardown()
         projector = None
+        print("  rebuilding the projection surface -- %s" % (why,))
     print("  projection surface: %s" % x3d_path)
     projector = SurfaceProjector(recdb, x3d_path, prefix="/ut/proj",
                                  radius=radius,
                                  horizontal_pixels=pixels,
                                  vertical_pixels=pixels,
                                  create_textured_part=PROJECTION_TEXTURED_PART)
+    # The patch is synthesised from this grid, so it should be impossible for
+    # the two to be disjoint -- which is exactly why checking is cheap and worth
+    # doing: if they ever are, the plane patch is not the one the scan just
+    # taught, and nothing else in this path would say so.
+    check_projection_covers_path(projector, (uu, vv, ww), what="scan grid")
 
 global projection_settings
 def projection_settings(plan=None):

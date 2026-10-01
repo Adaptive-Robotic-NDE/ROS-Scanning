@@ -18,7 +18,9 @@
 # was, which is correct by construction. Everything downstream is then shared
 # with the real-mesh case.
 
+import hashlib
 import os
+import re
 import sys
 import numpy as np
 import spatialnde2 as snde
@@ -29,9 +31,46 @@ global ORIENT_DTYPE
 global SurfaceProjector
 global loadable_projection_surface
 global describe_projection_status
+global PROJECTION_FOOTPRINT_SLACK_M
+global PROJECTION_RAY_WINDOW_M
+global PROJECTION_RAY_WINDOW_NEAR_M
+global projection_surface_geometry
+global projection_surface_fingerprint
+global projection_surface_matches
+global projection_surface_reusable
+global toolpath_world_bbox
+global bbox_gap
+global describe_bbox
+global check_projection_covers_path
 
 
 ORIENT_DTYPE = [('quat', '<f4', (4,)), ('offset', '<f4', (4,))]
+
+#: How far the toolpath's footprint may sit OUTSIDE the surface's, laterally,
+#: before the pre-flight guard refuses the scan. Metres.
+#:
+#: This is a disjointness slack and not a coverage requirement: the guard only
+#: fires when the two footprints do not overlap AT ALL, which means no pose on
+#: the path is over the surface. A path planned on a surface cannot do that --
+#: every waypoint's target is a point of the surface, and the pose is at most
+#: standoff*sin(tilt) away from it laterally (29 mm at the 50 mm UT standoff and
+#: the 35 degree tilt cap), so the two boxes still overlap however tilted the
+#: tool is. 10 mm is therefore slack against a surface whose own footprint is
+#: narrower than that, not against a legitimately offset path.
+#:
+#: ALONG the tool axis there is no constant: a scan may legitimately stand off,
+#: and how far is the projector's own business -- its min_dist..max_dist ray
+#: window. So the vertical allowance is taken from the projector rather than
+#: written down here. See check_projection_covers_path().
+PROJECTION_FOOTPRINT_SLACK_M = 0.010
+
+#: How far along the tool axis the projector looks for the surface, metres:
+#: project_point_onto_parameterization is given min_dist..max_dist and ignores
+#: anything outside. These are SurfaceProjector's defaults -- named so the
+#: pre-flight guard can use the same window when it is asked about an .x3d file
+#: at planning time, with no projector to read them off.
+PROJECTION_RAY_WINDOW_M = 0.25
+PROJECTION_RAY_WINDOW_NEAR_M = 0.05
 
 
 global write_plane_x3d
@@ -124,6 +163,360 @@ def loadable_projection_surface(x3d_path):
     return x3d_winding.loadable_x3d(x3d_path)
 
 
+def projection_surface_geometry(x3d_path):
+    """What is actually in this X3D file. -> (nverts, nfaces, lo, hi)
+
+    lo/hi are the bounding box of the Coordinate points, in the file's own
+    coordinates -- which for every surface this pipeline writes is the WORLD
+    frame: write_plane_x3d() emits the scan's own corners, and mesh_uv_blender.py
+    deliberately does not apply Blender's Y-up conversion for exactly this
+    reason. A projector built with a nonzero `offset` moves it; see
+    SurfaceProjector.surface_world_bbox().
+
+    Three numbers rather than a hash because they are the three the operator can
+    check against something else: the counts against what the loader reports
+    ("Inplanemat calculation complete; numtris=...") and the box against where
+    the part is. They are also what makes an overwritten file DIAGNOSABLE rather
+    than merely different -- 6489 triangles over x 0.797..0.828 becoming 6782
+    over x 0.852..0.906 says which part it is now, which a changed digest does
+    not.
+
+    Deliberately a text parse and not a load: this is asked before
+    x3d_load_geometry() is called, on a file whose purpose is to be handed to
+    it, and the loader aborts the process rather than returning an error.
+    """
+    with open(x3d_path, "r") as fh:
+        text = fh.read()
+    m = re.search(r'<Coordinate\b[^>]*\bpoint="([^"]*)"', text, re.S)
+    if m is None:
+        raise ValueError("%s has no <Coordinate point=...>: there is no surface "
+                         "in it to project onto" % (x3d_path,))
+    vals = np.array([float(t) for t in m.group(1).replace(",", " ").split()],
+                    dtype=np.float64)
+    if vals.size < 3 or vals.size % 3:
+        raise ValueError("%s has %d coordinate value(s), which is not a whole "
+                         "number of 3-vectors" % (x3d_path, vals.size))
+    pts = vals.reshape(-1, 3)
+
+    nfaces = 0
+    run = 0
+    fm = re.search(r'<IndexedFaceSet\b[^>]*\bcoordIndex="([^"]*)"', text, re.S)
+    if fm is not None:
+        for tok in fm.group(1).split():
+            if int(tok) == -1:
+                if run:
+                    nfaces += 1
+                run = 0
+            else:
+                run += 1
+        if run:
+            nfaces += 1
+    return (int(pts.shape[0]), int(nfaces),
+            tuple(float(v) for v in pts.min(axis=0)),
+            tuple(float(v) for v in pts.max(axis=0)))
+
+
+def projection_surface_fingerprint(x3d_path):
+    """Enough of a surface file to recognise it again. -> dict
+
+    THE PATH IS NOT THE SURFACE. A projection surface is written into a file
+    whose name is derived from the mesh, and two runs of the same pipeline over
+    different parts can be handed the same name -- that is how results16 came
+    about: run C overwrote run B's .x3d, the reuse test compared only the string,
+    and the process kept run B's loaded geometry while scanning run C's part.
+    The two surfaces were 31 mm apart, so not one of the 3531 traces could land,
+    and nothing anywhere said so.
+
+    So the reuse test is content-addressed instead. Keys:
+
+        size, mtime_ns   from stat(), for the message
+        sha1             the file's bytes; this is what decides
+        nverts, nfaces   so a mismatch can be DESCRIBED
+        bbox             (lo, hi) in the file's own (world) coordinates
+        error            why the geometry could not be read, if it could not
+
+    MTIME IS RECORDED AND NOT COMPARED. A rewrite always changes the digest, so
+    comparing mtime adds nothing to the detection; what it would add is a false
+    mismatch when the same bytes arrive with a new timestamp -- a copy, a
+    restore, a rewritten-identical parameterization -- and every false mismatch
+    costs a model tree that can never be handed back (see _surface_generation).
+    The digest is strictly stronger, so it is the whole test.
+    """
+    fp = {"path": x3d_path, "size": None, "mtime_ns": None, "sha1": None,
+          "nverts": None, "nfaces": None, "bbox": None, "error": None}
+    try:
+        st = os.stat(x3d_path)
+        fp["size"] = int(st.st_size)
+        fp["mtime_ns"] = int(st.st_mtime_ns)
+        h = hashlib.sha1()
+        with open(x3d_path, "rb") as fh:
+            for block in iter(lambda: fh.read(1 << 20), b""):
+                h.update(block)
+        fp["sha1"] = h.hexdigest()
+    except Exception as e:                                      # noqa: BLE001
+        fp["error"] = "%s: %s" % (type(e).__name__, e)
+        return fp
+    try:
+        nv, nf, lo, hi = projection_surface_geometry(x3d_path)
+        fp["nverts"], fp["nfaces"], fp["bbox"] = nv, nf, (lo, hi)
+    except Exception as e:                                      # noqa: BLE001
+        # The digest still stands, so reuse can still be decided. Only the
+        # readable description of a mismatch is lost.
+        fp["error"] = "%s: %s" % (type(e).__name__, e)
+    return fp
+
+
+def projection_surface_matches(before, now):
+    """Are these two fingerprints the same bytes? -> (bool, why)
+
+    UNKNOWN IS NOT A MATCH. A missing or unreadable fingerprint on either side
+    answers False, so the caller takes the teardown-and-rebuild branch, which is
+    merely expensive. Answering True there is what produced an empty image with
+    every pass reporting 100%.
+    """
+    if not isinstance(before, dict) or not isinstance(now, dict):
+        return False, "no fingerprint was recorded when the surface was loaded"
+    if before.get("sha1") is None or now.get("sha1") is None:
+        return False, ("the file could not be read (%s)"
+                       % (now.get("error") or before.get("error") or "unknown",))
+    if before["sha1"] == now["sha1"] and before.get("size") == now.get("size"):
+        return True, "same %d bytes, sha1 %s" % (now["size"], now["sha1"][:12])
+    was = describe_surface_counts(before)
+    isnow = describe_surface_counts(now)
+    return False, ("the contents changed: %s -> %s (sha1 %s -> %s)"
+                   % (was, isnow,
+                      (before.get("sha1") or "?")[:12],
+                      (now.get("sha1") or "?")[:12]))
+
+
+global describe_surface_counts
+def describe_surface_counts(fp):
+    """One phrase describing what a fingerprint says the surface is. -> str"""
+    if not isinstance(fp, dict):
+        return "unknown"
+    parts = []
+    if fp.get("nverts") is not None:
+        parts.append("%d vertices, %d triangles" % (fp["nverts"], fp["nfaces"]))
+    if fp.get("size") is not None:
+        parts.append("%d bytes" % (fp["size"],))
+    if fp.get("bbox") is not None:
+        parts.append("over %s" % (describe_bbox(fp["bbox"]),))
+    return "; ".join(parts) if parts else "unknown"
+
+
+def projection_surface_reusable(projector, x3d_path):
+    """May this projector be restart()ed for x3d_path, or must it be rebuilt?
+
+    -> (bool, why). The three scan modes all ask this, and they must all ask it
+    the same way: a reuse decision that is right in one of them and wrong in the
+    other two is the same silent empty image in two thirds of the configs.
+
+    Both halves have to hold. The PATH, because a different file is a different
+    surface and the loaded geometry is the old one. The CONTENTS, because the
+    same path may be a different file -- see projection_surface_fingerprint().
+    """
+    if projector is None:
+        return False, "there is no projector yet"
+    if x3d_path is None:
+        return False, "no surface was given"
+    have = getattr(projector, "x3d_path", None)
+    if have != x3d_path:
+        return False, "a different surface file (was %s)" % (have,)
+    same, why = projection_surface_matches(
+        getattr(projector, "x3d_fingerprint", None),
+        projection_surface_fingerprint(x3d_path))
+    if not same:
+        return False, "%s has been REWRITTEN since it was loaded -- %s" % (x3d_path, why)
+    return True, why
+
+
+# ------------------------------------------------------------------------------
+# Is the surface anywhere near the toolpath? The pre-flight guard.
+# ------------------------------------------------------------------------------
+
+def describe_bbox(box):
+    """A world bounding box as one readable phrase. -> str"""
+    if box is None:
+        return "an unknown extent"
+    lo, hi = box
+    return ("x %.4f..%.4f  y %.4f..%.4f  z %.4f..%.4f m"
+            % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+
+
+def toolpath_world_bbox(path):
+    """World bounding box of whatever describes where the probe will go.
+
+    Accepts a ScanPath (its .positions), an (N, 3) array of positions, or the
+    (uu, vv, ww) coordinate grids a plane scan builds -- those are the three
+    shapes the three scan modes have in hand at the moment the projector is
+    handed the plan, and the guard has to work in all three or it is only
+    installed in some of them. -> (lo, hi) or None when there is nothing to
+    measure.
+    """
+    pos = getattr(path, "positions", None)
+    if pos is None:
+        if isinstance(path, (tuple, list)) and len(path) == 3:
+            # (uu, vv, ww): three same-shaped coordinate grids.
+            grids = [np.asarray(g, dtype=np.float64) for g in path]
+            if all(g.size for g in grids):
+                return (tuple(float(g.min()) for g in grids),
+                        tuple(float(g.max()) for g in grids))
+            return None
+        pos = path
+    pos = np.asarray(pos, dtype=np.float64)
+    if pos.ndim != 2 or pos.shape[1] != 3 or not pos.shape[0]:
+        return None
+    finite = pos[np.all(np.isfinite(pos), axis=1)]
+    if not finite.shape[0]:
+        return None
+    return (tuple(float(v) for v in finite.min(axis=0)),
+            tuple(float(v) for v in finite.max(axis=0)))
+
+
+def bbox_gap(a, b):
+    """Per-axis separation of two world bounding boxes, metres. -> (gx, gy, gz)
+
+    Zero on an axis where they overlap. The Euclidean norm of the three is the
+    closest the two boxes come to each other, which is the number worth printing.
+    """
+    alo, ahi = a
+    blo, bhi = b
+    return tuple(max(0.0, float(blo[i]) - float(ahi[i]),
+                     float(alo[i]) - float(bhi[i])) for i in range(3))
+
+
+global projection_file_world_bbox
+def projection_file_world_bbox(x3d_path, offset=(0.0, 0.0, 0.0)):
+    """Where the surface in this X3D FILE is, in the world. -> (lo, hi) or None
+
+    The same box SurfaceProjector.surface_world_bbox() reports, read straight
+    off the file so that it can be asked at PLANNING time -- before any
+    projector exists, before the arm has moved. See
+    check_projection_covers_path(), which takes either.
+    """
+    fp = projection_surface_fingerprint(x3d_path)
+    box = fp.get("bbox")
+    if box is None:
+        return None
+    lo, hi = box
+    return (tuple(lo[i] + offset[i] for i in range(3)),
+            tuple(hi[i] + offset[i] for i in range(3)))
+
+
+def check_projection_covers_path(projector, path, what="toolpath",
+                                 lateral_slack_m=None,
+                                 offset=(0.0, 0.0, 0.0), reach_m=None):
+    """Refuse a scan whose surface is nowhere near its toolpath. -> dict
+
+    `projector` may be a SurfaceProjector -- whose LOADED surface and real
+    min_dist/max_dist are then used -- or the PATH to an .x3d, which is how the
+    same question gets asked at planning time, before a projector exists and
+    before the arm moves. `offset` and `reach_m` only apply to the file form;
+    a projector carries its own.
+
+    THE ONE CHECK THAT WOULD HAVE CAUGHT results16 IN ONE LINE, and it runs
+    before the arm touches the part. A projector holding the wrong surface --
+    overwritten file, stale reuse, a mesh placed by an offset nobody applied to
+    the toolpath -- produces an empty image and NO error: the ray misses,
+    raytrace_sensor_evaluate_zdist returns inf, and project_onto_parameterization
+    drops the point without logging it. Every pass still reports 100% of its
+    expected traces, because the traces were acquired; they just went nowhere.
+
+    Two allowances, because two directions mean different things:
+
+      LATERALLY (x, y) the boxes must overlap, bar PROJECTION_FOOTPRINT_SLACK_M.
+      A path planned on a surface always overlaps its footprint, however much
+      the tool is tilted -- see that constant.
+
+      ALONG z the allowance is the projector's OWN ray window, min_dist to
+      max_dist: that is the interval along the tool axis it will search, so a
+      surface further away than that cannot be hit by any pose at any tilt,
+      and one inside it might be. Nothing tighter can be claimed without the
+      per-pose tool axis, and nothing looser is worth checking.
+
+    Returns the measurement -- {"ok", "surface_bbox", "path_bbox", "gap",
+    "separation_m", "reason"} -- so a scan report can carry it. Raises
+    RuntimeError on a refusal, naming both boxes and the gap, because by the
+    time anything downstream could notice, the scan is over.
+
+    A surface whose extent could not be read, or a path with no positions, is
+    reported as unchecked rather than refused: this guard exists to catch a
+    geometry collision, and it must not be the thing that stops a scan it cannot
+    actually measure.
+    """
+    out = {"ok": True, "surface_bbox": None, "path_bbox": None,
+           "gap": None, "separation_m": None, "reason": None}
+    if isinstance(projector, str):
+        # One fingerprint, not two: the digest is a full pass over the file and
+        # a real parameterization is tens of megabytes.
+        fp = projection_surface_fingerprint(projector)
+        surf = None
+        if fp.get("bbox") is not None:
+            flo, fhi = fp["bbox"]
+            surf = (tuple(flo[i] + offset[i] for i in range(3)),
+                    tuple(fhi[i] + offset[i] for i in range(3)))
+        counts = describe_surface_counts(fp)
+        reach = PROJECTION_RAY_WINDOW_M if reach_m is None else float(reach_m)
+    elif projector is None:
+        surf, counts, reach = None, "unknown", PROJECTION_RAY_WINDOW_M
+    else:
+        surf = projector.surface_world_bbox()
+        counts = describe_surface_counts(getattr(projector, "x3d_fingerprint", None))
+        reach = max(abs(float(getattr(projector, "min_dist", 0.0))),
+                    abs(float(getattr(projector, "max_dist", 0.0))))
+    tp = toolpath_world_bbox(path)
+    out["surface_bbox"] = surf
+    out["path_bbox"] = tp
+    if surf is None or tp is None:
+        out["reason"] = ("not checked: %s"
+                         % ("the surface extent could not be read"
+                            if surf is None else
+                            "the %s has no finite positions" % (what,)))
+        print("  WARNING: the projection surface was NOT checked against the %s "
+              "-- %s. An empty projected image is the failure this check exists "
+              "to prevent, and it cannot be ruled out here." % (what, out["reason"]))
+        return out
+
+    gap = bbox_gap(surf, tp)
+    out["gap"] = gap
+    out["separation_m"] = float(np.linalg.norm(gap))
+
+    slack = (PROJECTION_FOOTPRINT_SLACK_M if lateral_slack_m is None
+             else float(lateral_slack_m))
+    bad = []
+    for i, axis in enumerate("xy"):
+        if gap[i] > slack:
+            bad.append("%s by %.1f mm (slack %.1f mm)"
+                       % (axis, gap[i]*1e3, slack*1e3))
+    if gap[2] > reach:
+        bad.append("z by %.1f mm, past the projector's own %.0f mm ray window"
+                   % (gap[2]*1e3, reach*1e3))
+    if not bad:
+        out["reason"] = ("the surface and the %s overlap (closest approach of "
+                         "the boxes %.1f mm)" % (what, out["separation_m"]*1e3))
+        return out
+
+    out["ok"] = False
+    out["reason"] = "; ".join(bad)
+    raise RuntimeError(
+        "THE PROJECTION SURFACE IS NOT UNDER THE %s. Refusing to scan.\n"
+        "  surface  %s  (%s)\n"
+        "  %-8s %s\n"
+        "  they are separated by %.1f mm (x %.1f, y %.1f, z %.1f) -- %s\n"
+        "  Not one trace could land on this surface, and nothing downstream "
+        "would say so: a ray that misses is dropped inside the projection math "
+        "function with no error and no log, so every pass would report 100%% of "
+        "its expected traces onto an empty image.\n"
+        "  Either the surface is the wrong one for this part -- a .x3d written "
+        "beside a different mesh, or an overwritten one reused -- or the mesh "
+        "offset that places the surface was not applied to the %s."
+        % (what.upper(),
+           describe_bbox(surf), counts,
+           what + ":", describe_bbox(tp),
+           out["separation_m"]*1e3, gap[0]*1e3, gap[1]*1e3, gap[2]*1e3,
+           out["reason"], what))
+
+
 #: How many surfaces have been loaded under each projection prefix.
 #:
 #: x3d_load_geometry() reserves the channels of the model tree it loads into --
@@ -170,6 +563,17 @@ def describe_projection_status(status):
                      "cannot report on its own -- the image is empty and no "
                      "error was raised anywhere.")
         lines.append("    surface %s" % status.get("surface"))
+        # The surface's OWN extent, not left to be looked up. "compare the pose
+        # bbox against the surface extent" is the whole diagnosis, and asking the
+        # reader to go and find the other half of it is how results16 went a
+        # whole session without anyone making the comparison. Formatted inline
+        # rather than through describe_bbox() so this function stays liftable on
+        # its own -- see projection_status_test.py.
+        if status.get("surface_bbox"):
+            slo, shi = status["surface_bbox"]
+            lines.append("    the surface itself spans x %.4f..%.4f  "
+                         "y %.4f..%.4f  z %.4f..%.4f m"
+                         % (slo[0], shi[0], slo[1], shi[1], slo[2], shi[2]))
         if status.get("pose_bbox"):
             lo, hi = status["pose_bbox"]
             lines.append("    the poses span x %.4f..%.4f  y %.4f..%.4f  "
@@ -202,7 +606,8 @@ class SurfaceProjector(object):
 
     def __init__(self, recdb, x3d_path, prefix="/proj",
                  texture_scaling=None,
-                 min_dist=-0.05, max_dist=0.25, radius=0.003,
+                 min_dist=-PROJECTION_RAY_WINDOW_NEAR_M,
+                 max_dist=PROJECTION_RAY_WINDOW_M, radius=0.003,
                  horizontal_pixels=512, vertical_pixels=512,
                  use_surface_normal=False, create_textured_part=True,
                  offset=(0.0, 0.0, 0.0)):
@@ -229,6 +634,12 @@ class SurfaceProjector(object):
         self.vertical_pixels = vertical_pixels
         self.use_surface_normal = use_surface_normal
         self.create_textured_part = create_textured_part
+
+        # WHAT THIS SURFACE IS, taken BEFORE the loader reads it, so the
+        # fingerprint provably describes the bytes that were loaded and not
+        # whatever is at that path later. This is the whole basis of the reuse
+        # test -- see projection_surface_fingerprint().
+        fingerprint = projection_surface_fingerprint(x3d_path)
 
         # Before anything is allocated or reserved: a surface the loader would
         # abort on is either repaired into a sibling file or refused outright.
@@ -284,6 +695,7 @@ class SurfaceProjector(object):
         trans.end_transaction().globalrev_wait().wait_complete()
 
         self.x3d_path = x3d_path
+        self.x3d_fingerprint = fingerprint
         self.projection = None
         self.proj_specimen_chan = None
         self._reset_projection_counters()
@@ -345,6 +757,27 @@ class SurfaceProjector(object):
         if own:
             trans.end_transaction().globalrev_wait().wait_complete()
 
+    def surface_world_bbox(self):
+        """Where the LOADED surface is, in the world frame. -> (lo, hi) or None
+
+        The file's own box moved by this projector's `offset`, because that
+        offset is what the specimen pose channel holds and therefore where the
+        ray tracer thinks the geometry is. Getting that wrong is the other half
+        of the same failure the pre-flight guard is for: a mesh placed by an
+        offset that was never applied to the toolpath projects nothing, and the
+        box is the only place the two can be compared.
+
+        None when the extent could not be read -- an X3D with no Coordinate
+        node, or a file that has since gone away.
+        """
+        fp = getattr(self, "x3d_fingerprint", None)
+        box = None if not isinstance(fp, dict) else fp.get("bbox")
+        if box is None:
+            return None
+        lo, hi = box
+        return (tuple(lo[i] + self.offset[i] for i in range(3)),
+                tuple(hi[i] + self.offset[i] for i in range(3)))
+
     def _reset_projection_counters(self):
         """Zero what projection_status() reports. Called on build and restart."""
         self.projected = 0            # project() calls that staged a pose
@@ -401,6 +834,9 @@ class SurfaceProjector(object):
                                 else (tuple(self._pose_lo), tuple(self._pose_hi))),
                   "channel": self.projection_channel,
                   "surface": self.x3d_path,
+                  "surface_bbox": self.surface_world_bbox(),
+                  "surface_counts": describe_surface_counts(
+                      getattr(self, "x3d_fingerprint", None)),
                   "error": err}
         if not quiet:
             print(describe_projection_status(status))
@@ -434,11 +870,24 @@ class SurfaceProjector(object):
         globalrevisions defined but not complete, and the recording database
         warning that nothing can be pruned so memory, fds and shm keep growing.
         The window is only a transaction round trip; at 1 kHz that is enough.
+
+        AND THE PROBE POSE IS SEEDED INVALID AGAIN, in the same transaction.
+        __init__ does that before the first instantiation for a reason: the pose
+        channel is a math-function INPUT, so a freshly instantiated projector
+        splats whatever is on it, and after a scan what is on it is that scan's
+        LAST pose. project_onto_parameterization's guard only skips an invalid
+        orientation, and only one pose can be invalid, so without this the first
+        thing a cleared image receives is one stale point from the previous scan
+        -- at full value, at a position nothing in the new scan put there. It
+        costs one array element and it is the difference between "empty" and
+        "empty except for one pixel that means nothing".
         """
         trans = self.recdb.start_transaction()
         if self.projection is not None:
             trans.delete_math_function([self.projection_channel], self.projection)
             self.projection = None
+        self._probe_pose_in_transaction(trans, snde.snde_invalid_orientation3())
+        self._value_in_transaction(trans, np.nan)
         self._instantiate_projection(trans)
         trans.end_transaction().globalrev_wait().wait_complete()
         # The picture is empty again, so the counts that describe it must be too.

@@ -905,7 +905,14 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
 
         if projection_enabled() and x3d_path is not None:
             radius, pixels = projection_settings(plan)
-            if ec_projector is not None and getattr(ec_projector, "x3d_path", None) == x3d_path:
+            # PATH AND CONTENTS. Comparing the path alone is what produced
+            # results16: the second measurement's parameterization was written
+            # over the first's, this test said "same surface", and the whole
+            # scan projected onto geometry 31 mm away from the part. Not one of
+            # its 3531 traces landed and every pass reported 100%. See
+            # projection_surface_reusable() in surface_projection.dpi.
+            reuse, why = projection_surface_reusable(ec_projector, x3d_path)
+            if reuse:
                 # Same surface: empty the picture and reuse it. Rebuilding would
                 # work but would reload the mesh and recompute its projection
                 # geometry, which on a CPU-only build is the slow part, and would
@@ -919,12 +926,27 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
                 if ec_projector is not None:
                     ec_projector.teardown()
                     ec_projector = None
+                    print("  rebuilding the projection surface -- %s" % (why,))
                 ec_projector = SurfaceProjector(recdb, x3d_path, prefix=proj_prefix,
                                                 radius=radius,
                                                 horizontal_pixels=pixels,
                                                 vertical_pixels=pixels)
                 print("  projection surface: %s  (projecting %s)"
                       % (x3d_path, ec_scan_component))
+            # IS THAT SURFACE UNDER THIS TOOLPATH? Refuses on disjoint, naming
+            # both boxes and the gap. The pre-flight below asks the same
+            # question of the FILE before any motion; this one asks it of the
+            # surface that is actually LOADED, which is the half that catches a
+            # stale reuse -- the file on disk may by then be the right one while
+            # the projector is still holding the previous run's geometry.
+            check_projection_covers_path(ec_projector, path, what="toolpath")
+
+    # BEFORE THE ARM MOVES. The projector itself is not built until the first
+    # reading has been staged -- by which time the probe is on the part -- so
+    # the surface is checked against the toolpath here, off the file, where a
+    # refusal costs nothing. results16 would have stopped on this line.
+    if projection_enabled() and x3d is not None:
+        check_projection_covers_path(x3d, path, what="toolpath")
 
     global ec_instrument_null
     ec_instrument_null = None
