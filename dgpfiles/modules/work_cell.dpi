@@ -45,6 +45,13 @@ global check_motion_volume
 global motion_volume_ok
 global describe_motion_volume_check
 global _MOTION_VOLUME
+global derive_safe_motion_volume
+global safe_motion_volume
+global safe_motion_volume_spec
+global describe_safe_motion_volume
+global in_safe_motion_volume
+global navigation_volume
+global _SAFE_MOTION_VOLUME
 global manifest_file
 global warning_light
 global software_versions
@@ -360,10 +367,293 @@ def describe_motion_volume_check(rep):
     return lines
 
 
+# ==============================================================================
+# THE SAFE MOTION VOLUME: THE ROOM, NOT THE PART AND NOT THE TOOLING
+# ==============================================================================
+# A THIRD box. work_volume is where a part may sit and where the contact probe
+# tip must stay; motion_volume is that box plus the tooling's own reach;
+# safe_motion_volume is the room an operator has walked and declared clear.
+#
+# IT EXISTS BECAUSE TILT IS EXPENSIVE IN SPACE. The tooling stack stands ~192 mm
+# above the probe tip and reaches ~75 mm to the side, so leaning the tool over to
+# follow a surface normal swings probe_end and the Azure body around by of order
+# 100 mm. Against motion_volume -- the work volume plus 150 mm of pad -- that
+# eats most of the pad, and tilted poses are then refused for leaving a box whose
+# faces were never about where the room is clear. None of the sensor stages touch
+# the part, so holding them to a box derived from where a PART may sit buys
+# nothing at all.
+#
+# DERIVED, NOT WRITTEN DOWN, and the three faces the operator said not to move
+# are the work volume's own by construction rather than by transcription:
+#
+#   y        both faces, unchanged. "It is also not safe to extend it left or
+#            right either." Nothing widens this.
+#   x_max    unchanged. There is a WALL behind the table.
+#   z_min    unchanged. That is the table, and it was touched off.
+#   x_min    base_x - reach: toward the robot, past the world origin, and on
+#            behind the robot, which the operator states is clear over the range
+#            of the arm's reach for these same y-z extents.
+#   z_max    base_z + reach.
+#
+# Deriving it is what keeps "unchanged" true when the work volume changes --
+# re-touched off, or a session running on the measured override file. It also
+# makes "contains the work volume" an identity rather than something a test has
+# to catch.
+#
+# NOT A LICENCE, exactly as for motion_volume: collision is the planner's to
+# refuse, the contact probe is still held to the work volume whenever it is in
+# contact, and wrist 3 is still bounded by the measured cable band. This box only
+# says where the arm is ALLOWED to try -- and unlike the work volume it is not
+# measured, it is an operator's statement about a room plus two numbers read out
+# of the robot description. Anything not in the URDF, the wall included, is
+# invisible to check_motion_volume().
+
+
+def derive_safe_motion_volume(work, base_xyz, reach):
+    """(lo, hi) of the safe motion volume, from the work volume and the arm.
+
+    PURE ARITHMETIC AND NOTHING ELSE, so it can be checked on the host with no
+    cell and no manifest -- see safe_motion_volume_test.py, which is where the
+    "y was not widened" and "the wall side did not move" assertions live.
+
+    `work` is (lo, hi) or (frame, lo, hi); `base_xyz` is where base_link sits in
+    the work volume's frame; `reach` is the arm's reach radius about base_link,
+    in metres.
+
+    THE RESULT ALWAYS CONTAINS `work`. Four of its six faces ARE the work
+    volume's, and the other two only ever move outward -- x_min below base_x
+    (which is inside the work volume's x span on this bench, and in any case
+    reach > 0 pushes it further out) and z_max above base_z. A reach small enough
+    to put either face inside the work volume is refused rather than returned,
+    because a "safe motion volume" that forbids a pose the work volume allows is
+    the one failure here that would not announce itself.
+    """
+    if work is None:
+        return None
+    # (frame, lo, hi) from work_volume(), or a bare (lo, hi). Accepting both is
+    # not politeness: every caller in the pipeline holds the three-tuple, and
+    # every test holds the pair.
+    if len(work) == 3 and isinstance(work[0], str):
+        lo, hi = work[1], work[2]
+    else:
+        lo, hi = work[0], work[1]
+    lo = np.asarray(lo, dtype=np.float64).reshape(3)
+    hi = np.asarray(hi, dtype=np.float64).reshape(3)
+    base = np.asarray(base_xyz, dtype=np.float64).reshape(3)
+    reach = float(reach)
+    if not np.isfinite(reach) or reach <= 0.0:
+        raise ValueError("the arm's reach is a positive distance in metres, "
+                         "not %r" % (reach,))
+    out_lo = (float(base[0] - reach), float(lo[1]), float(lo[2]))
+    out_hi = (float(hi[0]), float(hi[1]), float(base[2] + reach))
+    # THE CONTAINMENT CHECK, and it is not ceremony. The two derived faces come
+    # from a base position and a reach that are read out of a description; a
+    # description that moved the arm, or a reach typed in millimetres, would
+    # otherwise hand back a box SMALLER than the work volume on one face and
+    # every legal part position would become unreachable with no message.
+    if out_lo[0] > lo[0] + 1e-9 or out_hi[2] < hi[2] - 1e-9:
+        raise ValueError(
+            "the derived safe motion volume x %.4f..%.4f z %.4f..%.4f does not "
+            "contain the work volume x %.4f..%.4f z %.4f..%.4f. base_xyz %s and "
+            "reach %.4f m cannot both be right -- check the units (metres) and "
+            "where base_link actually sits."
+            % (out_lo[0], out_hi[0], out_lo[2], out_hi[2], lo[0], hi[0],
+               lo[2], hi[2], tuple(base), reach))
+    return (out_lo, out_hi)
+
+
+#: One-element cache, like _WORK_VOLUME and _MOTION_VOLUME.
+_SAFE_MOTION_VOLUME = []
+
+
+def safe_motion_volume_spec(cell=None, mode=None, quiet=False):
+    """The manifest's `safe_motion_volume.<mode>` block as a dict, or None.
+
+    Separated from safe_motion_volume() so the YAML reading and the arithmetic
+    can be looked at one at a time, and so a mode that declares nothing is a
+    plain None rather than an exception.
+    """
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    try:
+        from tari_bringup.cells import find_manifest
+        import yaml
+        with open(find_manifest(name)) as handle:
+            block = (yaml.safe_load(handle) or {}).get("safe_motion_volume") or {}
+    except Exception as e:                                        # noqa: BLE001
+        if not quiet:
+            print("  no safe motion volume for %s/%s (%s); the motion volume "
+                  "bounds navigation, as before"
+                  % (name, which, (str(e).splitlines() or [repr(e)])[0][:60]))
+        return None
+    raw = block.get(which)
+    if not raw:
+        return None
+    out = dict(raw)
+    out.setdefault("frame", block.get("frame") or "world")
+    return out
+
+
+def safe_motion_volume(cell=None, mode=None, quiet=False):
+    """Where the arm may NAVIGATE when nothing is in contact: (frame, lo, hi).
+
+    None when the manifest declares none for this mode, and then every caller
+    falls back to motion_volume() and behaves exactly as it did before this
+    existed. That is the state for `sim`, deliberately: nobody has walked that
+    room, because there is no room.
+
+    Cached, like the other two boxes. work_volume_reload() drops all three.
+    """
+    if _SAFE_MOTION_VOLUME:
+        return _SAFE_MOTION_VOLUME[0]
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    volume = None
+    spec = safe_motion_volume_spec(cell=name, mode=which, quiet=quiet)
+    if spec:
+        frame = spec.get("frame") or "world"
+        try:
+            if spec.get("min") and spec.get("max"):
+                # VERBATIM, for a cell that wants to state the box instead of
+                # deriving it. Still required to contain the work volume: the
+                # whole point of the box is to be LARGER than the one the probe
+                # tip is held to.
+                lo = tuple(float(v) for v in spec["min"])
+                hi = tuple(float(v) for v in spec["max"])
+                work = work_volume(cell=name, mode=which, quiet=True)
+                if work is not None:
+                    wlo, whi = work[1], work[2]
+                    if (any(a > b + 1e-9 for a, b in zip(lo, wlo))
+                            or any(a < b - 1e-9 for a, b in zip(hi, whi))):
+                        raise ValueError(
+                            "the explicit safe_motion_volume.%s does not contain "
+                            "the work volume (%s..%s vs %s..%s)"
+                            % (which, lo, hi, tuple(wlo), tuple(whi)))
+                volume = (frame, lo, hi)
+            else:
+                work = work_volume(cell=name, mode=which, quiet=True)
+                if work is None:
+                    raise ValueError(
+                        "the derivation needs a work volume and this cell/mode "
+                        "declares none")
+                lo, hi = derive_safe_motion_volume(
+                    work, spec["base_xyz"], spec["arm_reach"])
+                volume = (frame, lo, hi)
+        except Exception as e:                                    # noqa: BLE001
+            # REFUSE THE BOX, NOT THE RUN. A malformed safe volume must not take
+            # out a session: falling back to motion_volume() is the behaviour
+            # that predates this block, and it is strictly tighter.
+            print("  the safe motion volume for %s/%s could not be worked out "
+                  "(%s); the motion volume bounds navigation instead, as before"
+                  % (name, which, (str(e).splitlines() or [repr(e)])[0]))
+            volume = None
+    _SAFE_MOTION_VOLUME.append(volume)
+    return volume
+
+
+def navigation_volume(quiet=True):
+    """(lo, hi) the arm may NAVIGATE in when nothing is in contact, or None.
+
+    ONE PLACE RESOLVES THE PRECEDENCE, so a stage cannot quietly pick a
+    different box from the one the banner printed:
+
+        safe_motion_volume  the room, when the operator has declared one
+        motion_volume       the work volume plus the tooling's reach
+        work_volume         when neither exists, which is the oldest behaviour
+
+    NOT FOR CONTACT. The eddy-current probe tip is held to work_volume()
+    whenever it is touching the part, and nothing here changes that -- see
+    _crop_path_to_work_volume() in mesh_reconstruction.dpi, which takes the
+    bounds it is given and defaults to the work volume.
+    """
+    for fn in ("safe_motion_volume", "motion_volume"):
+        f = globals().get(fn)
+        v = f(quiet=quiet) if callable(f) else None
+        if v is not None:
+            return (np.asarray(v[1], float), np.asarray(v[2], float))
+    v = work_volume()
+    if v is None:
+        return None
+    return (np.asarray(v[1], float), np.asarray(v[2], float))
+
+
+def in_safe_motion_volume(points, margin=0.0):
+    """Boolean mask of which (n,3) world points are inside the safe volume.
+
+    Falls through to in_work_volume() when no safe volume is declared, so a
+    caller does not have to know whether this cell has one.
+    """
+    volume = safe_motion_volume(quiet=True)
+    if volume is None:
+        return in_work_volume(points, margin=margin)
+    _frame, lo, hi = volume
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    return np.all((p >= np.asarray(lo) - margin)
+                  & (p <= np.asarray(hi) + margin), axis=1)
+
+
+def describe_safe_motion_volume():
+    """Lines for a startup banner, or None when no safe volume is declared.
+
+    Says what the box DOES NOT cover as well as what it does, because the one
+    way to misread it is as permission for the contact probe.
+    """
+    volume = safe_motion_volume(quiet=True)
+    if volume is None:
+        return None
+    _frame, lo, hi = volume
+    spec = safe_motion_volume_spec(quiet=True) or {}
+    lines = ["  safe motion volume (bounds NON-CONTACT motion and the TOOLING): "
+             "x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f m"
+             % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2])]
+    if spec.get("min") and spec.get("max"):
+        lines.append("    stated outright in the cell manifest, not derived")
+    else:
+        lines.append("    derived: y and x_max and the floor are the work "
+                     "volume's unchanged; x_min = base_x - reach (behind the "
+                     "robot) and the ceiling = base_z + reach")
+        lines.append("    base_link at %s in the description, reach %.4f m "
+                     "(ur10e default_kinematics a2+a3+d5); NOT measured"
+                     % (tuple(float(v) for v in spec.get("base_xyz", ())),
+                        float(spec.get("arm_reach", float("nan")))))
+    lines.append("    the CONTACT probe tip is still held to the work volume; "
+                 "this box is for sensor stages and transit only")
+    # WHICH FACES THIS BOX IS TIGHTER THAN THE OLD ONE ON, SAID OUT LOUD.
+    # The safe volume is enormously larger than the motion volume toward and
+    # behind the robot and overhead, and on two faces it is SMALLER: the
+    # motion volume was derived as the work volume plus 150 mm of pad in x AND
+    # y, and the operator's specification pads neither the wall side nor
+    # either y face. So a sensor sweep over a part at the y edge of the work
+    # volume can now be refused where it previously flew, and the reason is
+    # the operator's own statement that the cell is not clear left or right.
+    # Finding that out from a refused first pose is the failure this line
+    # exists to prevent.
+    mv = globals().get("motion_volume")
+    mv = mv(quiet=True) if callable(mv) else None
+    if mv is not None:
+        tight = []
+        for i, axis in ((0, "x"), (1, "y"), (2, "z")):
+            if lo[i] > mv[1][i] + 1e-9:
+                tight.append("%s_min %+.3f -> %+.3f" % (axis, mv[1][i], lo[i]))
+            if hi[i] < mv[2][i] - 1e-9:
+                tight.append("%s_max %+.3f -> %+.3f" % (axis, mv[2][i], hi[i]))
+        if tight:
+            lines.append("    TIGHTER than the motion volume it replaces on: %s"
+                         % ("; ".join(tight),))
+            lines.append("      the motion volume padded the work volume by "
+                         "150 mm in x AND y; this box pads neither the wall "
+                         "side nor either y face, because the operator says "
+                         "the cell is not clear there. A sweep over a part at "
+                         "the y edge of the work volume may be refused where "
+                         "it used to fly.")
+    return "\n".join(lines)
+
+
 def work_volume_reload():
     """Forget the cached boxes and sensor topics, so an edited manifest is
     picked up."""
     del _MOTION_VOLUME[:]
+    del _SAFE_MOTION_VOLUME[:]
     del _WORK_VOLUME[:]
     _WORK_VOLUME_WHY.clear()
     _SENSOR_TOPICS.clear()

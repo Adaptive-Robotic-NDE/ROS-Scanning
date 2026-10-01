@@ -48,6 +48,13 @@ global AzureReconstruction
 global KeyenceReconstructionKey
 global KeyenceReconstructionPC
 global keyence_reconstruction_class
+global keyence_orient_mode
+global keyence_normal_fallback
+global smooth_fallback_mask
+global tool_axis_step_deg
+global keyence_tilt_summary
+global KEYENCE_ORIENT_ALIASES
+global KEYENCE_FALLBACK_REASONS
 global clean_mesh
 global mesh_to_x3d
 global call_ros_service
@@ -3209,8 +3216,30 @@ def region_of_measured_surface(mesh, region=None, depth_m=None,
 
 
 def _motion_bounds():
-    """(lo, hi) the ARM may navigate in, or the work volume's when no motion
-    volume is declared. None when neither is."""
+    """(lo, hi) the ARM may navigate in for a NON-CONTACT stage. None when the
+    cell declares no box at all.
+
+    THE PRECEDENCE IS work_cell.dpi's, not this file's: the safe motion volume
+    when the operator has declared one, else the motion volume, else the work
+    volume -- which is what this function did before the safe volume existed, and
+    is what a cell with no safe volume still gets.
+
+    WHY THE SAFE VOLUME MATTERS HERE RATHER THAN SOMEWHERE ELSE. This is the
+    bound the Keyence sweep's probe_end path is cropped to, and a sweep that
+    follows the surface normal leans the tool over: at 30 deg the stack's 192 mm
+    of height and 75 mm of reach move probe_end of order 100 mm, which is most of
+    the motion volume's 150 mm of pad. The sensor never touches the part, so the
+    box that should bound it is the room, not the part box plus a pad.
+
+    Nothing about CONTACT goes through here. The eddy-current toolpath is cropped
+    by _crop_path_to_work_volume() with its default bounds, which are the work
+    volume, and that is deliberate -- see the standing rule about the technician's
+    taught envelope.
+    """
+    nav = globals().get("navigation_volume")
+    if callable(nav):
+        return nav(quiet=True)
+    # work_cell.dpi not loaded (a config that includes this module alone).
     mv = globals().get("motion_volume")
     mv = mv(quiet=True) if callable(mv) else None
     if mv is not None:
@@ -4138,7 +4167,7 @@ class AzureReconstruction(ReconstructionSource):
         pos = np.asarray(path.positions, dtype=np.float64).reshape(-1, 3)
         quats = np.asarray(path.quats, dtype=np.float64).reshape(-1, 4)
         cams = np.asarray(camera_path.positions, dtype=np.float64).reshape(-1, 3)
-        keep, wrists = [], []
+        keep, wrists, wrist_of = [], [], {}
         # One /compute_ik round trip per stop, and a REFUSED stop costs the
         # whole 1.0 s KDL timeout -- a 5x5 raster whose far corners do not reach
         # is most of a minute, a denser one is several. Counted, because here
@@ -4155,6 +4184,10 @@ class AzureReconstruction(ReconstructionSource):
                 keep.append(i)
                 if w3 is not None:
                     wrists.append(np.degrees(w3))
+                    # KEPT PER STOP as well as in a min/max, because the band is
+                    # a function of the TILT at that stop and a tilted raster
+                    # has a different band at every one. See below.
+                    wrist_of[i] = float(w3)
             reach.result("%d of %d stops reach" % (len(keep), len(pos)))
         if len(keep) < 2:
             return None, None
@@ -4182,11 +4215,26 @@ class AzureReconstruction(ReconstructionSource):
             band = globals().get("check_wrist3")
             if callable(band):
                 try:
+                    # EVERY STOP AGAINST THE BAND AT ITS OWN TILT, point for
+                    # point, which is what check_wrist3(quats=) does when the
+                    # two lists are the same length.
+                    #
+                    # IT USED TO PASS THE MIN AND MAX WITH NO TILT, on the
+                    # reasoning that the raster held one straight-down
+                    # orientation for every stop. That is true of rot=False and
+                    # false of rot=True, which sweeps the camera through +/-15
+                    # degrees so the TSDF gets more than one ray per point --
+                    # and the band narrows sharply with tilt: 285 degrees of
+                    # travel untilted, 150 at a -20 degree x tilt. Checking a
+                    # tilted raster against the untilted band under-checks the
+                    # cables by over 100 degrees, which is the kind of mistake
+                    # the guard exists to make impossible.
+                    #
                     # A LIST of bare wrist_3 angles, never a bare configuration
-                    # -- see check_wrist3's six-value ambiguity. No tilt: this
-                    # raster holds ONE orientation for every stop, and it is
-                    # the straight-down one, so the untilted band is the band.
-                    band([np.radians(v) for v in (lo, hi)], "the dome raster")
+                    # -- see check_wrist3's six-value ambiguity.
+                    stops = [i for i in keep if i in wrist_of]
+                    band([wrist_of[i] for i in stops], "the dome raster",
+                         quats=[quats[i] for i in stops])
                 except Exception as e:
                     print("    REFUSED by the cable envelope: %s"
                           % (str(e).splitlines()[0],))
@@ -4464,6 +4512,238 @@ class AzureReconstruction(ReconstructionSource):
         return output_path
 
 
+# ==============================================================================
+# HOW THE PROFILER IS POINTED: ONE VOCABULARY, AND A FALLBACK THAT IS NOT A
+# FAILURE
+# ==============================================================================
+# The operator's names for the two orientations are "z" (locked to world z) and
+# "normal" (along the specimen's surface normal). The planner's names are
+# "fixed", "surface", "capped" and "auto". KEYENCE_ORIENTATION is read raw by two
+# call sites that are deliberately not shared -- reconstruct_fine() in the config
+# and check_keyence_standoff() in keyence_standoff.dpi -- so the translation lives
+# HERE, inside the planner both of them reach, rather than in either of them.
+
+#: Operator name -> planner name. "normal" is its own mode rather than an alias
+#: for "capped", because what makes it usable is the per-waypoint fallback and a
+#: capped path has none.
+KEYENCE_ORIENT_ALIASES = {
+    "z": "fixed", "world_z": "fixed", "worldz": "fixed", "vertical": "fixed",
+    "locked": "fixed", "down": "fixed", "fixed": "fixed",
+    "normal": "normal", "specimen": "normal", "part": "normal",
+    "surface": "surface", "capped": "capped", "auto": "auto",
+}
+
+#: Why a waypoint went back to vertical, in the order they are asked. The first
+#: reason that applies is the one reported, so a tally of reasons adds up to the
+#: number of fallbacks exactly.
+KEYENCE_FALLBACK_REASONS = ("tilt", "cable", "clearance", "standoff")
+
+
+def keyence_orient_mode(orient):
+    """The planner's orientation name for whatever a caller asked for.
+
+    Unknown names are passed straight through rather than refused: the planner
+    has its own argument checking, and a name invented downstream should fail
+    there with its own message instead of here with a translation error.
+    """
+    if orient is None:
+        return None
+    return KEYENCE_ORIENT_ALIASES.get(
+        str(orient).strip().lower().replace("-", "_"), orient)
+
+
+def keyence_normal_fallback(tilt_deg, cable_ok=None, clearance_m=None,
+                            standoff_m=None, max_tilt_deg=30.0,
+                            clearance_limit_m=0.005, window_m=None):
+    """Which waypoints may be flown along the surface normal. PURE ARITHMETIC.
+
+    -> (use_normal (n,) bool, reason (n,) list of str, tally dict)
+
+    `reason[i]` is "" where the normal pose is kept and one of
+    KEYENCE_FALLBACK_REASONS where it is not. `tally` counts them, plus "normal"
+    and "fallback" totals, so a caller can print one line.
+
+    SEPARATED FROM THE PLANNING ON PURPOSE, so the decision can be checked on the
+    host with no cell, no mesh and no robot -- see keyence_normal_test.py. Every
+    input is a plain array of numbers that something else measured.
+
+    THE FOUR WAYS A TILTED WAYPOINT IS REFUSED, in the order asked, each of which
+    has cost a run or a plate in this cell:
+
+      tilt       `tilt_deg` past `max_tilt_deg`. More tilt is more IK failures
+                 and more refused passes, and the measured cable band narrows
+                 sharply with it: 285 deg of wrist-3 travel at no tilt, 150 at
+                 -20 deg, 90 at -40 deg. A band 90 deg wide is not room to fly a
+                 raster in.
+      cable      `cable_ok[i]` False -- the measured wrist-3 band AT THAT TILT
+                 does not admit the angle this path needs, or the tilt is outside
+                 the hull that was measured at all. ABSOLUTE wrist-3 angle, never
+                 resolved by +/-360: two angles a turn apart are one tool
+                 orientation and two completely different cable states.
+      clearance  the tooling envelope comes within `clearance_limit_m` of the
+                 surface. THIS IS THE PROBE-INTO-THE-PART CASE: probe_end sits
+                 ~73 mm to one side of the optical frame on the same mounting
+                 plate and the barrel is 7.1 mm in radius, so a tilt that stands
+                 the SENSOR off correctly can swing the eddy-current probe down
+                 into a curved flank. motion.py and tari_cpp_mtc both carry that
+                 warning; this is the arithmetic behind it.
+      standoff   the commanded distance falls outside `window_m` = (lo, hi), the
+                 guarded part of the LJ-V7080's 57..103 mm range. Tilting changes
+                 the standoff across the laser line, which is the whole reason
+                 the tilt is wanted -- and it is also how a tilt puts the surface
+                 past the far limit, where this sensor returns scattered values
+                 rather than nothing.
+
+    NaN IS A REFUSAL, everywhere. A clearance that could not be measured, a ray
+    that hit nothing, a tilt that is not a number: none of those is permission.
+
+    A WAYPOINT WHOSE VERTICAL POSE IS ALSO BAD IS NOT THIS FUNCTION'S PROBLEM.
+    It says which of two poses to fly; the clearance and standoff gates that run
+    afterwards drop what neither pose can do, exactly as they do today.
+    """
+    tilt = np.asarray(tilt_deg, dtype=np.float64).reshape(-1)
+    n = tilt.shape[0]
+    use = np.ones(n, dtype=bool)
+    reason = [""]*n
+
+    def refuse(bad, why):
+        bad = np.asarray(bad, dtype=bool).reshape(-1)
+        hit = bad & use
+        for i in np.nonzero(hit)[0]:
+            reason[int(i)] = why
+        use[hit] = False
+
+    refuse(~np.isfinite(tilt) | (tilt > float(max_tilt_deg) + 1e-9), "tilt")
+    if cable_ok is not None:
+        refuse(~np.asarray(cable_ok, dtype=bool).reshape(-1), "cable")
+    if clearance_m is not None:
+        c = np.asarray(clearance_m, dtype=np.float64).reshape(-1)
+        refuse(~np.isfinite(c) | (c < float(clearance_limit_m)), "clearance")
+    if standoff_m is not None and window_m is not None:
+        s = np.asarray(standoff_m, dtype=np.float64).reshape(-1)
+        lo, hi = float(window_m[0]), float(window_m[1])
+        refuse(~np.isfinite(s) | (s < lo) | (s > hi), "standoff")
+
+    tally = {"normal": int(use.sum()), "fallback": int((~use).sum())}
+    for why in KEYENCE_FALLBACK_REASONS:
+        tally[why] = sum(1 for r in reason if r == why)
+    return use, reason, tally
+
+
+def smooth_fallback_mask(use, segment_starts=(), min_run=8):
+    """A copy of `use` with every run shorter than `min_run` absorbed. PURE.
+
+    WHY A MERGED PATH NEEDS THIS. The four gates are smooth functions of the
+    surface, so their crossings are usually few -- but a mask that alternates
+    even once costs a full orientation step between two waypoints 2 mm apart,
+    and a raster that alternates repeatedly asks the wrist to swing the tilt on
+    and off at every step. That is not a collision and it is not a cable fault:
+    it is a Cartesian path whose IK branch can change between adjacent poses,
+    which shows up as a row truncating at min_fraction with nothing saying why.
+
+    So runs shorter than `min_run` lose to their surroundings. A short island of
+    normal-following inside a fallen-back stretch is not worth the two steps it
+    costs, and a short island of fallback inside a following stretch gets flown
+    along the normal -- which is only sound because the surrounding waypoints
+    passed all four gates and the gates that come afterwards still see every
+    pose. BOTH ARE CHECKED AGAIN: enforce_path_clearance() and the standoff gate
+    run on the merged path and drop what cannot be flown, so absorbing a short
+    island can cost a dropped waypoint but never an unchecked one.
+
+    RUNS DO NOT CROSS A PASS BOUNDARY. `segment_starts` are the indices where a
+    pass begins; the arm lifts, approaches and re-enters there, so an
+    orientation change at a boundary costs nothing and a run that spans two
+    passes is two runs.
+
+    min_run <= 1 returns the mask unchanged, which is the way to turn this off.
+    """
+    use = np.asarray(use, dtype=bool).reshape(-1).copy()
+    n = use.shape[0]
+    if n == 0 or int(min_run) <= 1:
+        return use
+    bounds = sorted(set([0, n] + [int(i) for i in segment_starts
+                                  if 0 < int(i) < n]))
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        seg = use[a:b]
+        if seg.size < 2:
+            continue
+        # Run boundaries inside this pass.
+        edges = [0] + list(np.nonzero(np.diff(seg))[0] + 1) + [seg.size]
+        runs = list(zip(edges[:-1], edges[1:]))
+        # SHORTEST FIRST, repeatedly, so absorbing one run can merge its two
+        # neighbours and the result has no short runs left anywhere.
+        changed = True
+        while changed and len(runs) > 1:
+            changed = False
+            for k, (s, e) in enumerate(runs):
+                if e - s >= int(min_run):
+                    continue
+                # Absorb into the longer neighbour; at the ends there is only
+                # one, and a run that IS the whole pass is left alone.
+                left = runs[k-1] if k > 0 else None
+                right = runs[k+1] if k + 1 < len(runs) else None
+                if left is None and right is None:
+                    break
+                take = (right if left is None else
+                        left if right is None else
+                        (left if (left[1]-left[0]) >= (right[1]-right[0])
+                         else right))
+                seg[s:e] = seg[take[0]]
+                edges = [0] + list(np.nonzero(np.diff(seg))[0] + 1) + [seg.size]
+                runs = list(zip(edges[:-1], edges[1:]))
+                changed = True
+                break
+        use[a:b] = seg
+    return use
+
+
+def tool_axis_step_deg(quats, segment_starts=()):
+    """(m,) degrees the tool AXIS turns between adjacent waypoints. PURE.
+
+    Steps across a pass boundary are excluded: the arm lifts, approaches and
+    re-enters there, so an orientation change at a boundary costs nothing, while
+    one INSIDE a pass is a Cartesian move that has to carry it.
+
+    The axis, not the full orientation, because what can change the IK branch
+    mid-pass is where the tool points. Roll about the axis is the wrist-3
+    question and is bounded by the cable guard instead.
+    """
+    q = np.asarray(quats, dtype=np.float64).reshape(-1, 4)
+    n = q.shape[0]
+    if n < 2:
+        return np.zeros(0)
+    # Tool z in world, per pose, from the quaternion's third column.
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    ax = np.stack([2.0*(x*z + y*w), 2.0*(y*z - x*w),
+                   1.0 - 2.0*(x*x + y*y)], axis=1)
+    nrm = np.linalg.norm(ax, axis=1)
+    ax = ax/np.where(nrm < 1e-12, 1.0, nrm)[:, None]
+    dot = np.clip(np.einsum("ij,ij->i", ax[:-1], ax[1:]), -1.0, 1.0)
+    step = np.degrees(np.arccos(dot))
+    inside = np.ones(n - 1, dtype=bool)
+    for i in segment_starts:
+        i = int(i)
+        if 0 < i < n:
+            inside[i-1] = False
+    return step[inside]
+
+
+def keyence_tilt_summary(tilt_deg):
+    """One line describing a tilt distribution, or None for an empty one.
+
+    Percentiles rather than a mean: what decides whether a raster flies is the
+    worst few percent of its waypoints, and a mean over a mostly-flat plate hides
+    them completely.
+    """
+    t = np.asarray(tilt_deg, dtype=np.float64).reshape(-1)
+    t = t[np.isfinite(t)]
+    if not t.size:
+        return None
+    p = np.percentile(t, (50, 95, 99))
+    return ("tilt from vertical: median %.1f, p95 %.1f, p99 %.1f, worst %.1f deg "
+            "over %d waypoints" % (p[0], p[1], p[2], t.max(), t.size))
+
+
 class _KeyenceReconstruction(ReconstructionSource):
     """What the two Keyence backends have in common.
 
@@ -4512,7 +4792,36 @@ class _KeyenceReconstruction(ReconstructionSource):
     #: orient="surface" to plan_sweep() to compare.
     #: "auto" measures the surface and picks: "fixed" for anything within
     #: FIXED_TILT_DEG of flat, "capped" otherwise. Pass orient= to force one.
+    #: "normal" is "capped" plus a per-waypoint fallback to the vertical pose --
+    #: see _normal_with_fallback(). It is the one to reach for when the surface
+    #: really should be followed, because it is the only one that cannot cost
+    #: the whole stage.
     ORIENT = "auto"
+
+    #: Degrees from vertical a waypoint may be tilted in the "normal" mode.
+    #: KEYENCE_NORMAL_MAX_TILT_DEG in a config overrides it. 30 rather than the
+    #: tilt ladder's top rung of 45: at -40 deg of tilt the measured wrist-3 band
+    #: for this tooling is 90 deg wide, against 285 deg untilted, and a 90 deg
+    #: band is not room to fly a raster in.
+    NORMAL_MAX_TILT_DEG = 30.0
+
+    #: Waypoints a run of one orientation choice must be at least, or it is
+    #: absorbed into its neighbours. A mask that alternates costs a full
+    #: orientation step between waypoints a couple of millimetres apart, every
+    #: time. KEYENCE_NORMAL_MIN_RUN overrides it.
+    NORMAL_MIN_RUN = 8
+
+    #: Degrees of tool-axis change between adjacent waypoints of one pass that
+    #: is worth warning about on a merged path. Reporting only -- the pass is
+    #: still checked for clearance and standoff -- but a step this large can
+    #: change the IK branch mid-pass and truncate the row at min_fraction.
+    NORMAL_STEP_WARN_DEG = 20.0
+
+    #: Degrees of wrist-3 travel the band at a waypoint's tilt must still leave,
+    #: or the waypoint goes back to vertical. The IK branch for a pass is chosen
+    #: once, for the whole pass, so a band narrower than this leaves no room to
+    #: choose it in. KEYENCE_NORMAL_MIN_BAND_DEG overrides it.
+    NORMAL_MIN_BAND_DEG = 120.0
 
     def __init__(self, laser_pin=None, tf_offset=None, line_spacing=0.02,
                  z_offset=0.0, velocity=0.010, profile_topic=None,
@@ -4930,6 +5239,276 @@ class _KeyenceReconstruction(ReconstructionSource):
                   "planned one)" % (e,))
             return reference
 
+    def _cable_ok_for_tilts(self, quats, verbose=True):
+        """(n,) bool: does the measured cable band admit this pose's tilt?
+
+        None when nothing has been measured for this cell, which is NOT the same
+        as False: an unmeasured band is a thing nobody knows, the whole-path
+        guard has already warned about it, and refusing every tilted waypoint on
+        that basis would silently turn the normal mode back into the vertical
+        one.
+
+        WHAT IT ASKS, exactly, so nobody reads more into it:
+
+          * is this tilt inside the hull the envelope was MEASURED over? Outside
+            it, nothing is invented -- that is CableRefused, and it is a refusal.
+          * does the band at that tilt still leave NORMAL_MIN_BAND_DEG of
+            wrist-3 travel? The IK branch for a pass is chosen once for the whole
+            pass, so a narrow band is no room to choose in.
+          * does the wrist-3 angle this tooling sits at for zero probe rotation
+            -- the measured datum at THAT tilt -- fall inside that band?
+
+        ABSOLUTE ANGLES. wrist3_datum_deg() and wrist3_band_deg() are both in
+        absolute wrist-3 joint degrees and neither may be resolved by +/-360: two
+        angles a turn apart are one tool orientation and two completely different
+        cable states.
+
+        WHAT IT DOES NOT ASK: whether IK solves. One /compute_ik round trip costs
+        the solver's full timeout on a refusal, and a raster has thousands of
+        waypoints -- results16 spent 8.3 s on 25 of them. Reach is left to the
+        tilt cap, to the navigation-volume crop, and to min_fraction at
+        execution, which is where it has always been handled.
+
+        Cached per unique tilt rounded to a tenth of a degree, because a raster
+        over a mild surface has a few dozen distinct tilts and thousands of
+        waypoints.
+        """
+        band_of = globals().get("wrist3_band_deg")
+        datum_of = globals().get("wrist3_datum_deg")
+        # THE MODEL'S OWN tilt_of IN PREFERENCE to the module-level helper. Tilt
+        # coordinates are relative to the HOME orientation the envelope was
+        # measured from, and the helper defaults that to identity. On this cell
+        # the manifest's home_quat IS identity, so the two agree -- but a cell
+        # whose tooling is bolted on differently would have every tilt read
+        # wrong by that default, and a wrong tilt selects the wrong band.
+        env = globals().get("cable_envelope_model")
+        env = env() if callable(env) else None
+        if env is not None and hasattr(env, "tilt_of"):
+            tilt_of = lambda q, _m=env: _m.tilt_of(quat=q)
+        else:
+            helper = globals().get("wrist3_tilt_of")
+            tilt_of = helper if callable(helper) else None
+        if not (callable(band_of) and callable(tilt_of)):
+            if verbose:
+                print("    cable_envelope.dpi is NOT loaded, so the tilted "
+                      "waypoints are not checked against a wrist-3 band. The "
+                      "clearance and standoff gates still apply.")
+            return None
+        quats = np.asarray(quats, dtype=np.float64).reshape(-1, 4)
+        min_band = float(globals().get("KEYENCE_NORMAL_MIN_BAND_DEG")
+                         or self.NORMAL_MIN_BAND_DEG)
+        cache, out, unmeasured = {}, np.ones(len(quats), dtype=bool), False
+        for i in range(len(quats)):
+            tx, ty = tilt_of(quats[i])
+            key = (round(tx, 1), round(ty, 1))
+            if key not in cache:
+                try:
+                    lo, hi = band_of(tilt=key)
+                except KeyError:
+                    unmeasured = True
+                    break
+                except Exception:                                 # noqa: BLE001
+                    # CableRefused, or anything else the model says about a tilt
+                    # it was never measured at. Either way it is not a band.
+                    cache[key] = False
+                else:
+                    ok = (hi - lo) >= min_band - 1e-9
+                    if ok and callable(datum_of):
+                        try:
+                            d = datum_of(tilt=key)
+                        except Exception:                         # noqa: BLE001
+                            d = None
+                        if d is not None:
+                            ok = (lo - 1e-9) <= float(d) <= (hi + 1e-9)
+                    cache[key] = bool(ok)
+            out[i] = cache[key]
+        if unmeasured:
+            if verbose:
+                print("    no cable envelope measured for this cell, so the "
+                      "tilted waypoints are not checked against a wrist-3 band")
+            return None
+        return out
+
+    def _normal_with_fallback(self, candidate, crop, mesh, clearance=None,
+                              check_clearance=True, cap=None):
+        """(path, cap): follow the normal where it is allowed, vertical elsewhere.
+
+        THE POINT IS THAT THIS STAGE CANNOT FAIL MORE OFTEN THAN IT DOES NOW.
+        The vertical raster is built first and is the floor: every waypoint the
+        tilted pose cannot hold is flown exactly as it is flown today, so the
+        worst case of asking for the normal mode is the sweep that would have
+        been flown anyway, with a line saying how much of it fell back.
+
+        It is worth asking for because the vertical raster is measurably at the
+        edge of what the sensor can do on a curved part. results16, row 2 of a
+        two-row sweep: the laser line spanned 21.5 mm of height across one line,
+        the returns ran 71.8..112.4 mm against a 57..103 mm window, and 20.4% of
+        them were within 5 mm of the FAR limit -- where this sensor returns
+        scattered values rather than nothing, and the mesh built from them
+        contains those values with nothing downstream noticing.
+
+        HOW: two candidates from the same Noether response, so index i is the
+        same measurement point in both; four per-waypoint questions
+        (keyence_normal_fallback()); the chosen pose per waypoint; then the
+        navigation-volume crop, once, on the merged path. The clearance and
+        standoff gates in plan_sweep() run afterwards on the merged path and are
+        unchanged -- they are what drops a waypoint neither pose can fly.
+
+        One step between the choice and the merge: smooth_fallback_mask() absorbs
+        runs shorter than NORMAL_MIN_RUN, because the one way a merged path can
+        be WORSE than either of the two it came from is by tilting the tool on
+        and off along a pass. The worst remaining step is measured and reported.
+        """
+        max_tilt = float(cap if cap is not None
+                         else (globals().get("KEYENCE_NORMAL_MAX_TILT_DEG")
+                               or self.NORMAL_MAX_TILT_DEG))
+        fallback_on = globals().get("KEYENCE_ORIENT_FALLBACK")
+        fallback_on = True if fallback_on is None else bool(fallback_on)
+        flat = candidate("fixed", None)
+        tilted = candidate("capped", max_tilt)
+        if len(tilted) != len(flat):
+            # Cannot happen from one Noether response -- an orientation choice
+            # does not move a measurement point -- but if it ever does, merging
+            # by index would silently pair up different places on the part.
+            print("    the vertical and normal candidates have different "
+                  "lengths (%d vs %d), which they cannot if they came from one "
+                  "plan. Flying the vertical raster."
+                  % (len(flat), len(tilted)))
+            return crop(flat), None
+
+        tilt = tool_tilt_deg(tilted.quats)
+        summary = keyence_tilt_summary(tilt)
+        if summary:
+            print("    following the surface normal: %s" % (summary,))
+
+        # The tilted waypoints may be held to a STRICTER clearance than the
+        # untilted raster, because tilting is what swings the eddy-current probe
+        # toward the part. None at both levels means the cell-wide default, which
+        # is what the vertical raster is already held to.
+        limit = clearance
+        if limit is None:
+            limit = globals().get("KEYENCE_NORMAL_CLEARANCE_M")
+        if limit is None:
+            limit = TOOLING_CLEARANCE_M
+        limit = float(limit)
+        clear = None
+        if check_clearance:
+            try:
+                rep = path_clearance(tilted, mesh, description=None)
+                clear = np.asarray(rep["clearance"], dtype=np.float64)
+            except Exception as e:                                # noqa: BLE001
+                print("    could not measure the tilted raster's clearance "
+                      "(%s). Flying the vertical raster: a tilt that is not "
+                      "checked is a tilt that can put the eddy-current probe "
+                      "into the part." % (e,))
+                return crop(flat), None
+
+        stand, window = None, None
+        gate = globals().get("commanded_standoff")
+        win = globals().get("keyence_window")
+        if callable(gate) and callable(win):
+            try:
+                surface = (self.standoff_surface
+                           if self.standoff_surface is not None else mesh)
+                stand = np.asarray(gate(tilted, surface, source=self),
+                                   dtype=np.float64)
+                window = win(self.standoff_margin)[:2]
+            except Exception as e:                                # noqa: BLE001
+                print("    could not measure the tilted raster's standoff "
+                      "(%s); the standoff gate still runs on the merged path"
+                      % (e,))
+                stand, window = None, None
+
+        cable = self._cable_ok_for_tilts(tilted.quats)
+        use, _reason, tally = keyence_normal_fallback(
+            tilt, cable_ok=cable, clearance_m=clear, standoff_m=stand,
+            max_tilt_deg=max_tilt, clearance_limit_m=limit, window_m=window)
+
+        if not fallback_on:
+            # KEYENCE_ORIENT_FALLBACK off: DROP the refused waypoints instead of
+            # flying them vertical. For somebody who wants the measurement
+            # normal to the surface or not at all.
+            keep = np.nonzero(use)[0]
+            if len(keep) < 4:
+                raise ValueError(
+                    "the normal-following raster keeps only %d waypoint(s) of "
+                    "%d and KEYENCE_ORIENT_FALLBACK is off, so nothing is flown "
+                    "vertical. Reasons: %s"
+                    % (len(keep), len(use),
+                       ", ".join("%s %d" % (k, tally[k])
+                                 for k in KEYENCE_FALLBACK_REASONS if tally[k])))
+            print("    %d of %d waypoints follow the normal; %d DROPPED "
+                  "(KEYENCE_ORIENT_FALLBACK is off)"
+                  % (tally["normal"], len(use), tally["fallback"]))
+            # Segment boundaries rebuilt from the kept waypoints: dropping one
+            # shifts every boundary after it, and reusing the old indices would
+            # cut the passes in the wrong places.
+            was = set(int(i) for i in tilted.segment_starts)
+            starts = [k for k, i in enumerate(keep)
+                      if k == 0 or int(i) in was]
+            return crop(ScanPath(tilted.positions[keep], tilted.quats[keep],
+                                 starts, source="%s, normal where allowed"
+                                 % (tilted.source,))), max_tilt
+
+        print("    %d of %d waypoints follow the normal, %d fall back to "
+              "locked-Z (%s)"
+              % (tally["normal"], len(use), tally["fallback"],
+                 ", ".join("%s %d" % (k, tally[k])
+                           for k in KEYENCE_FALLBACK_REASONS if tally[k])
+                 or "none refused"))
+        # NO ALTERNATING. A mask that flips back and forth costs a full
+        # orientation step between waypoints 2 mm apart, every time; see
+        # smooth_fallback_mask().
+        run = int(globals().get("KEYENCE_NORMAL_MIN_RUN")
+                  or self.NORMAL_MIN_RUN)
+        smooth = smooth_fallback_mask(use, flat.segment_starts, min_run=run)
+        moved = int((smooth != use).sum())
+        if moved:
+            print("    %d waypoint(s) in runs shorter than %d absorbed into "
+                  "their neighbours, so the tool is not tilted on and off "
+                  "along a pass (%d follow the normal after that)"
+                  % (moved, run, int(smooth.sum())))
+        use = smooth
+        # The tally is re-read from the mask that will actually be flown, or the
+        # line below and the path's own source string report the choice BEFORE
+        # the smoothing rather than the one flown.
+        n_normal = int(use.sum())
+
+        pos = np.where(use[:, None], tilted.positions, flat.positions)
+        quats = np.where(use[:, None], tilted.quats, flat.quats)
+        # THE WORST ORIENTATION STEP ON THE PATH THAT WILL FLY, reported because
+        # it is the one way a merged path can be worse than either of the two it
+        # came from: a large tool-axis change between adjacent poses is a
+        # Cartesian path whose IK branch may change mid-pass, which costs a row
+        # at min_fraction and reads as a reach problem.
+        try:
+            step = tool_axis_step_deg(quats, flat.segment_starts)
+        except Exception:                                         # noqa: BLE001
+            step = None
+        if step is not None and len(step):
+            worst = float(np.max(step))
+            print("    worst tool-axis change between adjacent waypoints of a "
+                  "pass: %.1f deg" % (worst,))
+            if worst > self.NORMAL_STEP_WARN_DEG:
+                print("    WARNING: that is more than %.0f deg in one step. The "
+                      "pass is still checked for clearance and standoff, but a "
+                      "step this large can change the IK branch mid-pass and "
+                      "truncate the row at min_fraction. Lower "
+                      "KEYENCE_NORMAL_MAX_TILT_DEG, or raise "
+                      "KEYENCE_NORMAL_MIN_RUN."
+                      % (self.NORMAL_STEP_WARN_DEG,))
+        if n_normal:
+            kept = keyence_tilt_summary(tilt[use])
+            if kept:
+                print("    of the waypoints that kept it: %s" % (kept,))
+        # THE SEGMENT BOUNDARIES COME FROM THE FLAT CANDIDATE, because the two
+        # have the same waypoints and the flat one is the raster as it is flown
+        # today -- so a merge cannot reorganise the passes.
+        merged = ScanPath(pos, quats, flat.segment_starts,
+                          source="%s, %d/%d normal" % (flat.source, n_normal,
+                                                       len(use)))
+        return crop(merged), max_tilt
+
     def plan_sweep(self, region=None, mesh=None, **kwargs):
         """A Noether raster over the ROUGH mesh, offset by the sensor's own TF.
 
@@ -5082,7 +5661,12 @@ class _KeyenceReconstruction(ReconstructionSource):
                                                 pinned=_off_pinned)
         kwargs.pop("rotation_offset", None)
         kwargs.pop("estimate_normals", None)
-        orient = kwargs.pop("orient", None) or self.orient
+        # ONE VOCABULARY, RESOLVED IN ONE PLACE. The config's operator-facing
+        # names ("z", "normal") arrive here from two call sites that both read
+        # KEYENCE_ORIENTATION raw -- reconstruct_fine() and
+        # check_keyence_standoff() -- so normalising inside the planner is what
+        # keeps them from needing to agree about it. See keyence_orient_mode().
+        orient = keyence_orient_mode(kwargs.pop("orient", None) or self.orient)
         fixed_quat = kwargs.pop("fixed_quat", None)
         # "fixed", NOT "path". "path" puts tool x along the direction of travel,
         # which looks like the only answer for a sensor that measures a LINE:
@@ -5159,7 +5743,9 @@ class _KeyenceReconstruction(ReconstructionSource):
 
         # The one path-wide orientation is needed for orient="fixed" AND for the
         # tilt ladder's 0 degree rung, which is the same thing -- see build().
-        if orient in ("fixed", "capped") and fixed_quat is None:
+        # "normal" needs it too, because the pose it falls BACK to is exactly
+        # the "fixed" one.
+        if orient in ("fixed", "capped", "normal") and fixed_quat is None:
             # WHEN TO REACH FOR orient="fixed". "surface" points the tool along
             # the mesh's normals, and on a ROUGH mesh those are estimated from a
             # noisy TSDF -- around a hole or a step they point sideways. Planned
@@ -5190,8 +5776,19 @@ class _KeyenceReconstruction(ReconstructionSource):
         print("    sensor offset applied in the tool frame: "
               "(%+.4f, %+.4f, %+.4f) m" % (-dx, -dy, -dz))
 
-        def build(orient_mode, cap=None):
-            """One candidate sweep: orient, offset to the sensor, crop to the cell.
+        def candidate(orient_mode, cap=None):
+            """One candidate sweep: orient, crop to the region, offset to the
+            sensor. NOT yet cropped to the navigation volume -- see crop().
+
+            THE SPLIT IS WHAT MAKES THE PER-WAYPOINT FALLBACK POSSIBLE. Two
+            candidates built from the same Noether response have IDENTICAL
+            positions before the sensor offset is applied, because an orientation
+            choice does not move a measurement point; so the region crop keeps
+            the same waypoints in both and index i means the same place in each.
+            The navigation-volume crop is the one step that can disagree between
+            them -- the offset is in the TOOL frame, so a tilted pose puts
+            probe_end somewhere else -- and it therefore has to come AFTER the
+            merge rather than inside each candidate.
 
             A 0 degree cap is built as orient="fixed", not as a capped surface
             path, and that is deliberate: the two give the same tool AXIS but
@@ -5224,17 +5821,40 @@ class _KeyenceReconstruction(ReconstructionSource):
                 lo, hi = _region_box(region, pad=self.region_pad)
                 p = _crop_path_to_box(p, lo, hi, "keyence sweep", min_points=4,
                                       why="outside the region being measured")
-            p = _offset_path_in_tool_frame(p, (-dx, -dy, -dz))
-            # THE MOTION VOLUME, not the work volume: these are probe_end
-            # positions during a SENSOR sweep, and the sensor sits 73 mm to the
-            # side of probe_end. Holding probe_end inside the part box puts it
-            # against the volume wall while the laser is correctly over the part.
+            return _offset_path_in_tool_frame(p, (-dx, -dy, -dz))
+
+        def crop(p):
+            """The last step of every candidate: the NAVIGATION volume.
+
+            NOT the work volume: these are probe_end positions during a SENSOR
+            sweep, and the sensor sits 73 mm to the side of probe_end. Holding
+            probe_end inside the part box puts it against the volume wall while
+            the laser is correctly over the part. _motion_bounds() resolves which
+            box that is -- the safe motion volume when the cell declares one,
+            else the motion volume, else the work volume.
+            """
             return _crop_path_to_work_volume(p, "keyence sweep",
                                              bounds=_motion_bounds())
 
+        def build(orient_mode, cap=None):
+            """One candidate sweep, cropped and ready to fly."""
+            return crop(candidate(orient_mode, cap))
+
         check_clearance = check_clearance and _clearance_available(
             "the keyence sweep")
-        if orient == "capped" and max_tilt_deg is None and check_clearance:
+        if orient == "normal":
+            # SCANNING ALONG THE SURFACE NORMAL, WAYPOINT BY WAYPOINT, with the
+            # vertical pose as the fallback rather than as a failure. See
+            # _normal_with_fallback() for the four refusals and what each one is
+            # about; the short version is that tilting this head is right for the
+            # measurement and is also the one thing in this pipeline that can put
+            # the EDDY-CURRENT PROBE into the part, 73 mm to the side of the
+            # optical frame on the same plate.
+            path, max_tilt_deg = self._normal_with_fallback(
+                candidate, crop, mesh, clearance=clearance,
+                check_clearance=check_clearance, cap=max_tilt_deg)
+            orient = "normal"
+        elif orient == "capped" and max_tilt_deg is None and check_clearance:
             # A LADDER, BECAUSE THERE IS NO RIGHT ANSWER TO WRITE DOWN. Each cap
             # is planned, offset, cropped and CHECKED against the same rough
             # mesh the path is planned over; the one that leaves the most of the
