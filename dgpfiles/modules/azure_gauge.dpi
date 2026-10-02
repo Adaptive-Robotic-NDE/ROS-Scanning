@@ -825,8 +825,14 @@ def _gauge_fly_unattended(xyz, quat, label):
                 # cell's own bound on top, which is what every automated joint
                 # move in the pipeline goes at.
                 secs = max(4.0, float(np.linalg.norm(x1 - x0))/max(vmax, 1e-3))
+                # min_duration_s, not secs alone. `secs` is honoured only by the
+                # direct fallback, and it is a DEFAULT on most paths -- making it
+                # binding everywhere turned ApproachInConfiguration's secs=6.0
+                # into a six-second crawl for every raster-row approach. This is
+                # one of the few places a duration bound is actually computed
+                # rather than defaulted, so this is where it is asked for.
                 res = ros.MoveJoints([float(v) for v in q_there], secs=secs,
-                                     plan=True, **jmk)
+                                     min_duration_s=secs, plan=True, **jmk)
                 ok, why = _gauge_flew(res, x1, label)
                 if ok:
                     return {"ok": True, "route": "joint move", "why": None,
