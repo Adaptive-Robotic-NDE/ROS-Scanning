@@ -603,6 +603,7 @@ global ec_staging_chan
 global ec_projection_errors
 global ec_projection_last_error
 global ec_projection_status
+global scan_projection_status
 ec_trace_accum = None
 ec_projector = None
 
@@ -713,6 +714,15 @@ def ec_projection_status(quiet=False):
         print("    %d projection error(s) during the scan; last was %s"
               % (ec_projection_errors, ec_projection_last_error))
     return status
+
+
+#: The instrument-independent name surface_path_scan.dpi looks for.
+#:
+#: That module runs the pass loop and cannot know this config holds an
+#: eddy-current projector, so it asks globals() for this name -- the same idiom
+#: as cartesian_move and joint_move_kwargs. Defined here because this is the
+#: module that owns the projector.
+scan_projection_status = ec_projection_status
 
 
 def ec_first_contact_null(null_fn, required=True):
@@ -953,12 +963,32 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
     on_contact = (None if null_instrument is None
                   else ec_first_contact_null(null_instrument,
                                              required=null_required))
-    report = run_surface_path_scan(
-        path, x3d, source, stage_ec_reading, _prepare, _setup,
-        max_passes=max_passes, force=force,
-        projector_prefix="/ec/proj", label="Eddy-current path scan",
-        pitch_m=pitch_m, position_relative_to_origin=False, contact=contact,
-        on_first_contact=on_contact)
+    # try/finally, because the scans that most need the projection report are
+    # the ones that do not reach the end of this function. On 2026-10-01 one
+    # scan stopped when the pendant dropped External Control at pass 84 of 163
+    # and the other was aborted at pass 23 of 174; neither printed a projection
+    # line, so whether anything had landed was unrecorded. A KeyboardInterrupt
+    # or a supervisor abort now still says.
+    try:
+        report = run_surface_path_scan(
+            path, x3d, source, stage_ec_reading, _prepare, _setup,
+            max_passes=max_passes, force=force,
+            projector_prefix="/ec/proj", label="Eddy-current path scan",
+            pitch_m=pitch_m, position_relative_to_origin=False, contact=contact,
+            on_first_contact=on_contact)
+    except BaseException:
+        # BaseException, not Exception: Ctrl-C is the common case here.
+        try:
+            st = ec_projection_status(quiet=True)
+            if ec_projector is not None and st["projector"]:
+                print("  the scan did not finish; the projection stood at:")
+                print(describe_projection_status(st["projector"]))
+            if ec_projection_errors:
+                print("    %d projection error(s); last was %s"
+                      % (ec_projection_errors, ec_projection_last_error))
+        except Exception as e:                                # noqa: BLE001
+            print("  (projection status unavailable: %s)" % (e,))
+        raise
     report["instrument_null"] = ec_instrument_null
 
     # WHETHER THE TRACES REACHED THE IMAGE, printed with the rest of the report

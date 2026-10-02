@@ -379,6 +379,40 @@ def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
                  "" if frac is None else ", planner %.0f%%" % (100.0*frac),
                  elapsed))
 
+        # IS ANY OF THIS REACHING THE IMAGE? Asked after the first pass that
+        # staged anything, and then occasionally, because the end-of-scan report
+        # only runs when a scan ENDS -- and the scans that need this news are
+        # the ones that do not. Both eddy-current scans of 2026-10-01 stopped
+        # abnormally (the pendant dropped External Control on one, the operator
+        # aborted the other) and neither printed a projection line, so whether
+        # traces were landing is simply not recorded anywhere.
+        #
+        # A ray that misses the surface is dropped inside
+        # project_point_onto_parameterization without raising, so an empty image
+        # is silent by construction. Two hours of scanning can complete with
+        # nothing in it and nothing said.
+        #
+        # It WARNS and does not stop: every trace carries the pose it was taken
+        # at, so a scan whose projection is empty still records usable data and
+        # can be re-projected offline. Aborting would throw away a good
+        # measurement over a presentation fault.
+        check = globals().get("scan_projection_status")
+        staged = seg_report.get("staged") or 0
+        if callable(check) and staged > 0 and (si == 0 or (si + 1) % 25 == 0):
+            try:
+                st = check(quiet=True)
+                pr = (st or {}).get("projector")
+                if isinstance(pr, dict) and (pr.get("offered") or 0) > 0 \
+                        and pr.get("landed") == 0:
+                    print("  ** NOTHING IS REACHING THE PROJECTED IMAGE: %d trace(s) "
+                          "offered after pass %d and 0 image cells have data. The "
+                          "scan continues -- the traces carry their own poses and "
+                          "can be re-projected offline -- but the live image will "
+                          "stay empty." % (pr["offered"], si + 1))
+                    print(describe_projection_status(pr))
+            except Exception as e:                            # noqa: BLE001
+                print("  (projection status unavailable: %s)" % (e,))
+
     # Hold move_group's IK in local mode for the scan: it starts global for
     # interactive work, and a global solver may change arm branch mid-path and
     # truncate a row. See motion_profile() in scan_plan.dpi.
