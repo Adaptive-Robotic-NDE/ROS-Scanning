@@ -995,9 +995,16 @@ def capture_move(poses, label, speed=None, scaling=None, min_fraction=1.0,
         return stub
     timeout = max(300.0, 3.0*length/max(v, 1e-3) + 60.0)
     with _Monitor(vmax, label, force_limit) as mon:
+        # tool_speed_mps asks mtc_hub_node to solve the scaling from the path's
+        # own kinematics instead of trusting the curve `s` came from. `v` is the
+        # speed this class is allowed, already clamped, so it is the right thing
+        # to ask for. EMPTY unless set_tool_speed_solver(True) has been called,
+        # so this call is unchanged by default.
         res = _CAP["real_ros"].CartesianMove([_cap_pose(x, q) for x, q in P], vel=s, acc=acc,
                                              min_fraction=min_fraction,
-                                             result_timeout=timeout)
+                                             result_timeout=timeout,
+                                             **(globals().get("tool_speed_kwargs")
+                                                or (lambda *a: {}))(v))
     return _after_move(mon, rec, res, raise_on_fail, label)
 
 

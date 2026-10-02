@@ -159,14 +159,26 @@ def surface_scan_callables(path, segs, position_origin, contact=None, phase=None
         for k in range(start, end):
             poses.poses.append(_pose_msg(positions[k], quats[k]))
         vel = raster_velocity()
+        speed_mps = (globals().get("raster_tool_speed") or (lambda: None))()
         if contact is not None:
             # In contact for the whole pass: never faster than the near-part
-            # speed, whatever the plan would allow.
+            # speed, whatever the plan would allow. The m/s figure is clamped
+            # the same way as the scaling, from the same pair, so the two cannot
+            # disagree about what this pass is allowed to do.
             vel = min(vel, contact["near_scaling"])
+            near_mps = contact.get("near_speed_mps")
+            if near_mps:
+                speed_mps = (float(near_mps) if speed_mps is None
+                             else min(speed_mps, float(near_mps)))
         # A row of waypoints: the looser IK threshold, or it truncates. See
         # scan_plan.dpi's motion_kind().
+        #
+        # tool_speed_kwargs() is EMPTY unless set_tool_speed_solver(True) has
+        # been called, so this call is unchanged by default -- see the block
+        # comment in scan_plan.dpi for what turning it on does and does not buy.
         r = (globals().get("cartesian_move") or ros.CartesianMove)(
-            poses, vel=vel, acc=RASTER_ACCEL, min_fraction=PATH_MIN_FRACTION)
+            poses, vel=vel, acc=RASTER_ACCEL, min_fraction=PATH_MIN_FRACTION,
+            **(globals().get("tool_speed_kwargs") or (lambda *a: {}))(speed_mps))
         return _move_result(r)
 
     def pose_at(seg, s_m, xy):

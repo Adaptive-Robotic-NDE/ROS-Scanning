@@ -34,6 +34,123 @@ def projection_is_live():
     """
     return PROJECTION_MODE == "live"
 
+# ==============================================================================
+# COMMANDING A TOOL SPEED INSTEAD OF A JOINT-LIMIT FRACTION
+# ==============================================================================
+# OFF BY DEFAULT. Everything below changes nothing until set_tool_speed_solver()
+# turns it on, and turning it off puts the pipeline back bit for bit.
+#
+# WHAT IT IS. CartesianMove's `vel` is MoveIt's max_velocity_scaling_factor -- a
+# fraction of every joint's own limit -- and what the TOOL does with that is the
+# Jacobian's business, so it varies along a path and with configuration. This
+# pipeline converts a wanted m/s into one of those fractions through a scalar
+# curve (ROBOT_VELOCITY_CALIBRATION) fitted by driving ONE straight line at five
+# speeds. The curve does not transfer: re-measuring moved the eddy-current
+# figure from 0.0064 to 0.0047 for the same commanded 10 mm/s.
+#
+# mtc_hub_node can now solve for the scaling instead -- parameterise, measure
+# peak tool speed by forward kinematics, correct, repeat -- so the scaling
+# becomes an OUTPUT of the real kinematics of the actual path. Sending
+# tool_speed_mps is what asks for that.
+#
+# WHAT IT WILL AND WILL NOT BUY, HONESTLY. The caller's scaling is the solver's
+# ceiling as well as its guess, so a solved move can only ever come out SLOWER.
+# Measured in results17, every shortfall ran the OTHER way:
+#
+#     scaling   commanded   measured peak   ratio
+#     0.00254     6.0 mm/s       5.8 mm/s    97%
+#     0.00473    10.0            8.5         85%
+#     0.00630    13.0            8.0         62%
+#     0.01649    32.7           20.4         62%
+#
+# Reaching the commanded speed in those cases needs a scaling ABOVE the curve's,
+# which the ceiling forbids. So switching this on, by itself, buys a GUARANTEE
+# (the tool never overruns the speed it was commanded at, measured rather than
+# predicted) and not throughput. The throughput half needs the ceiling raised,
+# which is mtc_hub_node's raster_tool_speed_ceiling_factor -- a live ROS
+# parameter, default 1.0, and the planner prints "THE CEILING BOUND IT" on any
+# pass where that is what stopped it reaching the commanded speed. Read that
+# line before raising anything.
+global TOOL_SPEED_SOLVER
+TOOL_SPEED_SOLVER = False
+
+
+global set_tool_speed_solver
+def set_tool_speed_solver(on=True):
+    """Command tool speed in m/s rather than converting through the curve.
+
+        set_tool_speed_solver(True)    solve the scaling from the kinematics
+        set_tool_speed_solver(False)   back to ROBOT_VELOCITY_CALIBRATION
+
+    Takes effect on the NEXT move; a plan already in hand is unaffected. The
+    scaling the curve produced is still sent, as the solver's starting guess and
+    its ceiling, so this cannot make any move faster than it is today.
+
+    See the block comment above for what it does and does not buy.
+    """
+    global TOOL_SPEED_SOLVER
+    TOOL_SPEED_SOLVER = bool(on)
+    print(describe_tool_speed_solver())
+    return TOOL_SPEED_SOLVER
+
+
+global tool_speed_solver
+def tool_speed_solver():
+    """Whether tool speed is being commanded in m/s. Prints it."""
+    print(describe_tool_speed_solver())
+    return TOOL_SPEED_SOLVER
+
+
+global describe_tool_speed_solver
+def describe_tool_speed_solver():
+    """One line for the startup banner and the setter. Never blank."""
+    if TOOL_SPEED_SOLVER:
+        return ("  tool speed: COMMANDED IN M/S -- mtc_hub_node solves the "
+                "velocity scaling from the path's own kinematics, with the "
+                "curve's scaling as the guess and the ceiling. Watch for "
+                "'Tool speed solved' in the mtc_hub_node log, and for 'THE "
+                "CEILING BOUND IT'. set_tool_speed_solver(False) reverts.")
+    return ("  tool speed: CONVERTED THROUGH THE CURVE "
+            "(ROBOT_VELOCITY_CALIBRATION) -- the long-standing behaviour. The "
+            "curve over-predicted by up to 38%% on the last cell run. "
+            "set_tool_speed_solver(True) asks the planner to solve it instead.")
+
+
+global raster_tool_speed
+def raster_tool_speed():
+    """The sweep speed in m/s from the plan, or None when there is no plan.
+
+    The plan's `effective_velocity_mps` and not `requested_velocity_mps`: the
+    effective one is what the staging pipeline can keep up with at the chosen
+    step, and it is the speed the scaling was derived from, so it is the one the
+    solver should be asked to deliver.
+    """
+    if scan_plan is None:
+        return None
+    speed = scan_plan.get("effective_velocity_mps")
+    return float(speed) if speed else None
+
+
+global tool_speed_kwargs
+def tool_speed_kwargs(speed_mps=None):
+    """{tool_speed_mps: ...} when the solver is on, {} otherwise.
+
+        ros.CartesianMove(poses, vel=s, acc=a, **tool_speed_kwargs(0.010))
+
+    Follows joint_move_kwargs(): an empty dict leaves the call exactly as it
+    was, so a call site can be converted once and then be inert until the
+    toggle is flipped. `speed_mps` None falls back to the plan's sweep speed,
+    and if there is no plan either the result is empty -- a stage that does not
+    know its own speed in m/s must not pretend to.
+    """
+    if not TOOL_SPEED_SOLVER:
+        return {}
+    speed = speed_mps if speed_mps is not None else raster_tool_speed()
+    if not speed or not speed > 0.0:
+        return {}
+    return {"tool_speed_mps": float(speed)}
+
+
 global raster_velocity
 def raster_velocity():
     """MoveIt velocity scaling for the sweeps, from the plan when there is one.

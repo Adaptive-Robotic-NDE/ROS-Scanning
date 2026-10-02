@@ -3499,6 +3499,15 @@ try:
     print(describe_sensor_orientation())
 except Exception as _e:                                       # noqa: BLE001
     print("  sensor orientation: unavailable (%s)" % (_e,))
+# WHETHER TOOL SPEED IS COMMANDED IN M/S OR CONVERTED THROUGH THE CURVE. Off by
+# default -- the curve is what has always been used -- but the two produce
+# identical log lines everywhere else, and the curve over-predicted by up to 38%
+# on the last cell run, so which one is in force has to be stated once at the
+# top rather than inferred from a scaling later.
+try:
+    print(describe_tool_speed_solver())
+except Exception as _e:                                       # noqa: BLE001
+    print("  tool speed: unavailable (%s)" % (_e,))
 try:
     print("  " + describe_cable_envelope().replace("\n", "\n  "))
 except Exception as _e:
