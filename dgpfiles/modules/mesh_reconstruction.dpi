@@ -4046,12 +4046,34 @@ class AzureReconstruction(ReconstructionSource):
             p.orientation = Quaternion(x=float(quat[0]), y=float(quat[1]),
                                        z=float(quat[2]), w=float(quat[3]))
             try:
-                # 1.0 s, not 0.3. KDL is a randomised solver: at 0.3 it
+                # 1.0 s, not 0.3. The solver is randomised: at 0.3 it
                 # refuses poses it accepts on the next rung, and the height
                 # ladder then comes out non-monotonic (0.50 -> 1 direction,
                 # 0.45 -> 0, 0.40 -> 1) -- noise reported as geometry. A
                 # failing pose costs the whole timeout, which is why only the
                 # best few rolls are tried.
+                #
+                # IT IS NOT KDL, which this comment used to say. /compute_ik is
+                # served by move_group, and move_group loads
+                # tari_ur_description/config/kinematics.yaml the same as
+                # mtc_hub_node does -- so it is pick_ik, with only `mode`
+                # overridden, to `global` by ur_moveit.launch.py's ik_mode
+                # default. The randomness is therefore pick_ik's memetic search
+                # in global mode rather than KDL's random restarts. The symptom,
+                # the 1.0 s mitigation and the best-few-rolls strategy are all
+                # unchanged by that; the attribution was simply wrong, and it
+                # sent one investigation to the wrong solver.
+                #
+                # AND DO NOT "FIX" THIS BY SEEDING IT OR PINNING `local`. Both
+                # look like obvious determinism wins and both answer a different
+                # question than this function asks -- see the GLOBAL IK
+                # paragraph above. A seed makes the test "can the arm reach this
+                # FROM HERE", which is a transit problem belonging to
+                # ApproachInConfiguration, and would refuse poses that are
+                # perfectly reachable with a branch change the transit is
+                # entitled to make. Residual run-to-run variation here is the
+                # price of asking "does a solution exist" and is paid
+                # deliberately.
                 return motion.SolveIK(p, timeout=1.0)
             except Exception as e:
                 print("    IK check unavailable (%s); planning unchecked" % (e,))
