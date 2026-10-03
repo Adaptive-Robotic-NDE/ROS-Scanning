@@ -138,7 +138,8 @@ def build(args):
     probe = split_d_differential(**PROBE)
     sim = Simulation(probe=probe, material=ALUMINIUM_6061_T6,
                      frequency=FREQUENCY_HZ, solver=args.solver,
-                     backend=getattr(args, "backend", "numpy"))
+                     backend=getattr(args, "backend", "numpy"),
+                     precision=getattr(args, "precision", "double"))
     return probe, ALUMINIUM_6061_T6, sim
 
 
@@ -159,6 +160,10 @@ def axes():
     }
 
 
+#: Filled in by main() so the table records how it was computed.
+PRECISION = ["double"]
+
+
 def provenance(material):
     return {
         "frequency_hz": FREQUENCY_HZ,
@@ -170,6 +175,7 @@ def provenance(material):
         "coil_diameter_m": 2.0 * PROBE["r_outer"],
         "coil_separation_m": PROBE["gap"],
         "shielded": SHIELDED,
+        "solver_precision": PRECISION[0],
         "notes": (
             "response = flaw-induced CHANGE in impedance (ohms) relative to the "
             "flaw-free baseline at the same lift-off and tilt. No gain and no "
@@ -206,7 +212,7 @@ def provenance(material):
 _W = {}
 
 
-def _setup(solver, backend, ax):
+def _setup(solver, backend, precision, ax):
     """Initialise this worker once, lazily on its first task.
 
     NOT a Pool initializer. An initializer that raises leaves
@@ -228,9 +234,10 @@ def _setup(solver, backend, ax):
     a = A()
     a.solver = solver
     a.backend = backend
+    a.precision = precision
     probe, material, sim = build(a)
     _W.update(probe=probe, sim=sim, ax=ax, systems={}, ready=True,
-              backend=backend)
+              backend=backend, precision=precision)
 
 
 def _one_pose(task):
@@ -242,7 +249,7 @@ def _one_pose(task):
     resume, merge) can be exercised end to end in seconds rather than hidden
     behind a solver that takes minutes per pose.
     """
-    idx, solver, backend, ax_in = task
+    idx, solver, backend, precision, ax_in = task
     if os.environ.get("ECTABLE_FAKE"):
         import time as _t
         _t.sleep(0.02 if backend == "cupy" else 0.05)   # GPU lane "faster"
@@ -250,7 +257,7 @@ def _one_pose(task):
         val = complex(sum(idx) + 1, backend == "cupy")
         return idx, np.full((ny, nx), val, dtype=np.complex64)
     from ecsim.flaw import RectangularNotch
-    _setup(solver, backend, ax_in)
+    _setup(solver, backend, precision, ax_in)
     di, li, wi, yi, oi, tpi, tqi = idx
     ax, sim, probe = _W["ax"], _W["sim"], _W["probe"]
     key = (di, li, wi)
@@ -322,6 +329,14 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=None,
                     help="parallel processes; 0 means HALF the cores, "
                          "deliberately leaving the machine usable")
+    ap.add_argument("--precision", default="double", choices=("double", "single"),
+                    help="solver precision. The table is STORED as complex64 "
+                         "either way, so single carries no less than the "
+                         "deliverable keeps -- and it is what makes a GPU "
+                         "worth using, since consumer and RTX workstation "
+                         "silicon runs FP64 at 1/32 to 1/64 of its FP32 rate. "
+                         "Verify with scripts/gpu_check.py on the machine "
+                         "before trusting it for a whole run")
     ap.add_argument("--gpu-workers", type=int, default=0,
                     help="processes using the CuPy GPU backend, ALONGSIDE the "
                          "CPU workers. 1 per NVIDIA GPU is the usual answer; "
@@ -343,6 +358,7 @@ def main(argv=None):
                               "al6061_2mhz_response%s.h5" % suffix)
     base_path = os.path.join(args.out_dir, "al6061_2mhz_baseline.npz")
 
+    PRECISION[0] = args.precision
     probe, material, sim = build(args)
     ax = axes()
     shape = tuple(ax[k].size for k in
@@ -361,7 +377,7 @@ def main(argv=None):
     print("  grid         %s = %d poses, field %d x %d"
           % (" x ".join(str(s) for s in shape), n_poses, ax["y"].size, ax["x"].size))
     print("  table        %.0f MB complex64" % (n_poses*n_cells*8/1e6,))
-    print("  solver       %s" % args.solver)
+    print("  solver       %s, %s precision" % (args.solver, args.precision))
     print()
 
     # Resume if the file is already here, so an interrupted run on a borrowed
@@ -444,7 +460,8 @@ def main(argv=None):
                 return
             idx = pending.popleft()
             fut = lane["pool"].submit(
-                _one_pose, (idx, args.solver, lane["backend"], ax))
+                _one_pose, (idx, args.solver, lane["backend"],
+                            args.precision, ax))
             futures[fut] = (lane, idx, time.time())
 
         for lane in lanes:

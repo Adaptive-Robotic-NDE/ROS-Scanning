@@ -25,6 +25,42 @@ python scripts\gpu_check.py
 `gpu_check.py` verifies the GPU backend works and times it against the CPU. If
 it fails or CuPy is absent, nothing breaks — just leave `--gpu-workers` off.
 
+### Read the GPU check before you trust the GPU
+
+**Run it in both precisions and compare.** On an RTX 2070 SUPER, double
+precision made the GPU **2.7x SLOWER than the CPU** for identical work — 5.75 s
+against 2.15 s on 2000 cells, agreeing to 4.9e-08. The cause is not the card
+being a consumer part: the solver carries `complex128`, and that silicon runs
+FP64 at **1/32** of its FP32 rate.
+
+**This is why `--precision single` matters, and why "workstation GPU" does not
+by itself fix it.** The RTX A-series workstation cards are the same silicon as
+the consumer ones — an A6000 is GA102 at **1/64** FP64, worse in ratio than the
+2070 SUPER. Only data-centre parts (V100, A100, H100) run FP64 at 1/2 rate. So
+the question is never consumer-vs-workstation, it is **what this card's FP64
+throughput actually is** — and on anything RTX-branded, double precision will
+lose.
+
+Single precision sidesteps it entirely: 32-64x more peak rate on that silicon,
+half the memory, and the FFTs stay single (the solver uses scipy's FFT rather
+than numpy's, which would quietly promote back to double).
+
+**And it costs nothing we keep.** The table is *stored* as `complex64` whatever
+you choose, so double precision through the solve is more precision than the
+deliverable retains. The 4.9e-08 CPU-vs-GPU agreement says the headroom is
+there.
+
+What to do:
+
+1. Run `gpu_check.py`. Note the per-solve time and the agreement.
+2. If single precision agrees with double to ~1e-6 or better on your flaws and
+   is faster, use `--precision single` for the whole run.
+3. If the GPU is still slower, leave `--gpu-workers` off and run CPU-only. That
+   is a perfectly good outcome, not a failure.
+
+A slow GPU lane is not free: it holds one pose at a time and can become the
+straggler at the very end of a long run.
+
 Then, from the folder this file is in:
 
 ```bat
@@ -46,13 +82,19 @@ python -c "import ecsim, numpy, scipy, h5py; print('ok')"
 
 **Machine A:**
 ```bat
-python tools\generate_ec_table.py --out-dir out --of 2 --shard 0 --workers 16 --gpu-workers 1
+python tools\generate_ec_table.py --out-dir out --of 2 --shard 0 --workers 16 ^
+    --precision single --gpu-workers 1
 ```
 
 **Machine B:**
 ```bat
-python tools\generate_ec_table.py --out-dir out --of 2 --shard 1 --workers 16 --gpu-workers 1
+python tools\generate_ec_table.py --out-dir out --of 2 --shard 1 --workers 16 ^
+    --precision single --gpu-workers 1
 ```
+
+Drop `--precision single` if `gpu_check.py` says the accuracy does not hold on
+your flaws; `double` is the default. Whichever you pick is recorded in the
+table's provenance, so a file always says how it was computed.
 
 Drop `--gpu-workers` on a machine with no NVIDIA GPU. Use `--gpu-workers 2` if
 there are two GPUs; more than one worker per GPU usually just contends for its
