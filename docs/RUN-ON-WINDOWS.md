@@ -28,10 +28,17 @@ it fails or CuPy is absent, nothing breaks — just leave `--gpu-workers` off.
 ### Read the GPU check before you trust the GPU
 
 **Run it in both precisions and compare.** On an RTX 2070 SUPER, double
-precision made the GPU **2.7x SLOWER than the CPU** for identical work — 5.75 s
+precision made the GPU **2.7x slower than the CPU** for identical work — 5.75 s
 against 2.15 s on 2000 cells, agreeing to 4.9e-08. The cause is not the card
 being a consumer part: the solver carries `complex128`, and that silicon runs
 FP64 at **1/32** of its FP32 rate.
+
+Two caveats on that measurement, both since addressed in the tool, so your own
+numbers should be cleaner than the ones above. The iteration counts it reported
+(126 against 2) were not a convergence difference — the two paths were counting
+different things, and the check now counts operator applications on both. And
+the GPU timing included first-call setup; the check now warms the GPU up first.
+Re-measure rather than reading the figures above as the verdict.
 
 **This is why `--precision single` matters, and why "workstation GPU" does not
 by itself fix it.** The RTX A-series workstation cards are the same silicon as
