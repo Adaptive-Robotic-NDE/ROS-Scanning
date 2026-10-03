@@ -137,6 +137,135 @@ def read_indexed_face_set(path):
     return faces, got
 
 
+def read_point_array(path, tag, width):
+    """The `point` attribute of the first `tag` node, as an (N, width) array.
+
+    -> None when the node is absent, which is legitimate: an X3D with no
+    TextureCoordinate simply has no parameterization to check.
+    """
+    with open(path, "r") as fh:
+        text = fh.read()
+    m = re.search(r"<%s\b((?:[^>\"]|\"[^\"]*\")*)>" % (tag,), text, re.S)
+    if m is None:
+        return None
+    a = re.search(r'\bpoint="([^"]*)"', m.group(1), re.S)
+    if a is None:
+        return None
+    vals = np.array([float(t) for t in a.group(1).replace(",", " ").split()])
+    if vals.size % width:
+        raise ValueError("%s: <%s point=...> has %d values, not a multiple of %d"
+                         % (os.path.basename(path), tag, vals.size, width))
+    return vals.reshape(-1, width)
+
+
+def uv_handedness_report(path):
+    """Does the UV parameterization preserve orientation, per triangle?
+
+        triangles   triangles that carry a UV triple
+        agreeing    triangles whose UV winding matches their face winding
+        mirrored    triangles whose UV winding is reversed -- THESE TAKE NO DATA
+        degenerate  triangles whose UV triple has zero area
+        mirrored_fraction, verdict ("ok" / "partly_mirrored" / "mirrored" /
+        "no_parameterization")
+
+    WHY THIS MATTERS, AND WHY NOTHING ELSE CATCHES IT.
+    spatialnde2 builds a per-triangle in-plane 2D basis that is forced
+    right-handed about the triangle's trinormal, and the trinormal comes from
+    the winding (`inplanemat_calculation.cpp`). The map from that frame to UV is
+    `inplane2uvcoords`, and `project_onto_parameterization.cpp:660-672` takes
+
+        i2uv_det = ...                 # negative when the UV frame is mirrored
+        lambda_magnitude = sqrt(i2uv_det)
+
+    so a mirrored parameterization makes that a **NaN**. The assert on the next
+    line was written for exactly this case -- its comment reads "if this fails
+    then inplane2uvcoords could be doing some kind of weird mirroring maybe" --
+    but it tests for zero, and NaN is not zero, so it never fires. The NaN
+    becomes the projection spot radius, every accumulated weight comes out 0.0,
+    and the image stays empty with no error raised anywhere.
+
+    Because the in-plane frame is right-handed about the trinormal, the whole
+    test reduces to the SIGN OF THE UV SIGNED AREA taken in the face's own
+    winding order: det > 0 exactly when that area is positive. No 3D normal and
+    no spatialnde2 are needed, which is why this can run on a bare file minutes
+    before the arm moves.
+
+    Measured on 2026-10-02: two consecutive scan runs projected 1876 and 1673
+    traces into an empty image with every triangle mirrored (7058 of 7058 and
+    9341 of 9341); the third run of the same morning, 5308 of 5308 agreeing,
+    projected correctly. The difference was the sign numpy happened to return
+    for the second singular vector in the planar unwrap.
+    """
+    faces, extra = read_indexed_face_set(path)
+    uv = read_point_array(path, "TextureCoordinate", 2)
+    out = {"triangles": 0, "agreeing": 0, "mirrored": 0, "degenerate": 0,
+           "mirrored_fraction": 0.0, "verdict": "no_parameterization"}
+    if uv is None or len(uv) == 0:
+        return out
+    # texCoordIndex is optional: without it, UV is indexed by coordIndex.
+    uv_faces = extra.get("texCoordIndex") or faces
+    if len(uv_faces) != len(faces):
+        raise ValueError(
+            "%s: texCoordIndex has %d face(s) and coordIndex has %d; they index "
+            "the same faces and must agree"
+            % (os.path.basename(path), len(uv_faces), len(faces)))
+    for face, uv_face in zip(faces, uv_faces):
+        if len(face) != 3 or len(uv_face) != 3:
+            continue
+        out["triangles"] += 1
+        a, b, c = uv[uv_face[0]], uv[uv_face[1]], uv[uv_face[2]]
+        area2 = ((b[0] - a[0]) * (c[1] - a[1])
+                 - (c[0] - a[0]) * (b[1] - a[1]))
+        if area2 > 0.0:
+            out["agreeing"] += 1
+        elif area2 < 0.0:
+            out["mirrored"] += 1
+        else:
+            out["degenerate"] += 1
+    if out["triangles"]:
+        out["mirrored_fraction"] = out["mirrored"] / float(out["triangles"])
+    if out["mirrored"] == 0:
+        out["verdict"] = "ok"
+    elif out["agreeing"] == 0:
+        out["verdict"] = "mirrored"
+    else:
+        out["verdict"] = "partly_mirrored"
+    return out
+
+
+def orient_uv_basis(e0, e1, outward):
+    """Force a 2D UV basis right-handed about the surface's outward normal.
+
+    -> (e0, e1, flipped).
+
+    `numpy.linalg.svd` pins down the PLANE of a planar unwrap but not the
+    handedness of the basis in it: it is free to return -e1, and does, about
+    half the time. Nothing downstream notices, because the resulting UV map is
+    a perfectly good mirror image -- right up to the point where
+    project_onto_parameterization takes the square root of a negative
+    determinant. See uv_handedness_report() for that chain.
+
+    The condition is exact rather than heuristic. For a triangle with edge
+    vectors `u` and `v` in winding order, the UV signed area is
+    `0.5 * (u x v) . (e0 x e1)` = `Area * (n . (e0 x e1))`, so it is positive
+    for every triangle precisely when `(e0 x e1) . n > 0`.
+    """
+    e0 = np.asarray(e0, dtype=float)
+    e1 = np.asarray(e1, dtype=float)
+    outward = np.asarray(outward, dtype=float)
+    norm = float(np.linalg.norm(outward))
+    if norm == 0.0 or not np.isfinite(norm):
+        raise ValueError(
+            "the surface has no net outward direction (|mean normal| = %r), so "
+            "a planar parameterization of it cannot be oriented -- and would "
+            "not be bijective either. This is a closed or folded surface being "
+            "unwrapped as a plate." % (norm,))
+    handedness = float(np.dot(np.cross(e0, e1), outward / norm))
+    if handedness < 0.0:
+        return e0, -e1, True
+    return e0, e1, False
+
+
 def winding_report(faces):
     """How, and how badly, a triangle soup's winding disagrees with itself.
 
@@ -291,6 +420,56 @@ def rewind_file(path, out_path=None):
     return out_path, rep
 
 
+def flip_uv_file(path, out_path=None):
+    """Write a copy whose UV parameterization is mirrored, and so un-mirrored.
+
+    Returns (out_path, report) with `before` and `after` handedness reports.
+
+    Only the TextureCoordinate `point` attribute is rewritten; coordinates,
+    indices and everything else are copied through byte for byte, so this
+    changes no geometry and no topology -- it is the UV analogue of
+    rewind_file().
+
+    The mirror is of the FIRST uv coordinate about the midpoint of its own
+    range, so the uv bounding box comes out identical. That matters: the
+    projector derives its pixel pitch from the uv span and nothing else, so a
+    repair that rescaled the box would silently change the image resolution.
+
+    This is necessarily a GLOBAL mirror: there is no way to reverse one
+    triangle's orientation without tearing it away from its neighbours. So on a
+    surface that is only partly mirrored it trades one set of triangles for the
+    other, and whether that is worth doing is the caller's decision -- this
+    function reports what it did and judges nothing.
+    """
+    before = uv_handedness_report(path)
+    uv = read_point_array(path, "TextureCoordinate", 2)
+    if uv is None:
+        raise ValueError("%s has no TextureCoordinate to mirror"
+                         % (os.path.basename(path),))
+    mid = 0.5 * (float(uv[:, 0].min()) + float(uv[:, 0].max()))
+    uv = uv.copy()
+    uv[:, 0] = 2.0 * mid - uv[:, 0]
+
+    if out_path is None:
+        base, ext = os.path.splitext(os.path.abspath(path))
+        out_path = base + "_uvflip" + ext
+
+    with open(path, "r") as fh:
+        text = fh.read()
+    body = " ".join("%.9g %.9g" % (row[0], row[1]) for row in uv)
+    m = re.search(r"<TextureCoordinate\b((?:[^>\"]|\"[^\"]*\")*)>", text, re.S)
+    head, tail = text[:m.start()], text[m.end():]
+    node = re.sub(r'(\bpoint=")[^"]*(")',
+                  lambda mm: mm.group(1) + body + mm.group(2), m.group(0),
+                  count=1)
+    with open(out_path, "w") as fh:
+        fh.write(head + node + tail)
+
+    after = uv_handedness_report(out_path)
+    return out_path, {"before": before, "after": after, "path": path,
+                      "out_path": out_path, "mirror_about": mid}
+
+
 def loadable_x3d(path, quiet=False):
     """The surface to hand to x3d_load_geometry, repairing it if it needs it.
 
@@ -300,7 +479,7 @@ def loadable_x3d(path, quiet=False):
     faces, _ = read_indexed_face_set(path)
     rep = winding_report(faces)
     if rep["loadable"]:
-        return path
+        return _uv_oriented(path, quiet=quiet)
 
     if rep["overshared_edges"]:
         raise RuntimeError(
@@ -330,4 +509,66 @@ def loadable_x3d(path, quiet=False):
                  rep["inconsistent_edges"], os.path.basename(out_path)))
         print("    the geometry is unchanged; a single inconsistent edge makes "
               "the loader abort the process, so it cannot be left alone")
-    return out_path
+    # On the REWOUND file, not the original: rewind_file flips texCoordIndex
+    # alongside coordIndex, so reversing a face changes its handedness verdict.
+    return _uv_oriented(out_path, quiet=quiet)
+
+
+def _uv_oriented(path, quiet=False):
+    """The same surface with a parameterization the projector can use.
+
+    A mirrored parameterization is the failure that produces an EMPTY IMAGE AND
+    NO ERROR -- see uv_handedness_report() for the NaN chain that does it. It
+    is checked here, on the file that is about to be loaded, because at this
+    point nothing has moved yet and the alternative is finding out after a
+    whole scan's worth of traces has been thrown away.
+    """
+    uvrep = uv_handedness_report(path)
+    if uvrep["verdict"] in ("ok", "no_parameterization"):
+        return path
+
+    # A global mirror reverses EVERY triangle, so it is worth doing exactly
+    # when it leaves fewer triangles mirrored than it finds. On a uniformly
+    # mirrored surface that is all of them. On a mixed one it still rescues the
+    # majority, which is the common case after rewind_file() has corrected the
+    # winding of a handful of faces -- that correction flips those faces'
+    # handedness and is what makes an otherwise uniform surface mixed.
+    if uvrep["mirrored"] > uvrep["agreeing"]:
+        out_path, flipped = flip_uv_file(path)
+        after = flipped["after"]
+        if after["mirrored"] >= uvrep["mirrored"]:
+            raise RuntimeError(
+                "%s has %d of %d triangle(s) with a mirrored UV "
+                "parameterization and mirroring it back left %d. Refusing it "
+                "rather than projecting into an image that stays empty with no "
+                "error raised."
+                % (os.path.basename(path), uvrep["mirrored"],
+                   uvrep["triangles"], after["mirrored"]))
+        if not quiet:
+            print("  projection surface UV mirrored back: %d of %d triangle(s) "
+                  "were wound against their faces -- %s"
+                  % (uvrep["mirrored"], uvrep["triangles"],
+                     os.path.basename(out_path)))
+            print("    left alone, every ray would have landed and deposited "
+                  "ZERO WEIGHT, and the image would have stayed empty with no "
+                  "error anywhere. The geometry is unchanged.")
+            _warn_residual_mirroring(after, out_path)
+        return out_path
+
+    if not quiet:
+        _warn_residual_mirroring(uvrep, path)
+    return path
+
+
+def _warn_residual_mirroring(uvrep, path):
+    """Say which triangles still cannot take data, and why there are any."""
+    if not uvrep["mirrored"]:
+        return
+    print("  ** %d of %d triangle(s) of %s are still mirrored and CANNOT "
+          "RECEIVE DATA"
+          % (uvrep["mirrored"], uvrep["triangles"], os.path.basename(path)))
+    print("    the projector takes the square root of a negative determinant "
+          "there and the resulting NaN zeroes every weight. It raises no "
+          "error, so the only symptom is holes in the image.")
+    print("    a mixture cannot be fixed by mirroring -- that only trades one "
+          "set for the other. Re-run the parameterization.")

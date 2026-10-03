@@ -250,7 +250,7 @@ def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
                           max_passes=None, force=False, panel=None,
                           projector_prefix="/scan/proj", label="Surface path scan",
                           pitch_m=None, position_relative_to_origin=True,
-                          contact=None, on_first_contact=None):
+                          contact=None, on_first_contact=None, on_pass=None):
     """Acquire along a planned toolpath. No grid, no rectangular volume.
 
     Returns the report from run_triggered_path_scan(), after printing the plan,
@@ -265,6 +265,12 @@ def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
     part and before any reading is staged: see first_touchdown_hook() for why
     that is the only place instrument setup against the material can go. Only
     meaningful with `contact`.
+
+    `on_pass(index, segment_report)` is called after every pass that acquired
+    anything and is how an instrument gets that pass onto disk before the next
+    one starts -- the only thing that makes a scan survive the process that
+    took it. Passed straight to run_triggered_path_scan(); see there for what it
+    may and may not do, and ec_trace_store.dpi for the eddy-current one.
     """
     if getattr(source, "trigger_mode", "timer") not in (
             "position", "timestamped", "timestamped-ec"):
@@ -435,7 +441,8 @@ def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
                                          approach, sweep, stage, pose_at,
                                          setup_after_first=_setup, segments=segs,
                                          progress=_progress,
-                                         on_segment_failure="skip")
+                                         on_segment_failure="skip",
+                                         on_pass=on_pass)
     finally:
         source.disarm()
         ros.WaitUnPauseAcquisition()

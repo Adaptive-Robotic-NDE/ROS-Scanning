@@ -1043,6 +1043,16 @@ include(None, os.path.join(SCAN_MODULE_DIR, "tooling_clearance.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "surface_distance_fast.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "pitch_crossings.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "timestamped_trigger.dpi"))
+# WHAT MAKES AN EDDY-CURRENT SCAN SURVIVE THIS PROCESS. The recording database
+# is in memory: before this file existed an EC scan wrote nothing to disk at any
+# point, and on 2026-10-02 a run of 59 completed passes was lost in full when
+# the process was killed at pass 60 of 64. One npz per completed pass now goes
+# beside the meshes, and replay_ec_scan() rebuilds the projected image from
+# those files in any later session -- with the conditioning rotation overridable,
+# which is the half that cannot be done from a conditioned scalar.
+#
+# BEFORE ec_acquisition.dpi, which is what drives it.
+include(None, os.path.join(SCAN_MODULE_DIR, "ec_trace_store.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "ec_acquisition.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_parameters.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
@@ -2778,11 +2788,19 @@ def _ec_band_check(report):
 
 
 global run_ec_scan
-def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=False):
+def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=False,
+                save=True, run_dir=None):
     """Scan the planned toolpath in continuous motion.
 
     One complex impedance per SCAN_STEP_SIZE of travel, each carrying the pose it
     was taken at, conditioned and projected onto the surface.
+
+    EVERY COMPLETED PASS IS WRITTEN TO DISK, one file per pass, into its own
+    directory under SCAN_STORAGE_DIR beside the meshes -- so a scan that dies at
+    pass 60 of 64 still leaves 59 passes and replay_ec_scan() can rebuild the
+    image in a later session. The directory comes back in
+    report["run_dir"]. save=False is for a bench run that is deliberately
+    throwing its data away; see run_ec_path_scan().
 
     The acquisition is shared with the ultrasound scan (surface_path_scan.dpi);
     what is eddy-current here is what a reading is and which conditioned scalar
@@ -2852,7 +2870,8 @@ def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=Fals
                                 contact=_ec_contact(),
                                 null_instrument=(null_ec_instrument
                                                  if EC_NULL_ON_CONTACT else None),
-                                null_required=EC_NULL_REQUIRED)
+                                null_required=EC_NULL_REQUIRED,
+                                save=save, run_dir=run_dir)
 
 
 global ec_dry_run_report
@@ -3563,6 +3582,15 @@ print("           plan_ec_path()  preview_ec_scan()")
 print("  motion:  dry_run_ec_scan()  ec_joint_report()  ec_touch_down()  ec_lift()")
 print("           park_arm()")
 print("  setup:   setup_ec()  null_here()  set_rotation(deg)  set_gain(h, v)")
+# THE DATA OUTLIVES THE PROCESS, and the operator has to know where. Named on
+# the prompt because the moment these are wanted is after a crash, when reading
+# source is the last thing anybody wants to be doing.
+print("  on disk: every completed pass is written to %s/ec_scan_<time>/"
+      % (SCAN_STORAGE_DIR,))
+print("           ec_save_status() says how much has reached it; list_ec_runs()")
+print("           lists saved runs; replay_ec_scan() rebuilds the image from one")
+print("           -- replay_ec_scan(rotation_deg=40) tries a different rotation")
+print("           over the SAME traces, which is why the raw impedance is kept.")
 # set_probe_rotation() TURNS THE ARM; set_rotation() turns a phase. Two very
 # different verbs one letter apart, so they are named on separate lines with what
 # each one moves.

@@ -386,5 +386,109 @@ def test_the_report_survives_a_take_with_no_sweep():
     assert "UNAVAILABLE" in text
 
 
+# ==============================================================================
+# 8. A railed pass must be refused, not reported
+# ==============================================================================
+#
+# Measured on the 2026-10-02 take: the +6 deg pass had 64 of 64 samples at
+# exactly -5.0000 on the imaginary component, so its standard deviation was
+# exactly zero and it came out as the QUIETEST of the five passes. Including it
+# dropped the fitted axis's linearity from 0.904 to 0.649 and raised the
+# ruler's fit residual from 0.27 to 0.96 -- that is, the one unusable pass was
+# what made the whole take look untrustworthy.
+
+RAIL = 5.0
+
+
+def _clipped_pass(tilt_deg, **kw):
+    """A pass whose imaginary component is driven into a +/-RAIL digitiser."""
+    p = _pass(tilt_deg, **kw)
+    z = p["impedance"]
+    p["impedance"] = (np.clip(z.real, -RAIL, RAIL)
+                      + 1j * np.clip(z.imag, -RAIL, RAIL))
+    p["saturation"] = ec_liftoff.saturation(p["impedance"])
+    return p
+
+
+def test_a_clean_pass_is_not_called_saturated():
+    """Every pass reaches its own min and max once; that is not a rail.
+
+    This is the failure the first cut of the detector had: a bare fraction
+    threshold fires on every pass ever recorded, because at 64 traces a single
+    extremal sample is already 1.6% of them.
+    """
+    for n in (8, 64, 400, 4000):
+        sat = ec_liftoff.saturation(_pass(0.0, n=n, wander=1.0)["impedance"])
+        assert not sat["saturated"], "%d-trace clean pass called saturated" % n
+
+
+def test_a_railed_component_is_detected_and_quantified():
+    p = _clipped_pass(0.0, n=64, wander=0.0, defect=20.0)
+    sat = p["saturation"]
+    assert sat["saturated"]
+    im = sat["components"]["imag"]
+    assert im["railed"]
+    assert abs(abs(im["value"]) - RAIL) < 1e-9
+    assert im["count"] >= 3
+
+
+def test_a_fully_railed_pass_has_zero_spread_which_is_the_whole_danger():
+    """The number the detector exists to stop anyone acting on."""
+    z = np.full(64, -1.0 - RAIL * 1j)
+    assert np.std(np.imag(z)) == 0.0
+    assert ec_liftoff.saturation(z)["saturated"]
+
+
+def test_a_railed_pass_is_excluded_from_the_axis_and_the_ruler():
+    take = _take()
+    take[3] = _clipped_pass(6.0, seed=3, defect=20.0)     # the +6 deg pass
+    axis, detail = ec_liftoff.liftoff_axis_from_tilts(take)
+    assert detail["passes_used"] == len(take) - 1
+    names = [name for name, _why in detail["excluded"]]
+    assert take[3]["name"] in names
+    why = dict(detail["excluded"])[take[3]["name"]]
+    assert "SATURATED" in why
+    per_degree, step = ec_liftoff.tilt_step_size(take, axis)
+    assert [n for n, _ in step["excluded"]] == names, (
+        "the axis fit and the ruler must agree about which passes they used")
+
+
+def test_a_railed_pass_reports_nothing_rather_than_a_small_spread():
+    p = _clipped_pass(6.0, defect=20.0)
+    out = ec_liftoff.analyse_pass(p, 0.0, PER_DEGREE)
+    assert out.get("saturated")
+    assert "liftoff_std" not in out, (
+        "a railed pass must not carry a spread; the spread is the rail")
+    assert "SATURATED" in out["reason"]
+    assert "gain" in out["reason"], (
+        "the reason must say what to do about it, not just that it happened")
+
+
+def test_the_report_names_the_excluded_pass():
+    take = _take()
+    take[3] = _clipped_pass(6.0, seed=3, defect=20.0)
+    axis, detail = ec_liftoff.liftoff_axis_from_tilts(take)
+    text = ec_liftoff.report({
+        "passes": [ec_liftoff.analyse_pass(p, axis, PER_DEGREE) for p in take],
+        "axis_deg": axis,
+        "axis_detail": detail,
+        "rotation_used_deg": axis, "dialled_rotation_deg": None,
+        "per_degree": PER_DEGREE, "step_detail": {}})
+    assert "EXCLUDED" in text
+    assert take[3]["name"] in text
+
+
+def test_load_pass_records_saturation(tmp_path):
+    """The wiring: a file read off disk must arrive carrying the verdict."""
+    p = _clipped_pass(6.0, n=64, defect=20.0)
+    path = tmp_path / "ec_tilt+6.npz"
+    np.savez(str(path), impedance=p["impedance"], s_m=p["s_m"],
+             position=p["position"], index=p["index"],
+             wall_time=p["wall_time"])
+    loaded = ec_liftoff.load_pass(str(path))
+    assert loaded["saturation"]["saturated"]
+    assert loaded["tilt_deg"] == 6.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

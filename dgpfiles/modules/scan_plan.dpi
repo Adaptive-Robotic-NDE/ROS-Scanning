@@ -409,7 +409,21 @@ def project_traces(first=0, count=None, gate="cscan", quiet=False):
     end, which is safe here precisely because nothing else is producing.
 
     Run it again after changing the spot radius, the gate or the surface.
+
+    AN INSTRUMENT MAY OWN THIS. The three names read below -- `projector`,
+    `trace_accum`, `cscan_gates` -- belong to scan_accumulation.dpi and are the
+    ULTRASOUND ones. An eddy-current scan sets none of them: it has
+    ec_projector, ec_trace_accum and ec_cond_paths, and no gate at all, because
+    an impedance reading has no time axis to gate. So this function could not
+    serve an EC scan even in principle, and PROJECTION_MODE="deferred" used to
+    record an EC scan's traces and never replay them -- silently, because
+    finish_projection() returned None on `projector is None`.
+    scan_replay_projection is how an instrument says it has its own replay; the
+    eddy-current one is project_ec_traces() in ec_acquisition.dpi.
     """
+    replay = globals().get("scan_replay_projection")
+    if callable(replay):
+        return replay(first=first, count=count, quiet=quiet)
     if projector is None:
         raise RuntimeError("no projector -- PROJECTION_MODE is 'off', or no scan "
                            "has set up a surface yet")
@@ -594,10 +608,48 @@ def cartesian_move(poses, kind=None, **kwargs):
 
 global finish_projection
 def finish_projection():
-    """Run the deferred projection, if that is the mode."""
-    if PROJECTION_MODE != "deferred" or projector is None:
+    """Run the deferred projection, if that is the mode.
+
+    IT MAY NOT RETURN QUIETLY HAVING DONE NOTHING. "deferred" is the operator
+    asking for the image to be built after the scan rather than during it, so a
+    run that reaches here with nothing to replay has lost the picture of a
+    measurement it took -- and that is worth a paragraph, not a None.
+
+    It used to be a silent no-op for every eddy-current scan: the three names it
+    tested belong to the ultrasound accumulators and an EC scan sets none of
+    them, so `projector is None` was always true and PROJECTION_MODE="deferred"
+    meant "record the traces and never replay them" with nothing said anywhere.
+    An instrument with its own replay publishes scan_replay_projection; see
+    project_traces().
+    """
+    if PROJECTION_MODE != "deferred":
         return None
-    if trace_accum is None or not trace_accum.staged:
+    replay = globals().get("scan_replay_projection")
+    if callable(replay):
+        # The instrument's own. It reports its own state, including why there
+        # was nothing to do.
+        try:
+            return replay()
+        except Exception as e:                                # noqa: BLE001
+            # A presentation failure must not lose a finished scan: the traces
+            # carry their own poses and can be replayed by hand, or from disk in
+            # another session. Loud, because an empty image is otherwise
+            # indistinguishable from a scan that acquired nothing.
+            print("  ** THE DEFERRED PROJECTION DID NOT RUN: %s: %s"
+                  % (type(e).__name__, e))
+            print("     The scan's traces are not affected -- each carries the "
+                  "pose it was taken at. Re-run project_traces() once whatever "
+                  "that says is fixed.")
+            return None
+    if projector is None or trace_accum is None or not trace_accum.staged:
+        print("  ** PROJECTION_MODE IS 'deferred' AND NOTHING WAS REPLAYED: %s."
+              % ("there is no projector, so no surface was ever loaded"
+                 if projector is None else
+                 "there is no trace list" if trace_accum is None else
+                 "the trace list is empty -- no reading was staged"))
+        print("     So the projected image is empty, and that is not a display "
+              "fault. If this config's projector lives under another name, it "
+              "has to publish scan_replay_projection -- see project_traces().")
         return None
     print("  deferred projection: replaying %d trace(s) from %s"
           % (trace_accum.staged, trace_accum.poses_path))

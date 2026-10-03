@@ -49,6 +49,7 @@
 # any trace is recorded, and subtracting a constant afterwards does not move it.
 
 import os
+import time
 
 import numpy as np
 import spatialnde2 as snde
@@ -89,6 +90,7 @@ global set_ec_parameter
 global ec_null_from_traces
 global ec_channel_exists
 global ec_conditioning_parameters
+global ec_conditioning_in_force
 global ensure_ec_conditioning
 global ec_cond_pending
 global check_ec_conditioning
@@ -531,6 +533,40 @@ def ec_conditioning_parameters(null=None, rotation_deg=None, gain=None,
     return out
 
 
+def ec_conditioning_in_force(cond=None):
+    """The null, rotation and gain the math is ACTUALLY using. -> dict
+
+    Off the parameter CHANNELS when the conditioning is wired, because those are
+    what the math function reads: ec_cond_pending is kept in step by
+    ec_conditioning_parameters(), but set_ec_parameter() writes a channel
+    directly and anything that reports the pending dict would then be reporting
+    a stale number.
+
+    This is what the per-pass save records, so that a replay months later
+    conditions the saved traces the way the scan did rather than the way the
+    config was configured. Never raises: an unreadable channel falls back to the
+    pending value and says which it used.
+    """
+    out = {"null": tuple(float(v) for v in ec_cond_pending["null"]),
+           "rotation_deg": float(ec_cond_pending["rotation"]),
+           "gain": tuple(float(v) for v in ec_cond_pending["gain"]),
+           "from": "pending"}
+    paths = (cond or {}).get("paths")
+    if not paths:
+        return out
+    try:
+        null = np.asarray(recdb.latest.ref[paths["null"]].data).reshape(-1)
+        rot = np.asarray(recdb.latest.ref[paths["rotation"]].data).reshape(-1)
+        gain = np.asarray(recdb.latest.ref[paths["gain"]].data).reshape(-1)
+        out["null"] = (float(null[0]), float(null[1]))
+        out["rotation_deg"] = float(rot[0])
+        out["gain"] = (float(gain[0]), float(gain[1]))
+        out["from"] = "channels"
+    except Exception as e:                                    # noqa: BLE001
+        out["from"] = "pending (the parameter channels did not answer: %s)" % (e,)
+    return out
+
+
 def ensure_ec_conditioning(recdb, traces_path, prefix="/ec/cond", cond=None):
     """Wire the conditioning if it is not wired, using the pending parameters.
 
@@ -604,8 +640,19 @@ global ec_projection_errors
 global ec_projection_last_error
 global ec_projection_status
 global scan_projection_status
+global ec_pass_saver
+global project_ec_traces
+global scan_replay_projection
 ec_trace_accum = None
 ec_projector = None
+
+#: The per-pass recorder the running (or last) scan is writing through.
+#:
+#: Module level so ec_save_status() can be asked from the prompt mid-scan, and
+#: so the report of a scan that did not finish can still say what reached the
+#: disk. None means nothing is being written -- which, for an eddy-current scan,
+#: means the measurement exists only in this process.
+ec_pass_saver = None
 
 #: Projection failures counted rather than only printed.
 #:
@@ -641,20 +688,35 @@ def stage_ec_reading(data, metadata, pose7=None):
     traces[k] rather than merely correlate with it. Runs on the source's
     acquisition thread, so it must not touch a dgpy module -- no ros, no daq.
     """
+    # A TRANSACTION MUST BE ENDED ON EVERY PATH OUT OF HERE. An
+    # active_transaction ends itself when it is destroyed, which covers the
+    # ordinary exception case -- but only if nothing retains the traceback, and
+    # the caller's error bookkeeping used to do exactly that. An unended
+    # transaction is not a lost trace: under the timed transaction manager the
+    # map commits strictly from the head, so it stops every globalrev wait in
+    # the process permanently and silently. Do not rely on refcounting for
+    # something with that blast radius.
     transact = recdb.start_transaction()
-    staging_rec = snde.create_ndarray_ref(transact, ec_staging_chan,
-                                          snde.SNDE_RTN_COMPLEXFLOAT64)
-    if metadata:
-        staging_rec.rec.metadata = metadata
-    staging_rec.rec.mark_metadata_done()
-    staging_rec.allocate_storage(data.shape, True)
-    staging_rec.data[:] = data
-    staging_rec.rec.mark_data_ready()
+    ended = None
+    try:
+        staging_rec = snde.create_ndarray_ref(transact, ec_staging_chan,
+                                              snde.SNDE_RTN_COMPLEXFLOAT64)
+        if metadata:
+            staging_rec.rec.metadata = metadata
+        staging_rec.rec.mark_metadata_done()
+        staging_rec.allocate_storage(data.shape, True)
+        staging_rec.data[:] = data
+        staging_rec.rec.mark_data_ready()
 
-    if ec_trace_accum is not None and pose7 is not None:
-        ec_trace_accum.stage_pose_only_in_transaction(transact, pose7)
-
-    transact.end_transaction().globalrev_wait().wait_complete()
+        if ec_trace_accum is not None and pose7 is not None:
+            ec_trace_accum.stage_pose_only_in_transaction(transact, pose7)
+    finally:
+        # end_transaction() is what releases the head of the map. It is safe to
+        # call on a transaction whose recordings were never completed -- the
+        # globalrev simply carries whatever was defined -- and far safer than
+        # leaving it open.
+        ended = transact.end_transaction()
+    ended.globalrev_wait().wait_complete()
 
     # Project the CONDITIONED value at the pose it was taken at, after the
     # transaction -- the conditioning is a math function and its answer for this
@@ -725,6 +787,93 @@ def ec_projection_status(quiet=False):
 scan_projection_status = ec_projection_status
 
 
+def project_ec_traces(first=0, count=None, component=None, quiet=False):
+    """Replay THIS SESSION's eddy-current trace list through the projector.
+
+    The eddy-current counterpart of project_traces() (scan_plan.dpi), and the
+    deferred half of PROJECTION_MODE for this instrument. It exists because the
+    ultrasound one cannot serve an EC scan even in principle: it reads
+    `projector`, `trace_accum` and `cscan_gates`, which scan_accumulation.dpi
+    owns and an EC scan never sets -- an EC scan uses ec_projector,
+    ec_trace_accum and ec_cond_paths. So PROJECTION_MODE="deferred" used to
+    record the traces and silently never replay them, and
+    scan_settings_panel.dpi's re-project button raised "no projector" on a scan
+    whose projector was right there under another name.
+
+    Live or deferred, the image is the same: every trace carries the pose it was
+    taken at and the conditioning is a math function over the whole list, so the
+    only difference is when the splats happen. Deferred is also much faster --
+    wait=False per point with one wait at the end, measured at 11x on the
+    ultrasound path -- which is safe here precisely because nothing is
+    producing.
+
+    This needs the trace list that is in THIS process. For a scan whose process
+    is gone, replay_ec_scan() (ec_trace_store.dpi) does the same job from the
+    per-pass files on disk.
+    """
+    if ec_projector is None:
+        raise RuntimeError(
+            "no eddy-current projector -- PROJECTION_MODE is 'off', or no scan "
+            "has set up a surface yet. A scan from an earlier process is "
+            "replayed with replay_ec_scan() instead, off the per-pass files.")
+    if ec_trace_accum is None or not ec_trace_accum.staged:
+        raise RuntimeError(
+            "no eddy-current trace list to project from -- no scan has staged "
+            "a reading in this process. replay_ec_scan() replays a saved run.")
+    component = ec_scan_component if component is None else component
+    if not ec_cond_paths or component not in ec_cond_paths:
+        raise RuntimeError(
+            "the conditioning is not wired, so there is no %s channel to "
+            "project. It is wired by the scan itself once the first reading has "
+            "given it a trace list; a scan that never staged one has nothing to "
+            "replay." % (component,))
+
+    poses = np.array(recdb.latest.ref[ec_trace_accum.poses_path].data, copy=True)
+    vals = np.asarray(recdb.latest.ref[ec_cond_paths[component]].data).reshape(-1)
+
+    end = min(len(poses), len(vals))
+    # The accumulators are allocated for the whole planned scan; only the traces
+    # actually staged are real. Projecting the unwritten tail would splat zeros
+    # at an invalid orientation.
+    end = min(end, int(ec_trace_accum.staged))
+    if count is not None:
+        end = min(end, first + int(count))
+
+    started = time.monotonic()
+    done = 0
+    skipped = 0
+    gr = None
+    for k in range(first, end):
+        pose7 = poses[k]
+        if not float(np.linalg.norm(pose7[:4])) > 1e-6:
+            skipped += 1          # never staged: a zero quaternion is no pose
+            continue
+        gr = ec_projector.project(pose7, float(vals[k]), wait=False)
+        done += 1
+    if gr is not None:
+        # One wait, at the end. Each projection is a transaction and the
+        # projector accumulates in mutable storage, so they must all land -- but
+        # they need not land one at a time.
+        gr.globalrev_wait().wait_complete()
+    elapsed = time.monotonic() - started
+    if not quiet:
+        print("  projected %d %s trace(s) in %.1f s (%.1f traces/s)%s"
+              % (done, component, elapsed, done/elapsed if elapsed > 0 else 0.0,
+                 ", %d unstaged skipped" % skipped if skipped else ""))
+    return {"projected": done, "skipped": skipped, "elapsed": elapsed,
+            "component": component}
+
+
+#: The instrument-independent name scan_plan.dpi looks for when it is asked to
+#: replay a trace list.
+#:
+#: Same idiom as scan_projection_status above, and it is what makes
+#: project_traces(), finish_projection() and the settings panel's re-project
+#: button work in an eddy-current config rather than raising or, worse,
+#: returning quietly having done nothing.
+scan_replay_projection = project_ec_traces
+
+
 def ec_first_contact_null(null_fn, required=True):
     """The first-touchdown callable that balances the INSTRUMENT. -> callable
 
@@ -785,7 +934,7 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
                      staging_path="/ec/current", component=None,
                      max_passes=None, force=False, pitch_m=None, contact=None,
                      cond_prefix="/ec/cond", null_instrument=None,
-                     null_required=True):
+                     null_required=True, save=True, run_dir=None):
     """Scan a surface-following toolpath with an eddy-current instrument.
 
     The acquisition is shared with the ultrasound scan -- see
@@ -815,9 +964,23 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
     is staged; None skips it. `null_required` decides what a failed null means --
     see ec_first_contact_null(). Not the conditioning null; that is
     /ec/cond/null, wired below and set by null_here().
+
+    `save` writes every COMPLETED PASS to disk, into its own directory beside
+    the meshes, and is on by default for the reason the whole mechanism exists:
+    the recording database is in memory, so until a pass is on disk the process
+    IS the dataset. On 2026-10-02 a scan reached pass 59 of 64 with live
+    projection working and real indications visible, wedged, and was killed; all
+    59 passes went with it and there was nothing to reproject. `run_dir` puts
+    those files somewhere specific; None names one from the time the scan
+    started. The directory is returned in report["run_dir"], and
+    replay_ec_scan() rebuilds the image from it in any later session.
+
+    save=False is for a bench run that is deliberately throwing its data away.
+    It is not an optimisation: the write is a few hundred microseconds per pass
+    against passes that take tens of seconds.
     """
     global ec_trace_accum, ec_projector, ec_staging_chan, ec_cond_paths
-    global ec_scan_component, ec_cond
+    global ec_scan_component, ec_cond, ec_pass_saver
     if component is not None:
         ec_scan_component = component
     if ec_scan_component not in ("horizontal", "vertical", "magnitude"):
@@ -963,6 +1126,54 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
     on_contact = (None if null_instrument is None
                   else ec_first_contact_null(null_instrument,
                                              required=null_required))
+
+    # ONE DIRECTORY FOR THIS RUN'S TRACES, created BEFORE the arm moves so an
+    # unwritable path is a refusal here rather than 64 warnings with the probe
+    # on the part.
+    #
+    # The state closure is read ONCE PER PASS rather than captured now, and that
+    # is load-bearing: the conditioning does not exist yet. It is wired in
+    # _setup() -- after the first reading has been staged, because its input is
+    # the trace list -- so a recorder holding a snapshot taken here would record
+    # "no conditioning, no parameters" for every pass of the scan.
+    ec_pass_saver = None
+    if save:
+        def _saver_state():
+            params = ec_conditioning_in_force(ec_cond)
+            return {"accum": ec_trace_accum,
+                    "cond_paths": ec_cond_paths,
+                    "component": ec_scan_component,
+                    "null": params["null"],
+                    "rotation_deg": params["rotation_deg"],
+                    "gain": params["gain"],
+                    "parameters_from": params["from"],
+                    "x3d": (None if ec_projector is None
+                            else ec_projector.x3d_path) or x3d,
+                    # The mesh the surface was parameterized from, so a run
+                    # whose .x3d has since been overwritten says what to
+                    # re-parameterize. A ScanPath carries no mesh -- only a
+                    # `source` string -- so it comes from the pipeline's own
+                    # globals, newest stage first.
+                    "mesh": (globals().get("specimen_mesh")
+                             or globals().get("fine_mesh")
+                             or globals().get("rough_mesh")),
+                    "path_source": getattr(path, "source", None),
+                    "pitch_m": getattr(source, "trigger_pitch_m", pitch_m),
+                    "projection_radius_m": (None if ec_projector is None
+                                            else ec_projector.radius),
+                    "projection_pixels": (None if ec_projector is None
+                                          else ec_projector.horizontal_pixels),
+                    "trigger_report": getattr(source, "trigger_report", None),
+                    "label": "eddy-current path scan"}
+
+        ec_pass_saver = ec_pass_recorder(run_dir=run_dir, state=_saver_state)
+        print("  traces will be written one file per completed pass to %s"
+              % (ec_pass_saver.run_dir,))
+    else:
+        print("  ** NOT SAVING TRACES (save=False). The recording database is "
+              "in memory, so if this process dies the whole scan is gone -- "
+              "which is what happened on 2026-10-02 at pass 59 of 64.")
+
     # try/finally, because the scans that most need the projection report are
     # the ones that do not reach the end of this function. On 2026-10-01 one
     # scan stopped when the pendant dropped External Control at pass 84 of 163
@@ -975,7 +1186,7 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
             max_passes=max_passes, force=force,
             projector_prefix="/ec/proj", label="Eddy-current path scan",
             pitch_m=pitch_m, position_relative_to_origin=False, contact=contact,
-            on_first_contact=on_contact)
+            on_first_contact=on_contact, on_pass=ec_pass_saver)
     except BaseException:
         # BaseException, not Exception: Ctrl-C is the common case here.
         try:
@@ -986,10 +1197,32 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
             if ec_projection_errors:
                 print("    %d projection error(s); last was %s"
                       % (ec_projection_errors, ec_projection_last_error))
+            # AND WHAT SURVIVES IT. This is the branch the whole per-pass
+            # mechanism was built for -- a scan that did not reach its own last
+            # line -- so it is the branch that most has to say where the data
+            # is and how to get the picture back.
+            if ec_pass_saver is not None:
+                # AND THE PASS THAT WAS IN FLIGHT. The per-pass hook only fires
+                # on a pass that finished, so without this the sweep the scan
+                # was abandoned in the middle of is the one pass that is lost.
+                # Its traces are real measurements at real poses; they are
+                # marked partial rather than offered as a complete line.
+                saved, why = ec_pass_saver.flush()
+                if saved:
+                    print("  the interrupted pass was saved too (partial): %s"
+                          % (os.path.basename(why),))
+                print(ec_pass_saver.describe())
+                if ec_pass_saver.saved:
+                    print("    replay_ec_scan() rebuilds the image from those "
+                          "files, in this session or any later one")
         except Exception as e:                                # noqa: BLE001
             print("  (projection status unavailable: %s)" % (e,))
         raise
     report["instrument_null"] = ec_instrument_null
+    report["run_dir"] = None if ec_pass_saver is None else ec_pass_saver.run_dir
+    report["saved"] = None if ec_pass_saver is None else ec_pass_saver.status()
+    if ec_pass_saver is not None:
+        print(ec_pass_saver.describe())
 
     # WHETHER THE TRACES REACHED THE IMAGE, printed with the rest of the report
     # rather than left to be asked for. An empty projection is silent -- missed

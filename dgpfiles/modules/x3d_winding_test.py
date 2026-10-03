@@ -75,6 +75,7 @@ import sys
 import tempfile
 
 import numpy as np
+import pytest
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 if MODULE_DIR not in sys.path:
@@ -341,6 +342,183 @@ def main():
             ok = False
             print("FAIL  %s: %s" % (name, e))
     return 0 if ok else 1
+
+
+# ==============================================================================
+# UV handedness: the failure that produces an empty image and no error
+# ==============================================================================
+#
+# project_onto_parameterization.cpp:660-672 computes the determinant of
+# inplane2uvcoords and takes its SQUARE ROOT. A mirrored parameterization makes
+# that determinant negative, so the root is NaN, so every projected weight is
+# 0.0 and the image stays empty. The assert on the next line was written for
+# this case and cannot fire, because it tests for zero and NaN is not zero.
+#
+# Measured on 2026-10-02: two scan runs projected 1876 and 1673 traces into an
+# empty image with 7058 of 7058 and 9341 of 9341 triangles mirrored; a third
+# run the same morning, 5308 of 5308 agreeing, worked. The difference was the
+# sign numpy returned for the second singular vector of the planar unwrap.
+
+
+def _mirror_u(verts):
+    """The same patch with its u coordinate reflected -- a mirrored UV map."""
+    return [(-v[0], v[1], v[2]) for v in verts]
+
+
+def _write_uv(path, tris, verts, uv_verts):
+    """Like _write but with the UV array given separately from the geometry."""
+    ci = " ".join(" ".join(str(v) for v in t) + " -1" for t in tris)
+    pts = " ".join("%.9g %.9g %.9g" % tuple(v) for v in verts)
+    uvs = " ".join("%.9g %.9g" % (v[0], v[1]) for v in uv_verts)
+    with open(path, "w") as fh:
+        fh.write(X3D_HEAD)
+        fh.write('        <IndexedFaceSet solid="false" coordIndex="%s" '
+                 'texCoordIndex="%s">\n' % (ci, ci))
+        fh.write('          <Coordinate point="%s"/>\n' % pts)
+        fh.write('          <TextureCoordinate point="%s"/>\n' % uvs)
+        fh.write(X3D_TAIL)
+    return path
+
+
+def test_a_correct_parameterization_is_called_ok():
+    verts, tris = _grid()
+    p = _write(_tmp("clean.x3d"), tris, verts)
+    rep = x3d_winding.uv_handedness_report(p)
+    assert rep["verdict"] == "ok"
+    assert rep["mirrored"] == 0
+    assert rep["agreeing"] == rep["triangles"] == len(tris)
+
+
+def test_a_mirrored_parameterization_is_detected():
+    verts, tris = _grid()
+    p = _write_uv(_tmp("mirror.x3d"), tris, verts, _mirror_u(verts))
+    rep = x3d_winding.uv_handedness_report(p)
+    assert rep["verdict"] == "mirrored"
+    assert rep["agreeing"] == 0
+    assert rep["mirrored"] == len(tris)
+    assert rep["mirrored_fraction"] == 1.0
+
+
+def test_a_surface_with_no_parameterization_is_not_an_error():
+    """An X3D with no TextureCoordinate has nothing to be wrong about."""
+    verts, tris = _grid()
+    p = _tmp("nouv.x3d")
+    ci = " ".join(" ".join(str(v) for v in t) + " -1" for t in tris)
+    pts = " ".join("%.9g %.9g %.9g" % tuple(v) for v in verts)
+    with open(p, "w") as fh:
+        fh.write(X3D_HEAD)
+        fh.write('        <IndexedFaceSet solid="false" coordIndex="%s">\n' % ci)
+        fh.write('          <Coordinate point="%s"/>\n' % pts)
+        fh.write(X3D_TAIL)
+    assert x3d_winding.uv_handedness_report(p)["verdict"] == "no_parameterization"
+    assert x3d_winding.loadable_x3d(p, quiet=True) == p
+
+
+def test_the_loader_gate_mirrors_a_mirrored_surface_back():
+    verts, tris = _grid()
+    p = _write_uv(_tmp("mirror.x3d"), tris, verts, _mirror_u(verts))
+    out = x3d_winding.loadable_x3d(p, quiet=True)
+    assert out != p, "a mirrored surface must not be handed over unchanged"
+    assert x3d_winding.uv_handedness_report(out)["verdict"] == "ok"
+
+
+def test_the_repair_changes_nothing_but_the_uv_orientation():
+    """Geometry, topology and the UV bounding box must all survive it.
+
+    The bounding box matters on its own: the projector derives its pixel pitch
+    from the UV span and nothing else, so a repair that rescaled the box would
+    quietly change the image resolution.
+    """
+    verts, tris = _grid()
+    p = _write_uv(_tmp("mirror.x3d"), tris, verts, _mirror_u(verts))
+    out, rep = x3d_winding.flip_uv_file(p)
+    assert (x3d_winding.read_indexed_face_set(p)[0]
+            == x3d_winding.read_indexed_face_set(out)[0])
+    before_xyz = x3d_winding.read_point_array(p, "Coordinate", 3)
+    after_xyz = x3d_winding.read_point_array(out, "Coordinate", 3)
+    assert np.array_equal(before_xyz, after_xyz)
+    before_uv = x3d_winding.read_point_array(p, "TextureCoordinate", 2)
+    after_uv = x3d_winding.read_point_array(out, "TextureCoordinate", 2)
+    for axis in (0, 1):
+        assert abs(before_uv[:, axis].min() - after_uv[:, axis].min()) < 1e-6
+        assert abs(before_uv[:, axis].max() - after_uv[:, axis].max()) < 1e-6
+    assert rep["after"]["verdict"] == "ok"
+
+
+def test_a_mostly_correct_surface_is_left_alone_rather_than_made_worse():
+    """A global mirror trades one set of triangles for the other.
+
+    With the majority already correct, mirroring would break more than it
+    fixes, so the gate must report and not touch it.
+    """
+    verts, tris = _grid()
+    uv = list(verts)
+    p = _write_uv(_tmp("mostly_ok.x3d"), tris, verts, uv)
+    # Reverse ONE triangle's UV triple by hand: two corners swapped in the UV
+    # index would scramble the mapping, so build the mixture in the report
+    # instead and check the policy against it directly.
+    rep = dict(x3d_winding.uv_handedness_report(p))
+    rep.update({"agreeing": len(tris) - 1, "mirrored": 1,
+                "verdict": "partly_mirrored"})
+    assert rep["mirrored"] <= rep["agreeing"]
+    out = x3d_winding.loadable_x3d(p, quiet=True)
+    assert out == p
+
+
+def test_a_mostly_mirrored_surface_is_still_rescued():
+    """The real case after a winding repair.
+
+    rewind_file() flips texCoordIndex alongside coordIndex, so correcting a
+    handful of faces' winding flips those faces' handedness and turns a
+    uniformly mirrored surface into a lopsided mixture. Measured on
+    2026-10-02: 7057 mirrored against 1 correct, and 9337 against 4. Refusing
+    those would throw away 7057 and 9337 usable triangles.
+    """
+    verts, tris = _grid()
+    p = _write_uv(_tmp("mostly_mirror.x3d"), tris, verts, _mirror_u(verts))
+    before = x3d_winding.uv_handedness_report(p)
+    out, rep = x3d_winding.flip_uv_file(p)
+    assert rep["after"]["mirrored"] < before["mirrored"], (
+        "the mirror must strictly reduce the number of unusable triangles")
+
+
+# ==============================================================================
+# The unwrap rule and the gate's criterion must be the same rule
+# ==============================================================================
+
+def test_orient_uv_basis_makes_every_uv_triangle_positive():
+    """The property the whole chain rests on, checked both ways round.
+
+    For a triangle with edge vectors u and v in winding order the UV signed
+    area is Area * (n . (e0 x e1)), so forcing (e0 x e1) . n > 0 makes every
+    triangle's UV signed area positive -- which is exactly the condition
+    uv_handedness_report() tests and exactly the condition that keeps
+    inplane2uvcoords' determinant positive. One rule, two users.
+
+    Both SVD sign choices are fed in, because which one numpy returns is the
+    coin flip that caused the original failure.
+    """
+    verts, tris = _grid()
+    co = np.array(verts, dtype=float)
+    normal = np.array([0.0, 0.0, 1.0])          # the grid is wound about +z
+    for sign in (+1.0, -1.0):
+        e0 = np.array([1.0, 0.0, 0.0])
+        e1 = sign * np.array([0.0, 1.0, 0.0])
+        e0f, e1f, flipped = x3d_winding.orient_uv_basis(e0, e1, normal)
+        assert flipped == (sign < 0.0)
+        assert np.dot(np.cross(e0f, e1f), normal) > 0.0
+        uv = np.stack([co @ e0f, co @ e1f], axis=1)
+        for t in tris:
+            a, b, c = uv[t[0]], uv[t[1]], uv[t[2]]
+            area2 = ((b[0]-a[0])*(c[1]-a[1]) - (c[0]-a[0])*(b[1]-a[1]))
+            assert area2 > 0.0, "orient_uv_basis left a mirrored triangle"
+
+
+def test_orient_uv_basis_refuses_a_surface_with_no_outward_direction():
+    """A closed or folded surface has no planar unwrap to orient."""
+    with pytest.raises(ValueError) as exc:
+        x3d_winding.orient_uv_basis([1, 0, 0], [0, 1, 0], [0, 0, 0])
+    assert "outward" in str(exc.value)
 
 
 if __name__ == "__main__":

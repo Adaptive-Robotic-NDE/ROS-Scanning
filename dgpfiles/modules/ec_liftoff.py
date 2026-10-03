@@ -157,6 +157,57 @@ def condition(impedance, null=(0.0, 0.0), rotation_deg=0.0, gain=(1.0, 1.0)):
 # Loading
 # ==============================================================================
 
+def saturation(impedance, fraction=0.02, repeats=3):
+    """Is this pass railed against the digitiser's input range?
+
+    -> a dict; `['saturated']` is the only field most callers need.
+
+    WHY THIS EXISTS. The Uniwest's analogue outputs run into a +/-5 V DAQ
+    range, and a pass flown at enough tilt pins one component against the rail
+    and stays there. A railed pass does not report a small lift-off variation
+    -- it reports NO variation, because every sample is the same number -- so
+    its mean is not a measurement of anything and its standard deviation is a
+    measurement of the rail. Measured on the 2026-10-02 take: the +6 deg pass
+    had 64 of 64 samples at exactly -5.0000 on the imaginary component, giving
+    it a standard deviation of exactly zero and the smallest "lift-off spread"
+    of the five passes. Without this check that pass looks like the BEST one.
+
+    The test is for a REPEATED extremal value rather than for a particular
+    voltage, so it does not need to know the DAQ range: a hard rail produces
+    many samples at bit-identical extremes, which a real signal does not.
+    Both conditions are needed. Every pass reaches its own minimum and maximum
+    exactly once, so a fraction threshold alone fires on every pass ever
+    recorded -- at 64 traces a single extremal sample is already 1.6% -- which
+    is why `repeats` exists and why it is the condition that does the work.
+    `fraction` then keeps a handful of identical samples near a turning point,
+    which ADC quantisation can produce honestly, from counting as a rail.
+    """
+    z = np.asarray(impedance)
+    out = {"saturated": False, "components": {}, "n": int(z.size)}
+    if z.size == 0:
+        return out
+    for label, part in (("real", np.real(z)), ("imag", np.imag(z))):
+        info = {}
+        for end, value in (("low", float(np.min(part))),
+                           ("high", float(np.max(part)))):
+            # Bit-identical, not approximately equal: a clipped sample is the
+            # same float every time, a real extremum is reached once.
+            count = int(np.count_nonzero(part == value))
+            info[end] = {"value": value, "count": count,
+                         "fraction": count / float(part.size)}
+        end = ("low" if info["low"]["count"] >= info["high"]["count"]
+               else "high")
+        info["fraction"] = info[end]["fraction"]
+        info["count"] = info[end]["count"]
+        info["value"] = info[end]["value"]
+        info["railed"] = (info["count"] >= repeats
+                          and info["fraction"] >= fraction)
+        out["components"][label] = info
+        if info["railed"]:
+            out["saturated"] = True
+    return out
+
+
 def load_pass(path):
     """One npz from capture_contact(), as a dict. Tilt comes from the filename.
 
@@ -175,6 +226,8 @@ def load_pass(path):
         except (ValueError, TypeError):
             out["trigger_report"] = None
     out["tilt_deg"] = _tilt_from_name(out["name"])
+    out["saturation"] = (saturation(out["impedance"])
+                         if out["impedance"] is not None else None)
     return out
 
 
@@ -215,6 +268,39 @@ def load_take(*paths):
 # Finding the lift-off axis from the data
 # ==============================================================================
 
+def _usable(passes):
+    """The passes that can contribute to the axis and the ruler, and why not.
+
+    -> (usable, excluded) where `excluded` is a list of (name, reason).
+
+    A saturated pass is excluded outright: see saturation().  Its mean sits
+    wherever the rail is rather than where the signal would have been, so
+    including it bends both the fitted axis and the fitted ruler toward the
+    rail.
+    """
+    usable = []
+    excluded = []
+    for p in passes:
+        if p.get("impedance") is None or len(p["impedance"]) == 0:
+            excluded.append((p.get("name", "?"), "no impedance samples"))
+        elif p.get("tilt_deg") is None:
+            excluded.append((p.get("name", "?"),
+                             "filename carries no tilt, so it cannot be placed "
+                             "on the tilt axis"))
+        elif (p.get("saturation") or {}).get("saturated"):
+            sat = p["saturation"]
+            which = ", ".join(
+                "%s %d of %d samples at %+.4f"
+                % (name, info["count"], sat["n"], info["value"])
+                for name, info in sat["components"].items() if info["railed"])
+            excluded.append((p["name"],
+                             "SATURATED (%s) -- a railed mean is not a "
+                             "measurement" % which))
+        else:
+            usable.append(p)
+    return usable, excluded
+
+
 def liftoff_axis_from_tilts(passes):
     """The lift-off angle in degrees, derived from how tilt moves the signal.
 
@@ -237,14 +323,15 @@ def liftoff_axis_from_tilts(passes):
     coordinate on the other, because neither axis is the independent variable
     -- both are measured and either can be the one that barely moves.
     """
-    usable = [p for p in passes if p.get("tilt_deg") is not None
-              and p.get("impedance") is not None and len(p["impedance"]) > 0]
+    usable, excluded = _usable(passes)
     tilts = sorted({p["tilt_deg"] for p in usable})
     if len(tilts) < 2:
         return None, {"reason":
                       "need at least two distinct tilts to find the axis; got %d "
-                      "(%s). Fly capture_contact() with its default tilt sweep."
-                      % (len(tilts), tilts or "none")}
+                      "(%s) after exclusions. Fly capture_contact() with its "
+                      "default tilt sweep."
+                      % (len(tilts), tilts or "none"),
+                      "excluded": excluded}
 
     means = np.array([np.mean(p["impedance"]) for p in usable])
     pts = np.column_stack([np.real(means), np.imag(means)])
@@ -274,6 +361,7 @@ def liftoff_axis_from_tilts(passes):
         "off_axis_spread": off_axis,
         "linearity": linearity,
         "means": means,
+        "excluded": excluded,
     }
 
 
@@ -292,10 +380,10 @@ def tilt_step_size(passes, rotation_deg):
     the slope's magnitude; the sign is a convention of which way the axis points
     and carries no information.
     """
-    usable = [p for p in passes if p.get("tilt_deg") is not None
-              and p.get("impedance") is not None and len(p["impedance"]) > 0]
+    usable, excluded = _usable(passes)
     if len({p["tilt_deg"] for p in usable}) < 2:
-        return None, {"reason": "fewer than two distinct tilts"}
+        return None, {"reason": "fewer than two distinct tilts after exclusions",
+                      "excluded": excluded}
     tilt = np.array([p["tilt_deg"] for p in usable], dtype=float)
     h_mean = np.array([np.mean(condition(p["impedance"],
                                          rotation_deg=rotation_deg)[0])
@@ -308,6 +396,7 @@ def tilt_step_size(passes, rotation_deg):
         "residual_rms": float(np.sqrt(np.mean(residual**2))),
         "tilt_deg": tilt,
         "mean_liftoff": h_mean,
+        "excluded": excluded,
     }
 
 
@@ -341,6 +430,29 @@ def analyse_pass(p, rotation_deg, per_degree=None):
         out["reason"] = ("%d trace(s) -- nothing to characterise. A pass with "
                          "one trace is the position trigger never firing, not a "
                          "lift-off problem." % n)
+        return out
+
+    sat = p.get("saturation") or {}
+    if sat.get("saturated"):
+        # Refuse rather than report. Every statistic below would be a statistic
+        # about the rail, and the railed pass is the one that comes out looking
+        # quietest -- see saturation() for the measured case.
+        out["saturated"] = True
+        worst = ", ".join(
+            "%s component %d of %d samples (%.0f%%) pinned at %+.4f"
+            % (name, info["count"], n, 100.0 * info["fraction"], info["value"])
+            for name, info in sat.get("components", {}).items()
+            if info.get("railed"))
+        out["reason"] = (
+            "%d traces, tilt %s -- SATURATED, nothing reported: %s. The pass "
+            "ran the instrument into the digitiser's input range, so its "
+            "spread measures the rail and not lift-off. Reduce the "
+            "instrument's gain (or re-null it) until the whole tilt sweep "
+            "stays inside range, and fly the take again."
+            % (n,
+               "%+g deg" % p["tilt_deg"] if p.get("tilt_deg") is not None
+               else "unknown",
+               worst))
         return out
 
     out["liftoff_mean"] = float(np.mean(h))
@@ -472,6 +584,15 @@ def report(result):
         add("")
         add("  the ruler: UNAVAILABLE -- spreads below are in raw signal units "
             "and cannot be compared to anything.")
+
+    excluded = (result["axis_detail"].get("excluded")
+                or result.get("step_detail", {}).get("excluded") or [])
+    if excluded:
+        add("")
+        add("  EXCLUDED from the axis and the ruler (%d of %d pass(es)):"
+            % (len(excluded), len(result["passes"])))
+        for name, why in excluded:
+            add("    %-20s %s" % (name, why))
 
     add("")
     add("  per pass:")

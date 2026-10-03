@@ -1,0 +1,676 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  ec_trace_store.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-10-02
+# Description:
+#   Writes an eddy-current scan's traces to disk one pass at a time, and
+#   rebuilds the projected image from those files alone.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-10-02:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# AN EDDY-CURRENT SCAN THAT SURVIVES THE PROCESS THAT TOOK IT
+# ==============================================================================
+# The recording database is in memory. On 2026-10-02 an EC scan ran 59 of 64
+# passes over 28 minutes -- live projection working, real indications visible --
+# and then wedged. The process was killed, and because nothing had ever been
+# written to disk, all 59 passes went with it. The operator asked for the run to
+# be reprojected offline and there was nothing on disk to reproject. The meshes
+# survived because the meshes are files.
+#
+# Two halves, and they are separable on purpose:
+#
+#   ECPassRecorder   writes one npz per COMPLETED PASS, on the scan thread, in
+#                    the window after the stager has drained and before the
+#                    "pass N/M" line prints. Per pass, because end of scan is
+#                    exactly the case that does not happen.
+#   replay_ec_scan   rebuilds the projected image from those files and nothing
+#                    else -- a different session, a different day, after a crash
+#                    -- with the conditioning rotation and gain overridable,
+#                    which is the whole reason to do it offline.
+#
+# WHAT THE RECORDER MAY NOT DO. It runs on the scan thread between passes, so:
+#
+#   * it must be BOUNDED. It slices this pass's traces out of the arrays that
+#     are already there, so the cost is the pass's own length and not the
+#     scan's.
+#   * it must not need a globalrev. The scan's sustainable rate is already set
+#     by two serialised globalrev waits per trace (stage_ec_reading); a third
+#     wait between passes would be a third thing that can stall. It only READS
+#     recdb.latest, which is the same thing the live projection and
+#     ec_null_from_traces already do.
+#   * it must not be able to propagate. A failure to save is a warning and a
+#     counter, never a lost pass -- the data is in the database either way and
+#     the arm is on the part. Exception and not BaseException: a Ctrl-C during
+#     the write must still stop the scan.
+#
+# The arithmetic, the file format and the reading are in ec_trace_store.py, so
+# they are testable on the host with no snde, no ROS and no robot. This file is
+# the wiring: the recording database on one side and the projector on the other.
+
+import os
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global ECPassRecorder
+global ec_scan_run_dir
+global ec_run_dir
+global ec_pass_recorder
+global ec_save_status
+global replay_ec_scan
+global ec_replay_projector
+global ec_replay_report
+global list_ec_runs
+global ec_trace_store_module
+
+#: The directory this session's most recent eddy-current scan wrote its passes
+#: to. None until a scan has started one. Printed in the scan report so the
+#: operator does not have to go looking for it.
+ec_run_dir = None
+
+#: The projector a replay paints into, kept so a second replay -- a different
+#: rotation, a different component -- reuses the loaded surface instead of
+#: stranding another model tree. See SurfaceProjector.restart().
+ec_replay_projector = None
+
+#: What the last replay_ec_scan() did.
+ec_replay_report = None
+
+#: The ec_trace_store python module, once something has needed it.
+ec_trace_store_module = None
+
+
+def _store():
+    """The ec_trace_store python module.
+
+    Imported lazily and through SCAN_MODULE_DIR for the same reason
+    loadable_projection_surface() does it: a live config includes this file
+    before anything has added the module directory to sys.path, and the config
+    is what knows where that is.
+    """
+    global ec_trace_store_module
+    if ec_trace_store_module is not None:
+        return ec_trace_store_module
+    try:
+        import ec_trace_store
+    except ImportError:
+        import sys as _sys
+        module_dir = globals().get("SCAN_MODULE_DIR")
+        if module_dir and module_dir not in _sys.path:
+            _sys.path.insert(0, module_dir)
+        import ec_trace_store
+    ec_trace_store_module = ec_trace_store
+    return ec_trace_store
+
+
+def ec_scan_run_dir(root=None, label="ec_scan", when=None):
+    """Make this scan's output directory and return it.
+
+    BESIDE THE MESHES, under _scan_work_dir() -- which is SCAN_STORAGE_DIR, the
+    path the config resolved from what the site says, then the mount the cell
+    actually has, then this account's home. Not a hardcoded home directory: the
+    cell PC runs under a different account and writes to /data/scandata.
+
+    ONE DIRECTORY PER RUN, named by the time the scan started, because the mesh
+    names are not unique -- every run of the pipeline writes specimen_azure.ply
+    and specimen_keyence.ply to the same place and each overwrites the last.
+    Trace data must not work that way: a scan is the thing that cannot be
+    repeated.
+    """
+    if root is None:
+        work = globals().get("_scan_work_dir")
+        root = work() if callable(work) else globals().get("SCAN_STORAGE_DIR")
+    if not root:
+        raise RuntimeError(
+            "there is nowhere to write this scan's traces: neither "
+            "_scan_work_dir() nor SCAN_STORAGE_DIR named a directory. Set "
+            "SCAN_STORAGE_DIR (or TARI_SCANDATA in the environment) -- without "
+            "it the scan exists only in this process's memory, which is what "
+            "lost 59 passes on 2026-10-02.")
+    stamp = time.strftime("%Y-%m-%d_%H%M%S", time.localtime(when or time.time()))
+    path = os.path.join(root, "%s_%s" % (label, stamp))
+    if not os.path.isdir(path):
+        os.makedirs(path)
+    return path
+
+
+class ECPassRecorder(object):
+    """Writes one completed pass of an eddy-current scan to disk.
+
+    Called as `recorder(pass_index, segment_report)` from
+    run_triggered_path_scan()'s per-pass window, and NEVER RAISES: it returns
+    (ok, why) and counts its own failures. The caller is mid-scan with the probe
+    on the part, and the traces are safely in the recording database whether
+    this works or not -- so a save that fails is a warning about the next crash,
+    not a reason to abandon a measurement.
+
+    Deliberately has no reference to the recording database, the accumulator or
+    the config. It is given:
+
+      run_dir     where to write
+      read_array  read_array(channel_path) -> numpy array. One callable, so this
+                  class can be driven from a dict in a host test with no snde.
+      state       state() -> dict, called ONCE PER PASS. Returning the live
+                  values rather than holding them is what makes this correct
+                  across the moment the conditioning gets wired: that happens in
+                  the scan's setup_after_first hook, AFTER this recorder is
+                  built, and a recorder holding a snapshot would record "no
+                  conditioning" for the whole scan.
+
+    state() keys, all optional except `accum`:
+
+      accum                    the TraceAccumulator: .staged, .traces_path,
+                               .poses_path
+      cond_paths               {"vertical": channel, ...} or None
+      component                which conditioned scalar the scan is projecting
+      null / rotation_deg /    the conditioning parameters in force
+      gain
+      x3d / mesh               the surface and the mesh it came from
+      pitch_m                  trace pitch, which is what makes s_m meaningful
+      projection_radius_m /    what the live projector was built with, so a
+      projection_pixels        replay can reproduce the same image
+      trigger_report           dict, or a callable returning one
+      label                    what this scan was
+    """
+
+    #: Only the first few failures are printed. One recurring fault over 64
+    #: passes buries the pass-progress lines, which are what an operator is
+    #: actually reading.
+    PRINT_FIRST = 3
+
+    def __init__(self, run_dir, read_array, state, say=None):
+        self.run_dir = run_dir
+        self.read_array = read_array
+        self.state = state
+        self.say = print if say is None else say
+        #: The first trace index of the next pass to be written. The trace list
+        #: is one flat array for the whole scan, so a pass is a slice of it, and
+        #: this is the only thing that says where one pass ends and the next
+        #: begins. It is advanced only by a SUCCESSFUL write, so a pass whose
+        #: save failed is retried as part of the next one rather than lost.
+        self.next_index = 0
+        #: The highest pass index written, so flush() can name the next file
+        #: without being told which pass was in flight.
+        self.last_pass = None
+        self.saved = 0
+        self.traces_saved = 0
+        self.errors = 0
+        self.last_error = None
+        self.files = []
+
+    def flush(self):
+        """Save whatever has been staged since the last completed pass.
+
+        FOR THE PASS THAT WAS IN FLIGHT WHEN A SCAN STOPPED. The per-pass hook
+        only fires on a pass that finished, so a scan abandoned mid-sweep --
+        Ctrl-C, the pendant dropping External Control, a supervisor abort --
+        would otherwise leave that pass's traces behind. They are real
+        measurements at real poses, which is all a replay needs.
+
+        Marked `partial` in the metadata, because they are NOT a pass: the
+        sweep did not finish, so the coverage they represent is whatever the arm
+        managed before it stopped, and nothing downstream should treat them as a
+        complete line.
+
+        IT CANNOT HELP A PROCESS THAT IS KILLED OR WEDGED -- nothing running in
+        the process can. It covers the abort, which is the common case: both
+        eddy-current scans of 2026-10-01 ended that way.
+        """
+        return self(0 if self.last_pass is None else self.last_pass + 1,
+                    {"partial": True})
+
+    def __call__(self, pass_index, segment_report=None):
+        try:
+            return self._save(pass_index, segment_report)
+        except Exception as e:                                # noqa: BLE001
+            # Exception, not BaseException: a KeyboardInterrupt here is the
+            # operator stopping the scan and must not be swallowed by the
+            # thing that was supposed to make the scan survivable.
+            self.errors += 1
+            self.last_error = "%s: %s" % (type(e).__name__, e)
+            if self.errors <= self.PRINT_FIRST:
+                self.say("  WARNING: pass %d was NOT saved to disk (%s). The "
+                         "scan continues and the traces are in the recording "
+                         "database -- but they will not survive this process."
+                         % (pass_index + 1, self.last_error))
+                if self.errors == self.PRINT_FIRST:
+                    self.say("  (further save failures counted, not printed -- "
+                             "ec_save_status())")
+            return (False, self.last_error)
+
+    def _save(self, pass_index, segment_report):
+        st = dict(self.state() or {})
+        accum = st.get("accum")
+        if accum is None:
+            return (False, "no trace accumulator")
+
+        k0 = int(self.next_index)
+        k1 = int(getattr(accum, "staged", 0))
+        if k1 <= k0:
+            return (False, "no new traces since the last saved pass")
+
+        poses = np.asarray(self.read_array(accum.poses_path)).reshape(-1, 7)
+        traces = np.asarray(self.read_array(accum.traces_path)).reshape(-1)
+        k1 = min(k1, len(poses), len(traces))
+        if k1 <= k0:
+            return (False,
+                    "the trace list holds %d entries but the accumulator says "
+                    "%d were staged" % (min(len(poses), len(traces)),
+                                        getattr(accum, "staged", 0)))
+
+        cond = None
+        cond_paths = st.get("cond_paths") or {}
+        component = st.get("component") or "vertical"
+        if component in cond_paths:
+            try:
+                cond = np.asarray(
+                    self.read_array(cond_paths[component])).reshape(-1)[k0:k1]
+            except Exception as e:                            # noqa: BLE001
+                # The conditioned column is a convenience and a cross-check;
+                # the raw impedance and the poses are the measurement. Losing
+                # the first must not lose the second.
+                cond = None
+                self.say("  (pass %d saved without its conditioned column: %s)"
+                         % (pass_index + 1, e))
+
+        pitch = st.get("pitch_m")
+        n = k1 - k0
+        # s_m BY CONSTRUCTION, not measured: the trigger fires once per pitch of
+        # travel along the pass, so trace j of a pass is at j*pitch by
+        # definition -- that is what triggered_acquisition.dpi's header means by
+        # "the trigger is the index". Where the probe actually WAS is in `pose`,
+        # which is the measured quantity.
+        s_m = (np.arange(n, dtype=np.float64)*float(pitch)
+               if pitch else None)
+
+        report = st.get("trigger_report")
+        if callable(report):
+            try:
+                report = report()
+            except Exception:                                 # noqa: BLE001
+                report = None
+
+        meta = {"pass_index": int(pass_index),
+                "trace_index_first": k0,
+                "trace_index_last": k1 - 1,
+                "wall_time": time.time(),
+                "x3d": st.get("x3d"),
+                "mesh": st.get("mesh"),
+                "component": component,
+                "null": tuple(st.get("null") or (0.0, 0.0)),
+                "rotation_deg": float(st.get("rotation_deg") or 0.0),
+                "gain": tuple(st.get("gain") or (1.0, 1.0)),
+                "conditioned_channel": cond_paths.get(component),
+                "traces_channel": accum.traces_path,
+                "poses_channel": accum.poses_path,
+                "pitch_m": pitch,
+                "s_m_from": "trigger index x pitch",
+                "projection_radius_m": st.get("projection_radius_m"),
+                "projection_pixels": st.get("projection_pixels"),
+                "label": st.get("label"),
+                # NOT a completed pass: the sweep was abandoned part way, so
+                # the coverage is whatever the arm managed. Hoisted out of the
+                # segment report so a reader does not have to go looking.
+                "partial": bool((segment_report or {}).get("partial")),
+                "parameters_from": st.get("parameters_from"),
+                "path_source": st.get("path_source"),
+                "segment_report": segment_report,
+                "trigger_report": report}
+
+        path = _store().write_pass(self.run_dir, pass_index, poses[k0:k1],
+                                   traces[k0:k1], conditioned=cond, s_m=s_m,
+                                   trace_index=np.arange(k0, k1), meta=meta)
+        # Only now: a pass whose write raised is re-attempted, widened, by the
+        # next pass's save, so a transient full disk costs nothing permanent.
+        self.next_index = k1
+        self.last_pass = (int(pass_index) if self.last_pass is None
+                          else max(self.last_pass, int(pass_index)))
+        self.saved += 1
+        self.traces_saved += n
+        self.files.append(path)
+        return (True, path)
+
+    def status(self):
+        return {"run_dir": self.run_dir, "saved_passes": self.saved,
+                "saved_traces": self.traces_saved, "errors": self.errors,
+                "last_error": self.last_error, "files": list(self.files)}
+
+    def describe(self):
+        lines = ["  traces on disk: %d pass(es), %d trace(s) in %s"
+                 % (self.saved, self.traces_saved, self.run_dir)]
+        if self.errors:
+            lines.append("    %d pass(es) could NOT be saved; last was %s"
+                         % (self.errors, self.last_error))
+            lines.append("    those passes are in the recording database only "
+                         "and will not survive this process")
+        if not self.saved:
+            lines.append("    ** NOTHING WAS WRITTEN. A scan that stops now "
+                         "leaves no trace data at all -- which is the failure "
+                         "this file exists to prevent. Check that the "
+                         "directory above is writable.")
+        return "\n".join(lines)
+
+
+def ec_pass_recorder(run_dir=None, label="ec_scan", state=None, root=None):
+    """The per-pass recorder for the scan that is about to run. -> ECPassRecorder
+
+    Reads the eddy-current scan's own globals through `state`, which is called
+    once per pass so it always sees the CURRENT conditioning -- the conditioning
+    is wired in the scan's setup_after_first hook, after this is built.
+
+    Leaves the directory in `ec_run_dir`.
+    """
+    global ec_run_dir
+    ec_run_dir = run_dir or ec_scan_run_dir(root=root, label=label)
+
+    def read_array(path):
+        return np.asarray(recdb.latest.ref[path].data)
+
+    return ECPassRecorder(ec_run_dir, read_array, state)
+
+
+def ec_save_status(recorder=None, quiet=False):
+    """Is this scan's data actually reaching the disk? -> dict
+
+    The counterpart of ec_projection_status(): that one answers "is it reaching
+    the image", this one answers "would it survive the process dying". Both
+    questions have the same shape -- nothing says no on its own.
+    """
+    recorder = (globals().get("ec_pass_saver") if recorder is None
+                else recorder)
+    if recorder is None:
+        if not quiet:
+            print("  traces on disk: NO RECORDER -- either no scan has run in "
+                  "this session or it was started with save=False. Nothing is "
+                  "being written; the traces exist only in this process.")
+        return {"run_dir": None, "saved_passes": 0, "saved_traces": 0,
+                "errors": 0, "last_error": None, "files": []}
+    if not quiet:
+        print(recorder.describe())
+    return recorder.status()
+
+
+def list_ec_runs(root=None):
+    """Saved eddy-current runs, oldest first, with what is in each. -> list
+
+    What to call before replay_ec_scan() when it is not obvious which run is
+    wanted -- after a crash, the newest is usually the one, and that is what
+    replay_ec_scan() takes by default.
+    """
+    if root is None:
+        work = globals().get("_scan_work_dir")
+        root = work() if callable(work) else globals().get("SCAN_STORAGE_DIR")
+    store = _store()
+    out = []
+    for path in store.run_directories(root):
+        files = store.pass_files(path)
+        entry = {"dir": path, "passes": len(files), "traces": None, "x3d": None}
+        try:
+            # The LAST pass only: reading every file of a 64-pass run to list
+            # it is the kind of thing that makes a listing not worth calling.
+            last = store.read_pass(files[-1])
+            entry["x3d"] = last["meta"].get("x3d")
+            # The trace list is one flat array and every pass records where its
+            # slice ended, so the last pass's end IS the run's trace count --
+            # without reading the other 63 files. A file that does not say
+            # answers "?" rather than the last pass's own count, which would
+            # look like a cumulative figure and would not be one.
+            end = last["meta"].get("trace_index_last")
+            entry["traces"] = None if end is None else int(end) + 1
+        except Exception as e:                                # noqa: BLE001
+            entry["error"] = "%s: %s" % (type(e).__name__, e)
+        out.append(entry)
+        print("  %s -- %d pass(es), %s trace(s)%s"
+              % (os.path.basename(path), entry["passes"],
+                 entry["traces"] if entry["traces"] is not None else "?",
+                 "  [%s]" % entry["error"] if entry.get("error") else ""))
+    if not out:
+        print("  no saved eddy-current runs under %s" % (root,))
+    return out
+
+
+def replay_ec_scan(run_dir=None, component=None, rotation_deg=None, gain=None,
+                   null=None, x3d=None, passes=None, radius=None, pixels=None,
+                   prefix="/ec/replay", root=None, quiet=False):
+    """Rebuild the projected image of a saved eddy-current scan. -> dict
+
+    THE OFFLINE REPROJECTION PATH, and the EC counterpart of project_traces().
+    It needs the pass files and the surface .x3d and nothing else: no robot, no
+    instrument, no earlier scan in this session, no surviving recording
+    database. That is the point -- the run it exists for is one whose process
+    was killed.
+
+        replay_ec_scan()                        the newest saved run, as scanned
+        replay_ec_scan(rotation_deg=40.0)       the same traces, rotated
+        replay_ec_scan(component="magnitude")   ... ignoring the rotation
+
+    ROTATION AND GAIN ARE OVERRIDABLE BECAUSE THAT IS THE USE CASE. Setting the
+    rotation IS the setup procedure for an eddy-current inspection -- it is
+    turned until lift-off lies horizontal and what is left vertically is the
+    part -- and it is chosen by eye, during setup, before anything has been
+    scanned. The note from the lost run of 2026-10-02 was "I rotated the scan
+    line noise to be horizontal and it does appear that notches were showing up
+    as a vertical response", which is a decision made while watching, and the
+    only way to revisit it is from the RAW impedance. That is why the pass files
+    carry the raw complex value and not only the conditioned scalar.
+
+    The replay paints into its own prefix (/ec/replay), so it can be compared
+    against a live image in the same session rather than drawn over it.
+
+    Returns {"projected", "skipped", "elapsed", "run", "traces", "surface",
+    "conditioning", "check", "covers", "channel", "status"} -- `channel` being
+    where the rebuilt image is, and `status` whether anything landed on it.
+    Also left in ec_replay_report.
+    """
+    global ec_replay_projector, ec_replay_report
+    store = _store()
+
+    if run_dir is None:
+        if root is None:
+            work = globals().get("_scan_work_dir")
+            root = work() if callable(work) else globals().get("SCAN_STORAGE_DIR")
+        run_dir = store.latest_run(root)
+        if run_dir is None:
+            raise RuntimeError(
+                "no saved eddy-current run under %s to replay. A scan writes "
+                "one directory per run, one file per completed pass; a run that "
+                "died before its first pass finished has nothing on disk. "
+                "list_ec_runs() shows what there is." % (root,))
+
+    run = store.read_run(run_dir, passes=passes)
+    if not quiet:
+        print(store.describe_run(run))
+
+    # WHICH SURFACE. The one the scan recorded, unless the caller names another
+    # -- which is legitimate: a reparameterized surface is exactly the sort of
+    # thing worth trying offline. A missing one is refused here, naming what the
+    # files said, rather than deeper inside the loader.
+    surface = x3d if x3d is not None else run["x3d"]
+    if not surface:
+        raise RuntimeError(
+            "the saved passes in %s do not say which surface they were "
+            "projected onto, so there is nothing to project them onto now. "
+            "Pass x3d= the parameterized surface for this part."
+            % (run_dir,))
+    if not os.path.exists(surface):
+        raise IOError(
+            "the surface this run was scanned against is gone: %s\n"
+            "  The traces are intact -- they carry their own poses -- so this "
+            "is recoverable: re-parameterize the mesh (%s) and pass the new "
+            "x3d= here. It must be the SAME geometry, in the same world "
+            "coordinates, or the image will be empty with no error."
+            % (surface, run.get("mesh") or "unknown"))
+
+    # The conditioning actually used, override by override, so the report says
+    # what produced the image rather than what was asked for.
+    cond = {"component": component or run["component"],
+            "null": tuple(null) if null is not None else run["null"],
+            "rotation_deg": (float(rotation_deg) if rotation_deg is not None
+                             else run["rotation_deg"]),
+            "gain": tuple(gain) if gain is not None else run["gain"]}
+    cond["overridden"] = sorted(
+        k for k, v in (("component", component), ("null", null),
+                       ("rotation_deg", rotation_deg), ("gain", gain))
+        if v is not None)
+
+    # THE SELF-CHECK, and only when nothing was overridden: with the saved
+    # parameters this numpy conditioning must reproduce the compiled C++ one,
+    # trace for trace. That is what makes "the replay shows the same image the
+    # scan showed" a measurement rather than a claim. With an override it is
+    # deliberately a different answer and there is nothing to compare.
+    check = None
+    if not cond["overridden"]:
+        check = store.condition_matches_stored(run)
+        if not quiet and check["checked"]:
+            print("  %s" % (check["why"],))
+        elif not quiet:
+            print("  (no stored conditioned column, so the replay's own "
+                  "conditioning could not be checked against the scan's)")
+
+    values = store.component_values(run["impedance"], cond["component"],
+                                    null=cond["null"],
+                                    rotation_deg=cond["rotation_deg"],
+                                    gain=cond["gain"])
+
+    # The projector the live scan was built with, when the files say, so the
+    # replayed image is the same resolution and the same spot size. Falling back
+    # to the settings as they stand now is right for a fresh session that never
+    # ran the scan.
+    if radius is None:
+        radius = run["projection_radius_m"]
+    if pixels is None:
+        pixels = run["projection_pixels"]
+    if radius is None or pixels is None:
+        settings = globals().get("projection_settings")
+        if callable(settings):
+            auto_radius, auto_pixels = settings()
+            radius = auto_radius if radius is None else radius
+            pixels = auto_pixels if pixels is None else pixels
+    radius = 0.003 if radius is None else float(radius)
+    pixels = 512 if pixels is None else int(pixels)
+
+    # Through SurfaceProjector, so the replay inherits loadable_x3d()'s gate on
+    # the way in: a surface with one inconsistently wound edge ABORTS the
+    # process inside x3d_load_geometry, and a MIRRORED parameterization makes
+    # every projected weight zero and leaves the image empty with no error at
+    # all. Both are repaired or refused before anything is allocated.
+    reuse, why = projection_surface_reusable(ec_replay_projector, surface)
+    if reuse:
+        ec_replay_projector.radius = radius
+        ec_replay_projector.horizontal_pixels = pixels
+        ec_replay_projector.vertical_pixels = pixels
+        ec_replay_projector.restart()
+        if not quiet:
+            print("  replay surface reused (image cleared): %s" % (surface,))
+    else:
+        if ec_replay_projector is not None:
+            ec_replay_projector.teardown()
+            ec_replay_projector = None
+            if not quiet:
+                print("  rebuilding the replay surface -- %s" % (why,))
+        ec_replay_projector = SurfaceProjector(recdb, surface, prefix=prefix,
+                                               radius=radius,
+                                               horizontal_pixels=pixels,
+                                               vertical_pixels=pixels)
+        if not quiet:
+            print("  replay surface: %s  (projecting %s at %.2f mm spot, %d px)"
+                  % (surface, cond["component"], radius*1e3, pixels))
+
+    # IS THAT SURFACE UNDER THESE POSES? The same check the scan runs against
+    # its toolpath, asked of the recorded poses -- which is the honest version
+    # of it here, because the poses ARE where the probe went. A refusal names
+    # both boxes; without it the whole replay would run and paint nothing, and
+    # nothing would say so.
+    covers = check_projection_covers_path(ec_replay_projector, run["position"],
+                                          what="saved trace poses")
+
+    started = time.monotonic()
+    done = 0
+    skipped = 0
+    gr = None
+    for k in range(len(values)):
+        pose7 = run["pose"][k]
+        if not float(np.linalg.norm(pose7[:4])) > 1e-6:
+            skipped += 1          # never staged: a zero quaternion is no pose
+            continue
+        if not np.isfinite(values[k]):
+            skipped += 1
+            continue
+        # wait=False per point with ONE wait at the end, the same way
+        # project_traces() does it and for the same reason: each projection is a
+        # transaction into mutable storage so they must all land, but nothing
+        # else is producing, so they need not land one at a time. Measured on
+        # the ultrasound path at 11x the live rate.
+        gr = ec_replay_projector.project(pose7, float(values[k]), wait=False)
+        done += 1
+    if gr is not None:
+        gr.globalrev_wait().wait_complete()
+    elapsed = time.monotonic() - started
+
+    out = {"projected": done, "skipped": skipped, "elapsed": elapsed,
+           "run": run_dir, "traces": run["traces"], "surface": surface,
+           "conditioning": cond, "check": check, "covers": covers,
+           "channel": ec_replay_projector.projection_channel,
+           "status": ec_replay_projector.projection_status(quiet=True)}
+    ec_replay_report = out
+    if not quiet:
+        print("  replayed %d trace(s) in %.1f s (%.1f traces/s)%s"
+              % (done, elapsed, done/elapsed if elapsed > 0 else 0.0,
+                 ", %d skipped" % skipped if skipped else ""))
+        note = ("   (overridden: %s)" % (", ".join(cond["overridden"]),)
+                if cond["overridden"] else "   (as scanned)")
+        print("  conditioning used: component %s, null (%.5f, %.5f), rotation "
+              "%.1f deg, gain h=%.2f v=%.2f%s"
+              % ((cond["component"],) + tuple(cond["null"])
+                 + (cond["rotation_deg"],) + tuple(cond["gain"]) + (note,)))
+        print(describe_projection_status(out["status"]))
+        print("  the replayed image is on %s" % (out["channel"],))
+    return out

@@ -24,6 +24,7 @@
 
 import time
 import threading
+import traceback
 try:
     import queue
 except ImportError:
@@ -52,13 +53,14 @@ class TraceStager:
     before trace k+1, which is what makes the trigger index the trace index.
     """
 
-    def __init__(self, stage, maxsize=4096):
+    def __init__(self, stage, maxsize=4096, print_errors=3):
         self._stage = stage
         self._q = queue.Queue(maxsize)
         self._quit = False
         self.staged = 0
         self.errors = 0
         self.last_error = None
+        self.print_errors = print_errors
         self.max_depth = 0
         self._thread = threading.Thread(target=self._run)
         self._thread.daemon = True
@@ -74,9 +76,30 @@ class TraceStager:
             try:
                 self._stage(*item)
                 self.staged += 1
-            except Exception as e:
+            except Exception:
                 self.errors += 1
-                self.last_error = e
+                # STORE THE FORMATTED TRACEBACK, NEVER THE EXCEPTION OBJECT.
+                # Retaining the exception retains e.__traceback__, which retains
+                # the frame it was raised in, which retains that frame's locals
+                # -- including any active_transaction it was holding. An
+                # active_transaction ends itself in its destructor, so an
+                # exception thrown mid-transaction normally self-heals when the
+                # frame is collected; pinning it here means the transaction is
+                # NEVER ended. Under the timed transaction manager the
+                # transaction map is committed strictly in order from the head,
+                # so one unended transaction blocks every globalrev wait in the
+                # whole process, for good, with nothing printed anywhere.
+                # 2026-10-02: a scan froze between pass 59 and 60 of 64 and all
+                # 59 completed passes were lost. format_exc() keeps everything
+                # worth keeping and holds no references.
+                self.last_error = traceback.format_exc()
+                # Printed when it happens, not only in the end-of-scan report.
+                # The report is written after the last pass, which is exactly
+                # the run that does not reach it.
+                if self.errors <= self.print_errors:
+                    print("  ** staging error %d of this scan:" % (self.errors,))
+                    for line in self.last_error.rstrip().split("\n"):
+                        print("     %s" % (line,))
             finally:
                 self._q.task_done()
 
@@ -88,12 +111,64 @@ class TraceStager:
             self.max_depth = d
 
     def drain(self, timeout=120.0):
-        """Wait for everything queued so far to be staged."""
+        """Wait for everything queued so far to be staged.
+
+        THE TIMEOUT USED TO BE COSMETIC. The polling loop below was bounded,
+        but the `self._q.join()` that followed it was not and ran whether or
+        not the deadline had expired -- so a worker stuck inside one _stage()
+        blocked here for good and the 120 s meant nothing. A scan froze exactly
+        here on 2026-10-02, between pass 59 and 60 of 64, and printed nothing
+        at all for 27 minutes: every wait in the staging path is an
+        uninterruptible globalrev wait with no deadline, and the counters that
+        would have explained it are only printed in the end-of-scan report,
+        which that run never reached.
+
+        So it still waits indefinitely -- abandoning a half-staged trace would
+        be worse -- but it now SAYS SO, once, with the state needed to tell the
+        three candidate causes apart.
+        """
         deadline = time.monotonic() + timeout
-        while not self._q.empty() and time.monotonic() < deadline:
+        while self._unfinished() and time.monotonic() < deadline:
             time.sleep(0.01)
+        if self._unfinished():
+            self._stalled_note(timeout)
         self._q.join()
         return self.staged
+
+    def _unfinished(self):
+        """Queued items not yet task_done()'d -- exactly what join() waits on.
+
+        Read defensively: a diagnostic must never be the thing that raises.
+        """
+        return getattr(self._q, "unfinished_tasks", self._q.qsize())
+
+    def _stalled_note(self, waited):
+        """Everything that tells the candidate causes apart, printed once."""
+        print("  ** STAGING STALLED: still waiting after %.0f s -- %d trace(s) "
+              "queued, %d staged, %d error(s)"
+              % (waited, self._unfinished(), self.staged, self.errors))
+        # The recording database is a dgpy global owned by the .dgp rather than
+        # something this module is handed, so ask for it rather than requiring
+        # it. str(recdb) is "latest ready/latest defined", and ready lagging
+        # defined is a globalrev that cannot complete -- a different fault from
+        # a stage that is merely slow.
+        try:
+            db = globals().get("recdb")
+            print("     recdb: %s" % (db,) if db is not None
+                  else "     recdb: not reachable from this module")
+        except Exception:
+            print("     recdb: could not be read")
+        if self.last_error:
+            print("     the last staging error was:")
+            for line in self.last_error.rstrip().split("\n"):
+                print("       %s" % (line,))
+            print("     an error inside a transaction is the known way to wedge "
+                  "this: see the note in _run().")
+        else:
+            print("     no staging error has been recorded, so this is a stage "
+                  "that has not returned rather than one that failed.")
+        print("     the scan is NOT abandoning the trace; it will continue if "
+              "the stage completes.")
 
     def stop(self):
         self._q.put(None)
@@ -120,7 +195,7 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
                             approach, sweep, stage, pose_at,
                             setup_after_first=None, segments=None,
                             progress=None, on_segment_failure="stop",
-                            traces_per_segment=None):
+                            traces_per_segment=None, on_pass=None):
     """Acquire along scan_path, one trace per pitch_m of travel.
 
     Callables, all supplied by the caller:
@@ -177,6 +252,28 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
     path where the trace list is the product. Do not derive a raster's count
     that way: its pitch is row/(m-1), so the ratio sits exactly on an integer
     and floor() lands either side of it from one row to the next.
+
+    on_pass(index, segment_report) is called once per pass that acquired
+    anything, after the stager has drained and before the progress line prints
+    -- the one moment in a scan when the arm is off the part, nothing is being
+    staged, and the trace list is quiescent. It is where an instrument puts its
+    data somewhere that survives this process: an eddy-current scan used to
+    write nothing to disk at any point, and on 2026-10-02 a run of 59 completed
+    passes was lost in full when the process was killed, because the recording
+    database IS the dataset until something writes it out.
+
+    PER PASS AND NOT AT THE END, because the end is exactly the case that does
+    not happen. It runs on the SCAN THREAD, so what it does must be bounded and
+    must not need a globalrev -- the sustainable trace rate is already set by
+    two serialised globalrev waits per trace and a third wait here is a third
+    thing that can stall a scan with the probe on the part.
+
+    ITS FAILURES ARE ITS OWN. Anything it raises is caught here, counted in
+    report["pass_hook_errors"] and reported, and the scan carries on: whatever
+    it was for, it was not the measurement, and the measurement is already in
+    the database. A KeyboardInterrupt is NOT caught -- the operator stopping a
+    scan must not be swallowed by the thing that was meant to make the scan
+    survivable.
     """
     if segments is None:
         segments = scan_path.acquiring_segments()
@@ -298,6 +395,29 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
         report["over_budget"] = report.get("over_budget", 0) + over
         staged_here = [triggered_here[0]+1]
 
+        # THIS PASS, SOMEWHERE THAT SURVIVES THE PROCESS. After drain(), so
+        # every trace of the pass is in the database and the hook can read it;
+        # before progress(), so the operator's "pass N/M" line is the last word
+        # about the pass and a save failure is printed above it rather than
+        # after.
+        #
+        # Exception and not BaseException: a Ctrl-C during the write is the
+        # operator stopping the scan and must still stop it. Counted as well as
+        # printed, because the hook's own report is written at the end of the
+        # scan and the run that needs it does not get there.
+        if on_pass is not None:
+            try:
+                on_pass(si, report["per_segment"][-1])
+            except Exception as e:                            # noqa: BLE001
+                report.setdefault("pass_hook_errors", []).append(
+                    {"segment": si, "error": "%s: %s" % (type(e).__name__, e)})
+                if len(report["pass_hook_errors"]) <= 3:
+                    print("  WARNING: the per-pass hook failed after pass %d "
+                          "(%s: %s). The scan continues -- the traces are in "
+                          "the recording database -- but whatever that hook "
+                          "was for did not happen for this pass."
+                          % (si+1, type(e).__name__, e))
+
         if progress is not None:
             progress(si, len(segments), report["per_segment"][-1],
                      time.monotonic()-report["started"])
@@ -323,7 +443,7 @@ def run_triggered_path_scan(scan_path, source, pitch_m,
     stager.stop()
     report["stager_staged"] = stager.staged
     report["stager_errors"] = stager.errors
-    report["stager_last_error"] = repr(stager.last_error) if stager.last_error else None
+    report["stager_last_error"] = stager.last_error
     report["stager_max_queue_depth"] = stager.max_depth
     report["elapsed"] = time.monotonic() - report["started"]
     return report

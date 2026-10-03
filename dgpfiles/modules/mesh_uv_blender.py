@@ -27,6 +27,10 @@ import sys
 import bpy
 import numpy as np
 
+# Pure numpy, no bpy: the same module the projection loader uses to check a
+# surface, so the orientation rule is written down in exactly one place.
+import x3d_winding
+
 
 def load_mesh(src):
     for obj in list(bpy.context.scene.objects):
@@ -84,6 +88,26 @@ def unwrap_planar(obj):
     centre = co.mean(axis=0)
     _, sv, vt = np.linalg.svd(co - centre, full_matrices=False)
     e0, e1 = vt[0], vt[1]
+
+    # THE SVD PINS DOWN THE PLANE BUT NOT THE HANDEDNESS OF THE BASIS IN IT.
+    # numpy is free to return -e1, and does, about half the time; the resulting
+    # UV map is a perfectly good MIRROR IMAGE and nothing downstream notices
+    # until project_onto_parameterization takes the square root of a negative
+    # determinant, gets a NaN, and silently deposits zero weight for every ray.
+    # Two consecutive scan runs on 2026-10-02 threw away 1876 and 1673 traces
+    # into an empty image this way, and a third run of the same morning worked
+    # -- the only difference was this sign. Pin it to the surface's own outward
+    # direction so the orientation is a property of the part rather than of the
+    # decomposition, which also makes the image comparable between runs.
+    areas = np.array([poly.area for poly in me.polygons])
+    normals = np.array([poly.normal[:] for poly in me.polygons])
+    outward = (normals * areas[:, None]).sum(axis=0)
+    e0, e1, flipped = x3d_winding.orient_uv_basis(e0, e1, outward)
+    print("MESHUV planar handedness %s (|mean normal| %.4f of %.4f m2 of area)"
+          % ("FLIPPED to match the surface normal" if flipped
+             else "already matched the surface normal",
+             float(np.linalg.norm(outward)), float(areas.sum())))
+
     proj = np.stack([(co-centre) @ e0, (co-centre) @ e1], axis=1)
     lo = proj.min(axis=0)
     span = float((proj.max(axis=0) - lo).max())
