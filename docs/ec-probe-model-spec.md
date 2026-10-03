@@ -60,10 +60,22 @@ entire problem we are trying to solve.
 
 Tilt must be parameterised as two independent angles:
 
-- **tilt_parallel** — about the axis joining the two coil centres. Maximally
-  flaw-like. This is the one that hurts.
-- **tilt_perpendicular** — about the orthogonal in-plane axis. Largely
-  common-mode, should behave much more like uniform lift-off.
+**Define them by what they DO, because the names alone are ambiguous and an
+earlier draft of this section got the geometry backwards.** Put the two coils on
+the probe-frame x axis, so the split line between them runs along y:
+
+- **`tilt_parallel`** — rotation about the **split line** (y). One D rises and
+  the other falls, so the two coils see different lift-offs. **Differential,
+  flaw-like. This is the one that hurts.**
+- **`tilt_perpendicular`** — rotation about the **line joining the coil
+  centres** (x). Both coils lie on that axis, so neither changes height
+  relative to the other. **Common-mode**, and should behave much more like
+  uniform lift-off.
+
+The unambiguous test, which overrides any wording above: **if a tilt raises one
+coil and lowers the other it is `tilt_parallel`; if it moves both the same way
+it is `tilt_perpendicular`.** An implementation that disagrees with a sentence
+here should follow the physics and record the mapping in the table provenance.
 
 A single lumped "tilt" parameter conflates two physically different effects and
 the model will not be able to reproduce what we measure. Our cell commands tilt
