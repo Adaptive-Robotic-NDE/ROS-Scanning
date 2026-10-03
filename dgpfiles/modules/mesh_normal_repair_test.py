@@ -600,6 +600,69 @@ def test_artefacts_are_repaired():
 
 
 @_checked
+def test_a_subtle_outlier_is_caught_at_three_degrees():
+    print("\nTHE FAILURE MODE 15 DEGREES WAS A NO-OP AGAINST")
+    # Measured on the ROI the 2026-10-02 eddy-current scan actually flew: no
+    # artefact anywhere near 80 degrees, and instead a handful of vertices
+    # disagreeing with their own fit by 8. The repair at 15 replaced NOTHING --
+    # the cell log reads "0 of 2765 (0.00%)" -- and those normals were flown.
+    #
+    # The cost is not subtle even though the angle is. The toolpath pose is
+    # specified at probe_end, so a commanded tilt rotates about the TIP: the
+    # probe barely moves while the wrist swings through 0.192 m times the angle.
+    # 8 degrees is 27 mm of wrist travel to advance the probe 1 mm, and TOTG
+    # bounds joint speed rather than tool speed, so the arm dwells there too.
+    for label, mesh in (("flat plate", flat()),
+                        ("cylinder crown", cylinder_crown()[:3])):
+        v, n, t = mesh
+        # One vertex, tilted 8 degrees about an axis perpendicular to its own
+        # normal, which is an outlier and not curvature: its neighbours are
+        # untouched, so the local fit still describes the surface.
+        bad = n.copy()
+        k = len(v)//2
+        axis = np.cross(n[k], [1.0, 0.0, 0.0])
+        if np.linalg.norm(axis) < 1e-6:
+            axis = np.cross(n[k], [0.0, 1.0, 0.0])
+        axis = axis/np.linalg.norm(axis)
+        th = np.radians(8.0)
+        bad[k] = (n[k]*np.cos(th) + np.cross(axis, n[k])*np.sin(th))
+
+        loose = repair_mesh_normals((v, bad, t), tol_deg=15.0, verbose=False,
+                                    write=False)
+        tight = repair_mesh_normals((v, bad, t), tol_deg=3.0, verbose=False,
+                                    write=False)
+        check("%s: an 8 deg outlier is INVISIBLE at the old tolerance "
+              "(%d replaced)" % (label, loose["replaced"]),
+              loose["replaced"] == 0,
+              "which is why the cell flew these")
+        check("%s: and is replaced at 3 deg (%d replaced)"
+              % (label, tight["replaced"]), tight["replaced"] >= 1)
+        check("%s: the error against the true normal falls %.2f -> %.4f deg"
+              % (label, ang_between(bad, n).max(),
+                 ang_between(tight["normals"], n).max()),
+              ang_between(tight["normals"], n).max()
+              < 0.25*ang_between(bad, n).max())
+        el, et = loose["edge_turn_after"], tight["edge_turn_after"]
+        check("%s: worst commanded turn across an edge %.2f -> %.2f deg"
+              % (label, el["max"], et["max"]), et["max"] < el["max"])
+
+    # The other half of the claim: tightening to 3 must not start eating
+    # curvature. A clean crown turns 3.3 deg across an edge -- ABOVE the
+    # tolerance -- and must still be left entirely alone, because the tolerance
+    # measures a vertex against a QUADRIC fit of its neighbourhood rather than
+    # against its neighbours. That distinction is the whole reason a curved part
+    # can be repaired at all.
+    v, n, t, _nu, _nv = cylinder_crown()
+    clean = repair_mesh_normals((v, n, t), tol_deg=3.0, verbose=False,
+                                write=False)
+    check("a clean 60 mm radius turns %.2f deg per edge, above the tolerance, "
+          "and is STILL untouched at 3 deg (%d replaced)"
+          % (clean["edge_turn_before"]["max"], clean["replaced"]),
+          clean["replaced"] == 0 and clean["edge_turn_before"]["max"] > 3.0,
+          "curvature is not an outlier; a quadric fit knows the difference")
+
+
+@_checked
 def test_a_mean_of_normals_cannot_do_this():
     print("\nMUTATION: FIT THE POSITIONS -> AVERAGE THE NORMALS, AND IT FAILS")
     # The whole design claim is that the reference normal comes from the
@@ -1034,14 +1097,20 @@ def test_run2_the_expected_input():
     rep = repair_mesh_normals(path, verbose=False, write=False)
     check("%d vertices in %d component(s)" % (rep["vertices"], rep["components"]),
           rep["vertices"] == 6090 and rep["components"] == 1)
-    # The measured distribution, and the reason NORMAL_REPAIR_TOL_DEG is 15: the
-    # part's own surface disagrees with its own neighbourhood by a THIRD of a
-    # degree at p99.9, and the artefacts sit at 89.
+    # This mesh carries the GROSS failure mode: the part's own surface disagrees
+    # with its own neighbourhood by a third of a degree at p99.9 and the
+    # artefacts sit at 89. Any threshold between 2 and 80 catches those, which
+    # is why 15 looked safe for as long as this was the only mesh.
+    #
+    # It is not the only failure mode -- see
+    # test_a_subtle_outlier_is_caught_at_three_degrees below, where the worst
+    # disagreement is 8 degrees and 15 does nothing at all. The tolerance has to
+    # catch both, which is what 3 does.
     b = rep["disagreement_before"]
     check("the part disagrees with its own local fit by %.2f deg at p99.9 and "
           "%.1f at worst" % (b["p999"], b["max"]),
           b["p999"] < 2.0 and b["max"] > 80.0,
-          "a threshold anywhere between 2 and 80 gives the same answer")
+          "gross artefacts; a subtler mesh is covered separately")
     check("so exactly %d normal(s) and %d face(s) need repairing"
           % (rep["replaced"], rep["faces_rewound"]),
           rep["replaced"] <= 5 and rep["faces_rewound"] <= 5)
@@ -1503,7 +1572,9 @@ def main():
     for fn in (test_not_blind, test_neighbourhood_and_components,
                test_blocking_changes_no_number,
                test_fit_accuracy, test_curvature_is_not_repaired_away,
-               test_artefacts_are_repaired, test_a_mean_of_normals_cannot_do_this,
+               test_artefacts_are_repaired,
+               test_a_subtle_outlier_is_caught_at_three_degrees,
+               test_a_mean_of_normals_cannot_do_this,
                test_component_boundary_survives, test_winding_and_missing_normals,
                test_sampling, test_orientation_is_constrained_by_construction,
                test_postcondition_fires_without_the_constraint,

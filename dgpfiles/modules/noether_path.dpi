@@ -2365,17 +2365,47 @@ global NORMAL_REPAIR_RADIUS_M
 NORMAL_REPAIR_RADIUS_M = 0.006
 
 #: How far a vertex normal may disagree with the local surface fit before it is
-#: called an artefact and replaced, degrees. Set from the distribution of
-#: exactly that quantity on real reconstructed meshes -- see
-#: mesh_axis_sanity_test.py, which pins it -- where the part's own surface
-#: disagrees with its own neighbourhood by a THIRD of a degree at p99.9 and the
-#: artefacts sit at 80 and above. 15 degrees is forty-five times the former and
-#: a fifth of the latter, so there is no value in this range that changes the
-#: answer. It is the same threshold MESH_AXIS_OUTLIER_DEG uses downstream, kept
-#: equal on purpose: the two measure the same disagreement, one on the mesh and
-#: one on the path, and a reader should not have to hold two numbers.
+#: called an artefact and replaced, degrees.
+#:
+#: WAS 15, WHICH CAUGHT ONE FAILURE MODE AND WAS A NO-OP AGAINST THE OTHER.
+#: 15 was measured against meshes whose bad normals were GROSS -- the part's own
+#: surface disagreeing with its own neighbourhood by a third of a degree at
+#: p99.9, artefacts at 80 to 89, and nothing in between. That is still true of
+#: those meshes and 3 still catches them, because 3 < 80.
+#:
+#: The meshes this cell produces now fail differently. Measured on the ROI the
+#: 2026-10-02 eddy-current scan actually flew (2765 vertices, 8073 edges):
+#:
+#:                                        p50    p95    p99   p99.9    max
+#:   vertex normal vs its local fit      0.251  0.593  0.857  1.288   8.063
+#:   normal turn across a mesh edge      0.27   0.67   0.87   1.88    8.73
+#:
+#: There is no 80 degree artefact anywhere in it. The worst is 8, which sits
+#: inside the range the old comment called empty, so the repair replaced NOTHING
+#: -- the cell log for that run reads "0 of 2765 (0.00%) ... planning on the
+#: mesh as it is" -- and those normals were flown.
+#:
+#: WHAT THEY COST. The toolpath pose is specified at probe_end, so a commanded
+#: tilt rotates about the tip: the probe barely moves while the wrist swings
+#: through 0.192 m times the angle. 8.73 degrees is 29 mm of wrist travel to
+#: advance the probe 1 mm, and because TOTG bounds joint speed rather than tool
+#: speed that segment also takes about 30 times longer than a median one. The
+#: arm visibly stops, tilts, and carries on. Eight edges per ROI do this.
+#:
+#: WHY 3. At this tolerance exactly 2 of those 2765 vertices are replaced --
+#: 0.07% -- and that removes every one of the eight: the worst edge turn falls
+#: from 8.73 to 1.90 degrees, p99.9 from 1.88 to 1.19. Going to 1 replaces 6
+#: vertices and changes the worst edge by 0.02 degrees, so there is nothing
+#: below 3 worth having. And 3 is still 2.3x what the real surface does against
+#: its own fit at p99.9, so it cannot reach geometry.
+#:
+#: NO LONGER EQUAL TO MESH_AXIS_OUTLIER_DEG, which stays at 15. They were kept
+#: equal when they looked like one quantity. They are not: this one is a vertex
+#: against a quadric fit of its own neighbourhood on the MESH, that one is an
+#: axis against a 6 mm median along the PATH, and they have different measured
+#: distributions. Tightening the path side wants its own measurement first.
 global NORMAL_REPAIR_TOL_DEG
-NORMAL_REPAIR_TOL_DEG = 15.0
+NORMAL_REPAIR_TOL_DEG = 3.0
 
 #: Ceiling on the ring count the radius is turned into. A coarse mesh (the Azure
 #: reconstructions are all 6.00 mm median edge) would otherwise ask for one ring
