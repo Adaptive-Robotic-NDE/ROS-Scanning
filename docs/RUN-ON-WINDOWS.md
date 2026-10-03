@@ -52,6 +52,14 @@ Single precision sidesteps it entirely: 32-64x more peak rate on that silicon,
 half the memory, and the FFTs stay single (the solver uses scipy's FFT rather
 than numpy's, which would quietly promote back to double).
 
+**Measured on the 2070 at full size, single and double both took about 360 s
+for a 101x101 field and gave the same peak |dZ| to five figures.** Two things
+follow. The answer is the same, so single is safe to use. And it bought no time
+at that size, because the GMRES solve is no longer the bottleneck there -- the
+per-position field evaluation is, and that does not care about precision. So
+**choose single for the MEMORY, which is what limits how many workers fit, not
+for speed.**
+
 **And it costs nothing we keep.** The table is *stored* as `complex64` whatever
 you choose, so double precision through the solve is more precision than the
 deliverable retains. The 4.9e-08 CPU-vs-GPU agreement says the headroom is
@@ -122,11 +130,35 @@ the per-pose time for each lane when it finishes, e.g.
 
 which also tells you whether the GPU was worth using at all.
 
-`--workers` defaults to HALF your cores if you leave it off. Pick a number you
-are comfortable with: **each worker is a separate process holding its own
-solver state**, so memory is what bites first, not CPU. Watch the first few
-minutes in Task Manager and raise or lower it — the run is resumable, so
-stopping and restarting with a different number costs only the pose in flight.
+`--workers` defaults to HALF your cores if you leave it off. **On a machine
+with 1.5 TB that default is far too timid — use most of the cores.**
+
+What ends a run is memory, not CPU. Each worker is a separate process holding
+its own solver state: ecsim measures about **2.6 GB for one 101x101
+double-precision solve**, and a run on a 2070-class box with modest RAM failed
+exactly that way, on allocation, after a long time. The script now prints its
+estimate per worker at startup — multiply it by `--workers` and compare with
+what the machine has. At 1.5 TB you will not get close.
+
+Watch the first few minutes in Task Manager anyway and adjust; the run is
+resumable, so changing your mind costs only the pose in flight.
+
+### The field is now a flag, and worth thinking about
+
+```bat
+--field-step-mm 0.1      --field-halfwidth-mm 6
+```
+
+Default is 0.25 mm over +/-6 mm (49x49), which is still 4x oversampled against
+our 1 mm trace pitch. **Cost is dominated by per-pose setup rather than by
+field points**, so a finer field is cheaper in time than it looks — measured
+here, a 9x9 field still took over 200 s against 635 s for 101x101. What it is
+not cheap in is memory per worker, which is the thing that actually fails.
+
+With 1.5 TB, 0.1 mm (121x121) is affordable: about 3.7 GB per worker double,
+1.9 GB single. It buys the ability to study trace pitches finer than 1 mm in
+simulation later, which the coarser grid cannot. Your call — the table is
+usable either way, and the choice is recorded in the file.
 
 It prints a measured seconds-per-pose and an ETA after the first few poses and
 **asks before committing to the rest**. That estimate is the real one for your

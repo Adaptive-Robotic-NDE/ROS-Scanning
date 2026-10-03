@@ -313,6 +313,9 @@ def merge(args):
     return 0
 
 def main(argv=None):
+    # Declared here because both are read in the argument help below and
+    # rebound further down; Python wants the declaration before either.
+    global FIELD_STEP_M, FIELD_HALF_WIDTH_M
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default=".", help="where the two output files go")
@@ -329,6 +332,15 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=None,
                     help="parallel processes; 0 means HALF the cores, "
                          "deliberately leaving the machine usable")
+    ap.add_argument("--field-step-mm", type=float, default=None,
+                    help="spacing of the probe-frame field. Default %.2f mm. "
+                         "Cost is dominated by per-pose setup rather than by "
+                         "field points, so a finer field is cheaper than it "
+                         "looks -- but it is also memory per worker, which is "
+                         "what actually runs a machine out" % (FIELD_STEP_M*1e3,))
+    ap.add_argument("--field-halfwidth-mm", type=float, default=None,
+                    help="half-extent of the field. Default %.1f mm"
+                         % (FIELD_HALF_WIDTH_M*1e3,))
     ap.add_argument("--precision", default="double", choices=("double", "single"),
                     help="solver precision. The table is STORED as complex64 "
                          "either way, so single carries no less than the "
@@ -359,6 +371,10 @@ def main(argv=None):
     base_path = os.path.join(args.out_dir, "al6061_2mhz_baseline.npz")
 
     PRECISION[0] = args.precision
+    if args.field_step_mm:
+        FIELD_STEP_M = args.field_step_mm*1e-3
+    if args.field_halfwidth_mm:
+        FIELD_HALF_WIDTH_M = args.field_halfwidth_mm*1e-3
     probe, material, sim = build(args)
     ax = axes()
     shape = tuple(ax[k].size for k in
@@ -377,7 +393,19 @@ def main(argv=None):
     print("  grid         %s = %d poses, field %d x %d"
           % (" x ".join(str(s) for s in shape), n_poses, ax["y"].size, ax["x"].size))
     print("  table        %.0f MB complex64" % (n_poses*n_cells*8/1e6,))
+    print("  field        +/-%.1f mm at %.2f mm = %d x %d point(s)"
+          % (FIELD_HALF_WIDTH_M*1e3, FIELD_STEP_M*1e3,
+             ax["y"].size, ax["x"].size))
     print("  solver       %s, %s precision" % (args.solver, args.precision))
+    # MEMORY IS WHAT ENDS A RUN, NOT CPU. ecsim measures about 2.6 GB for one
+    # 101x101 double-precision solve; the position-dependent part scales with
+    # the field, and single precision halves it. This is a rough scaling of
+    # that one measurement, not a model -- watch the first minutes and adjust.
+    per = 2.6*(ax["y"].size*ax["x"].size)/(101.0*101.0)
+    if args.precision == "single":
+        per *= 0.5
+    print("  memory       roughly %.1f GB per worker (scaled from ecsim's "
+          "2.6 GB at 101x101 double)" % per)
     print()
 
     # Resume if the file is already here, so an interrupted run on a borrowed
