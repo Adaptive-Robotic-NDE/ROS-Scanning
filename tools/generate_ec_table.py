@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -70,7 +71,17 @@ PROBE = dict(
     height=0.0012,           # m
     turns=150.0,
     gap=0.0001,              # m, the split
-    z_offset=0.0,            # coil at the probe face
+    # THE WINDING IS NOT AT THE SURFACE. A real probe has a wear face, and 0.1
+    # mm is reasonable for this one. Zero is not merely optimistic, it is what
+    # stalled the first attempted run: at zero stand-off the lowest filament
+    # sits 40 um above the conductor, the incident-field map sizes its spectral
+    # grid to resolve that, and one coil map then takes tens of minutes. Worse,
+    # the flaw-major task order puts every lift-off-zero pose first, so every
+    # worker started on the worst case at once -- high CPU, almost no memory,
+    # nothing written. ecsim now bounds that grid and warns below 50 um, but
+    # zero is physically wrong regardless. At 0.1 mm a coil map is ~48 s at
+    # contact and ~10 s at 0.5 mm lift-off.
+    z_offset=0.0001,         # m, wear face between winding and surface
     shaft_diameter=0.0047498,   # 0.187 in, the one number we actually know
 )
 FREQUENCY_HZ = 2.0e6
@@ -173,7 +184,16 @@ def provenance(material):
         "probe_type": "differential shielded split-D pencil, UniWest PDS-.187-2MHz",
         "probe_shaft_diameter_m": PROBE["shaft_diameter"],
         "coil_diameter_m": 2.0 * PROBE["r_outer"],
-        "coil_separation_m": PROBE["gap"],
+        # Centre-to-centre, which is what the spec means by separation; the
+        # gap is the slot between the two chords and is a different number.
+        # The centroid of a half-annulus sits 4(ro^3-ri^3)/(3 pi (ro^2-ri^2))
+        # from its flat.
+        "coil_separation_m": 2.0*(
+            4.0*(PROBE["r_outer"]**3 - PROBE["r_inner"]**3)
+            / (3.0*math.pi*(PROBE["r_outer"]**2 - PROBE["r_inner"]**2))
+            + 0.5*PROBE["gap"]),
+        "coil_gap_m": PROBE["gap"],
+        "coil_z_offset_m": PROBE["z_offset"],
         "shielded": SHIELDED,
         "solver_precision": PRECISION[0],
         "notes": (
@@ -269,8 +289,10 @@ def _one_pose(task):
     flaw, system = _W["systems"][key]
     tilt_par = float(ax["tilt_parallel"][tpi])
     tilt_perp = float(ax["tilt_perpendicular"][tqi])
-    edge = max(probe.edge_contact_liftoff(tilt_par),
-               probe.edge_contact_liftoff(tilt_perp))
+    # BOTH angles together. A face inclined about two axes drops further than
+    # either alone, so max() understates it -- 0.56 mm against the true 0.79 mm
+    # at 10 deg / 10 deg -- and the pose would be driven into the surface.
+    edge = probe.edge_contact_liftoff(tilt_perp, tilt_par)
     field = sim.flaw_field(flaw, ax["x"], ax["y"],
                            liftoff=float(ax["liftoff"][oi]) + edge,
                            yaw=float(ax["yaw"][yi]),
@@ -322,9 +344,15 @@ def main(argv=None):
     ap.add_argument("--solver", default="fft", choices=("fft", "dense"),
                     help="fft is far faster for a field; dense is the reference")
     ap.add_argument("--probe-poses", type=int, default=3,
-                    help="poses to time before estimating the whole run")
+                    help="minimum poses to time before estimating the whole "
+                         "run; raised to the worker count, because an estimate "
+                         "taken before one full wave has landed is wrong by "
+                         "the concurrency factor")
     ap.add_argument("--yes", action="store_true",
-                    help="do not stop for confirmation after the estimate")
+                    help="do not stop for confirmation after the estimate. USE "
+                         "THIS FOR ANY UNATTENDED RUN: otherwise the parent "
+                         "blocks on the prompt while every worker keeps "
+                         "burning CPU on the task it already has")
     ap.add_argument("--shard", type=int, default=0,
                     help="which shard this machine computes, 0-based")
     ap.add_argument("--of", type=int, default=1,
@@ -397,15 +425,14 @@ def main(argv=None):
           % (FIELD_HALF_WIDTH_M*1e3, FIELD_STEP_M*1e3,
              ax["y"].size, ax["x"].size))
     print("  solver       %s, %s precision" % (args.solver, args.precision))
-    # MEMORY IS WHAT ENDS A RUN, NOT CPU. ecsim measures about 2.6 GB for one
-    # 101x101 double-precision solve; the position-dependent part scales with
-    # the field, and single precision halves it. This is a rough scaling of
-    # that one measurement, not a model -- watch the first minutes and adjust.
-    per = 2.6*(ax["y"].size*ax["x"].size)/(101.0*101.0)
-    if args.precision == "single":
-        per *= 0.5
-    print("  memory       roughly %.1f GB per worker (scaled from ecsim's "
-          "2.6 GB at 101x101 double)" % per)
+    # MEMORY IS WHAT ENDS A RUN, NOT CPU: a worker holds its flaw system, the
+    # incident-field images for both coils, and the reduced basis. Since the
+    # image spacing was tied to the field's own scale it is well under 1 GB per
+    # worker on this grid -- it was the earlier spacing that could reach 100 GB
+    # across 61 workers. No formula here is worth trusting over the first few
+    # minutes of Task Manager.
+    print("  memory       expect well under 1 GB per worker; WATCH THE FIRST "
+          "MINUTES and set --workers from what you see")
     print()
 
     # Resume if the file is already here, so an interrupted run on a borrowed
@@ -496,6 +523,19 @@ def main(argv=None):
             for _ in range(lane["n"]):
                 submit(lane)
 
+        # DO NOT ESTIMATE BEFORE ONE FULL WAVE HAS LANDED.
+        #
+        # elapsed/completed only measures throughput once completions are
+        # steady. With W workers in flight the first W finish together after
+        # roughly one pose time, so estimating at 3 completions gives
+        # (one pose)/3 and then multiplies by everything remaining -- which
+        # with 61 workers overstates the run by about twenty times. Waiting
+        # for W completions makes the same arithmetic correct, because by then
+        # the rate really is W poses per pose-time.
+        n_total_workers = sum(l["n"] for l in lanes)
+        probe_after = max(args.probe_poses, n_total_workers)
+        probe_after = min(probe_after, len(mine))
+
         n = 0
         failures = 0
         try:
@@ -516,11 +556,12 @@ def main(argv=None):
                     n += 1
                     submit(lane)
 
-                    if n == args.probe_poses:
+                    if n == probe_after:
                         per = (time.time() - t_start)/n
-                        print("\n   %.1f s per pose wall-clock across %s"
+                        print("\n   %.1f s per completed pose across %s "
+                              "(measured over %d, one full wave)"
                               % (per, " + ".join("%d %s" % (l["n"], l["name"])
-                                                 for l in lanes)))
+                                                 for l in lanes), n))
                         for l in lanes:
                             if l["done"]:
                                 print("      %s lane: %d pose(s), %.0f s each"
@@ -561,8 +602,7 @@ def main(argv=None):
     for a, lo in enumerate(ax["liftoff"]):
         for b, tp in enumerate(ax["tilt_parallel"]):
             for c, tq in enumerate(ax["tilt_perpendicular"]):
-                edge = max(probe.edge_contact_liftoff(float(tp)),
-                           probe.edge_contact_liftoff(float(tq)))
+                edge = probe.edge_contact_liftoff(float(tq), float(tp))
                 base[a, b, c] = sim.liftoff_tilt_response(
                     liftoff=float(lo) + edge,
                     tilt_y=float(tp), tilt_x=float(tq))

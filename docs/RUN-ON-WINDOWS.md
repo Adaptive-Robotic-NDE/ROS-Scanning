@@ -95,10 +95,15 @@ python -c "import ecsim, numpy, scipy, h5py; print('ok')"
 
 ## 2. Run it
 
+**Always pass `--yes` for an unattended run.** Without it the parent stops at
+`continue? [y/N]` after its first timing estimate, while every worker carries
+on burning CPU on the task it already holds. The prompt is easy to miss because
+it only appears after one full wave of poses has completed.
+
 **Machine A:**
 ```bat
 python tools\generate_ec_table.py --out-dir out --of 2 --shard 0 --workers 16 ^
-    --precision single --gpu-workers 1
+    --precision single --gpu-workers 1 --yes
 ```
 
 **Machine B:**
@@ -143,6 +148,18 @@ what the machine has. At 1.5 TB you will not get close.
 Watch the first few minutes in Task Manager anyway and adjust; the run is
 resumable, so changing your mind costs only the pose in flight.
 
+### Windows processor groups — this one will catch you
+
+Windows puts processes in a **processor group of at most 64 logical
+processors**, and a process does not span groups without asking. On a dual
+socket machine with more than 64 threads, launching 61 workers lands them all
+in one group: you will see about half the machine busy and wonder why.
+
+The `--of` / `--shard` split is the right tool — run one instance per group
+rather than one giant instance. Two machines x two groups is simply `--of 4`
+with `--shard 0..3`, and the merge step takes all four. Setting affinity per
+instance also works if you prefer.
+
 ### The field is now a flag, and worth thinking about
 
 ```bat
@@ -150,14 +167,16 @@ resumable, so changing your mind costs only the pose in flight.
 ```
 
 Default is 0.25 mm over +/-6 mm (49x49), which is still 4x oversampled against
-our 1 mm trace pitch. **Cost is dominated by per-pose setup rather than by
-field points**, so a finer field is cheaper in time than it looks — measured
-here, a 9x9 field still took over 200 s against 635 s for 101x101. What it is
-not cheap in is memory per worker, which is the thing that actually fails.
+our 1 mm trace pitch.
 
-With 1.5 TB, 0.1 mm (121x121) is affordable: about 3.7 GB per worker double,
-1.9 GB single. It buys the ability to study trace pitches finer than 1 mm in
-simulation later, which the coarser grid cannot. Your call — the table is
+**The field grid barely affects run time at all.** Per-pose cost is two coil
+incident-field maps plus roughly 150 basis solves, and neither depends on how
+many points you sample the field at. An earlier note here claimed 0.25 mm saved
+4.3x over 0.1 mm; that was wrong. What the step actually changes is memory per
+worker.
+
+So with 1.5 TB, 0.1 mm (121x121) is close to free and buys the ability to study
+trace pitches finer than 1 mm in simulation later. Your call — the table is
 usable either way, and the choice is recorded in the file.
 
 It prints a measured seconds-per-pose and an ETA after the first few poses and
