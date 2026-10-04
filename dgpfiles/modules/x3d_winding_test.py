@@ -523,3 +523,117 @@ def test_orient_uv_basis_refuses_a_surface_with_no_outward_direction():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------------------------------------------------------------------------
+# Overlapping faces: the ones no winding can fix
+# ---------------------------------------------------------------------------
+# These came from a real run. The mesh cleaning step rewinds individual faces
+# so they all point away from the part -- a face the wrong way round makes a
+# clearance check read the tool as inside it -- and on a reconstruction with
+# sliver triangles that turns 8 inconsistent edges into 34. Rewinding cannot
+# undo it, because the faces OVERLAP rather than being wound backwards, and the
+# projector then refuses the surface and the scan stops.
+
+
+def _overlapping_pair(verts, tris, big=False):
+    """Fold a second face back over the first, sharing a BOUNDARY edge.
+
+    The edge matters. Hanging the extra face on an INTERIOR edge gives that
+    edge three users, which is a different defect entirely (overshared, and
+    refused rather than repaired). A real overlap sits on an edge with exactly
+    two users that both traverse it the same way, and that is what the grid's
+    boundary edge (0, 1) gives: one face uses it, we add a second, and both go
+    0 -> 1 with their third vertices on the same side.
+
+    `big` makes the new face the larger of the pair, so the repair has to drop
+    the ORIGINAL -- which is how the area ceiling gets exercised.
+    """
+    verts = list(verts)
+    tris = [list(t) for t in tris]
+    partner = next(k for k, t in enumerate(tris) if t[0] == 0 and t[1] == 1)
+    a, b, c = tris[partner]
+    va, vb, vc = (np.asarray(verts[i], dtype=float) for i in (a, b, c))
+    if big:
+        # Far along the same side, so this face dwarfs its partner.
+        p = va + 6.0*(vc - va)
+    else:
+        p = (va + vb + vc)/3.0
+    verts.append(tuple(p))
+    tris.append([a, b, len(verts) - 1])
+    return verts, tris
+
+
+def test_overlapping_faces_are_told_apart_from_backwards_ones():
+    """A face wound backwards must NOT be dropped -- it must be flipped.
+
+    The distinction is the whole value of this: dropping a face that merely
+    needs turning round would cut a hole in the surface, and a hole in the
+    projection surface is a hole in the image.
+    """
+    verts, tris = _grid()
+    tris = [list(t) for t in tris]
+    tris[5] = [tris[5][0], tris[5][2], tris[5][1]]          # backwards, not overlapping
+    p = _write(_tmp("backwards.x3d"), tris, verts)
+    faces, _ = x3d_winding.read_indexed_face_set(p)
+    pts = x3d_winding.read_point_array(p, "Coordinate", 3)
+    drop, rep = x3d_winding.overlapping_faces(faces, pts)
+    assert drop == set(), "a backwards face is not an overlap and must be kept"
+    assert rep["overlapping_pairs"] == 0
+    # and the ordinary rewind still repairs it, losing nothing
+    out = x3d_winding.loadable_x3d(p, quiet=True)
+    after, _ = x3d_winding.read_indexed_face_set(out)
+    assert len(after) == len(faces)
+    assert x3d_winding.winding_report(after)["loadable"]
+
+
+def test_the_smaller_face_of_an_overlapping_pair_is_the_one_dropped():
+    """The big face is the surface; the small one is the artefact."""
+    verts, tris = _grid()
+    verts, tris = _overlapping_pair(verts, tris)
+    p = _write(_tmp("smaller.x3d"), tris, verts)
+    faces, _ = x3d_winding.read_indexed_face_set(p)
+    pts = x3d_winding.read_point_array(p, "Coordinate", 3)
+    drop, _ = x3d_winding.overlapping_faces(faces, pts)
+    assert drop == {len(tris) - 1}, "the appended sliver, not its larger partner"
+
+
+def test_texture_indices_are_dropped_with_their_faces():
+    """The parameterization has to stay attached to the geometry.
+
+    A coordIndex cut without its texCoordIndex is a surface whose every face
+    after the cut carries somebody else's texture coordinates -- which loads
+    cleanly and projects every trace to the wrong place. Exercised against
+    drop_faces_file() directly, because on a small fixture the gate repairs by
+    rewinding and never reaches the drop path.
+    """
+    verts, tris = _grid()
+    p = _write(_tmp("tex.x3d"), tris, verts)
+    before, extra_before = x3d_winding.read_indexed_face_set(p)
+    out = x3d_winding.drop_faces_file(p, {3, 7, 11})
+    faces, extra = x3d_winding.read_indexed_face_set(out)
+    assert len(faces) == len(before) - 3
+    assert "texCoordIndex" in extra
+    assert len(extra["texCoordIndex"]) == len(faces)
+    # and the surviving runs are the ones that were kept, in order
+    kept = [t for i, t in enumerate(before) if i not in (3, 7, 11)]
+    assert [list(t) for t in faces] == [list(t) for t in kept]
+
+
+def test_a_surface_needing_too_much_cut_away_is_refused():
+    """The ceiling. Slivers are a fraction of a percent of the area; anything
+    bigger is a different problem and gets looked at rather than quietly
+    deleted -- loadable_x3d() leaves the drop unapplied above it.
+
+    Built so the face that must GO is one of the originals -- the added face is
+    the larger of the pair -- which on a small patch is well over the ceiling.
+    """
+    verts, tris = _grid(3)
+    verts, tris = _overlapping_pair(verts, tris, big=True)
+    p = _write(_tmp("toomuch.x3d"), tris, verts)
+    faces, _ = x3d_winding.read_indexed_face_set(p)
+    pts = x3d_winding.read_point_array(p, "Coordinate", 3)
+    drop, rep = x3d_winding.overlapping_faces(faces, pts)
+    assert drop, "there is an overlap to find"
+    assert rep["dropped_area_fraction"] > x3d_winding.MAX_DROP_AREA_FRACTION, \
+        "this fixture is meant to exceed the ceiling (%.4f)" % rep["dropped_area_fraction"]

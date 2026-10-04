@@ -375,6 +375,149 @@ def orient_consistently(faces):
                   "non_orientable_conflicts": int(conflicts)}
 
 
+#: How much of a surface's area loadable_x3d() will remove on its own to make
+#: it orientable. Overlapping slivers are a fraction of a percent (0.015% on
+#: the mesh this was written for); anything needing more than this is not a
+#: sliver problem and should be refused and looked at, not quietly cut away.
+MAX_DROP_AREA_FRACTION = 0.01
+
+
+def same_way_edges(faces):
+    """Edges that two faces both traverse in the same direction. -> {edge: [i, j]}
+
+    One of these is enough to make x3d_load_geometry abort, and each is either
+    a face wound the wrong way round -- which rewinding fixes -- or two faces
+    that OVERLAP, which rewinding cannot fix. overlapping_faces() tells them
+    apart.
+    """
+    out = {}
+    for i, f in enumerate(faces):
+        if len(f) != 3:
+            continue
+        a, b, c = f
+        for e in ((a, b), (b, c), (c, a)):
+            out.setdefault(e, []).append(i)
+    return {e: u for e, u in out.items() if len(u) >= 2}
+
+
+def overlapping_faces(faces, points):
+    """Faces to DROP so that a consistent winding can exist. -> (drop, report)
+
+    WHAT THIS IS AND IS NOT. Winding consistency is COMBINATORIAL, not
+    geometric: an isolated pair of overlapping triangles can always be made
+    consistent by flipping one of them, and orient_consistently() will do it
+    (measured -- a single fold on a boundary edge rewinds clean). So an overlap
+    is not by itself unrepairable, and this function is not a claim that it is.
+
+    What overlaps do is FRUSTRATE the orientation globally. Each one demands a
+    flip, those demands conflict around cycles, and a mesh carrying enough of
+    them has no consistent assignment at all: on the surface this was written
+    for, rewinding took 26 inconsistent edges to 104 with 208 conflicts while
+    propagating, and dropping 16 overlapping faces took the same mesh to 0.
+    That is the empirical ground for this, and the mechanism beyond "the flips
+    conflict" has not been characterised further.
+
+    So this is the SECOND tool, reached only when rewinding has already failed,
+    and the geometric overlap test is how it chooses which faces to remove
+    rather than a proof that they are the only possible choice. The test needs
+    no normals: project each face's third vertex onto the plane perpendicular
+    to the shared edge; if the two land on the same side, the faces overlap.
+
+    The SMALLER face of each pair goes. These are slivers thrown off by
+    surface reconstruction and smoothing -- on the mesh this was written for,
+    37 faces carrying 0.16% of the area, a median of 5x smaller than typical --
+    so the larger one is the surface and the smaller one is the artefact.
+
+    Returns the set of face indices to drop and a report carrying the area
+    dropped, so a caller can refuse a repair that would eat real surface
+    instead of slivers.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    tri_idx = [i for i, f in enumerate(faces) if len(f) == 3]
+    area = {}
+    for i in tri_idx:
+        a, b, c = (pts[v] for v in faces[i])
+        area[i] = 0.5*float(np.linalg.norm(np.cross(b - a, c - a)))
+    total_area = sum(area.values())
+
+    drop = set()
+    examined = 0
+    overlaps = 0
+    # Iterated, because dropping one face can resolve several edges at once and
+    # can also expose an edge that was previously shared by three.
+    for _ in range(8):
+        live = [f if i not in drop else None for i, f in enumerate(faces)]
+        bad = same_way_edges([f if f is not None else () for f in live])
+        if not bad:
+            break
+        progress = False
+        for (p0, p1), users in bad.items():
+            users = [u for u in users if u not in drop]
+            if len(users) < 2:
+                continue
+            examined += 1
+            i, j = users[0], users[1]
+            e = pts[p1] - pts[p0]
+            n = np.linalg.norm(e)
+            if n == 0.0:
+                continue
+            e = e/n
+            sides = []
+            for f in (i, j):
+                other = [v for v in faces[f] if v != p0 and v != p1]
+                if not other:
+                    sides = []
+                    break
+                w = pts[other[0]] - pts[p0]
+                sides.append(w - float(w @ e)*e)
+            if len(sides) != 2:
+                continue
+            if float(sides[0] @ sides[1]) <= 0.0:
+                # Opposite sides: a genuine winding error, and rewinding owns it.
+                continue
+            overlaps += 1
+            drop.add(i if area[i] <= area[j] else j)
+            progress = True
+        if not progress:
+            break
+
+    dropped_area = sum(area.get(i, 0.0) for i in drop)
+    return drop, {"dropped": len(drop),
+                  "overlapping_pairs": overlaps,
+                  "edges_examined": examined,
+                  "dropped_area_m2": dropped_area,
+                  "total_area_m2": total_area,
+                  "dropped_area_fraction": (dropped_area/total_area
+                                            if total_area > 0 else 0.0)}
+
+
+def drop_faces_file(path, drop, out_path=None):
+    """Write a copy of an X3D surface with `drop` faces removed.
+
+    Every per-face index attribute is cut in step -- coordIndex, texCoordIndex,
+    normalIndex -- so the parameterization stays attached to the geometry. An
+    attribute that does not have one run per face is left alone rather than
+    corrupted, the same rule rewind_file() follows.
+    """
+    faces, extra = read_indexed_face_set(path)
+    keep = [i for i in range(len(faces)) if i not in drop]
+    if out_path is None:
+        base, ext = os.path.splitext(os.path.abspath(path))
+        out_path = base + "_dropped" + ext
+
+    with open(path, "r") as fh:
+        text = fh.read()
+    for name, polys in [("coordIndex", faces)] + sorted(extra.items()):
+        if len(polys) != len(faces):
+            continue
+        body = " ".join(" ".join(str(v) for v in polys[i]) + " -1" for i in keep)
+        text = re.sub(r'(\b%s=")[^"]*(")' % (name,),
+                      lambda m: m.group(1) + body + m.group(2), text, count=1)
+    with open(out_path, "w") as fh:
+        fh.write(text)
+    return out_path
+
+
 def rewind_file(path, out_path=None):
     """Write a consistently wound copy of an X3D surface.
 
@@ -494,14 +637,56 @@ def loadable_x3d(path, quiet=False):
 
     out_path, fixed = rewind_file(path)
     if not fixed["after"]["loadable"]:
+        # REWINDING WAS NOT ENOUGH, so try the other tool before giving up.
+        # It comes back WORSE than it went in -- 26 inconsistent edges became
+        # 104, with 208 conflicts while propagating -- which says the flips it
+        # needs conflict with each other and no consistent assignment exists.
+        # Removing the overlapping faces removes that frustration. See
+        # overlapping_faces() for what is and is not claimed about why.
+        #
+        # Ordered this way round deliberately: rewinding removes nothing and is
+        # tried first, so a surface that is merely wound backwards is repaired
+        # without losing a single triangle. Dropping is the fallback.
+        points = read_point_array(path, "Coordinate", 3)
+        dropped = None
+        # Captured BEFORE the second rewind overwrites `fixed`: what the
+        # message is about is why the first attempt failed.
+        first_conflicts = fixed["non_orientable_conflicts"]
+        if points is not None:
+            drop, dropped = overlapping_faces(faces, points)
+            if drop and dropped["dropped_area_fraction"] <= MAX_DROP_AREA_FRACTION:
+                pruned = drop_faces_file(path, drop)
+                out_path, fixed = rewind_file(pruned)
+                if fixed["after"]["loadable"]:
+                    if not quiet:
+                        print("  MESHUV rewinding could not orient this surface "
+                              "(%d inconsistent edge(s), %d conflict(s)), so %d "
+                              "overlapping face(s) carrying %.4f%% of the area "
+                              "were dropped and it rewound clean"
+                              % (rep["inconsistent_edges"], first_conflicts,
+                                 dropped["dropped"],
+                                 100.0*dropped["dropped_area_fraction"]))
+                    return _uv_oriented(out_path, quiet=quiet)
+
+    if not fixed["after"]["loadable"]:
+        extra = ""
+        if dropped is not None and dropped["dropped"]:
+            extra = (" %d overlapping face(s) carrying %.4f%% of the area were "
+                     "identified, which is over the %.1f%% this will remove "
+                     "without being asked -- a surface that needs more than "
+                     "that cut away is not a sliver problem."
+                     % (dropped["dropped"],
+                        100.0*dropped["dropped_area_fraction"],
+                        100.0*MAX_DROP_AREA_FRACTION))
         raise RuntimeError(
             "%s cannot be loaded for projection: %d interior edge(s) are wound "
             "inconsistently and the surface is not orientable, so no consistent "
-            "winding exists (%d conflict(s) while propagating one).\n"
+            "winding exists (%d conflict(s) while propagating one).%s\n"
             "  x3d_load_geometry aborts the process on this rather than "
             "returning an error, so it is refused here instead."
             % (os.path.basename(path), rep["inconsistent_edges"],
-               fixed["non_orientable_conflicts"]))
+               locals().get("first_conflicts",
+                            fixed["non_orientable_conflicts"]), extra))
     if not quiet:
         print("  projection surface rewound: %d of %d face(s) reversed to clear "
               "%d inconsistently wound edge(s) -- %s"
