@@ -117,7 +117,32 @@ RECDB_TRANSACTION_MANAGER = "timed"
 # The ordering window: a transaction stamped at T is held this long so anything
 # stamped earlier can still arrive and commit first. Too small and correlated
 # reads see an incomplete picture, reported as late transactions.
-TRANSACTION_LATENCY = 0.02
+#
+# 0.02 ON HARDWARE, UNCHANGED AND DELIBERATELY SO. It has run the real cell
+# without trouble, the window is latency the correlation pays on every reading,
+# and nothing measured here is a reason to widen it there.
+#
+# WIDER IN SIMULATION, because this machine is not the cell PC. One simulated
+# scan reported 33 late transactions since startup, worst 25.4 ms older than its
+# predecessor -- committed, but with their globalrev timestamps out of order --
+# and the manager refused 22 more at the door. Of those refusals only 2 were the
+# simulated instrument (which counts them as dropped samples and carries on);
+# the rest belonged to other producers. That is what an eight-core box running
+# Gazebo, RViz, MoveIt, the profiler, the reconstruction and the acquisition all
+# at once does to thread scheduling, and it is a property of this bench rather
+# than of the pipeline.
+#
+# Overridable so a bench can be told to behave like the cell:
+#     TARI_TRANSACTION_LATENCY=0.02 dataguzzler-python ...
+#
+# Read from the ENVIRONMENT rather than from CELL_MODE, which is not defined
+# until further down -- the transaction manager is built immediately below and
+# everything else depends on it, so this cannot wait for it. The two are
+# cross-checked where CELL_MODE is set, so they cannot drift apart silently.
+TRANSACTION_LATENCY = float(
+    os.environ.get("TARI_TRANSACTION_LATENCY")
+    or (0.02 if (os.environ.get("TARI_CELL_MODE") or "hardware") == "hardware"
+        else 0.08))
 
 if RECDB_TRANSACTION_MANAGER != "timed":
     raise RuntimeError(
@@ -176,6 +201,19 @@ CELL_NAME = os.environ.get("TARI_CELL_NAME") or "ex-ur10e-1"
 # against the simulated cell without editing this file. The DEFAULT is
 # hardware, so a cell PC that sets nothing runs as hardware.
 CELL_MODE = os.environ.get("TARI_CELL_MODE") or "hardware"
+
+# The transaction window was chosen from the same environment variable before
+# this line existed, because the manager has to be built first. If that ever
+# stops being true the window would be the wrong one for the mode and nothing
+# would say so, so it is checked rather than assumed.
+if not os.environ.get("TARI_TRANSACTION_LATENCY"):
+    _want_latency = 0.02 if CELL_MODE == "hardware" else 0.08
+    if abs(TRANSACTION_LATENCY - _want_latency) > 1e-12:
+        raise RuntimeError(
+            "TRANSACTION_LATENCY is %.4f s but CELL_MODE is %r, which wants "
+            "%.4f s. The window is chosen from TARI_CELL_MODE before CELL_MODE "
+            "exists; they have come apart."
+            % (TRANSACTION_LATENCY, CELL_MODE, _want_latency))
 
 # ==============================================================================
 # TECHNICIAN CONTROLS
@@ -348,6 +386,16 @@ EC_NULL_ON_CONTACT = True
 # True whenever there is real hardware to measure with: an un-nulled scan is not
 # a scan that needs redoing, it is a scan whose data cannot be recovered.
 EC_NULL_REQUIRED = EC_SOURCE == "hardware"
+
+# MEASURE THE LIFT-OFF ROTATION AT THE END OF A SCAN AND RE-PAINT WITH IT.
+#
+# The projected channel is /ec/cond/vertical, which only means "the part" once
+# the rotation lays lift-off along the horizontal axis. Unset, the image is the
+# standing offset plus tilt. The angle is a property of this probe, this
+# frequency and this instrument today, so it is measured from the scan's own
+# traces -- see rotation_from_scan(). Off means the image stays as acquired and
+# an operator sets the rotation by hand.
+EC_AUTO_ROTATION = True
 
 # Impedance-plane conditioning -- the SOFTWARE offset, rotation and gain, applied
 # to recorded traces. NONE OF THESE ARE MEANINGFUL DEFAULTS: the null depends on
@@ -1524,6 +1572,63 @@ def null_here(count=20):
           % (null[0], null[1], count,
              "" if ec_cond is not None else " (held until the scan wires it)"))
     return null
+
+
+global rotation_from_scan
+def rotation_from_scan(first=0, count=None, apply=True, reproject=True,
+                       min_traces=200):
+    """MEASURE the lift-off rotation from the traces just acquired, and use it.
+
+    THE SETUP PROCEDURE, done from the data instead of by eye. Over good
+    material the reading moves almost entirely along one direction in the
+    impedance plane -- lift-off and tilt dominate and they share an axis -- so
+    the first principal direction of the nulled traces IS the lift-off
+    direction, and turning it onto horizontal leaves the part on vertical.
+
+    WHY THIS MATTERS MORE THAN IT SOUNDS. The projection paints
+    /ec/cond/vertical (ec_scan_component). With the rotation unset that channel
+    is just the raw imaginary part, so the image is the instrument's standing
+    offset plus tilt, and the flaws are a few per cent of it. Measured on a
+    2212-trace scan over four notches of 1.016 to 2.540 mm:
+
+        unrotated (magnitude)   noise p99 0.0262 V   SNR 0.6 / 0.9 / 1.5 / 2.6
+        rotated   (vertical)    noise p99 0.0023 V   SNR 2.2 / 1.6 / 3.6 / 6.1
+
+    An order of magnitude in the noise floor, and every notch over the floor
+    instead of two under it. It costs one call.
+
+    `apply` sets the rotation; `reproject` then re-paints the surface from
+    every trace already taken, because the projector paints each reading as it
+    arrives and pixels already laid down do not change when the parameters do.
+    Pass reproject=False to look at the number without touching the image.
+
+    Returns (degrees, detail). detail["anisotropy"] says how clearly there was
+    a direction to find; see ec_liftoff_rotation_from_traces(), which refuses
+    rather than inventing an angle from a round scatter.
+    """
+    if not ec_channel_exists(recdb, EC_TRACES_PATH):
+        raise RuntimeError(
+            "there are no traces to measure a rotation from: %s does not exist "
+            "until a scan has staged its first reading. Run a pass "
+            "(run_ec_scan(max_passes=1)) first." % (EC_TRACES_PATH,))
+    degrees, detail = ec_liftoff_rotation_from_traces(
+        recdb, EC_TRACES_PATH, first=first, count=count, min_traces=min_traces)
+    print("  lift-off lies at %+.2f deg over %d trace(s); the scatter is %.1fx "
+          "longer along it than across (%.5f vs %.5f V)"
+          % (degrees, detail["traces"], detail["anisotropy"],
+             detail["sigma_along"], detail["sigma_across"]))
+    if not apply:
+        print("    not applied (apply=False)")
+        return degrees, detail
+    set_rotation(degrees)
+    if reproject:
+        # The pixels already painted carry the OLD rotation. Re-painting from
+        # trace 0 is what makes the image agree with the parameters; without it
+        # the numbers are right and the picture is still the old one.
+        out = project_ec_traces(first=0, count=None)
+        print("    re-projected %s trace(s) onto the surface"
+              % (out.get("projected") if isinstance(out, dict) else "all",))
+    return degrees, detail
 
 
 global set_rotation
@@ -2994,16 +3099,49 @@ def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=Fals
             "decision; set_ec_nulling(enabled=False) is for bench work."
             % (EC_INSTRUMENT,))
     with warning_light("eddy-current scan"):
-        return run_ec_path_scan(path, x3d, ec_source, ec_cond,
-                                prefix="/ec", staging_path="/ec/current",
-                                cond_prefix=EC_COND_PREFIX,
-                                component=component, max_passes=max_passes,
-                                force=force, pitch_m=SCAN_STEP_SIZE,
-                                contact=_ec_contact(),
-                                null_instrument=(null_ec_instrument
-                                                 if EC_NULL_ON_CONTACT else None),
-                                null_required=EC_NULL_REQUIRED,
-                                save=save, run_dir=run_dir)
+        report = run_ec_path_scan(path, x3d, ec_source, ec_cond,
+                                  prefix="/ec", staging_path="/ec/current",
+                                  cond_prefix=EC_COND_PREFIX,
+                                  component=component, max_passes=max_passes,
+                                  force=force, pitch_m=SCAN_STEP_SIZE,
+                                  contact=_ec_contact(),
+                                  null_instrument=(null_ec_instrument
+                                                   if EC_NULL_ON_CONTACT else None),
+                                  null_required=EC_NULL_REQUIRED,
+                                  save=save, run_dir=run_dir)
+
+    # CONDITION THE IMAGE BEFORE ANYONE LOOKS AT IT.
+    #
+    # The projection paints /ec/cond/vertical, and with the rotation unset that
+    # is the raw imaginary part: the picture is the instrument's standing offset
+    # and the tilt, with the flaws a few per cent of it. The angle that fixes it
+    # is measurable from the scan's own traces and from nothing else -- it
+    # belongs to this probe at this frequency on this instrument today -- so the
+    # scan measures it rather than leaving an operator to find it by eye on an
+    # image that does not show the flaws yet.
+    #
+    # AFTER the scan, not during: the projector paints each reading as it
+    # arrives, so a rotation applied halfway leaves the first half painted with
+    # the old one. This sets it and re-paints every trace.
+    #
+    # NEVER FATAL. The scan is the measurement and it is already on disk; this
+    # is presentation, and a scan that refused to return because it could not
+    # pick an angle would be the tail wagging the dog. A failure says so and
+    # leaves the unrotated image, which is what the previous behaviour was.
+    if EC_AUTO_ROTATION:
+        try:
+            degrees, detail = rotation_from_scan()
+            report["rotation_measured_deg"] = degrees
+            report["rotation_detail"] = detail
+        except Exception as _e:                            # noqa: BLE001
+            report["rotation_measured_deg"] = None
+            report["rotation_error"] = "%s: %s" % (type(_e).__name__, _e)
+            print("  could not measure the lift-off rotation (%s: %s)"
+                  % (type(_e).__name__, _e))
+            print("    the traces are unaffected and on disk; the IMAGE is "
+                  "unrotated, so set_rotation() and project_ec_traces() by hand, "
+                  "or replay_ec_scan(rotation_deg=...).")
+    return report
 
 
 global ec_dry_run_report

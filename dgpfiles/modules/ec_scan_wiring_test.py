@@ -93,6 +93,7 @@ ships.
     python3 ec_scan_wiring_test.py
     python3 -m pytest -q ec_scan_wiring_test.py
 """
+import math
 import os
 import subprocess
 import sys
@@ -546,6 +547,101 @@ try:
           "...the child's own output is quoted instead")
 finally:
     ns["ec_conditioning_selftest_source"] = _real_source
+
+
+# ==============================================================================
+print("")
+print("the lift-off rotation is measured from the traces, not dialled in")
+
+# The projection paints /ec/cond/vertical, and that channel only means "the
+# part" once lift-off lies along the horizontal axis. The angle belongs to the
+# probe, the frequency and the instrument's own phase -- not to a config file --
+# so it is measured from the scan's own data. Planting an angle and recovering
+# it is the only way to know the measurement works.
+#
+# ONE recording database for every case here, with a channel per case. Each
+# snde.recdatabase carries its own compute threads, and this file already holds
+# every one it makes for the life of the process (see _RECDBS); a database per
+# case would put eighty-odd threads on an eight-core machine and the earlier
+# blocks start timing out. _trace_list() takes the path, so one database does.
+_rot_db = _recdb()
+_rot_case = [0]
+
+
+def _rot_angle(z, **kw):
+    """Measure the lift-off angle of one synthetic trace set. -> (deg, detail)"""
+    _rot_case[0] += 1
+    path = "/rot/case%d" % _rot_case[0]
+    _trace_list(_rot_db, np.asarray(z).reshape(-1, 1), path=path)
+    return ns["ec_liftoff_rotation_from_traces"](_rot_db, path, **kw)
+
+
+def _traces_along(angle_deg, n=800, along=0.4, across=0.01, centre=(1.2, -0.35),
+                  flaws=(), seed=0):
+    """Traces scattered along one impedance-plane direction, plus optional flaw
+    excursions off it."""
+    rng = np.random.default_rng(seed)
+    t = rng.standard_normal(n)*along
+    perp = rng.standard_normal(n)*across
+    a = math.radians(angle_deg)
+    re = centre[0] + t*math.cos(a) - perp*math.sin(a)
+    im = centre[1] + t*math.sin(a) + perp*math.cos(a)
+    z = re + 1j*im
+    for where, mag, ang in flaws:
+        b = math.radians(ang)
+        z[where] += mag*complex(math.cos(b), math.sin(b))
+    return z
+
+
+def _axis_err(got, planted):
+    """Angle error treating the axis as a LINE: theta and theta+180 agree."""
+    d = abs(math.degrees(math.atan2(math.sin(math.radians(got - planted)),
+                                    math.cos(math.radians(got - planted)))))
+    return min(d, abs(180.0 - d))
+
+
+for _planted in (-66.0, -30.0, 0.0, 17.5, 72.0):
+    _got, _detail = _rot_angle(_traces_along(_planted))
+    check(_axis_err(_got, _planted) < 2.0,
+          "planted %+.1f deg, recovered %+.2f deg (err %.2f)"
+          % (_planted, _got, _axis_err(_got, _planted)))
+check(_detail["anisotropy"] > 10.0,
+      "...and it reports how clearly there was a direction (%.1fx)"
+      % _detail["anisotropy"])
+
+# A scan does not know where its flaws are, so the angle has to survive them
+# being left in. They are sparse and lie off the lift-off axis, so they perturb
+# it rather than defining it.
+_got, _ = _rot_angle(_traces_along(-66.0, n=800,
+                                   flaws=[(np.arange(0, 800, 37), 0.25, 20.0)],
+                                   seed=3))
+check(_axis_err(_got, -66.0) < 5.0,
+      "flaws left in move the angle but do not set it: %+.2f deg (err %.2f)"
+      % (_got, _axis_err(_got, -66.0)))
+
+# No direction means no angle. Returning one anyway would rotate the image by
+# something arbitrary and make it look conditioned.
+try:
+    _rot_angle(_traces_along(0.0, along=0.05, across=0.05))
+    check(False, "a round scatter should have been refused")
+except ValueError as _e:
+    check("anisotropy" in str(_e),
+          "a round scatter is refused rather than given an arbitrary angle")
+
+# An angle from a handful of traces is noise with a decimal point.
+try:
+    _rot_angle(_traces_along(-66.0, n=40))
+    check(False, "40 traces should have been refused")
+except ValueError as _e:
+    check("min_traces" in str(_e) or "are wanted" in str(_e),
+          "too few traces is refused")
+
+# theta and theta-180 are the same rotation, so two scans of one setup must not
+# report numbers that differ by a half turn.
+for _planted in (120.0, -120.0, 200.0):
+    _got, _ = _rot_angle(_traces_along(_planted))
+    check(-90.0 < _got <= 90.0,
+          "planted %+.1f reports %+.2f, inside (-90, 90]" % (_planted, _got))
 
 
 def test_ec_scan_wiring():

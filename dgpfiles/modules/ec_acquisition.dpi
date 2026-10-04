@@ -49,6 +49,7 @@
 # any trace is recorded, and subtracting a constant afterwards does not move it.
 
 import os
+import re
 import time
 
 import numpy as np
@@ -87,7 +88,10 @@ global ECTimestampedSource
 global setup_ec_conditioning
 global teardown_ec_conditioning
 global set_ec_parameter
+global EC_CONDITIONING_READY_TIMEOUT_S
 global ec_null_from_traces
+global ec_liftoff_rotation_from_traces
+global MIN_LIFTOFF_ANISOTROPY
 global ec_channel_exists
 global ec_conditioning_parameters
 global ec_conditioning_in_force
@@ -274,6 +278,13 @@ def ec_channel_exists(recdb, path):
             return False
 
 
+#: How long setup_ec_conditioning() waits for the math it just wired to produce
+#: its first output. Generous: it is paid once per scan, and the alternative to
+#: waiting is an intermittent "channel not found" in whatever reads the
+#: conditioned channels next.
+EC_CONDITIONING_READY_TIMEOUT_S = 30.0
+
+
 def setup_ec_conditioning(recdb, traces_path, prefix="/ec/cond",
                           null=(0.0, 0.0), rotation_deg=0.0, gain=(1.0, 1.0)):
     """Wire the conditioning math onto an EC trace list.
@@ -354,6 +365,40 @@ def setup_ec_conditioning(recdb, traces_path, prefix="/ec/cond",
     trans.add_math_function(fcn, False)
 
     trans.end_transaction().globalrev_wait().wait_complete()
+
+    # AND WAIT FOR THE OUTPUTS, which is a different thing from waiting for the
+    # transaction. The globalrev above carries the math function's DEFINITION;
+    # whether its outputs have been computed into a COMPLETE globalrev yet is a
+    # scheduling question, and recdb.latest only advances to complete ones. So a
+    # caller that wires the conditioning and immediately reads
+    # /ec/cond/vertical can find it missing -- intermittently, because it
+    # depends on how busy the math threads are.
+    #
+    # It is not a hypothetical: it made ec_scan_wiring_test.py fail about one
+    # run in four with "get_recording(): channel /ec/cond/horizontal not found",
+    # and the same read happens in the scan's own setup_after_first hook.
+    # Waiting here, once, is cheaper than every caller learning to.
+    deadline = time.monotonic() + EC_CONDITIONING_READY_TIMEOUT_S
+    wanted = set(outputs.values())
+    have = set()
+    while time.monotonic() < deadline:
+        try:
+            have = set(recdb.latest.list_recordings())
+        except Exception:                                  # noqa: BLE001
+            have = set()
+        if wanted <= have:
+            break
+        time.sleep(0.02)
+    else:
+        raise RuntimeError(
+            "the conditioning math was defined but produced no output within "
+            "%.1f s: %s missing. The function is wired and the parameters are "
+            "set, so this is the math not running rather than a wiring fault -- "
+            "check that ec_condition_function instantiated against a matching "
+            "spatialnde2 build (check_ec_conditioning())."
+            % (EC_CONDITIONING_READY_TIMEOUT_S,
+               ", ".join(sorted(wanted - have)) or "(none)"))
+
     return {"function": fcn, "chans": chans, "paths": paths,
             "outputs": outputs, "recdb": recdb, "prefix": prefix}
 
@@ -424,12 +469,55 @@ def ec_conditioning_selftest_source():
         "    '/', False, False, False, snde.math_definition('selftest'), [], None)\n"
         "t.add_math_function(f, False)\n"
         "t.end_transaction().globalrev_wait().wait_complete()\n"
+        # THE SAME WAIT setup_ec_conditioning() does, and for the same reason:
+        # the globalrev above carries the math function's DEFINITION, and
+        # whether its OUTPUTS have reached a complete globalrev yet is a
+        # scheduling question. Reading straight through failed about one child
+        # in eight with "channel /selftest/vertical not found" -- which this
+        # self-test then reported as a conditioning fault, i.e. it blamed the
+        # compiled extension for a race in its own harness.
+        "import time as _t\n"
+        "_deadline = _t.monotonic() + 30.0\n"
+        "while _t.monotonic() < _deadline:\n"
+        "    try:\n"
+        "        if outs[2] in set(recdb.latest.list_recordings()): break\n"
+        "    except Exception: pass\n"
+        "    _t.sleep(0.02)\n"
+        "else:\n"
+        "    raise SystemExit('the conditioning math produced no output in 30 s')\n"
         "v = np.asarray(recdb.latest.ref(outs[2]).data "
         "if callable(getattr(recdb.latest, 'ref', None)) "
         "else recdb.latest.ref[outs[2]].data).reshape(-1)\n"
         "assert abs(float(v[0])) < 1e-9, 'nulled trace did not condition to 0'\n"
         "assert abs(float(v[-1])) > 1e-6, 'a departing trace conditioned to 0'\n"
         "print('EC_CONDITIONING_OK')\n")
+
+
+def _selftest_excerpt(out, lines=25):
+    """The part of a failed self-test's output that says what went wrong.
+
+    THE TAIL IS THE WRONG END. snde_error.what() appends a C++ backtrace --
+    twenty-odd frames of hex addresses -- so quoting the last N characters
+    reliably shows the backtrace and hides the message, which is what it did
+    while this was being debugged: "exit 1" followed by nothing but addresses.
+
+    So the backtrace frames are dropped and the first `lines` of what is left
+    are quoted, with a count of what was removed so nobody wonders where it
+    went.
+    """
+    kept = []
+    dropped = 0
+    for line in (out or "").splitlines():
+        if re.match(r"^\s*\[\s*\d+\s*\]:", line) or re.match(r"^\s*Binary file ", line):
+            dropped += 1
+            continue
+        kept.append(line)
+    text = "\n".join(kept[:lines]).strip()
+    if len(kept) > lines:
+        text += "\n  ... and %d more line(s)" % (len(kept) - lines,)
+    if dropped:
+        text += "\n  (%d C++ backtrace frame(s) omitted)" % (dropped,)
+    return text or "(the child produced no output)"
 
 
 def check_ec_conditioning(timeout=180.0):
@@ -497,7 +585,7 @@ def check_ec_conditioning(timeout=180.0):
                 "libspatialnde2.so; if the library is newer, that is the "
                 "fault.\n%s" % (p.returncode, out[-800:]))
     return (False, "the conditioning self-test failed (exit %s):\n%s"
-                   % (p.returncode, out[-1200:]))
+                   % (p.returncode, _selftest_excerpt(out)))
 
 
 def ec_conditioning_parameters(null=None, rotation_deg=None, gain=None,
@@ -608,6 +696,13 @@ def set_ec_parameter(cond, key, value):
     return tuple(float(v) for v in values)
 
 
+#: How much longer the first principal axis of the trace scatter has to be than
+#: the second before ec_liftoff_rotation_from_traces() will call it a direction.
+#: Measured scans run 9 to 21; a round scatter is 1. Three is well clear of
+#: round and well under anything real.
+MIN_LIFTOFF_ANISOTROPY = 3.0
+
+
 def ec_null_from_traces(recdb, traces_path, first=0, count=None):
     """The mean impedance over a span of traces, to use as the null point.
 
@@ -626,6 +721,77 @@ def ec_null_from_traces(recdb, traces_path, first=0, count=None):
         raise ValueError("no traces at %s to null against" % (traces_path,))
     mean = np.mean(data)
     return (float(np.real(mean)), float(np.imag(mean)))
+
+
+def ec_liftoff_rotation_from_traces(recdb, traces_path, null=None,
+                                    first=0, count=None, min_traces=200):
+    """The rotation that lays lift-off along the horizontal axis. -> (deg, detail)
+
+    THE ANGLE IS MEASURED FROM THE SCAN'S OWN TRACES, not dialled in. An
+    instrument's lift-off direction belongs to the probe, the frequency and the
+    instrument's own phase; it is not a number that survives a session, a probe
+    change or a warm-up, and the one reliable place to get it is the data just
+    acquired.
+
+    HOW: over good material the reading moves almost entirely along one
+    direction in the impedance plane, because lift-off and tilt dominate and
+    they share an axis. So the first principal direction of the nulled traces
+    IS that axis, and the angle returned is the one to hand to set_rotation()
+    -- which quotes the angle a feature SITS AT, the way an instrument does.
+
+    FLAWS DO NOT HAVE TO BE EXCLUDED, and that matters because a scan does not
+    know where they are. They are sparse and they lie off this axis, so they
+    perturb it rather than defining it: measured on a 2212-trace scan over
+    twelve notches, using every trace gave -65.41 deg against -66.00 deg from
+    good material alone, and the detection that followed was within a few per
+    cent either way.
+
+    `detail["anisotropy"]` is how much longer the first principal axis is than
+    the second -- how clearly there IS a lift-off direction. Near 1 means the
+    scatter is round and the angle is arbitrary; this refuses below
+    MIN_LIFTOFF_ANISOTROPY rather than returning a number that means nothing.
+
+    The median is used for centring rather than the mean, so a handful of large
+    flaw excursions cannot drag the centre.
+    """
+    ref = recdb.latest.ref[traces_path]
+    data = np.asarray(ref.data).reshape(-1)
+    data = data[first:first+count] if count is not None else data[first:]
+    if data.size < min_traces:
+        raise ValueError(
+            "only %d trace(s) at %s; %d are wanted before the lift-off "
+            "direction means anything. Scan further, or lower min_traces "
+            "deliberately." % (data.size, traces_path, min_traces))
+    if null is None:
+        centre = np.median(data.real) + 1j*np.median(data.imag)
+    else:
+        centre = complex(null[0], null[1])
+    z = data - centre
+    X = np.column_stack([z.real, z.imag])
+    X = X - np.median(X, axis=0)
+    _u, sv, vt = np.linalg.svd(X, full_matrices=False)
+    anisotropy = float(sv[0]/sv[1]) if sv[1] > 0 else float("inf")
+    angle = float(np.degrees(np.arctan2(vt[0, 1], vt[0, 0])))
+    # The axis is a LINE, not a direction: +theta and theta-180 describe the
+    # same rotation. Reported in (-90, 90] so two scans of the same setup give
+    # the same number instead of ones that differ by a half turn.
+    while angle <= -90.0:
+        angle += 180.0
+    while angle > 90.0:
+        angle -= 180.0
+    detail = {"traces": int(data.size), "anisotropy": anisotropy,
+              "centre": (float(centre.real), float(centre.imag)),
+              "sigma_along": float(sv[0]/max(np.sqrt(len(X)), 1.0)),
+              "sigma_across": float(sv[1]/max(np.sqrt(len(X)), 1.0))}
+    if anisotropy < MIN_LIFTOFF_ANISOTROPY:
+        raise ValueError(
+            "the traces at %s scatter almost equally in every direction "
+            "(anisotropy %.2f, under %.2f), so there is no lift-off direction "
+            "to find and any angle would be arbitrary. That is what a scan over "
+            "a part with no lift-off variation looks like -- and also what a "
+            "dead instrument looks like."
+            % (traces_path, anisotropy, MIN_LIFTOFF_ANISOTROPY))
+    return angle, detail
 
 
 # ==============================================================================
