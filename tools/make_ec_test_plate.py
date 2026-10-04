@@ -20,16 +20,29 @@ separate, exactly as they are on a real part.
 
 OUTPUTS
 
-    ec_test_plate.ply     the surface, metres, with vertex normals
+    ec_test_plate.ply     the surface in WORLD coordinates, metres, with
+                          vertex normals
     ec_test_plate.stl     the same, for Gazebo
     model.sdf             a Gazebo model that places it in the cell
-    flaws.json            every notch: centre, orientation, dimensions
+    flaws.json            every notch in PLATE coordinates, plus where the
+                          plate was placed
     README.txt            what this is and how the numbers were chosen
+
+THE MESHES ARE IN WORLD COORDINATES AND THE FLAW LIST IS NOT, and that split is
+deliberate. sim_specimen.dpi's place_gazebo_mesh() and write_keyence_sim_scene()
+both require world coordinates -- they write a model with an identity pose, so
+that nothing has to be kept in step between the Gazebo model and the simulated
+profiler's own scene. The flaws, on the other hand, are a property of the PLATE:
+a flaw table in world coordinates would be a property of one plate on one bench
+and would be wrong the moment it moved. So the manifest describes the plate in
+its own frame and records where it was put, and ec_plate_model.py does that one
+transform at load.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import struct
 from datetime import datetime, timezone
@@ -44,8 +57,11 @@ PLATE_Y = 0.120
 PLATE_Z = 0.012
 TOP_CELL = 0.002          # tessellation of the scanned face
 
-# Where the plate sits in the cell. The top face lands at this z.
+# Where the plate sits in the cell. The top face lands at this z. Overridable
+# with --place / --yaw-deg, because where the plate sits is a decision about
+# this bench and not a property of the plate.
 PLACE_XYZ = (0.850, -0.200, 0.950)
+PLACE_YAW_DEG = 0.0
 
 #: Notch dimensions ON THE RESPONSE TABLE'S NODES -- see
 #: tools/generate_ec_table.py. Lengths are the UniWest 99073 standard's four,
@@ -136,6 +152,21 @@ def plate_mesh():
     return verts, normals, tris
 
 
+def place(verts, normals, place_xyz, yaw_deg):
+    """Plate coordinates to WORLD coordinates. -> (verts, normals)
+
+    A yaw about z and a translation. The normals rotate and do not translate,
+    which is the one half of this that is easy to get wrong and impossible to
+    see afterwards: a mesh with translated normals loads, renders, and gives
+    the toolpath planner garbage orientations.
+    """
+    a = math.radians(float(yaw_deg))
+    c, s = math.cos(a), math.sin(a)
+    R = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    return (verts @ R.T + np.asarray(place_xyz, dtype=np.float64),
+            normals @ R.T)
+
+
 def write_ply(path, v, n, t):
     with open(path, "wb") as f:
         f.write(b"ply\nformat binary_little_endian 1.0\n")
@@ -186,10 +217,17 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", default="ec_test_plate")
+    ap.add_argument("--place", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                    default=list(PLACE_XYZ),
+                    help="where the plate's top face goes, world metres "
+                         "(default %s)" % (list(PLACE_XYZ),))
+    ap.add_argument("--yaw-deg", type=float, default=PLACE_YAW_DEG,
+                    help="rotation of the plate about world z, degrees")
     args = ap.parse_args(argv)
     os.makedirs(args.out_dir, exist_ok=True)
 
     v, n, t = plate_mesh()
+    v, n = place(v, n, args.place, args.yaw_deg)
     write_ply(os.path.join(args.out_dir, "ec_test_plate.ply"), v, n, t)
     write_stl(os.path.join(args.out_dir, "ec_test_plate.stl"), v, t)
     with open(os.path.join(args.out_dir, "model.sdf"), "w") as f:
@@ -199,8 +237,10 @@ def main(argv=None):
     manifest = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "plate": {"size_m": [PLATE_X, PLATE_Y, PLATE_Z],
-                  "place_xyz_m": list(PLACE_XYZ),
-                  "frame": "plate centre, z=0 at the scanned face, x along the long axis"},
+                  "place_xyz_m": [float(c) for c in args.place],
+                  "place_yaw_deg": float(args.yaw_deg),
+                  "frame": "plate centre, z=0 at the scanned face, x along the long axis",
+                  "meshes_frame": "world"},
         "material": "aluminium 6061-T6",
         "flaws": fl,
         "notes": ("Flaw dimensions are on the response table's nodes so no "
@@ -216,7 +256,8 @@ def main(argv=None):
 
     print("plate %gx%gx%g mm, %d vertices, %d faces"
           % (PLATE_X*1e3, PLATE_Y*1e3, PLATE_Z*1e3, len(v), len(t)))
-    print("top face at z = %g m when placed at %s" % (PLACE_XYZ[2], PLACE_XYZ))
+    print("meshes are in WORLD coordinates: top face at z = %g m, placed at "
+          "%s, yaw %g deg" % (args.place[2], tuple(args.place), args.yaw_deg))
     print("%d notches:" % len(fl))
     for d in fl:
         print("   %-8s (%+7.1f, %+6.1f) mm  L %.3f  D %.2f  W %.2f mm  yaw %3.0f deg"

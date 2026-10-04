@@ -83,13 +83,28 @@
 #     accumulator reads the time axis off its input.
 #   * float64, because that is what ai_voltage writes.
 #
-# WHAT THIS IS NOT. Eddy-current physics. There is a proper way to simulate an
-# EC probe over a flaw -- an analytic impedance-plane model, or a FEM of the
-# coil and the conductor -- and this is deliberately not it. What breaks in this
-# pipeline is the ARCHITECTURE (a math function wired onto a channel that does
-# not exist yet, a trace bound to the wrong pose), and an architectural stand-in
-# is what tests that. The numbers are synthetic and must not be read as an
-# instrument response.
+# TWO SOURCES OF NUMBERS, AND THE CHANNELS DO NOT KNOW WHICH. Everything above
+# is about the SHAPE of what is published; what fills it is either of:
+#
+#   * a MODEL (pass model=), driven by the response table that ecsim generates
+#     and ec_plate_model.py reads. Real impedance-plane physics: a differential
+#     probe's double-lobed loop over a notch, the flaw-free lift-off/tilt
+#     trajectory, and tilt about the split line producing a signal of the same
+#     KIND as a flaw rather than merely noise on top of it. That last point is
+#     the whole reason the table exists.
+#   * the SYNTHETIC signal below, when there is no model. Gaussian bumps along
+#     an invented direction in the impedance plane.
+#
+# THE SYNTHETIC PATH IS NOT EDDY-CURRENT PHYSICS and has never claimed to be.
+# It stays because it needs no table, no HDF5 and no overnight generation run:
+# what breaks in this pipeline is mostly the ARCHITECTURE (a math function
+# wired onto a channel that does not exist yet, a trace bound to the wrong
+# pose), an architectural stand-in is what tests that, and it has to keep
+# working on a machine with nothing installed. Its numbers are synthetic and
+# must not be read as an instrument response. The model's numbers may be, with
+# the caveats ec_plate_model.py records -- chiefly that the probe's coil
+# geometry is a documented placeholder rather than a fit, so shapes are
+# meaningful and absolute amplitudes are not.
 #
 # The synthetic signal is not pure noise, though, and that is not decoration:
 #
@@ -103,7 +118,9 @@
 #     eddy-current setup procedure itself exercisable without an instrument.
 #
 # TO USE THE REAL INSTRUMENT, set EC_SOURCE = "hardware" in the config. This
-# module is not included then, and nothing else changes.
+# module is not included then, and nothing else changes. To drive the
+# simulation from the response table instead of the synthetic signal, set
+# EC_TABLE and EC_PLATE; the config builds the model and passes it here.
 
 import math
 import threading
@@ -175,12 +192,30 @@ class SimECSource(object):
     NOISE_V = 0.004
 
     def __init__(self, recdb, clock, real_path, imag_path, position_fn=None,
-                 sample_rate=1000.0, block_hz=50.0, seed=None):
+                 sample_rate=1000.0, block_hz=50.0, seed=None,
+                 model=None, pose_fn=None):
         self.recdb = recdb
         self.clock = clock
         self.real_path = real_path
         self.imag_path = imag_path
         self.position_fn = position_fn
+        # `model` is an ec_plate_model.ECPlateModel, or None for the synthetic
+        # signal. `pose_fn` returns ((x,y,z), (qx,qy,qz,qw), ...) -- the probe's
+        # ORIENTATION as well as its position, which the synthetic signal never
+        # needed and the model cannot do without: lift-off and both tilts come
+        # out of the orientation, and tilt is the dominant term.
+        self.model = model
+        self.pose_fn = pose_fn
+        if model is not None and pose_fn is None:
+            raise ValueError(
+                "a model needs pose_fn as well as position_fn: the response "
+                "table is indexed by probe ORIENTATION (lift-off and two tilt "
+                "axes) as much as by position, and tilt is the larger signal. "
+                "Driving a model from position alone would hold the probe "
+                "permanently square-on and hide exactly the effect the table "
+                "was generated to study.")
+        self.model_errors = 0
+        self.model_no_pose = 0
         self.sample_rate = float(sample_rate)
         self.block_hz = float(block_hz)
         self.block_samples = max(1, int(round(self.sample_rate/self.block_hz)))
@@ -206,6 +241,22 @@ class SimECSource(object):
             return None
         try:
             return self.position_fn()
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def current_pose(self):
+        """((x,y,z), (qx,qy,qz,qw)) or None. Never raises -- see
+        current_position(); this runs on the acquisition thread too."""
+        if self.pose_fn is None:
+            return None
+        try:
+            snap = self.pose_fn()
+        except Exception:                                  # noqa: BLE001
+            return None
+        if snap is None:
+            return None
+        try:
+            return (snap[0], snap[1])
         except Exception:                                  # noqa: BLE001
             return None
 
@@ -260,6 +311,32 @@ class SimECSource(object):
         """
         if n is None:
             n = self.block_samples
+
+        if self.model is not None:
+            pose = self.current_pose()
+            if pose is not None:
+                try:
+                    return self.model.volts(pose[0], pose[1], n=n)
+                except Exception:                          # noqa: BLE001
+                    # A model that raises must not stop the instrument. Count
+                    # it, record it, and fall through to the synthetic signal
+                    # for this block -- publishing SOMETHING keeps the
+                    # correlation and the trigger alive, and report() says how
+                    # often it happened. Formatted, not the object: an
+                    # exception object here would pin its traceback, and its
+                    # frame, and the active transaction in that frame, which
+                    # wedges every globalrev wait in the process.
+                    self.model_errors += 1
+                    self.last_error = traceback.format_exc()
+            else:
+                # No pose yet -- TF has produced nothing. Counted separately
+                # from a model that raised, because they want opposite
+                # responses: this one resolves itself as soon as the cell comes
+                # up, and a nonzero count AFTER a scan means the model was
+                # never consulted at all. Falls through to the synthetic
+                # signal, which needs no pose.
+                self.model_no_pose += 1
+
         if pos is None:
             pos = self.current_position()
 
@@ -290,6 +367,20 @@ class SimECSource(object):
         md.AddMetaDatum(snde.metadatum("ande_array-ampl_units", "V"))
         md.AddMetaDatum(snde.metadatum("ande_array-ampl_coord", "Voltage"))
         md.AddMetaDatum(snde.metadatum("EC-simulated", 1))
+        # WHICH simulation, recorded on every block. A stored dataset whose
+        # traces came from the synthetic bumps and one whose traces came from
+        # the response table are not comparable, and nothing else in the file
+        # distinguishes them.
+        md.AddMetaDatum(snde.metadatum("EC-sim-source",
+                                       "table-model" if self.model is not None
+                                       else "synthetic"))
+        if self.model is not None:
+            md.AddMetaDatum(snde.metadatum(
+                "EC-sim-table",
+                str(self.model.table.path if self.model.table is not None else "")))
+            md.AddMetaDatum(snde.metadatum(
+                "EC-sim-table-stub",
+                1 if getattr(self.model.table, "is_stub", False) else 0))
         return md
 
     def publish_once(self, pos=None):
@@ -351,8 +442,21 @@ class SimECSource(object):
             self._thread = None
 
     def report(self):
+        if self.model is not None:
+            return {"blocks": self.blocks, "errors": self.errors,
+                    "model_errors": self.model_errors,
+                    "model_no_pose": self.model_no_pose,
+                    "last_error": self.last_error,
+                    "sample_rate": self.sample_rate,
+                    "block_samples": self.block_samples,
+                    "block_hz": self.block_hz,
+                    "real_path": self.real_path, "imag_path": self.imag_path,
+                    "source": "table-model",
+                    "model": self.model.report()}
         return {"blocks": self.blocks, "errors": self.errors,
+                "model_errors": self.model_errors,
                 "last_error": self.last_error,
+                "source": "synthetic",
                 "sample_rate": self.sample_rate,
                 "block_samples": self.block_samples,
                 "block_hz": self.block_hz,

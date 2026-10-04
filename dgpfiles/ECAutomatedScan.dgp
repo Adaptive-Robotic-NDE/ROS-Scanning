@@ -213,12 +213,14 @@ EC_IMAG_PATH = "/%s/%s" % (EC_DAQ_DEVICE, EC_CHANNELS[1])
 #               which is most of the pipeline and most machines -- and
 #               run_ec_scan() refuses rather than inventing data.
 #   "sim"       SimECSource (sim_ec_source.dpi): two free-running channels of
-#               SYNTHETIC volts, published exactly the way ai_voltage publishes
-#               real ones. An ARCHITECTURAL stand-in, not a model of an eddy-
-#               current probe: it exercises the trigger correlation, the trace
-#               accumulator, the impedance-plane conditioning and the projection
-#               end to end without a card. The numbers are not instrument
-#               readings and must never be reported as measurements.
+#               simulated volts, published exactly the way ai_voltage publishes
+#               real ones. What FILLS them depends on EC_TABLE below -- either
+#               a real impedance-plane model driven by a generated response
+#               table, or, with no table, synthetic bumps that are an
+#               ARCHITECTURAL stand-in and not a model of a probe at all. Both
+#               exercise the trigger correlation, the trace accumulator, the
+#               impedance-plane conditioning and the projection end to end
+#               without a card.
 #
 # "sim" exists so the architecture can be exercised without an instrument. The
 # failures it catches are wiring failures: the conditioning must not be attached
@@ -242,6 +244,61 @@ EC_SOURCE = os.environ.get("EC_SOURCE", "hardware")
 # sweep is 0.2 mm of travel per block against a 1.00 mm trace pitch.
 EC_SIM_SAMPLE_RATE = 1000.0
 EC_SIM_BLOCK_HZ = 50.0
+
+# ------------------------------------------------------------------------------
+# THE SIMULATED PROBE RESPONSE -- only read when EC_SOURCE == "sim"
+# ------------------------------------------------------------------------------
+# Point these at a generated response table and a test plate and the simulated
+# instrument stops inventing its numbers and starts computing them:
+#
+#   EC_TABLE  the HDF5 response table. tools/generate_ec_table.py writes it,
+#             running against ecsim on a machine with the compute for it (a
+#             night on a workstation); the flaw-free lift-off/tilt trajectory
+#             sits beside it as *_baseline.npz and is found automatically.
+#             tools/make_ec_stub_table.py writes a schema-conformant STUB in
+#             seconds for working on the pipeline itself -- its physics is
+#             invented and the file says so, and everything that prints a
+#             result from it repeats that.
+#   EC_PLATE  flaws.json from tools/make_ec_test_plate.py: a flat aluminium
+#             plate carrying notches whose dimensions sit exactly on the
+#             table's nodes, so no interpolation in flaw geometry is needed and
+#             any error seen is the pipeline's. The notches are deliberately
+#             NOT in the mesh -- a 0.15 mm slot is below what the profiler
+#             resolves and the 4.75 mm probe bridges it -- so the geometry and
+#             the flaws are separate, exactly as they are on a real part.
+#
+# WITH BOTH, the simulated instrument reproduces what we are actually trying to
+# fight: a differential probe's double-lobed loop over a notch, and tilt about
+# the split line producing a signal of the SAME KIND as a flaw rather than
+# noise on top of it. Separating those two is the whole problem, and it cannot
+# be rehearsed against synthetic bumps that put them on different axes by
+# construction.
+#
+# WITH NEITHER, the synthetic signal runs and nothing else changes. That is the
+# normal case on a machine with no table, and it keeps working with no h5py.
+#
+#     EC_SOURCE=sim EC_TABLE=~/ectable/al6061_2mhz_response.h5 \
+#         EC_PLATE=~/ecplate/flaws.json dataguzzler-python ...
+EC_TABLE = os.environ.get("EC_TABLE", "")
+EC_PLATE = os.environ.get("EC_PLATE", "")
+
+# The angle from the probe_end frame's x axis to the probe's COIL-SEPARATION
+# axis, degrees. NOT KNOWN for the real probe -- it is a pencil probe in a
+# holder and its rotation about its own axis was never recorded -- and it
+# matters, because it decides which tilt is the dangerous one and rotates every
+# notch's apparent orientation by the same amount. Measuring it is on the cell
+# visit plan. Zero means the coils lie along probe_end x.
+EC_COIL_AXIS_DEG = float(os.environ.get("EC_COIL_AXIS_DEG", "0.0"))
+
+# Instrument output scale, volts per ohm, and None to take the model's own
+# default. The real instrument's gain is a front-panel setting and choosing it
+# is one of the things this simulation exists to study, so it is a knob here
+# too. The model prints what the loaded table suggests for 2 V on its largest
+# notch -- which assumes a NULLED instrument, since un-nulled the standing
+# reading is two orders of magnitude up on the flaw and that gain rails every
+# block.
+EC_SIM_V_PER_OHM = (float(os.environ["EC_SIM_V_PER_OHM"])
+                    if os.environ.get("EC_SIM_V_PER_OHM") else None)
 
 # What to do with the DAQ block a trigger correlates to. The block spans time and
 # the probe moved during it, so this is a SPATIAL averaging choice: "mean" is
@@ -1107,9 +1164,14 @@ ReconstructionSource.MAX_SWEEP_VELOCITY = min(ReconstructionSource.MAX_SWEEP_VEL
 global daq
 global ec_source
 global ec_cond
+global ec_model
 daq = None
 ec_source = None
 ec_cond = None
+# The response-table model, when EC_SOURCE == "sim" and a table was named.
+# None in every other case, including "sim" with no table -- so "is there a
+# model?" is one test everywhere and not a question about EC_SOURCE.
+ec_model = None
 
 if EC_SOURCE == "hardware":
     try:
@@ -1126,16 +1188,69 @@ if EC_SOURCE == "hardware":
         print("  reconstruction and planning still work; run_ec_scan() will refuse.")
 elif EC_SOURCE == "sim":
     include(None, os.path.join(SCAN_MODULE_DIR, "sim_ec_source.dpi"))
+
+    # The response-table model, if a table and a plate were named. Built BEFORE
+    # the source, because the source needs it; and failing to build it is not
+    # fatal -- the synthetic signal still runs, and a scan that silently used
+    # synthetic numbers while the operator believed it was using the table
+    # would be far worse than one that says so here.
+    ec_model = None
+    if EC_TABLE and EC_PLATE:
+        try:
+            import ec_response_table as _ec_table_mod
+            import ec_plate_model as _ec_plate_mod
+        except ImportError:
+            # include() puts the .dpi's own path on sys.path, not the module
+            # directory; the config knows where that is.
+            if SCAN_MODULE_DIR and SCAN_MODULE_DIR not in sys.path:
+                sys.path.insert(0, SCAN_MODULE_DIR)
+            import ec_response_table as _ec_table_mod
+            import ec_plate_model as _ec_plate_mod
+        try:
+            _ec_tbl = _ec_table_mod.ECResponseTable(EC_TABLE)
+            ec_model = _ec_plate_mod.ECPlateModel(
+                _ec_tbl, _ec_plate_mod.load_plate(EC_PLATE),
+                coil_axis_deg=EC_COIL_AXIS_DEG,
+                v_per_ohm=EC_SIM_V_PER_OHM,
+                pose_fn=lambda: live_pose.snapshot())
+        except Exception as _e:
+            ec_model = None
+            print("  ** NO response-table model (%s: %s)"
+                  % (type(_e).__name__, _e))
+            print("     Falling back to the SYNTHETIC signal. Nothing this "
+                  "scan produces comes from the table.")
+    elif EC_TABLE or EC_PLATE:
+        # One without the other is always a mistake, and a silent fallback here
+        # is the kind that is noticed a week later.
+        print("  ** EC_TABLE and EC_PLATE must BOTH be set to use the response "
+              "table (table=%r plate=%r). Using the SYNTHETIC signal."
+              % (EC_TABLE, EC_PLATE))
+
     daq = SimECSource(recdb, transaction_clock, EC_REAL_PATH, EC_IMAG_PATH,
                       position_fn=lambda: probe_position(),
+                      pose_fn=(None if ec_model is None
+                               else (lambda: live_pose.snapshot())),
+                      model=ec_model,
                       sample_rate=EC_SIM_SAMPLE_RATE,
                       block_hz=EC_SIM_BLOCK_HZ)
     print("  ** SIMULATED eddy-current instrument on %s and %s "
           "(%.0f Hz in blocks of %d)"
           % (EC_REAL_PATH, EC_IMAG_PATH, EC_SIM_SAMPLE_RATE, daq.block_samples))
-    print("     THE NUMBERS ARE SYNTHETIC. This is an architectural stand-in "
-          "for the DAQ, not a model of an eddy-current probe -- nothing it "
-          "produces is a measurement of anything.")
+    if ec_model is None:
+        print("     THE NUMBERS ARE SYNTHETIC. This is an architectural "
+              "stand-in for the DAQ, not a model of an eddy-current probe -- "
+              "nothing it produces is a measurement of anything. Set EC_TABLE "
+              "and EC_PLATE to drive it from a generated response table.")
+    else:
+        for _line in ec_model.describe().splitlines():
+            print("     %s" % (_line,))
+        if ec_model.table.is_stub:
+            print("     ** THE TABLE IS A STUB: its physics is invented. "
+                  "Shapes are exercised, numbers mean nothing.")
+        else:
+            print("     Simulated from the response table. The coil geometry "
+                  "behind it is a documented placeholder rather than a fit, so "
+                  "SHAPES are meaningful and absolute amplitudes are not.")
 elif EC_SOURCE != "none":
     raise ValueError("EC_SOURCE must be 'hardware', 'sim' or 'none', not %r"
                      % (EC_SOURCE,))
@@ -1218,6 +1333,22 @@ def null_ec_instrument():
     the manual step from ClientScannerTest ("Null Uniwest?") -- put the probe on
     good material first with ec_touch_down(0).
     """
+    if ec_instrument is None and ec_model is not None:
+        # The SIMULATED instrument's bridge. Same zero-argument call and the
+        # same one correct moment -- probe on the part, before any trace is
+        # read -- so the whole nulling sequence is exercised in simulation
+        # rather than only on the arm. It can be nulled in mid-air here too,
+        # and reports that it was, because that is the bench mistake and
+        # catching it in simulation is the point.
+        out = ec_model.null()
+        print("  simulated instrument nulled at %.4f%+.4fj ohms "
+              "(standoff %s, %s)"
+              % (out["ohms"].real, out["ohms"].imag,
+                 "unknown" if out["standoff_m"] is None
+                 else "%.3f mm" % (out["standoff_m"]*1e3,),
+                 "OFF THE PART -- this null is wrong" if out["off_part"]
+                 else "on the part"))
+        return
     if ec_instrument is None:
         raise RuntimeError(
             "there is no eddy-current instrument to null (EC_INSTRUMENT=%r). "
@@ -2851,7 +2982,8 @@ def run_ec_scan(path=None, x3d=None, component=None, max_passes=None, force=Fals
     # of a minute in with the probe on the part. A null command that fails is not
     # knowable until it is issued, and that is caught at the first touchdown.
     print(describe_ec_nulling())
-    if EC_NULL_ON_CONTACT and EC_NULL_REQUIRED and ec_instrument is None:
+    if (EC_NULL_ON_CONTACT and EC_NULL_REQUIRED
+            and ec_instrument is None and ec_model is None):
         raise RuntimeError(
             "there is no eddy-current instrument to null on the part "
             "(EC_INSTRUMENT=%r) and a null is required, so this refuses before "
@@ -3435,6 +3567,63 @@ include(None, os.path.join(SCAN_MODULE_DIR, "azure_gauge.dpi"))
 # SCAN_ORIGIN constants above, so it must come after both.
 include(None, os.path.join(SCAN_MODULE_DIR, "sim_specimen.dpi"))
 
+
+global place_ec_test_plate
+def place_ec_test_plate(plate_dir=None):
+    """Put the simulated eddy-current test plate into the running world.
+
+    ONE CALL, because the plate has to reach THREE places that do not talk to
+    each other, and a plate in two of them is worse than a plate in none:
+
+        the Gazebo model      what the simulated camera renders
+        the Keyence scene     what the simulated profiler raycasts against
+        ec_model              where the flaws are, for the instrument
+
+    The first two are place_gazebo_mesh()'s job and it does both. The third is
+    already loaded -- the model was built from EC_PLATE at startup -- so all
+    this adds is the CHECK that the two agree: the same directory, and the
+    manifest the model is using sitting beside the mesh being spawned. Spawn a
+    plate from one directory while the instrument reads flaws from another and
+    every notch is in the wrong place, with nothing anywhere saying so, and the
+    scan comes out looking like a projection fault.
+
+    `plate_dir` defaults to EC_PLATE's own directory, which is the arrangement
+    tools/make_ec_test_plate.py produces: mesh and manifest together.
+    """
+    if plate_dir is None:
+        if not EC_PLATE:
+            raise RuntimeError(
+                "EC_PLATE is not set, so there is no test plate to place. "
+                "Generate one with tools/make_ec_test_plate.py and start with "
+                "EC_PLATE=<dir>/flaws.json.")
+        plate_dir = os.path.dirname(os.path.abspath(os.path.expanduser(EC_PLATE)))
+    stl = os.path.join(plate_dir, "ec_test_plate.stl")
+    if not os.path.isfile(stl):
+        raise RuntimeError(
+            "no %s. place_ec_test_plate() spawns the mesh that "
+            "tools/make_ec_test_plate.py writes beside flaws.json; point "
+            "plate_dir at that directory." % (stl,))
+    if ec_model is not None:
+        mine = os.path.abspath(ec_model.plate.get("_path", ""))
+        if os.path.dirname(mine) != os.path.abspath(plate_dir):
+            raise RuntimeError(
+                "the instrument is reading flaws from %s but you are spawning "
+                "the mesh from %s. One of them is the wrong plate, and a scan "
+                "run like this puts every notch in the wrong place with "
+                "nothing to show it. Pass the matching directory, or restart "
+                "with EC_PLATE pointing at this one." % (mine, plate_dir))
+    out = place_gazebo_mesh(stl, name="ec_test_plate")
+    if ec_model is None:
+        print("    NOTE: the plate is in the world but the instrument has no "
+              "model of it (EC_TABLE/EC_PLATE unset), so the readings are "
+              "still the synthetic signal. The geometry is real; the numbers "
+              "are not.")
+    else:
+        print("    the instrument's %d notches are on this plate, scanned face "
+              "at z = %.4f m" % (len(ec_model.flaws), ec_model.surface_z))
+    return out
+
+
 # ==============================================================================
 # THE CABLE GUARD, ON FOR THE WHOLE SESSION
 # ==============================================================================
@@ -3582,6 +3771,23 @@ print("           plan_ec_path()  preview_ec_scan()")
 print("  motion:  dry_run_ec_scan()  ec_joint_report()  ec_touch_down()  ec_lift()")
 print("           park_arm()")
 print("  setup:   setup_ec()  null_here()  set_rotation(deg)  set_gain(h, v)")
+# NAMED ONLY IN SIMULATION, because on hardware there is nothing to place and a
+# prompt offering it invites somebody to try.
+if EC_SOURCE == "sim":
+    print("  sim:     place_ec_test_plate()  -- puts the test plate into the "
+          "running")
+    print("           world, for the camera, the profiler and the instrument at "
+          "once.")
+    if ec_model is None:
+        print("           The instrument is on its SYNTHETIC signal: set "
+              "EC_TABLE and")
+        print("           EC_PLATE to drive it from a generated response table "
+              "instead.")
+    else:
+        print("           ec_model.report() says what the instrument is "
+              "modelling%s"
+              % (" -- A STUB TABLE, INVENTED PHYSICS"
+                 if ec_model.table.is_stub else ""))
 # THE DATA OUTLIVES THE PROCESS, and the operator has to know where. Named on
 # the prompt because the moment these are wanted is after a crash, when reading
 # source is the last thing anybody wants to be doing.
