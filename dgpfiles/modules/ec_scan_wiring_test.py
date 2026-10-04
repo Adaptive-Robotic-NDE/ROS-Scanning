@@ -636,6 +636,20 @@ except ValueError as _e:
     check("min_traces" in str(_e) or "are wanted" in str(_e),
           "too few traces is refused")
 
+# UNWRITTEN SLOTS MUST NOT SET THE DIRECTION. The trace list is allocated for
+# the PLANNED trace count, so a scan that drops a pass leaves the tail at 0+0j.
+# Those sit about 1.25 V from a cluster that spans 0.01 V, so each carries over
+# a hundred times the leverage of a real reading. Left in, they turned a -65 deg
+# axis into -18 and the image was conditioned with a rotation wrong by 47 deg.
+_z = _traces_along(-66.0, n=800)
+_padded = np.concatenate([_z, np.zeros(16, dtype=complex)])
+_got, _detail = _rot_angle(_padded)
+check(_axis_err(_got, -66.0) < 2.0,
+      "16 unwritten slots among 800 traces do not move the axis: %+.2f deg" % _got)
+check(_detail["unwritten_dropped"] == 16 and _detail["traces"] == 800,
+      "...and it says it ignored them (%d dropped, %d kept)"
+      % (_detail["unwritten_dropped"], _detail["traces"]))
+
 # theta and theta-180 are the same rotation, so two scans of one setup must not
 # report numbers that differ by a half turn.
 for _planted in (120.0, -120.0, 200.0):

@@ -757,6 +757,27 @@ def ec_liftoff_rotation_from_traces(recdb, traces_path, null=None,
     ref = recdb.latest.ref[traces_path]
     data = np.asarray(ref.data).reshape(-1)
     data = data[first:first+count] if count is not None else data[first:]
+
+    # DROP THE SLOTS THE SCAN NEVER FILLED.
+    #
+    # The trace list is allocated for the PLANNED number of traces and a scan
+    # that drops a pass, or ends a pass early, leaves the tail at 0+0j. Those
+    # are not readings: a real one carries the instrument's standing offset, so
+    # it is about 1.25 V from the origin, while the whole cloud of real readings
+    # spans about 0.01 V. Sixteen unwritten slots among 2370 therefore carry
+    # over a hundred times the leverage of a real point each, and the principal
+    # direction stops describing the data and starts describing the line from
+    # the cluster to the origin. Measured: a scan whose axis is -65.1 deg
+    # computed from its own saved traces reported -17.8 deg from this channel,
+    # and the rotation applied to the image was wrong by 47 degrees.
+    #
+    # An exact zero on BOTH components is the signature of an untouched slot and
+    # not of a measurement, so testing for it is safe; a reading that genuinely
+    # landed on 0+0j would be one point among thousands and is no loss.
+    keep = np.isfinite(data) & (data != 0)
+    dropped_unwritten = int((~keep).sum())
+    data = data[keep]
+
     if data.size < min_traces:
         raise ValueError(
             "only %d trace(s) at %s; %d are wanted before the lift-off "
@@ -779,7 +800,8 @@ def ec_liftoff_rotation_from_traces(recdb, traces_path, null=None,
         angle += 180.0
     while angle > 90.0:
         angle -= 180.0
-    detail = {"traces": int(data.size), "anisotropy": anisotropy,
+    detail = {"traces": int(data.size), "unwritten_dropped": dropped_unwritten,
+              "anisotropy": anisotropy,
               "centre": (float(centre.real), float(centre.imag)),
               "sigma_along": float(sv[0]/max(np.sqrt(len(X)), 1.0)),
               "sigma_across": float(sv[1]/max(np.sqrt(len(X)), 1.0))}

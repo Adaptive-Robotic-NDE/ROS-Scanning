@@ -1613,9 +1613,12 @@ def rotation_from_scan(first=0, count=None, apply=True, reproject=True,
             "(run_ec_scan(max_passes=1)) first." % (EC_TRACES_PATH,))
     degrees, detail = ec_liftoff_rotation_from_traces(
         recdb, EC_TRACES_PATH, first=first, count=count, min_traces=min_traces)
-    print("  lift-off lies at %+.2f deg over %d trace(s); the scatter is %.1fx "
+    print("  lift-off lies at %+.2f deg over %d trace(s)%s; the scatter is %.1fx "
           "longer along it than across (%.5f vs %.5f V)"
-          % (degrees, detail["traces"], detail["anisotropy"],
+          % (degrees, detail["traces"],
+             ("" if not detail.get("unwritten_dropped") else
+              " (%d unwritten slot(s) ignored)" % detail["unwritten_dropped"]),
+             detail["anisotropy"],
              detail["sigma_along"], detail["sigma_across"]))
     if not apply:
         print("    not applied (apply=False)")
