@@ -216,6 +216,12 @@ class SimECSource(object):
                 "was generated to study.")
         self.model_errors = 0
         self.model_no_pose = 0
+        #: Blocks the recording database would not accept because something
+        #: newer had already been committed. A DROPPED SAMPLE, not a fault --
+        #: see publish_once(). Watch it: steady growth means TRANSACTION_LATENCY
+        #: is too small for this block rate, or this thread is being starved.
+        self.dropped_blocks = 0
+        self.last_drop = None
         self.sample_rate = float(sample_rate)
         self.block_hz = float(block_hz)
         self.block_samples = max(1, int(round(self.sample_rate/self.block_hz)))
@@ -241,6 +247,40 @@ class SimECSource(object):
             return None
         try:
             return self.position_fn()
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def acquisition_time(self):
+        """When the block being published was measured. -> measurement_time
+
+        THE TIMESTAMP IS THE CORRELATION KEY, and under
+        timed_transaction_manager it is what decides which pose a reading lines
+        up with. Letting it default makes it mean "when this thread got round
+        to opening a transaction" instead, which is the distinction that
+        manager exists to draw -- spatialnde2's own start_transaction() spells
+        this out and calls the default right for CONFIGURATION and wrong for
+        ACQUISITION. The channel definitions in __init__ are configuration and
+        rightly take the default; a block of volts is acquisition and does not.
+
+        FROM THE MANAGER'S OWN CLOCK, not a clock of our own. The two must not
+        drift against each other: the manager orders by this stamp and refuses
+        anything older than what it has already committed, so a producer
+        stamping from somewhere else would see its blocks refused for a reason
+        that has nothing to do with when they were measured. `clock` is the one
+        the config built the manager with; transmgr.get_current_time() is the
+        same thing reached the other way, and is on the base class so it works
+        under either manager.
+
+        Returns None when neither is reachable -- a bare recdb in a test --
+        and publish_once() then falls back to the unstamped call.
+        """
+        if self.clock is not None:
+            return self.clock.get_current_time()
+        transmgr = getattr(self.recdb, "transmgr", None)
+        if transmgr is None:
+            return None
+        try:
+            return transmgr.get_current_time()
         except Exception:                                  # noqa: BLE001
             return None
 
@@ -389,9 +429,35 @@ class SimECSource(object):
         ONE transaction for the pair, exactly as ai_voltage does it: the
         correlation reads both channels out of a single globalrev, so they have
         to arrive together or the pairing is a race.
+
+        STAMPED AT MEASUREMENT, immediately after synthesising the block and
+        before anything else can delay us -- see acquisition_time().
+
+        A STAMP THE DATABASE REFUSES IS A DROPPED SAMPLE, not a fault, and not
+        a reason to stop. Something newer has already been committed, so this
+        block can no longer be put in order; the manager says so at the front
+        door precisely so the producer can decide, while it is still on the
+        stack. Counting it and leaving a GAP is the right answer -- shifting it
+        to a later timestamp would move a reading to a place the probe was not,
+        and raising would kill the acquisition thread and leave a scan running
+        against a dead instrument, which is the failure the real digitizer's
+        AcquisitionThreadCode() was fixed for. Returns None when it drops.
         """
         xs, ys = self.synthesize(pos=pos)
-        with self.recdb.start_transaction() as trans:
+        when = self.acquisition_time()
+        try:
+            opened = (self.recdb.start_transaction() if when is None
+                      else self.recdb.start_transaction(when))
+        except snde.snde_error as refused:
+            self.dropped_blocks += 1
+            # First line only: snde_error.what() appends a C++ backtrace, and a
+            # dropped sample is routine rather than a crash.
+            self.last_drop = str(refused).split("\n")[0]
+            if self.dropped_blocks <= 5 or self.dropped_blocks % 1000 == 0:
+                print("  simulated EC: block dropped (%d so far): %s"
+                      % (self.dropped_blocks, self.last_drop))
+            return None
+        with opened as trans:
             rref = snde.create_ndarray_ref(trans, self.real_chan,
                                            snde.SNDE_RTN_FLOAT64)
             iref = snde.create_ndarray_ref(trans, self.imag_chan,
@@ -446,6 +512,8 @@ class SimECSource(object):
             return {"blocks": self.blocks, "errors": self.errors,
                     "model_errors": self.model_errors,
                     "model_no_pose": self.model_no_pose,
+                    "dropped_blocks": self.dropped_blocks,
+                    "last_drop": self.last_drop,
                     "last_error": self.last_error,
                     "sample_rate": self.sample_rate,
                     "block_samples": self.block_samples,
@@ -455,6 +523,8 @@ class SimECSource(object):
                     "model": self.model.report()}
         return {"blocks": self.blocks, "errors": self.errors,
                 "model_errors": self.model_errors,
+                "dropped_blocks": self.dropped_blocks,
+                "last_drop": self.last_drop,
                 "last_error": self.last_error,
                 "source": "synthetic",
                 "sample_rate": self.sample_rate,

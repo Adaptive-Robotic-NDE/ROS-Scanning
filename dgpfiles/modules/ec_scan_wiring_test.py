@@ -130,6 +130,16 @@ def _load(names):
     return ns
 
 
+#: Every recording database this file makes, held for the life of the process.
+#: snde.recdatabase has no shutdown or close, so one that goes out of scope is
+#: destroyed underneath its own background threads, and one of them then locks
+#: a weak_ptr to a compute-resource database that is gone -- std::bad_weak_ptr,
+#: an uncaught C++ exception, terminate(), and the whole run aborts with "Fatal
+#: Python error: Aborted". Measured at roughly one run in three here. Holding
+#: them removes the provocation; the teardown race itself is spatialnde2's.
+_RECDBS = []
+
+
 def _recdb(timed=False):
     recdb = snde.recdatabase()
     if timed:
@@ -140,6 +150,7 @@ def _recdb(timed=False):
     snde.setup_storage_manager(recdb)
     snde.setup_math_functions(recdb, [])
     recdb.startup()
+    _RECDBS.append(recdb)
     return recdb
 
 

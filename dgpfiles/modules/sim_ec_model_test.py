@@ -118,12 +118,32 @@ def load_sim_ec_source():
     return ns
 
 
+#: Every recording database this file makes, kept alive for the life of the
+#: process. NOT a leak -- a deliberate hold.
+#:
+#: snde.recdatabase has no shutdown, close or stop: there is no way from Python
+#: to bring one down and wait for its background threads. So a database that
+#: goes out of scope is destroyed underneath those threads, and one of them
+#: then locks a weak_ptr to the compute-resource database that no longer
+#: exists. That is std::bad_weak_ptr, which is an uncaught C++ exception, which
+#: is terminate() -- the whole pytest process aborts with "Fatal Python error:
+#: Aborted" and takes the results with it. Measured at roughly one run in four
+#: with a database per test, on this file and on ec_scan_wiring_test.py
+#: alike, and present before anything here changed.
+#:
+#: Holding them costs a few megabytes for the length of a 1 s test run and
+#: removes the provocation entirely. The underlying teardown race is
+#: spatialnde2's and is not fixed here.
+_RECDBS = []
+
+
 def recdb():
     db = snde.recdatabase()
     snde.setup_cpu(db, [], 4)
     snde.setup_storage_manager(db)
     snde.setup_math_functions(db, [])
     db.startup()
+    _RECDBS.append(db)
     return db
 
 
@@ -403,5 +423,110 @@ def test_the_block_is_many_samples_of_one_pose(table, built, SimECSource):
         assert md.GetMetaDatumDbl("ande_array-axis0_scale", 0.0) \
             == pytest.approx(1.0/1000.0)
         assert md.GetMetaDatumStr("ande_array-ampl_units", "") == "V"
+    finally:
+        sim.stop()
+
+
+# ---------------------------------------------------------------------------
+# The acquisition timestamp
+# ---------------------------------------------------------------------------
+# A block of volts is ACQUISITION, and under timed_transaction_manager the
+# transaction's timestamp is the correlation key -- it decides which pose a
+# reading lines up with. Letting it default records when the publish thread got
+# round to opening a transaction instead of when the block was measured, which
+# is exactly the distinction that manager exists to draw. spatialnde2's
+# start_transaction() says so itself.
+
+
+def test_the_block_is_stamped_from_the_managers_own_clock(table, built,
+                                                          SimECSource):
+    """Stamped, and from the clock the manager orders by -- not a clock of ours.
+
+    Two clocks that drift apart would get blocks refused for a reason that has
+    nothing to do with when they were measured.
+    """
+    db = recdb()
+    clock = snde.measurement_clock_cpp_steady("")
+    sim = SimECSource(db, clock, "/sim/x", "/sim/y", position_fn=None,
+                      sample_rate=1000.0, block_hz=100.0, seed=11)
+    try:
+        sim.stop()
+        t0 = sim.acquisition_time()
+        assert t0 is not None
+        t1 = sim.acquisition_time()
+        assert t1.difference_seconds(t0) >= 0.0, "time ran backwards"
+    finally:
+        sim.stop()
+
+    # and with no clock it still finds one, through the manager
+    plain = SimECSource(db, None, "/sim/x2", "/sim/y2", position_fn=None,
+                        sample_rate=1000.0, block_hz=100.0, seed=12)
+    try:
+        plain.stop()
+        assert plain.acquisition_time() is not None
+    finally:
+        plain.stop()
+
+
+def test_the_channel_definitions_are_not_stamped(SimECSource):
+    """Defining channels is CONFIGURATION, and the default is right for it.
+
+    Only the blocks are acquisition. Stamping the definitions would be
+    harmless but it would also be a claim about when something was measured
+    when nothing was, so the distinction is kept.
+    """
+    src = open(os.path.join(HERE, "sim_ec_source.dpi")).read()
+    init = src[src.index("def __init__("):src.index("def acquisition_time(")]
+    assert "start_transaction()" in init, \
+        "the channel definitions should take the default timestamp"
+    publish = src[src.index("def publish_once("):src.index("def _loop(")]
+    assert "start_transaction(when)" in publish, \
+        "the block should be stamped at acquisition"
+
+
+def test_a_refused_stamp_is_a_dropped_block_not_a_stop(SimECSource):
+    """The database refusing a timestamp must not kill the instrument.
+
+    Something newer has already been committed, so this block can no longer be
+    ordered. Counting it and leaving a GAP is the answer: shifting it to a
+    later stamp would move a reading to a place the probe was not, and raising
+    would leave a scan running against a dead instrument -- the failure the
+    real digitizer's acquisition thread was fixed for.
+    """
+    class Refusing(object):
+        """Just enough recdb to refuse, and to count how often it was asked."""
+
+        def __init__(self, real):
+            self._real = real
+            self.asks = 0
+
+        def start_transaction(self, *args):
+            if args:                      # the stamped acquisition call
+                self.asks += 1
+                raise snde.snde_error("timestamp is older than the last "
+                                      "committed transaction")
+            return self._real.start_transaction()
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    real = recdb()
+    db = Refusing(real)
+    clock = snde.measurement_clock_cpp_steady("")
+    sim = SimECSource(db, clock, "/sim/x", "/sim/y", position_fn=None,
+                      sample_rate=1000.0, block_hz=200.0, seed=13)
+    try:
+        deadline = time.monotonic() + 10.0
+        while sim.dropped_blocks < 5 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        r = sim.report()
+        assert r["dropped_blocks"] >= 5
+        assert r["blocks"] == 0, "a refused block must not be counted as published"
+        assert r["errors"] == 0, "a drop is routine, not a publish-loop error"
+        assert isinstance(r["last_drop"], str) and r["last_drop"]
+        assert "\n" not in r["last_drop"], \
+            "the C++ backtrace should be trimmed; a dropped sample is not a crash"
+        assert sim._thread is not None and sim._thread.is_alive(), \
+            "the instrument must keep acquiring"
     finally:
         sim.stop()
