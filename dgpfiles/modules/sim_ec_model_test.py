@@ -225,12 +225,22 @@ def test_the_flaw_shows_up_in_the_published_channels(table, built, SimECSource):
                       pose_fn=lambda: pose["v"], model=model,
                       sample_rate=1000.0, block_hz=100.0, seed=5)
     try:
+        # DRIVEN SYNCHRONOUSLY, not by waiting on the free-running thread.
+        # publish_once() is one pose, one transaction, and returns when the
+        # block is published; waiting for sim.blocks to advance instead proves
+        # nothing about WHICH pose the newest globalrev holds, because a block
+        # already in flight carries the pose from before the change and
+        # recdb.latest lags until a globalrev completes. That race made the
+        # first version of this test fail about half the time -- correctly, in
+        # that the instrument really is asynchronous. The free-running path is
+        # covered by the other tests here; what this one is about is whether
+        # moving the probe changes what lands on the channels.
+        sim.stop()
         got = []
         for dx in (-0.002, 0.0, +0.002):
             pose["v"] = (tuple(f["centre"] + np.array([dx, 0.0, 0.0])),
                          IDENTITY, 0.0)
-            start = sim.blocks
-            wait_for_blocks(sim, start + 4)
+            sim.publish_once()
             got.append(float(np.asarray(db.latest.ref["/sim/y"].data)
                              .reshape(-1).mean()))
         # The lobes either side of the notch differ from the null on it, and

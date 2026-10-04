@@ -329,6 +329,32 @@ def merge(args):
         print("merged table: %d of %d poses written" % (done, size))
         if done != size:
             print("   WARNING: %d poses are still missing" % (size - done))
+
+    # AND THE FLAW-FREE TRAJECTORY, which is not in the table and has to end up
+    # beside it. Every shard writes an identical copy -- it is seconds of work
+    # and needs no flaw system -- so any one of them will do; the consumer finds
+    # it by name, replacing _response.h5 with _baseline.npz.
+    #
+    # Copied here rather than left to the operator because a merged table
+    # WITHOUT it is the worst outcome available: it loads, it validates, every
+    # flaw reads correctly, and the probe reads nothing at all over good
+    # material however far it is tilted -- which is the one effect this table
+    # was generated to show.
+    base_out = os.path.join(args.out_dir, "al6061_2mhz_baseline.npz")
+    for src_path in srcs:
+        cand = os.path.join(os.path.dirname(os.path.abspath(src_path)),
+                            "al6061_2mhz_baseline.npz")
+        if os.path.isfile(cand):
+            if os.path.abspath(cand) != os.path.abspath(base_out):
+                shutil.copyfile(cand, base_out)
+            print("   baseline from %s" % cand)
+            break
+    else:
+        print("   WARNING: NO al6061_2mhz_baseline.npz found beside any shard. "
+              "The merged table will load and validate, and the simulated "
+              "probe will read nothing over good material at any tilt -- "
+              "which is the effect the table exists to show. Copy one in "
+              "beside %s before using it." % (out,))
     from ecsim.table import validate_file
     validate_file(out)
     print("ok")

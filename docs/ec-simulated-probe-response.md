@@ -6,19 +6,30 @@ piece is responsible for, and what the result does and does not mean.
 The short version:
 
 ```bash
-# once, wherever ecsim is installed (a night on a workstation)
-python3 tools/generate_ec_table.py --out-dir ~/ectable --yes
+# the table already exists -- it lives in the test_data repository
+ls ../test_data/ec_response/        # al6061_2mhz_response.h5 + _baseline.npz
 
 # once per plate, anywhere
 python3 tools/make_ec_test_plate.py --out-dir ~/ecplate
 
 # every run
-EC_SOURCE=sim EC_TABLE=~/ectable/al6061_2mhz_response.h5 \
+EC_SOURCE=sim EC_TABLE=../test_data/ec_response/al6061_2mhz_response.h5 \
     EC_PLATE=~/ecplate/flaws.json \
     dataguzzler-python dgpfiles/ECAutomatedScan.dgp
 # then, at the prompt:
 place_ec_test_plate()
 ```
+
+To regenerate it (a night across two machines, wherever ecsim is installed):
+
+```bash
+python3 tools/generate_ec_table.py --out-dir ~/ectable --shard 0 --of 2 --yes
+python3 tools/generate_ec_table.py --out-dir ~/merged --merge a/*.h5 b/*.h5
+```
+
+`--merge` carries the baseline `.npz` across with the table. **Keep the merged
+pair and throw the shards away**: each shard file is full-shape, so four shards
+are four times the size of the result for nothing.
 
 With no table the simulated instrument runs its old synthetic signal and says
 so on startup. Nothing else about the pipeline changes either way: the
@@ -41,11 +52,17 @@ asymmetry is precisely what a differential probe exists to detect. Separating
 tilt from a flaw is the whole problem, and a model that puts them on different
 axes by construction makes the problem disappear.
 
-With the table, a few degrees of tilt reads **more than ten times** the largest
-notch in the table. That ordering is asserted by a test in both
-`ec_response_table_test.py` and `ec_plate_model_test.py`, because if a change
-ever reversed it, every conclusion drawn in simulation about separating the two
-would be worthless.
+With the table, **1.37° of tilt about the split line reads the same as the
+largest notch in the set** — and the mesh contributes more than that on its own
+(measured normal error on the ROI ran to a p99.9 of 1.88° before repair, and
+`NORMAL_REPAIR_TOL_DEG` is 3.0°). That ordering is asserted by tests, because if
+a change ever reversed it then every conclusion drawn in simulation about
+separating the two would be worthless.
+
+**An earlier draft of this page said "more than ten times", which was a stub
+number.** The real ratio at 5° is 3.6×; see the measured table below. The
+ordering is the robust claim and the tests assert that rather than a figure
+that a fitted coil geometry will move.
 
 ---
 
@@ -172,11 +189,17 @@ make either one impossible to exercise.
 | **hardware** | the operating point, in **ohms**, ahead of the gain stage | the instrument's bridge | `null_ec_instrument()` → `ec_model.null()` |
 | **software** | the analog chain's **voltage** offset | `/ec/cond/null` | `null_here()` |
 
-The hardware null is why a usable gain is possible at all. Un-nulled, the
-flaw-free reading is an order of magnitude up on the biggest notch even square
-on, so a gain chosen to put that notch at 2 V puts the standing reading past
-the digitiser — which is the real instrument's behaviour, and why an
-eddy-current bridge is balanced before the gain is set.
+**On the real table the hardware null has nothing to remove until the probe is
+tilted**, because this model is a *perfectly balanced* differential probe: square
+on, its flaw-free reading is zero at every lift-off (see the measurements below).
+What it removes is the TILT trajectory — and since the arm holds whatever tilt
+the mesh gives it for a whole pass, that is a standing offset in practice even
+though it is not one in principle.
+
+That also means the suggested gain is usable without nulling here, where on the
+real instrument it would not be: a real probe has a residual imbalance that this
+one has none of. The code is unchanged either way — the suggestion is reported,
+never adopted — but do not carry the simulated gain to the bench.
 
 `ec_model.null()` takes **no arguments**, matching `UniWest.null()`, so the
 scan reaches it through the same `ec_first_contact_null(null_fn)` path at the
@@ -339,6 +362,94 @@ evicts.
 
 ---
 
+## Measured from the real table, 2026-10-04
+
+`test_data/ec_response/`, 4200 of 4200 poses written, 81 MB, aluminium 6061-T6
+at 2 MHz, single-precision solve. All of the following is read off that file and
+is asserted by `ec_real_table_test.py`, which skips when the fixture is absent.
+
+**Flaw amplitude is ordered by notch length and by depth** — the acceptance
+check the spec asked for, at yaw 90°, zero standoff, no tilt:
+
+| peak \|dZ\| (Ω) | 1.016 mm | 1.524 mm | 2.032 mm | 2.540 mm |
+|---|---|---|---|---|
+| 0.20 mm deep | 0.619 | 0.766 | 1.048 | 1.305 |
+| 0.50 mm deep | 0.756 | 0.912 | 1.175 | 1.587 |
+
+Monotone in both directions, across all eight. The 0.040″ notch is **not** near
+a detection floor, which the spec expected it to be — at 0.62 Ω it is two
+thirds of the 0.100″ one.
+
+**The flaw-free reading, |Z| in ohms** (tilt⊥ = 0):
+
+| standoff | −10° | −5° | 0° | +5° | +10° |
+|---|---|---|---|---|---|
+| 0.00 mm | 6.030 | 6.685 | **0.000** | 6.685 | 6.030 |
+| 0.10 mm | 4.597 | 4.847 | **0.000** | 4.847 | 4.597 |
+| 0.25 mm | 3.157 | 3.124 | **0.000** | 3.124 | 3.157 |
+| 0.50 mm | 1.804 | 1.643 | **0.000** | 1.643 | 1.804 |
+| 1.00 mm | 0.709 | 0.574 | **0.000** | 0.574 | 0.709 |
+
+Four things in that table, all of which the consumer depends on:
+
+- **Exactly odd in tilt∥.** `Z(−10°) + Z(+10°) = 0` to the solver's precision.
+  The sign of the tilt is the sign of the reading, which is what makes it
+  flaw-like.
+- **Exactly zero in tilt⊥.** Not "much less" — *nothing*. Perfect common-mode
+  rejection.
+- **Exactly zero square-on, at every lift-off.** So **lift-off alone produces no
+  signal.** This is the one real surprise and it has consequences: `set_rotation()`
+  has no *lift-off* direction to find in simulation — the trajectory it would
+  rotate onto an axis is the tilt one.
+- **Not monotone in tilt**: 6.685 Ω at 5° but 6.030 Ω at 10°, because
+  `edge_contact_liftoff` lifts the probe centre 0.56 mm at 10° and both coils
+  retreat. That is the geometry working as documented, not an artefact.
+
+**Tilt against flaw:** 1.337 Ω/deg near zero, so the 1.834 Ω largest notch
+(yaw 0°) is matched at **1.37°**, and 5° of tilt is **3.6×** the notch.
+
+**Yaw matters less than the spec expected.** Peak |dZ| for the largest notch
+runs 1.834 Ω at yaw 0°, 1.486 Ω at 60°, 1.587 Ω at 90° — a 1.23× spread, with
+the *maximum* at 0° rather than the minimum. The spec anticipated a flaw aligned
+with the coil axis giving "nearly nothing". It does not, at least not in peak
+amplitude; whatever yaw information there is lives in the shape, not the size.
+Worth knowing before leaning on the yaw axis. (The 2.54 mm notch is also long
+against the 1.53 mm coil separation, which would blunt orientation selectivity.)
+
+**Yaw period π confirmed in the data**: yaw 0° ≡ 180°, 30° ≡ 150°, 60° ≡ 120°,
+to 1e-5 relative. The reader's modulo-π reduction is therefore sound and not an
+assumption.
+
+**The stand-off decay fit gives 0.535 mm** from the real baseline's top two
+lift-off nodes. This is the number that caught a real bug: the fit originally
+sampled zero tilt, where this probe's flaw-free reading is *identically zero*,
+so it was the ratio of two zeros and silently fell back to a constant. It
+samples the largest parallel tilt instead. **A stub could not have found that**,
+because a stub chooses its own baseline.
+
+**A pass across the 0.100″ × 0.020″ notch**, zero standoff, square on:
+
+| dx | dZ (Ω) |
+|---|---|
+| −3.0 mm | +0.0007 +0.0033j |
+| −2.0 mm | −0.0059 +0.1649j |
+| −1.0 mm | −0.6793 +1.0041j |
+| 0.0 mm | **0 (the null)** |
+| +1.0 mm | +0.6793 −1.0041j |
+| +2.0 mm | +0.0059 −0.1649j |
+| +3.0 mm | −0.0007 −0.0033j |
+
+Textbook: exactly antisymmetric, hard null on the notch, gone by ±3 mm.
+
+**And a warning in that table.** The lobes peak at **±1 mm** and the response is
+essentially over by ±2 mm. Our trace pitch is **1 mm**, so a pass puts roughly
+one trace on each lobe and one in the null, with no margin — and that is for the
+*largest* notch. `test_the_response_is_narrower_than_the_trace_pitch_is_coarse`
+exists to keep that number visible. The spec's claim that a 0.1 mm field step
+was "10× oversampled" against our pitch was about the FIELD, not about the
+response: against the response the pitch is marginal, and `SCAN_STEP_SIZE` is
+worth revisiting.
+
 ## Verified in the container, 2026-10-04
 
 The config loaded with the stub table, and with a pose placed on the `L3_D0`
@@ -361,3 +472,8 @@ job: it is how you tell a run that never consulted the model from one that did.
   ladder with the probe's own rotation recorded.
 - **`yaw_period_rad` is not in the real table's provenance.** Handled in the
   reader; the file would be better self-describing.
+- **The trace pitch is marginal against the real response width** (lobes at
+  ±1 mm, pitch 1 mm). Worth a simulated pitch study now that one is possible.
+- **`test_data/` is not mounted into the ros2-workstation container**, so a
+  simulated scan there cannot read the table from where it lives. Either mount
+  it read-only or copy the pair into `scandata/`, which is mounted.
