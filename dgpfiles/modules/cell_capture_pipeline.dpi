@@ -437,8 +437,9 @@ def _ec_disarm(take, rows, label):
 
 
 def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -6),
-                    tilt_axis="travel", approach_mm=20.0, speed_mm_s=None, ec=None,
-                    force_limit=None, max_orientation_diff_deg=5.0):
+                    rotations_deg=(0.0,), tilt_axis="travel", approach_mm=20.0,
+                    speed_mm_s=None, ec=None, force_limit=None,
+                    max_orientation_diff_deg=5.0):
     """SCENARIO 7. Spring-loaded eddy-current probe passes between taught points.
 
     Teach both points with the probe ON the cylinder, compressed as it should
@@ -450,9 +451,36 @@ def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -
     direction (tilt_axis="travel") or across it ("across"), so the tip stays on
     the taught line. Wrench, joint states and TF are recorded.
 
+    `rotations_deg` turns the probe about ITS OWN AXIS -- which coil orientation
+    the split-D presents to the flaw -- and the ladder is flown once per
+    rotation, giving a (rotation x tilt) matrix rather than a tilt ladder. A
+    split-D answers to cracks across its split, so this is the axis that decides
+    which flaw ORIENTATION is being looked for, and the notches on the 99073
+    exist in two orientations; (0, 90) flies both without re-teaching.
+
+    THE TILT AXIS DOES NOT CO-ROTATE. Tilt stays about a fixed world direction
+    -- travel, or across it -- while rotation turns the tool about its own z.
+    If tilt were taken in the rotated tool frame the two factors would not be
+    separable and the matrix would not mean anything: a cell at (90 deg, +6 deg)
+    has to be the same tilt as (0 deg, +6 deg), applied to a differently
+    oriented coil.
+
+    WRIST 3 MOVES ONE-FOR-ONE WITH ROTATION, so a rotation can walk the wrist
+    out of the measured cable band even though the tip has not moved. Every
+    motion here goes through the cable guard, which refuses and names the angle
+    and the band -- but it refuses at the FIRST MOVE OF THAT PASS, part way into
+    a run. Check before committing the day to it:
+
+        ec_joint_report()            wrist 3 along the planned path
+        wrist3_band_deg(tilt=(0,0))  the band it has to land inside
+
+    The measured no-tilt band is +16.1..+301.1 deg and nothing here wraps an
+    angle: +200 is inside it and -160 is outside, and they are the same tool
+    orientation.
+
     ec=True (default: when ec_ready() says the DAQ is live) also records the
-    eddy-current signal through ec_source, one ec_<tilt>.npz per pass in the
-    take. THIS PART IS UNTESTED: there is no DAQ off the cell.
+    eddy-current signal through ec_source, one ec_rot<rot>_tilt<tilt>.npz per
+    pass in the take. THIS PART IS UNTESTED: there is no DAQ off the cell.
     """
     a, b = _cap_point(points[0]), _cap_point(points[1])
     qa = tuple(taught_points[points[0]]["xyzw"])
@@ -470,38 +498,55 @@ def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -
     if use_ec and globals().get("ec_source") is None:
         setup_ec()
     L = float(np.linalg.norm(b - a))
-    params = {"points": list(points), "tilts_deg": list(tilts_deg), "tilt_axis": tilt_axis,
+    params = {"points": list(points), "tilts_deg": list(tilts_deg),
+              "rotations_deg": list(rotations_deg), "tilt_axis": tilt_axis,
               "approach_mm": approach_mm, "speed_mps": speed, "force_limit_n": force_limit,
               "ec": use_ec, "orientation_diff_deg": diff, "pass_length_m": L}
     with capture_scenario("contact", sets=("core",),
-                          expect_s=len(tilts_deg)*(L/speed + 2*approach_mm/1000.0/speed + 90.0) + 120.0,
+                          expect_s=len(tilts_deg)*len(rotations_deg)
+                                   *(L/speed + 2*approach_mm/1000.0/speed + 90.0) + 120.0,
                           params=params, near_points=_cap_densify([a, b], 0.005),
                           uses=list(points)) as take:
         q = qa
-        for deg in tilts_deg:
-            q = quat_mul(_cap_q_axis(axis, math.radians(deg)), qa)
-            z = quat_to_matrix(q)[:, 2]
-            try:
-                capture_transit((a + approach_mm/1000.0*z, q),
-                                "contact %+g deg: over %s" % (deg, points[0]))
-                capture_move([(a, q)], "contact %+g deg: onto %s along the tool axis"
-                             % (deg, points[0]), speed=speed, force_limit=force_limit)
-            except CaptureSkip:
-                continue
-            rows = _ec_arm() if use_ec else None
-            t0, m0 = capture_node.now_ns(), time.monotonic()
-            capture_move([(b, q)], "contact %+g deg: pass %s -> %s" % (deg, points[0], points[1]),
-                         speed=speed, force_limit=force_limit)
-            t1, m1 = capture_node.now_ns(), time.monotonic()
-            ec_file = _ec_disarm(take, rows, "tilt%+g" % deg) if use_ec else None
-            w = np.array([r[1:] for r in list(capture_node.wrench) if m0 <= r[0] <= m1])
-            capture_move([(b + approach_mm/1000.0*z, q)], "contact %+g deg: off %s along "
-                         "the tool axis" % (deg, points[1]), speed=speed)
-            take.event(event="pass", tilt_deg=deg, tilt_axis=tilt_axis, quat=list(q),
-                       t_start_ros_ns=t0, t_end_ros_ns=t1, ec_file=ec_file,
-                       wrench_samples=int(len(w)),
-                       force_mean=w[:, :3].mean(0).tolist() if len(w) else None,
-                       force_max_n=float(np.linalg.norm(w[:, :3], axis=1).max()) if len(w) else None)
+        for rot in rotations_deg:
+            # Rotation about the probe's OWN axis: za is the taught tool z in
+            # world, so this turns the coil in place and leaves the tip where it
+            # was taught. Applied to qa first; the tilt below is then taken
+            # about a fixed WORLD axis, so the two stay separable -- see the
+            # docstring.
+            q_rot = quat_mul(_cap_q_axis(za, math.radians(rot)), qa) if rot else qa
+            for deg in tilts_deg:
+                q = quat_mul(_cap_q_axis(axis, math.radians(deg)), q_rot)
+                z = quat_to_matrix(q)[:, 2]
+                tag = "%+g deg" % deg if not rot else "rot %+g, %+g deg" % (rot, deg)
+                try:
+                    capture_transit((a + approach_mm/1000.0*z, q),
+                                    "contact %s: over %s" % (tag, points[0]))
+                    capture_move([(a, q)], "contact %s: onto %s along the tool axis"
+                                 % (tag, points[0]), speed=speed, force_limit=force_limit)
+                except CaptureSkip:
+                    continue
+                rows = _ec_arm() if use_ec else None
+                t0, m0 = capture_node.now_ns(), time.monotonic()
+                capture_move([(b, q)], "contact %s: pass %s -> %s" % (tag, points[0], points[1]),
+                             speed=speed, force_limit=force_limit)
+                t1, m1 = capture_node.now_ns(), time.monotonic()
+                # A plain tilt ladder keeps the OLD name, so a default
+                # capture_contact() produces artifacts identical to previous
+                # takes and stays comparable with them. Only a run that
+                # actually sweeps rotation says so in the name.
+                label = ("tilt%+g" % deg if len(rotations_deg) == 1 and not rot
+                         else "rot%+g_tilt%+g" % (rot, deg))
+                ec_file = _ec_disarm(take, rows, label) if use_ec else None
+                w = np.array([r[1:] for r in list(capture_node.wrench) if m0 <= r[0] <= m1])
+                capture_move([(b + approach_mm/1000.0*z, q)], "contact %s: off %s along "
+                             "the tool axis" % (tag, points[1]), speed=speed)
+                take.event(event="pass", tilt_deg=deg, rotation_deg=rot,
+                           tilt_axis=tilt_axis, quat=list(q),
+                           t_start_ros_ns=t0, t_end_ros_ns=t1, ec_file=ec_file,
+                           wrench_samples=int(len(w)),
+                           force_mean=w[:, :3].mean(0).tolist() if len(w) else None,
+                           force_max_n=float(np.linalg.norm(w[:, :3], axis=1).max()) if len(w) else None)
         env = capture_envelope()
         here = np.asarray(live_pose.snapshot()[0], float)
         top = env["top"] + float(CAPTURE_TRANSIT_ABOVE)

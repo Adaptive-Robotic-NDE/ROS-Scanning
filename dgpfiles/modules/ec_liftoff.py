@@ -226,9 +226,34 @@ def load_pass(path):
         except (ValueError, TypeError):
             out["trigger_report"] = None
     out["tilt_deg"] = _tilt_from_name(out["name"])
+    out["rotation_deg"] = _rotation_from_name(out["name"])
     out["saturation"] = (saturation(out["impedance"])
                          if out["impedance"] is not None else None)
     return out
+
+
+def _rotation_from_name(name):
+    """The probe rotation in degrees from `ec_rot+90_tilt-6.npz`, else None.
+
+    None means a take that never swept rotation, which is every take before the
+    parameter existed -- not a rotation of zero that failed to parse. The
+    distinction matters: passes at DIFFERENT rotations are different coil
+    orientations and must not be pooled when finding the lift-off axis, whereas
+    a take with no rotation axis at all is the ordinary tilt ladder.
+    """
+    stem = name[:-4] if name.endswith(".npz") else name
+    at = stem.find("rot")
+    if at < 0:
+        return None
+    rest = stem[at + 3:]
+    cut = rest.find("_tilt")
+    if cut >= 0:
+        rest = rest[:cut]
+    rest = rest.replace("p", ".").replace("_", "")
+    try:
+        return float(rest)
+    except ValueError:
+        return None
 
 
 def _tilt_from_name(name):
