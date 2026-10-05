@@ -1199,6 +1199,29 @@ include(None, os.path.join(SCAN_MODULE_DIR, "roi_select.dpi"))
 global SCAN_LIMITS
 SCAN_LIMITS = dict(DEFAULT_LIMITS)
 
+# EXCEPT THE LIVE TRACE RATE, IN SIMULATION ONLY.
+#
+# The measured 10.0 traces/s in DEFAULT_LIMITS is the ultrasound pipeline's
+# number on the cell PC. This bench is not that machine: it runs Gazebo, RViz,
+# MoveIt, the simulated profiler, the reconstruction and the acquisition on
+# eight cores, and the staging queue has backed up on every simulated scan so
+# far -- to 29 at a planned 10 traces/s, and still to 31 at 6.2, which is the
+# scan's own report saying the ceiling is above what this machine can hold.
+#
+# 6.2 was never this constant, incidentally: it is the TRANSACTION_LATENCY
+# floor. waits_per_trace["live"] is 2, so the sim window of 0.08 s caps the rate
+# at 1/(2*0.08) = 6.25 traces/s on its own. Widening that window to stop
+# out-of-order commits cost trace rate directly, and this constant has to come
+# below the floor to bind at all.
+#
+# HARDWARE IS UNTOUCHED. The cell PC has not shown this and its 10.0 is a
+# measurement; a simulated number must not travel there, which is the same rule
+# the velocity curve in the cell manifest follows and for the same reason.
+if CELL_MODE != "hardware":
+    SCAN_LIMITS["max_trace_rate_hz"] = dict(SCAN_LIMITS["max_trace_rate_hz"])
+    SCAN_LIMITS["max_trace_rate_hz"]["live"] = float(
+        os.environ.get("TARI_MAX_TRACE_RATE_LIVE") or 4.0)
+
 # The Azure dome sweep's ceiling is the transit speed, not the module's 50 mm/s
 # (see TRANSIT_SPEED: a sweep commanded at 50 peaked at 74). Coverage does not
 # suffer -- it is set by the motion gate over path length, not by speed.
