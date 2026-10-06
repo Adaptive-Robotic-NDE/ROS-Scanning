@@ -705,20 +705,22 @@ def fan_report(path):
     return out
 
 
-#: What a pinch repair will remove on its own, as a face count and as a share of
-#: the area. BOTH have to hold.
+#: How much of a surface's area a pinch repair will remove on its own.
 #:
-#: The two bounds answer different questions and neither does it alone. A pinch
-#: that is a meshing artefact is ONE OR TWO triangles hanging off a corner --
-#: the one that stopped a scan on 2026-10-05 was a single triangle of 8245 --
-#: and the count is what says so; on a coarse mesh that single triangle is still
-#: 0.4% of the area, so an area bound tight enough to be meaningful on a fine
-#: mesh would refuse it. A pinch joining two real sheets of surface is a
-#: different thing, and there the count is what catches it: dropping a fan then
-#: means deleting a part of the specimen, which is not a repair whatever
-#: fraction it happens to be. The area bound is the backstop for a mesh coarse
-#: enough that four triangles are a lot of it.
-MAX_PINCH_FACES = 4
+#: A pinch that is a meshing artefact is a sliver hanging off a corner and costs
+#: a few thousandths of a percent. A pinch joining two real sheets of surface
+#: costs half the part, and there the right answer is to say so and let somebody
+#: look, not to delete one of the sheets. 1% sits three orders of magnitude above
+#: the first and two below the second, so it separates them with room to spare.
+#:
+#: THERE WAS A FACE-COUNT BOUND HERE TOO, and it was wrong. It was set to 4 from
+#: the first case this ever saw -- one triangle of 8245 -- and read as "an
+#: artefact is one or two triangles". It is not: dropping 121 overlapping faces
+#: to make a surface orientable left 26 pinched vertices behind it on
+#: 2026-10-06, costing 0.236% of the area, and a count bound refused the repair
+#: while the area bound would have allowed it with a factor of four to spare.
+#: The count was a proxy for "is this structural", and area answers that
+#: question directly on any mesh density.
 MAX_PINCH_AREA_FRACTION = 0.01
 
 
@@ -808,24 +810,23 @@ def unpinch_file(path, out_path=None, max_rounds=4):
             break
         total_area += rep["dropped_area_fraction"]
         total_drop += len(drop)
-        if total_drop > MAX_PINCH_FACES or total_area > MAX_PINCH_AREA_FRACTION:
+        if total_area > MAX_PINCH_AREA_FRACTION:
             raise RuntimeError(
                 "%s cannot be loaded for projection: clearing its pinched "
                 "vertex(es) would remove %d face(s) carrying %.3f%% of the "
-                "area, over the %d face / %.1f%% this will remove without "
-                "being asked.\n"
-                "  A vertex whose triangles fall into two fans is two sheets "
-                "meeting at a single point. One or two triangles there is a "
-                "meshing artefact and goes; this many is a join between real "
-                "pieces of surface, and deleting one of them is not a repair.\n"
+                "area, over the %.1f%% this will remove without being asked.\n"
+                "  A vertex whose triangles fall into two fans is two sheets of "
+                "surface meeting at a single point. A sliver there is an "
+                "artefact and goes; this much area is a join between real "
+                "pieces of the part, and deleting one of them is not a "
+                "repair.\n"
                 "  x3d_load_geometry() sorts the triangles around every vertex "
                 "into a ring and REFUSES a file it cannot, so this is refused "
                 "here -- before the probe is on the part -- rather than after "
-                "a null and a first pass. Re-run the parameterization, or "
-                "check the reconstruction for two surfaces touching at a "
-                "corner."
+                "a null and a first pass. Re-run the parameterization, or check "
+                "the reconstruction for two surfaces touching at a corner."
                 % (os.path.basename(path), total_drop, 100.0*total_area,
-                   MAX_PINCH_FACES, 100.0*MAX_PINCH_AREA_FRACTION))
+                   100.0*MAX_PINCH_AREA_FRACTION))
         if out_path is None:
             base, ext = os.path.splitext(os.path.abspath(path))
             target = base + "_unpinched" + ext
@@ -854,21 +855,38 @@ def loadable_x3d(path, quiet=False):
 
     Returns the path to load. Raises RuntimeError when the surface cannot be made
     loadable, because the alternative is that the loader aborts the process.
+
+    THREE REPAIRS, AND THE ORDER BETWEEN THEM IS LOAD-BEARING:
+
+      1. winding -- make every shared edge consistent, dropping overlapping
+         faces if that is the only way (_wound_consistently)
+      2. fans -- make the triangles around every vertex form one ring
+         (_fans_split)
+      3. uv handedness -- make the parameterization able to receive data
+         (_uv_oriented)
+
+    FANS AFTER WINDING, because the winding repair can REMOVE FACES and removing
+    a face from the middle of a fan splits it in two. That is not hypothetical:
+    on 2026-10-06 a surface with 219 inconsistent edges and zero pinched
+    vertices had 121 overlapping faces dropped to make it orientable, which left
+    16 pinched geometry vertices and 10 pinched uv vertices, and the loader
+    refused it -- with the probe on the part and the instrument already nulled.
+    The fan repair had run first, found nothing to do, and never looked again.
+
+    The reverse order is safe and is why this one works: dropping faces from a
+    consistently wound mesh leaves it consistently wound, and unpinching only
+    drops faces.
     """
-    # PINCHED VERTICES FIRST. The loader has two families of invariant and they
-    # are independent: winding (which edge is shared the same way round twice)
-    # and fans (whether the triangles around a vertex form one ring). Rewinding
-    # cannot touch the second -- see vertex_fans() -- so a mesh with a pinch
-    # went through the whole repair below, came out reported as fixed, and then
-    # failed in the loader anyway. That is what happened on 2026-10-05 at
-    # 14:53: the surface was rewound clean, the probe was already on the part
-    # and the instrument nulled, and x3d_load_geometry() refused the file for
-    # uv vertex 2001. Splitting first makes that a repaired file instead.
-    path = _fans_split(path, quiet=quiet)
+    return _uv_oriented(_fans_split(_wound_consistently(path, quiet=quiet),
+                                    quiet=quiet), quiet=quiet)
+
+
+def _wound_consistently(path, quiet=False):
+    """The same surface with every shared edge wound consistently."""
     faces, _ = read_indexed_face_set(path)
     rep = winding_report(faces)
     if rep["loadable"]:
-        return _uv_oriented(path, quiet=quiet)
+        return path
 
     if rep["overshared_edges"]:
         raise RuntimeError(
@@ -912,7 +930,7 @@ def loadable_x3d(path, quiet=False):
                               % (rep["inconsistent_edges"], first_conflicts,
                                  dropped["dropped"],
                                  100.0*dropped["dropped_area_fraction"]))
-                    return _uv_oriented(out_path, quiet=quiet)
+                    return out_path
 
     if not fixed["after"]["loadable"]:
         extra = ""
@@ -940,9 +958,7 @@ def loadable_x3d(path, quiet=False):
                  rep["inconsistent_edges"], os.path.basename(out_path)))
         print("    the geometry is unchanged; a single inconsistent edge makes "
               "the loader abort the process, so it cannot be left alone")
-    # On the REWOUND file, not the original: rewind_file flips texCoordIndex
-    # alongside coordIndex, so reversing a face changes its handedness verdict.
-    return _uv_oriented(out_path, quiet=quiet)
+    return out_path
 
 
 def _fans_split(path, quiet=False):

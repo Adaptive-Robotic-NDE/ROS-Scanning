@@ -729,7 +729,6 @@ def test_a_sliver_pinch_is_repaired_by_dropping_the_smaller_fan():
 
     drop, rep = x3d_winding.pinched_fan_faces(p)
     assert drop == {len(tris) - 1}, "the sliver goes, not the patch"
-    assert len(drop) <= x3d_winding.MAX_PINCH_FACES
     assert rep["dropped_area_fraction"] < x3d_winding.MAX_PINCH_AREA_FRACTION
 
     out, fixed = x3d_winding.unpinch_file(p)
@@ -754,6 +753,7 @@ def test_a_structural_pinch_is_refused_rather_than_half_deleted():
     msg = str(e.value)
     assert "pinched" in msg
     assert "not a repair" in msg
+    assert "%" in msg, "the refusal has to say how much area it would have cost"
     assert "before the probe is on the part" in msg, \
         "the message has to say when this is caught, which is the whole point"
 
@@ -852,3 +852,55 @@ def test_a_pinched_surface_actually_loads():
         + snde.project_onto_parameterization_processing_tags)
     trans.end_transaction().globalrev_wait().wait_complete()
     assert "/graphics/specimen/meshed" in set(recdb.latest.list_recordings())
+
+
+def test_the_fan_repair_runs_on_whatever_the_winding_repair_returns():
+    """The ordering regression, from the mesh that stopped a scan on 2026-10-06.
+
+    A surface with 219 inconsistent edges and ZERO pinched vertices had 121
+    overlapping faces dropped to make it orientable, and the drop left 16 pinched
+    geometry vertices and 10 pinched uv vertices behind it: removing a face from
+    the middle of a fan splits that fan in two. The fan repair had already run,
+    found nothing, and never looked again, so the loader refused the file -- with
+    the probe on the part and the instrument nulled.
+
+    The property is that the fan repair sees the OUTPUT of the winding repair,
+    whatever that output is. Stubbing the winding half is the honest way to pin
+    it: synthesising a mesh that is non-orientable in the particular way that
+    reaches the face-dropping branch is a test of the fixture rather than of the
+    ordering, and the real mesh is 10831 faces of scan data.
+    """
+    verts, tris = _grid(12)
+    verts = list(verts) + [(-0.05, -0.05, 0.0), (-0.05, 0.0, 0.0)]
+    pinched = [list(t) for t in tris] + [[0, len(verts) - 2, len(verts) - 1]]
+    dropped = _write(_tmp("after_drop.x3d"), pinched, verts)
+    assert not x3d_winding.fan_report(dropped)["loadable"], "fixture is not pinched"
+
+    clean = _write(_tmp("before.x3d"), tris, verts)
+    real = x3d_winding._wound_consistently
+    try:
+        # Stands in for "the winding repair dropped faces and handed back a
+        # different file", which is exactly what happened.
+        x3d_winding._wound_consistently = lambda path, quiet=False: dropped
+        out = x3d_winding.loadable_x3d(clean, quiet=True)
+    finally:
+        x3d_winding._wound_consistently = real
+
+    assert x3d_winding.fan_report(out)["loadable"], \
+        "the fan repair did not run on the winding repair's output"
+
+
+def test_the_repair_loops_until_the_mesh_stops_pinching():
+    """Dropping a pinched fan can pinch its neighbour. The real 2026-10-06 mesh
+    needed two rounds, so one pass of the repair is not enough."""
+    verts, tris = _grid(12)
+    verts = list(verts) + [(-0.05, -0.05, 0.0), (-0.05, 0.0, 0.0),
+                           (-0.10, -0.10, 0.0)]
+    n = len(verts)
+    # A sliver off vertex 0, and a second sliver hanging off the first one's
+    # own corner, so clearing the first exposes the second.
+    tris = [list(t) for t in tris] + [[0, n - 3, n - 2], [n - 3, n - 1, n - 2]]
+    p = _write(_tmp("cascade.x3d"), tris, verts)
+    out, rep = x3d_winding.unpinch_file(p)
+    assert rep["after"]["loadable"], rep["after"]
+    assert rep["rounds"] >= 1
