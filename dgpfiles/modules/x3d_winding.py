@@ -613,12 +613,258 @@ def flip_uv_file(path, out_path=None):
                       "out_path": out_path, "mirror_about": mid}
 
 
+#: The index attribute that addresses each point array, with the X3D node that
+#: holds that array and its width. x3d_load_geometry() sorts the triangles
+#: around every vertex of BOTH into a ring, and reports them separately
+#: ([vertex_fan_discontiguous] and [uv_vertex_fan_discontiguous]), so both have
+#: to be checked and both can need the same repair.
+FAN_ARRAYS = (("coordIndex", "Coordinate", 3),
+              ("texCoordIndex", "TextureCoordinate", 2))
+
+
+def vertex_fans(faces):
+    """Which triangles around each vertex form one fan, as {vertex: [fan, ...]}.
+
+    A fan is a set of triangle indices. The test is the one the loader makes:
+    the triangles touching a vertex have to form a single ring, which they do
+    exactly when the OPPOSITE edges -- for a triangle (v, b, c) the edge b-c --
+    form one connected chain. Two chains mean two sheets of surface meeting at
+    that single point and nothing else, and no ring can be sorted through it.
+
+    Deliberately independent of winding: reversing a triangle swaps b and c and
+    leaves the chain alone, so this answers the same before and after
+    rewind_file() -- which is why rewinding a mesh never clears it.
+    """
+    touching = {}
+    for fi, f in enumerate(faces):
+        if len(f) != 3 or len(set(f)) != 3:
+            continue                        # degenerate: it bounds no fan
+        for k in range(3):
+            touching.setdefault(f[k], []).append((fi, f[(k+1) % 3], f[(k+2) % 3]))
+    out = {}
+    for v, tris in touching.items():
+        adj = {}
+        for _fi, b, c in tris:
+            adj.setdefault(b, set()).add(c)
+            adj.setdefault(c, set()).add(b)
+        seen = set()
+        groups = []
+        for start in list(adj):
+            if start in seen:
+                continue
+            comp = set()
+            stack = [start]
+            while stack:
+                u = stack.pop()
+                if u in comp:
+                    continue
+                comp.add(u)
+                stack.extend(adj[u] - comp)
+            seen |= comp
+            groups.append(comp)
+        if len(groups) < 2:
+            continue
+        fans = [set() for _ in groups]
+        for fi, b, c in tris:
+            for gi, comp in enumerate(groups):
+                if b in comp:
+                    fans[gi].add(fi)
+                    break
+        out[v] = fans
+    return out
+
+
+def fan_report(path):
+    """What x3d_load_geometry()'s two fan invariants say about this file.
+
+    -> {"coordIndex": {...}, "texCoordIndex": {...}} with `vertices` (how many
+    are pinched), `extra_fans` (how many duplicate points a repair would add)
+    and `worst` (the first offending vertex and its fan count), plus `loadable`
+    over both.
+    """
+    faces, extra = read_indexed_face_set(path)
+    arrays = {"coordIndex": faces}
+    arrays.update({k: v for k, v in extra.items()})
+    out = {}
+    for name, _node, _width in FAN_ARRAYS:
+        polys = arrays.get(name)
+        if polys is None or len(polys) != len(faces):
+            out[name] = {"vertices": 0, "extra_fans": 0, "worst": None,
+                         "present": polys is not None}
+            continue
+        bad = vertex_fans(polys)
+        worst = None
+        if bad:
+            v = min(bad)
+            worst = (int(v), len(bad[v]), sum(len(f) for f in bad[v]))
+        out[name] = {"vertices": len(bad),
+                     "extra_fans": sum(len(f) - 1 for f in bad.values()),
+                     "worst": worst, "present": True}
+    out["loadable"] = not any(out[n]["vertices"]
+                              for n, _n2, _w in FAN_ARRAYS)
+    return out
+
+
+#: What a pinch repair will remove on its own, as a face count and as a share of
+#: the area. BOTH have to hold.
+#:
+#: The two bounds answer different questions and neither does it alone. A pinch
+#: that is a meshing artefact is ONE OR TWO triangles hanging off a corner --
+#: the one that stopped a scan on 2026-10-05 was a single triangle of 8245 --
+#: and the count is what says so; on a coarse mesh that single triangle is still
+#: 0.4% of the area, so an area bound tight enough to be meaningful on a fine
+#: mesh would refuse it. A pinch joining two real sheets of surface is a
+#: different thing, and there the count is what catches it: dropping a fan then
+#: means deleting a part of the specimen, which is not a repair whatever
+#: fraction it happens to be. The area bound is the backstop for a mesh coarse
+#: enough that four triangles are a lot of it.
+MAX_PINCH_FACES = 4
+MAX_PINCH_AREA_FRACTION = 0.01
+
+
+def _triangle_areas(faces, points):
+    tri = np.array([f for f in faces if len(f) == 3], dtype=np.intp)
+    if not len(tri):
+        return np.zeros(0), []
+    p = np.asarray(points, dtype=float)[:, :3]
+    a = p[tri[:, 1]] - p[tri[:, 0]]
+    b = p[tri[:, 2]] - p[tri[:, 0]]
+    return 0.5*np.linalg.norm(np.cross(a, b), axis=1), [
+        i for i, f in enumerate(faces) if len(f) == 3]
+
+
+def pinched_fan_faces(path):
+    """Which faces to remove so that every vertex fan becomes contiguous.
+
+    -> (drop, report). At each pinched vertex the fan carrying the most AREA is
+    kept and the others are dropped, in the geometry index and the
+    parameterization index alike -- the loader checks both and a mesh can be
+    pinched in either.
+
+    DROPPING RATHER THAN SPLITTING, and this is not the first choice. Giving
+    each fan its own copy of the point is the repair that loses nothing, and it
+    does not survive the loader: x3d_load_geometry() is called with
+    `reindex_vertices`, which keys a hash map on the coordinate itself
+    (x3d.hpp, vertexnum_bycoord.find), so two points at the same position are
+    welded back into one and the pinch comes straight back. Moving the copy
+    instead trades this failure for the other one this module exists to catch --
+    a sliver with a near-zero determinant projects NaN weights and leaves a hole
+    with no error. So the fan goes.
+    """
+    faces, extra = read_indexed_face_set(path)
+    points = read_point_array(path, "Coordinate", 3)
+    arrays = {"coordIndex": faces}
+    arrays.update(extra)
+    areas, tri_pos = _triangle_areas(faces, points) if points is not None \
+        else (None, [])
+    area_of = {fi: float(areas[k]) for k, fi in enumerate(tri_pos)} \
+        if areas is not None else {}
+    total = float(sum(area_of.values())) if area_of else 0.0
+
+    drop = set()
+    per_array = {}
+    for name, _node, _width in FAN_ARRAYS:
+        polys = arrays.get(name)
+        if polys is None or len(polys) != len(faces):
+            per_array[name] = 0
+            continue
+        n = 0
+        for _v, fans in sorted(vertex_fans(polys).items()):
+            keep = max(range(len(fans)),
+                       key=lambda i: sum(area_of.get(fi, 1.0) for fi in fans[i]))
+            for i, fan in enumerate(fans):
+                if i != keep:
+                    drop |= set(fan)
+                    n += 1
+        per_array[name] = n
+    lost = float(sum(area_of.get(fi, 0.0) for fi in drop))
+    return drop, {"dropped": len(drop),
+                  "fans_dropped": per_array,
+                  "dropped_area": lost,
+                  "dropped_area_fraction": (lost/total) if total > 0 else 0.0}
+
+
+def unpinch_file(path, out_path=None, max_rounds=4):
+    """Write a copy of an X3D surface with no pinched vertex, or say why not.
+
+    Returns (out_path, report). Removing a fan can expose another pinch in the
+    triangles that bounded it, so this repeats until the surface is clean or
+    nothing more is removed; `rounds` says how many it took and the area
+    fractions accumulate.
+
+    Raises RuntimeError when the repair would cost more than
+    MAX_PINCH_AREA_FRACTION of the surface, which means the pinch is structural
+    rather than a sliver.
+    """
+    before = fan_report(path)
+    cur = path
+    total_drop = 0
+    total_area = 0.0
+    rounds = 0
+    tmp_paths = []
+    while rounds < max_rounds:
+        drop, rep = pinched_fan_faces(cur)
+        if not drop:
+            break
+        total_area += rep["dropped_area_fraction"]
+        total_drop += len(drop)
+        if total_drop > MAX_PINCH_FACES or total_area > MAX_PINCH_AREA_FRACTION:
+            raise RuntimeError(
+                "%s cannot be loaded for projection: clearing its pinched "
+                "vertex(es) would remove %d face(s) carrying %.3f%% of the "
+                "area, over the %d face / %.1f%% this will remove without "
+                "being asked.\n"
+                "  A vertex whose triangles fall into two fans is two sheets "
+                "meeting at a single point. One or two triangles there is a "
+                "meshing artefact and goes; this many is a join between real "
+                "pieces of surface, and deleting one of them is not a repair.\n"
+                "  x3d_load_geometry() sorts the triangles around every vertex "
+                "into a ring and REFUSES a file it cannot, so this is refused "
+                "here -- before the probe is on the part -- rather than after "
+                "a null and a first pass. Re-run the parameterization, or "
+                "check the reconstruction for two surfaces touching at a "
+                "corner."
+                % (os.path.basename(path), total_drop, 100.0*total_area,
+                   MAX_PINCH_FACES, 100.0*MAX_PINCH_AREA_FRACTION))
+        if out_path is None:
+            base, ext = os.path.splitext(os.path.abspath(path))
+            target = base + "_unpinched" + ext
+        else:
+            target = out_path
+        cur = drop_faces_file(cur, drop, out_path=target)
+        rounds += 1
+    after = fan_report(cur)
+    if not after["loadable"]:
+        raise RuntimeError(
+            "%s cannot be loaded for projection: %d round(s) of removing "
+            "pinched fans left %d geometry and %d parameterization vertex(es) "
+            "still pinched.\n"
+            "  x3d_load_geometry() refuses these, so this is refused here "
+            "instead -- before anything moves."
+            % (os.path.basename(path), rounds,
+               after["coordIndex"]["vertices"],
+               after["texCoordIndex"]["vertices"]))
+    return cur, {"before": before, "after": after, "rounds": rounds,
+                 "dropped": total_drop, "dropped_area_fraction": total_area,
+                 "path": path, "out_path": cur}
+
+
 def loadable_x3d(path, quiet=False):
     """The surface to hand to x3d_load_geometry, repairing it if it needs it.
 
     Returns the path to load. Raises RuntimeError when the surface cannot be made
     loadable, because the alternative is that the loader aborts the process.
     """
+    # PINCHED VERTICES FIRST. The loader has two families of invariant and they
+    # are independent: winding (which edge is shared the same way round twice)
+    # and fans (whether the triangles around a vertex form one ring). Rewinding
+    # cannot touch the second -- see vertex_fans() -- so a mesh with a pinch
+    # went through the whole repair below, came out reported as fixed, and then
+    # failed in the loader anyway. That is what happened on 2026-10-05 at
+    # 14:53: the surface was rewound clean, the probe was already on the part
+    # and the instrument nulled, and x3d_load_geometry() refused the file for
+    # uv vertex 2001. Splitting first makes that a repaired file instead.
+    path = _fans_split(path, quiet=quiet)
     faces, _ = read_indexed_face_set(path)
     rep = winding_report(faces)
     if rep["loadable"]:
@@ -697,6 +943,33 @@ def loadable_x3d(path, quiet=False):
     # On the REWOUND file, not the original: rewind_file flips texCoordIndex
     # alongside coordIndex, so reversing a face changes its handedness verdict.
     return _uv_oriented(out_path, quiet=quiet)
+
+
+def _fans_split(path, quiet=False):
+    """The same surface with every vertex fan contiguous, repairing if needed."""
+    rep = fan_report(path)
+    if rep["loadable"]:
+        return path
+    out_path, fixed = unpinch_file(path)
+    if not quiet:
+        for name, _node, _width in FAN_ARRAYS:
+            b = rep[name]
+            if not b["vertices"]:
+                continue
+            where = "geometry" if name == "coordIndex" else "parameterization"
+            print("  projection surface unpinched: %d %s vertex(es) had "
+                  "triangles in more than one fan (worst vertex %d, %d fans "
+                  "from %d triangles)"
+                  % (b["vertices"], where, b["worst"][0], b["worst"][1],
+                     b["worst"][2]))
+        print("    %d face(s) carrying %.4f%% of the area were removed in %d "
+              "round(s) -- %s"
+              % (fixed["dropped"], 100.0*fixed["dropped_area_fraction"],
+                 fixed["rounds"], os.path.basename(out_path)))
+        print("    a pinched vertex is two sheets of surface meeting at one "
+              "point; the loader REFUSES one, and rewinding cannot clear it, "
+              "so it cannot be left alone")
+    return out_path
 
 
 def _uv_oriented(path, quiet=False):

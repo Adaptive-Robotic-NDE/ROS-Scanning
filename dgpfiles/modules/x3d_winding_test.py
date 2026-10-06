@@ -637,3 +637,218 @@ def test_a_surface_needing_too_much_cut_away_is_refused():
     assert drop, "there is an overlap to find"
     assert rep["dropped_area_fraction"] > x3d_winding.MAX_DROP_AREA_FRACTION, \
         "this fixture is meant to exceed the ceiling (%.4f)" % rep["dropped_area_fraction"]
+
+
+# ==============================================================================
+# Pinched vertices: the invariant rewinding cannot reach
+# ==============================================================================
+#
+# x3d_load_geometry() has two families of invariant. Winding is the one above.
+# The other is that the triangles around every vertex form ONE ring, in the
+# geometry and in the parameterization separately:
+#
+#   [vertex_fan_discontiguous]    The triangles touching vertex 1517 are not
+#       contiguous: its 5 edges fall into 2 separate fans, so the loader cannot
+#       sort them into a ring
+#   [uv_vertex_fan_discontiguous] ... uv vertex 2001 ...
+#
+# Reversing a triangle swaps the two ends of its opposite edge and leaves the
+# chain alone, so rewinding cannot change this verdict -- which is how a scan on
+# 2026-10-05 rewound a surface clean, reported it repaired, and was then refused
+# by the loader anyway, with the probe already on the part and the instrument
+# already nulled. 8245 triangles, ONE pinched uv vertex, three triangles in two
+# fans, and the whole scan lost. These tests pin the second invariant.
+
+
+def _bowtie(n=4):
+    """Two patches that touch at exactly one vertex. -> (verts, tris)
+
+    Each patch is wound consistently and the two are disjoint apart from the
+    shared corner, so nothing here is a winding fault: this is the topology the
+    loader refuses and rewinding cannot help with.
+    """
+    va, ta = _grid(n)
+    vb, tb = _grid(n)
+    pinch_a = n*n - 1                       # top-right corner of the first
+    pinch_b = 0                             # bottom-left corner of the second
+    shift = (float(n - 1), float(n - 1), 0.0)
+    vb = [(v[0] + shift[0], v[1] + shift[1], v[2]) for v in vb]
+
+    verts = list(va)
+    # The second patch's pinch vertex becomes the first patch's corner; every
+    # other vertex of the second patch is appended.
+    remap = {}
+    for i, v in enumerate(vb):
+        if i == pinch_b:
+            remap[i] = pinch_a
+        else:
+            remap[i] = len(verts)
+            verts.append(v)
+    tris = [list(t) for t in ta] + [[remap[i] for i in t] for t in tb]
+    return verts, tris, pinch_a
+
+
+def test_a_pinched_vertex_is_detected_and_rewinding_cannot_see_it():
+    verts, tris, pinch = _bowtie()
+    p = _write(_tmp("pinch.x3d"), tris, verts)
+
+    # Winding is clean, which is the whole point: the old gate passed this.
+    assert x3d_winding.winding_report(
+        x3d_winding.read_indexed_face_set(p)[0])["loadable"]
+
+    rep = x3d_winding.fan_report(p)
+    assert not rep["loadable"]
+    assert rep["coordIndex"]["vertices"] == 1, rep["coordIndex"]
+    assert rep["coordIndex"]["worst"][0] == pinch
+    assert rep["coordIndex"]["worst"][1] == 2, "two sheets, so two fans"
+
+
+def test_rewinding_a_pinched_surface_leaves_it_pinched():
+    """The regression that cost a scan: 'rewound clean' is not 'loadable'."""
+    verts, tris, _ = _bowtie()
+    p = _write(_tmp("pinch.x3d"), tris, verts)
+    out, rep = x3d_winding.rewind_file(p)
+    assert rep["after"]["loadable"], "winding was fine to begin with"
+    assert not x3d_winding.fan_report(out)["loadable"]
+
+
+def test_a_sliver_pinch_is_repaired_by_dropping_the_smaller_fan():
+    """One stray triangle touching a patch at a corner: the real case.
+
+    8245 triangles and ONE pinched uv vertex, three triangles in two fans, is
+    what the scan on 2026-10-05 hit. The fan carrying the area is kept.
+    """
+    verts, tris = _grid(12)
+    verts = list(verts) + [(-0.05, -0.05, 0.0), (-0.05, 0.0, 0.0)]
+    # A sliver hanging off vertex 0 and touching the patch nowhere else -- the
+    # same shape and the same scale as the one triangle of 8245 that stopped a
+    # real scan.
+    tris = [list(t) for t in tris] + [[0, len(verts) - 2, len(verts) - 1]]
+    p = _write(_tmp("sliver.x3d"), tris, verts)
+    assert not x3d_winding.fan_report(p)["loadable"]
+
+    drop, rep = x3d_winding.pinched_fan_faces(p)
+    assert drop == {len(tris) - 1}, "the sliver goes, not the patch"
+    assert len(drop) <= x3d_winding.MAX_PINCH_FACES
+    assert rep["dropped_area_fraction"] < x3d_winding.MAX_PINCH_AREA_FRACTION
+
+    out, fixed = x3d_winding.unpinch_file(p)
+    assert fixed["after"]["loadable"]
+    after_f, _ = x3d_winding.read_indexed_face_set(out)
+    assert len(after_f) == len(tris) - 1
+
+    # Nothing that survives has moved: the repair removes, it never edits.
+    P0 = x3d_winding.read_point_array(p, "Coordinate", 3)
+    P1 = x3d_winding.read_point_array(out, "Coordinate", 3)
+    assert np.array_equal(P0, P1)
+    before_f, _ = x3d_winding.read_indexed_face_set(p)
+    assert after_f == [f for i, f in enumerate(before_f) if i not in drop]
+
+
+def test_a_structural_pinch_is_refused_rather_than_half_deleted():
+    """Two real sheets meeting at a point. Dropping one is not a repair."""
+    verts, tris, _ = _bowtie(5)
+    p = _write(_tmp("bowtie.x3d"), tris, verts)
+    with pytest.raises(RuntimeError) as e:
+        x3d_winding.unpinch_file(p)
+    msg = str(e.value)
+    assert "pinched" in msg
+    assert "not a repair" in msg
+    assert "before the probe is on the part" in msg, \
+        "the message has to say when this is caught, which is the whole point"
+
+
+def test_the_refusal_reaches_the_loader_gate():
+    verts, tris, _ = _bowtie(5)
+    p = _write(_tmp("bowtie.x3d"), tris, verts)
+    with pytest.raises(RuntimeError):
+        x3d_winding.loadable_x3d(p, quiet=True)
+
+
+def test_a_pinch_in_the_parameterization_only_is_caught():
+    """The case that actually occurred: geometry clean, uv pinched.
+
+    The two index arrays address different point arrays and the loader checks
+    them separately, so a mesh can be sound in one and not the other.
+    """
+    verts, tris = _grid(12)
+    uv_tris = [list(t) for t in tris]
+    # One far-away triangle given a uv corner at uv vertex 0, so the uv fan
+    # there is in two pieces while the geometry fan around vertex 0 is not.
+    uv_tris[-1] = [0, uv_tris[-1][1], uv_tris[-1][2]]
+    p = _write(_tmp("uvpinch.x3d"), tris, verts, uv_tris=uv_tris)
+
+    rep = x3d_winding.fan_report(p)
+    assert rep["coordIndex"]["vertices"] == 0, "the geometry is fine"
+    assert rep["texCoordIndex"]["vertices"] >= 1, rep["texCoordIndex"]
+    assert not rep["loadable"]
+
+    out, fixed = x3d_winding.unpinch_file(p)
+    assert fixed["after"]["loadable"]
+    assert np.array_equal(x3d_winding.read_point_array(p, "Coordinate", 3),
+                          x3d_winding.read_point_array(out, "Coordinate", 3))
+
+
+def test_the_loader_gate_unpinches_as_well_as_rewinds():
+    """Both faults at once, which is what a real reconstruction hands over."""
+    verts, tris = _grid(12)
+    verts = list(verts) + [(-0.05, -0.05, 0.0), (-0.05, 0.0, 0.0)]
+    tris = [list(t) for t in tris] + [[0, len(verts) - 2, len(verts) - 1]]
+    for k in (2, 9):
+        tris[k] = [tris[k][0], tris[k][2], tris[k][1]]
+    p = _write(_tmp("both.x3d"), tris, verts)
+    assert not x3d_winding.winding_report(
+        x3d_winding.read_indexed_face_set(p)[0])["loadable"]
+    assert not x3d_winding.fan_report(p)["loadable"]
+
+    out = x3d_winding.loadable_x3d(p, quiet=True)
+
+    assert x3d_winding.fan_report(out)["loadable"]
+    assert x3d_winding.winding_report(
+        x3d_winding.read_indexed_face_set(out)[0])["loadable"]
+
+
+def test_a_clean_surface_is_not_rewritten_for_fans():
+    verts, tris = _grid(6)
+    p = _write(_tmp("clean.x3d"), tris, verts)
+    assert x3d_winding.fan_report(p)["loadable"]
+    assert x3d_winding.loadable_x3d(p, quiet=True) == p
+
+
+def test_a_pinched_surface_actually_loads():
+    """End to end against the real loader -- the test that matters.
+
+    Everything above is a proxy for "x3d_load_geometry will accept this". This
+    asks it, with the file the gate produces.
+    """
+    try:
+        import spatialnde2 as snde
+    except ImportError:
+        import pytest
+        pytest.skip("spatialnde2 is not importable, so the loader cannot be "
+                    "asked whether the repair worked")
+
+    verts, tris = _grid(12)
+    verts = list(verts) + [(-0.05, -0.05, 0.0), (-0.05, 0.0, 0.0)]
+    tris = [list(t) for t in tris] + [[0, len(verts) - 2, len(verts) - 1]]
+    p = _write(_tmp("pinchload.x3d"), tris, verts)
+    assert not x3d_winding.fan_report(p)["loadable"]
+
+    out = x3d_winding.loadable_x3d(p, quiet=True)
+
+    recdb = snde.recdatabase()
+    snde.setup_cpu(recdb, [], 4)
+    snde.setup_storage_manager(recdb)
+    snde.setup_math_functions(recdb, [])
+    recdb.startup()
+    graphman = snde.graphics_storage_manager(
+        "/graphics/", recdb.lowlevel_alloc, recdb.alignment_requirements,
+        recdb.lockmgr, 1e-8, 2000000000)
+    trans = recdb.start_transaction()
+    trans.define_channel("/graphics/", "main", False, graphman)
+    snde.x3d_load_geometry(
+        trans, graphman, out, 0, "main", "/graphics/specimen/", None,
+        ["reindex_vertices", "reindex_tex_vertices"]
+        + snde.project_onto_parameterization_processing_tags)
+    trans.end_transaction().globalrev_wait().wait_complete()
+    assert "/graphics/specimen/meshed" in set(recdb.latest.list_recordings())
