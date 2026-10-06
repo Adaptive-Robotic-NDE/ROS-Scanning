@@ -734,6 +734,28 @@ EC_PRELOAD_M = 0.0
 # pushing the part: the fixture bottoms out, the reading saturates, and the
 # probe or the specimen is what gives. To gain margin, shrink the scan area --
 # never press harder.
+#
+# RUNNING AT OR NEAR THIS CEILING IS THE INTENDED OPERATING POINT, and the
+# reasoning above should not be read as discouraging it. Both of those numbers
+# come from the DESCRIPTION, and on the bench the fixture has more retract
+# travel than the URDF represents -- the plunger is modelled as a fixed joint,
+# so the description cannot show travel it does not have. Against that, the
+# surface the tip is commanded onto is a measured mesh whose own error runs to
+# half a millimetre, and at zero preload every bit of that error becomes
+# lift-off one for one. Lift-off loses the measurement; a little too much
+# preload costs clearance margin the planner can be told about. The operator's
+# ruling (2026-10-05) is that the factor of safety belongs on the contact side,
+# and runs here are expected to use 1-2 mm.
+#
+# WHAT THAT COSTS, so that it is a decision and not a surprise: past 0.25 mm
+# the modelled probe body is inside the part, so the clearance the gate reports
+# for ec_probe is optimistic by the preload -- it read -4.7 mm on the
+# 2026-10-05 scan at 2.00 mm, and contact for ec_probe and probe_holder is
+# declared to the planner anyway, so nothing is refused by it. Every OTHER link
+# is still checked honestly, because none of them is inside the part. The thing
+# that would actually want fixing one day is the URDF: a prismatic joint for
+# the plunger would let the planner model the retract instead of the pipeline
+# working around its absence. Not needed now.
 EC_PRELOAD_CEILING_M = 0.002
 # Scan only this part of the toolpath: (xmin, ymin, xmax, ymax) in world
 # metres, or None for everything on the part. Waypoints outside are dropped and
