@@ -29,6 +29,32 @@ Four code changes landed. All of them are on `main` in `ROS-Scanning` and in
 | Pinched vertices are repaired before the surface is loaded | the 14:51 scan died in `x3d_load_geometry` **after** the probe was on the part and the instrument nulled | either nothing, or one line saying a face was removed |
 | `mtc_node` drains its goal threads before shutting down | it segfaulted on the way out three times in one session | a clean exit when you stop the cell |
 | The preload ceiling note records that 1–2 mm is the intended operating point | so nobody "fixes" it back | nothing; it is a comment |
+| `r` at a capture prompt runs the rest of that take without asking | a tilt × rotation matrix is ~50 prompts and by pass two you are confirming the same descent for the ninth time | a new key in the prompt — see below |
+
+### `r` — stop confirming, for the rest of this take
+
+Every capture prompt now reads:
+
+```
+  [Enter=go, s=skip, q=abort, r=run the rest of this take without asking] >
+```
+
+Press `r` once you have watched a pass and are satisfied. Every later move in
+**that take** proceeds without asking — still previewed, still printed, still
+recorded (the take's artifact marks them `auto_by: operator`, so the record
+distinguishes a move you looked at from one you armed through).
+
+Three things worth knowing:
+
+- **It is scoped to the take, by identity.** The next `capture_contact()` asks
+  again from its first move, even minutes later. Nothing has to be cleared.
+- **There is no way back except Ctrl-C**, which the supervisor turns into a stop
+  at the next checkpoint without moving the arm. The line printed when you arm
+  it says so.
+- **It is not `CAPTURE_AUTO_CONFIRM`**, which is still refused outside
+  simulation and still should be. That one is set before anything runs by
+  someone who has not seen the arm move; `r` is a decision made mid-run by the
+  person watching it.
 
 **Nothing here changes a number you were using.** A square sampling grid gets
 exactly the radius it got before; only a raster whose line spacing differs from

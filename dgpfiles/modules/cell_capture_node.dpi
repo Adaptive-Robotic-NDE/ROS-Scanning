@@ -671,10 +671,38 @@ def confirm(prompt, extra=None):
     """Ask the operator. Returns "go", "skip", "abort", or one of `extra`.
 
     Enter/y = go. s = skip this step. q/n = abort the scenario (the take is
-    closed and kept). `extra` maps single letters to answers a scenario wants,
-    e.g. {"t": "tight"} for the cable test.
+    closed and kept). r = go, and stop asking for the rest of THIS TAKE.
+    `extra` maps single letters to answers a scenario wants, e.g. {"t": "tight"}
+    for the cable test.
+
+    WHAT `r` IS, AND WHY IT IS NOT CAPTURE_AUTO_CONFIRM. That flag is refused
+    outside simulation and stays refused: it is set before anything runs, by
+    someone who has not seen the arm move, and every motion at the cell is
+    confirmed by the operator. `r` is a different thing -- a decision made in
+    the middle of a run, by the person watching it, after the same move has
+    already succeeded in front of them. A tilt-and-rotation matrix is ten passes
+    of five prompts, and by pass two the operator is confirming the identical
+    descent for the ninth time; that is not supervision, it is a reflex, and a
+    reflex is worth less than an informed decision to stop asking.
+
+    SCOPED TO THE TAKE, and the scoping is by identity rather than by a flag
+    somebody has to remember to clear: the armed take is stored, and a prompt
+    only skips if the take it is in IS that object. So a later scenario -- a new
+    capture_contact() over different taught points, an hour later -- asks again
+    from its first move, and nothing can leak the setting across a take boundary
+    or outside a take entirely.
+
+    THERE IS NO WAY BACK except Ctrl-C, which the supervisor turns into a stop
+    at the next checkpoint without moving the arm. The line printed on arming
+    says so, because an operator who does not know the escape has been handed a
+    worse position than they were in.
+
+    Every skipped prompt is still printed and still recorded, with auto_by
+    "operator", so the take's artifact says exactly which moves a human looked
+    at and which ones they armed through.
     """
     take = _CAP.get("take")
+    auto_by = None
     if CAPTURE_AUTO_CONFIRM:
         if CELL_MODE != "sim":
             raise CaptureRefused(
@@ -685,10 +713,23 @@ def confirm(prompt, extra=None):
         # (the cable test's "tight"): _CAP["sim_answer"](prompt, extra).
         fn = _CAP.get("sim_answer")
         answer = (fn(prompt, extra) if fn else None) or "go"
+        auto_by = "sim"
         _capture_say("  [auto-confirm, sim] %s%s" % (prompt, "" if answer == "go"
                                                      else "  -> " + answer))
+    elif take is not None and _CAP.get("auto_rest") is take:
+        # Armed by the operator earlier in THIS take. Say what is being done
+        # anyway: the point of arming is to stop being asked, not to stop being
+        # told, and the log has to carry the move either way.
+        answer = "go"
+        auto_by = "operator"
+        _capture_say("  [running on, armed with r] %s" % (prompt,))
     else:
         keys = "Enter=go, s=skip, q=abort"
+        # Only offered inside a take, because that is the only thing it can be
+        # scoped to -- and never shadowing a key the scenario has claimed.
+        offer_run_on = take is not None and not (extra and "r" in extra)
+        if offer_run_on:
+            keys += ", r=run the rest of this take without asking"
         if extra:
             keys += ", " + ", ".join("%s=%s" % kv for kv in extra.items())
         # If nothing is subscribed to the preview topics, the operator is being
@@ -710,14 +751,27 @@ def confirm(prompt, extra=None):
             if ans in ("q", "n", "no", "abort", "quit"):
                 answer = "abort"
                 break
+            # The scenario's own keys win over `r`, which is why offer_run_on
+            # checked for a collision rather than this branch ordering alone.
             if extra and ans in extra:
                 answer = extra[ans]
                 break
+            if offer_run_on and ans in ("r", "run"):
+                _CAP["auto_rest"] = take
+                answer = "go"
+                _capture_say(
+                    "  RUNNING ON: the rest of this take will not be confirmed. "
+                    "Every move is still previewed, printed and recorded. "
+                    "Ctrl-C stops at the next checkpoint without moving the arm, "
+                    "and the next take asks again from its first move.")
+                break
             print("  ?")
+
     if take is not None:
         take.confirmations.append({"prompt": prompt, "answer": answer,
                                    "ros_time_ns": capture_node.now_ns(),
-                                   "auto": bool(CAPTURE_AUTO_CONFIRM)})
+                                   "auto": auto_by is not None,
+                                   "auto_by": auto_by})
     return answer
 
 
@@ -819,3 +873,9 @@ def capture_status():
                                  "live" if w is not None else "none"))
     print("  taught points: %s" % (", ".join(sorted(taught_points)) or "none"))
     print("  auto-confirm: %s" % CAPTURE_AUTO_CONFIRM)
+    # Whether THIS take has been armed with `r`. Worth a line of its own: an
+    # operator who walked away and came back has no other way to tell whether
+    # the next move will stop and ask them.
+    if take is not None and _CAP.get("auto_rest") is take:
+        print("  running on: YES -- this take will not ask again (Ctrl-C stops "
+              "at the next checkpoint; the next take asks from its first move)")
