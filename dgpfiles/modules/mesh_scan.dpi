@@ -409,6 +409,14 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
         x3d = mesh_projection_x3d(mesh)
         print("  parameterizing %s -> %s" % (os.path.basename(mesh), x3d))
         mesh_uv_x3d(mesh, x3d, method=uv_method)
+        # AND CHECK IT HERE, where it was written and nothing has moved.
+        #
+        # The projector is built when the SCAN starts -- after the approach, the
+        # touchdown and the hardware null -- so a surface the loader will not
+        # take used to cost the whole setup, with the probe pressed into the
+        # part. Three runs went that way in two days. The file has existed since
+        # this line every time.
+        check_projection_surface(x3d)
 
     acq = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
     print("  %d of %d segments are scanning passes (>= %.0f mm); %.3f m of travel, "

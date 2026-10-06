@@ -163,6 +163,85 @@ def loadable_projection_surface(x3d_path):
     return x3d_winding.loadable_x3d(x3d_path)
 
 
+global check_projection_surface
+def check_projection_surface(x3d_path, quiet=False):
+    """Prove this surface is loadable, NOW, where it was written.
+
+    -> the path that will actually be loaded (a repaired sibling, or the one
+    given). Raises RuntimeError naming what is wrong when it cannot be made
+    loadable.
+
+    WHY HERE AND NOT AT THE SCAN. SurfaceProjector is built when the scan
+    starts, which is after the approach, the touchdown and the hardware null. A
+    surface x3d_load_geometry() will not take therefore costs the whole setup,
+    with the probe pressed into the part and the instrument already balanced --
+    three runs went that way on 2026-10-05 and 2026-10-06, and every time the
+    file had existed since the parameterization minutes earlier. This is the
+    same work, done where the answer is still free.
+
+    TWO CHECKS, AND NEITHER IS ENOUGH ALONE. That is measured, not assumed:
+
+      * loadable_x3d() repairs winding, pinched vertex fans and a mirrored
+        parameterization. Winding is the one the loader does NOT validate -- it
+        still reaches an assert, `edgecheck < vertexnum_edges.second.size()`,
+        which is SIGABRT for the whole process with no traceback and nothing to
+        catch. The scan surface of 2026-10-06 had 219 inconsistently wound edges
+        and passed x3d_validate_geometry() with ZERO problems; loading it
+        aborted the process.
+      * x3d_validate_geometry() is the loader's OWN list -- out-of-range
+        indices, non-triangular polygons, degenerate triangles, orphan
+        vertices, over-shared edges, discontiguous fans -- and it is the half
+        that cannot drift from what the loader requires, because it is the same
+        code. It reserves no channel and allocates nothing, so it is free to
+        ask.
+
+    So: repair with ours, then confirm with theirs.
+    """
+    load_path = loadable_projection_surface(x3d_path)
+    try:
+        import spatialnde2 as snde
+        validate = getattr(snde, "x3d_validate_geometry", None)
+    except ImportError:                                           # noqa: BLE001
+        validate = None
+    if validate is None:
+        # An older spatialnde2 without the validator: the repairs above still
+        # ran, and saying so is better than implying a check that did not happen.
+        if not quiet:
+            print("  projection surface: repaired and checked for winding, fans "
+                  "and UV handedness; this spatialnde2 has no "
+                  "x3d_validate_geometry() so the loader's own index checks were "
+                  "not run")
+        return load_path
+    tags = (["reindex_vertices", "reindex_tex_vertices"]
+            + list(snde.project_onto_parameterization_processing_tags))
+    problems = validate(load_path, 0, tags)
+    fatal = [p for p in problems if p.fatal]
+    if fatal:
+        raise RuntimeError(
+            "%s cannot be loaded for projection, and this is the plan stage, so "
+            "nothing has moved:\n  %s\n"
+            "  The surface was repaired for winding, pinched fans and UV "
+            "handedness first; what is left is in the loader's own list and is "
+            "not something this pipeline knows how to repair. Re-run the "
+            "parameterization, or look at the reconstruction that produced %s."
+            % (os.path.basename(load_path),
+               snde.x3d_describe_fatal_problems(problems).replace("\n", "\n  "),
+               os.path.basename(x3d_path)))
+    if not quiet:
+        extra = ""
+        if problems:
+            # Non-fatal ones are worth one line: an orphan vertex is a hole in
+            # the surface where no trace will ever land.
+            kinds = {}
+            for p in problems:
+                kinds[p.check] = kinds.get(p.check, 0) + 1
+            extra = (" (%s -- not fatal, but nothing projects there)"
+                     % ", ".join("%d %s" % (v, k) for k, v in sorted(kinds.items())))
+        print("  projection surface checked at plan time: %s loads%s"
+              % (os.path.basename(load_path), extra))
+    return load_path
+
+
 def projection_surface_geometry(x3d_path):
     """What is actually in this X3D file. -> (nverts, nfaces, lo, hi)
 
