@@ -509,6 +509,64 @@ def _check_wrist3(qs, what, quats=None):
         raise CaptureRefused(str(e))
 
 
+global _cap_what_the_arm_does
+def _cap_what_the_arm_does(qs, quats=None):
+    """"wrist 3 +173 -> +263 deg ..." for a move whose IK is already solved.
+
+    THE PREVIEW USED TO DESCRIBE A POSITION AND NOTHING ELSE. For a move that
+    translates, that is the whole story. For a move that ROTATES THE TOOL it is
+    worse than nothing: a capture pass at a different probe rotation shows as
+
+        contact rot +90, +0 deg: over contact_b: straight to the target
+          1 waypoint(s), 335 mm straight-line, near the part: 10.0 mm/s
+          probe_end -> (0.8061, 0.0156, 0.9582)
+
+    and the operator is asked to approve a straight line while the wrist swings
+    90 degrees. On 2026-10-06 a `rotations_deg=(90.0,)` that was meant to be
+    -90 -- the sign lost while recalling the line from history -- took wrist 3
+    from the taught +173 to +263, and the operator stopped it with the emergency
+    stop because the loom looked wrong. Nothing in front of them said a number.
+
+    The joint solution is already in hand: capture_move() solves IK along the
+    path to bound the scaling and to check the cable band, and then threw it
+    away. So this costs nothing and says the three things that decide whether a
+    move is the one that was meant: where wrist 3 starts and ends, how far the
+    busiest joint travels, and how much the TOOL turns.
+    """
+    try:
+        sol = [q for q in (qs or []) if q is not None]
+        if len(sol) < 1:
+            return ""
+        arr = np.asarray(sol, float)
+        if arr.ndim != 2 or arr.shape[1] < 6:
+            return ""
+        w3 = np.degrees(arr[:, -1])
+        out = "  wrist 3 %+.0f -> %+.0f deg" % (w3[0], w3[-1])
+        if len(w3) > 2:
+            out += " (through %+.0f..%+.0f)" % (w3.min(), w3.max())
+        # The band this move is actually judged against, when it is known.
+        band = globals().get("wrist3_band_deg")
+        if band is not None:
+            try:
+                lo, hi = band(quat=(quats[-1] if quats else None))
+                room = min(w3[-1] - lo, hi - w3[-1])
+                out += ", %.0f deg from the cable limit" % (room,)
+            except Exception:                                     # noqa: BLE001
+                pass
+        if arr.shape[0] > 1:
+            span = np.degrees(np.abs(arr[-1] - arr[0]))
+            out += "; largest joint %.0f deg" % (span.max(),)
+        if quats and len(quats) >= 2:
+            d = 2.0*math.degrees(math.acos(
+                min(1.0, abs(float(np.dot(np.asarray(quats[0], float),
+                                          np.asarray(quats[-1], float)))))))
+            if d >= 1.0:
+                out += "; the TOOL turns %.0f deg" % (d,)
+        return out
+    except Exception:                                             # noqa: BLE001
+        return ""
+
+
 global path_motion_scaling
 def path_motion_scaling(poses, speed, quiet=True):
     """The MoveIt scaling that moves the tooling along THIS path at `speed`.
@@ -987,9 +1045,14 @@ def capture_move(poses, label, speed=None, scaling=None, min_fraction=1.0,
            "gain": _gain("cartesian"), "waypoints": len(P), "length_m": length,
            "t0_ros_ns": capture_node.now_ns()}
     _lands = _cap_where_it_lands(P)
+    # What the ARM does, not only where the tip ends up. See
+    # _cap_what_the_arm_does(): a pure rotation reads as a short straight line
+    # without it, and that is how a wrist swing reaches the operator unannounced.
+    _does = _cap_what_the_arm_does(qs, quats=[q for _x, q in path])
     stub = _decide(label, "%s\n  %d waypoint(s), %.0f mm straight-line, %s the part: "
-                   "%.1f mm/s%s" % (label, len(P), length*1e3, cls, v*1e3,
-                                    ("\n" + _lands) if _lands else ""),
+                   "%.1f mm/s%s%s" % (label, len(P), length*1e3, cls, v*1e3,
+                                      ("\n" + _does) if _does else "",
+                                      ("\n" + _lands) if _lands else ""),
                    rec, raise_on_fail)
     if stub is not None:
         return stub
