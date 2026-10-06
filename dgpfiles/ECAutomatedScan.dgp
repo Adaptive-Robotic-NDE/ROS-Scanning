@@ -2164,6 +2164,54 @@ def set_ec_preload(metres):
     return EC_PRELOAD_M
 
 
+global set_scan_velocity
+def set_scan_velocity(mps):
+    """Set the scan speed, IN METRES PER SECOND. The one way to change it.
+
+        set_scan_velocity(0.010)   10 mm/s, the default
+        set_scan_velocity(0.004)    4 mm/s
+
+    A bare `SCAN_VELOCITY = 0.004` typed at the prompt is the same trap as
+    EC_PRELOAD_M: whether it reaches the shared globals is not something an
+    operator should have to know, and a scan that silently used the old speed
+    looks exactly like a scan that used the new one. This is the way in, and it
+    says what it set.
+
+    METRES PER SECOND, matching SCAN_VELOCITY itself and set_ec_preload(). It
+    prints the millimetre equivalent, which is the unit the number is chosen in.
+
+    IT IS A REQUEST, NOT A GUARANTEE, and the plan says so: trace rate is
+    velocity / step, so the rate ceiling is a velocity ceiling once the step is
+    chosen, and plan_scan() will clamp and print both numbers. Separately, the
+    speed the arm ACHIEVES has been seen well under the speed commanded -- a
+    2026-10-05 scan asked for 10 mm/s and flew every pass at 3.9 -- so read the
+    per-pass elapsed time rather than this setting when the speed is the
+    measurement.
+    """
+    global SCAN_VELOCITY
+    value = float(mps)
+    if not value > 0.0:
+        raise ValueError("the scan velocity is a speed in m/s, not %r" % (mps,))
+    if value > 0.5:
+        raise ValueError(
+            "a scan velocity of %.3f m/s is %.0f mm/s, which is almost "
+            "certainly millimetres per second typed into a metres-per-second "
+            "setter. set_scan_velocity(%.4f) is %.1f mm/s."
+            % (value, value*1e3, value/1e3, value))
+    SCAN_VELOCITY = value
+    print("  scan velocity %.1f mm/s. The rate ceiling may clamp it -- the plan "
+          "prints both numbers -- and the arm may achieve less, which only the "
+          "per-pass elapsed time shows." % (SCAN_VELOCITY*1e3,))
+    return SCAN_VELOCITY
+
+
+global scan_velocity
+def scan_velocity():
+    """The scan speed in force, m/s."""
+    print("  scan velocity %.1f mm/s" % (SCAN_VELOCITY*1e3,))
+    return SCAN_VELOCITY
+
+
 global ec_preload
 def ec_preload():
     """The preload in force now, in metres. Prints it in millimetres."""
