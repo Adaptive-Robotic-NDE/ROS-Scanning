@@ -572,7 +572,20 @@ def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -
     u = (b - a)/np.linalg.norm(b - a)
     za = quat_to_matrix(qa)[:, 2]
     axis = u if tilt_axis == "travel" else np.cross(za, u)/np.linalg.norm(np.cross(za, u))
-    speed = min(CAPTURE_SPEED_NEAR, speed_mm_s/1000.0) if speed_mm_s else CAPTURE_SPEED_NEAR
+    # THE NEAR-PART SPEED LIMIT BINDS, AND IT SAYS SO. A probe on the part is
+    # held to CAPTURE_SPEED_NEAR whatever is asked for, which is right -- but it
+    # used to clamp in silence, and the take's own params recorded the CLAMPED
+    # value, so neither the operator nor the artifact said the request had not
+    # been honoured. A latency ladder run at 4, 10 and 20 mm/s on 2026-10-06
+    # produced two speeds and nobody could tell from the data why.
+    speed = CAPTURE_SPEED_NEAR
+    if speed_mm_s:
+        speed = min(CAPTURE_SPEED_NEAR, speed_mm_s/1000.0)
+        if speed < speed_mm_s/1000.0 - 1e-9:
+            print("  %.1f mm/s was asked for; %.1f mm/s is the near-part limit "
+                  "(CAPTURE_SPEED_NEAR) and that is what will be flown. Raise "
+                  "the limit deliberately if a faster pass is the measurement."
+                  % (float(speed_mm_s), speed*1e3))
     force_limit = CAPTURE_CONTACT_FORCE_LIMIT if force_limit is None else force_limit
     use_ec = ec if ec is not None else bool(globals().get("ec_ready") and ec_ready()[0])
     if use_ec and globals().get("ec_source") is None:
@@ -580,7 +593,9 @@ def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -
     L = float(np.linalg.norm(b - a))
     params = {"points": list(points), "tilts_deg": list(tilts_deg),
               "rotations_deg": list(rotations_deg), "tilt_axis": tilt_axis,
-              "approach_mm": approach_mm, "speed_mps": speed, "force_limit_n": force_limit,
+              "approach_mm": approach_mm, "speed_mps": speed,
+              "speed_requested_mps": (speed_mm_s/1000.0 if speed_mm_s else None),
+              "force_limit_n": force_limit,
               "ec": use_ec, "orientation_diff_deg": diff, "pass_length_m": L,
               "declare_contact": bool(declare_contact)}
     with _cap_specimen_contact(declare=declare_contact), \
