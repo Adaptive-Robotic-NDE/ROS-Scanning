@@ -30,6 +30,7 @@ Four code changes landed. All of them are on `main` in `ROS-Scanning` and in
 | `mtc_node` drains its goal threads before shutting down | it segfaulted on the way out three times in one session | a clean exit when you stop the cell |
 | The preload ceiling note records that 1–2 mm is the intended operating point | so nobody "fixes" it back | nothing; it is a comment |
 | `r` at a capture prompt runs the rest of that take without asking | a tilt × rotation matrix is ~50 prompts and by pass two you are confirming the same descent for the ninth time | a new key in the prompt — see below |
+| `capture_contact()` declares specimen contact for its own take | the probe is pressed into a collision object, so moves made *from* the part were refused at 14–86% | a `contact with 'specimen' is now ALLOWED` line at the start of each take, `now refused` at the end |
 
 ### `r` — stop confirming, for the rest of this take
 
@@ -166,19 +167,36 @@ teach_point("contact_b")
 taught_points.keys()
 ```
 
-### 2.2 Declare contact to the planner
+### 2.2 Contact — nothing to do, but know what you will see
 
-The specimen will be in the planning scene from any earlier run, and the probe is
-pressed into it. Without this, short tool-axis moves come back at 14–86% and the
-pass is refused.
+`capture_contact()` now declares the probe's contact with the specimen itself,
+for the duration of the take, and withdraws it after. You should see this when
+a take starts:
 
 ```
-planning_scene_objects()
-allow_specimen_contact(["ec_probe", "probe_holder"])
+planning scene: contact with 'specimen' is now ALLOWED for ec_probe, probe_holder.
 ```
 
-If `planning_scene_objects()` comes back empty there is nothing in the scene and
-nothing to declare — skip the second line.
+and the matching `now refused` line when it ends. If instead it says
+
+```
+  no specimen in the planning scene, so there is no contact to declare --
+  and nothing is checked against the part either.
+```
+
+that is also fine for a capture take, and worth noting: it means nothing on the
+tooling is being collision-checked against the part at all.
+
+This is what was behind the refusals last time — `onto contact_a along the tool
+axis` at 86%, `off contact_a` at 14%, and `over contact_a: lift off` reporting a
+100% plan that then moved 1.0 mm of the 10 it was commanded. All three read as
+planner faults; all three were the planner correctly refusing to interpolate out
+of a start state it had been told was illegal. If you see one of those again,
+it is **not** this, and I want to know.
+
+A declaration you made by hand is left alone and not withdrawn.
+`capture_contact(..., declare_contact=False)` keeps every protection, for the
+case where the refusal is the thing being tested.
 
 ### 2.3 Set the probe to its sensitive orientation
 

@@ -61,6 +61,7 @@
 # them: a take has to say what it measured.
 
 # Each .dpi is its own function body: another part's imports are not visible.
+import contextlib
 import json
 import math
 import os
@@ -68,6 +69,7 @@ import time
 
 import numpy as np
 
+global _cap_specimen_contact
 global capture_azure_sweeps
 global capture_keyence_sweeps
 global capture_contact
@@ -436,10 +438,80 @@ def _ec_disarm(take, rows, label):
     return path
 
 
+@contextlib.contextmanager
+def _cap_specimen_contact(links=None, declare=True):
+    """Declare the probe's contact with the specimen for the duration, then undo it.
+
+    A capture scenario that presses the probe onto the part is a CONTACT
+    scenario, and a planner that refuses contact refuses the measurement. With
+    the specimen in the planning scene and nothing declared, the start state of
+    every move made from the part is in collision: `onto contact_a along the
+    tool axis` came back at 86%, `off contact_a` at 14%, and `over contact_a:
+    lift off` at 100% of a plan that then moved 1.0 mm of the 10 it was
+    commanded. All three read as planner faults. They are not -- they are the
+    planner correctly refusing to interpolate out of a state it has been told is
+    illegal.
+
+    mesh_scan and surface_path_scan have declared this for their own scans since
+    the eddy-current path scan needed it. The capture tool never did, so the
+    operator had to know to call allow_specimen_contact() first -- and if they
+    did not, the failure arrived mid-take as a refused move with a message about
+    planning.
+
+    RESTORED ON THE WAY OUT, and only what this changed. If contact was already
+    declared when the take started -- the operator did it by hand, or a scan is
+    in progress -- it is left declared, because taking away a protection setting
+    somebody else chose is worse than leaving one on. If this turned it on, this
+    turns it off, so a later standoff scenario gets the part's protection back.
+
+    Never fatal. A take that cannot reach move_group's scene has bigger
+    problems than the matrix, and the alternative to a warning here is a
+    scenario that will not start.
+    """
+    allow = globals().get("allow_specimen_contact")
+    links = list(links or globals().get("TOOLING_CONTACT_LINKS") or ())
+    declared = False
+    if declare and allow is not None and links:
+        try:
+            scene_id = globals().get("SPECIMEN_SCENE_ID", "specimen")
+            if scene_id in planning_scene_objects():
+                already = tuple(globals().get("specimen_contact_allowed") or ())
+                if set(links) <= set(already):
+                    _capture_say("  contact with the specimen is already declared for "
+                          "%s; left as it was" % (", ".join(already),))
+                else:
+                    allow(links)
+                    declared = True
+            else:
+                # Not an error and not silent: with no specimen in the scene
+                # nothing is collision checked against the part either, which is
+                # a different and larger thing than contact not being declared.
+                _capture_say("  no specimen in the planning scene, so there is no "
+                      "contact to declare -- and nothing is checked against the "
+                      "part either.")
+        except Exception as e:                                    # noqa: BLE001
+            _capture_say("  WARNING: could not declare the probe's contact with the "
+                  "specimen (%s). Moves made from the part may be refused as "
+                  "collisions; allow_specimen_contact(%r) by hand, or "
+                  "remove_specimen_from_scene() is the blunt way out."
+                  % (e, links))
+    try:
+        yield declared
+    finally:
+        if declared:
+            try:
+                allow(links, allow=False)
+            except Exception as e:                                # noqa: BLE001
+                _capture_say("  WARNING: could not withdraw the contact declaration "
+                      "(%s). The probe may still touch the specimen as far as "
+                      "the planner is concerned; allow_specimen_contact(%r, "
+                      "allow=False) clears it." % (e, links))
+
+
 def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -6),
                     rotations_deg=(0.0,), tilt_axis="travel", approach_mm=20.0,
                     speed_mm_s=None, ec=None, force_limit=None,
-                    max_orientation_diff_deg=5.0):
+                    max_orientation_diff_deg=5.0, declare_contact=True):
     """SCENARIO 7. Spring-loaded eddy-current probe passes between taught points.
 
     Teach both points with the probe ON the cylinder, compressed as it should
@@ -481,6 +553,14 @@ def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -
     ec=True (default: when ec_ready() says the DAQ is live) also records the
     eddy-current signal through ec_source, one ec_rot<rot>_tilt<tilt>.npz per
     pass in the take. THIS PART IS UNTESTED: there is no DAQ off the cell.
+
+    CONTACT IS DECLARED TO THE PLANNER for the duration and withdrawn after --
+    see _cap_specimen_contact(). This is a contact scenario and the probe spends
+    the whole take pressed into a specimen that is a collision object, so
+    without it the moves made FROM the part are refused: three of them on
+    2026-10-05, at 14%, 86% and a plan that reported 100% and then moved a
+    tenth of what it was told. declare_contact=False keeps every protection,
+    for the case where the refusal is the thing being tested.
     """
     a, b = _cap_point(points[0]), _cap_point(points[1])
     qa = tuple(taught_points[points[0]]["xyzw"])
@@ -501,8 +581,10 @@ def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -
     params = {"points": list(points), "tilts_deg": list(tilts_deg),
               "rotations_deg": list(rotations_deg), "tilt_axis": tilt_axis,
               "approach_mm": approach_mm, "speed_mps": speed, "force_limit_n": force_limit,
-              "ec": use_ec, "orientation_diff_deg": diff, "pass_length_m": L}
-    with capture_scenario("contact", sets=("core",),
+              "ec": use_ec, "orientation_diff_deg": diff, "pass_length_m": L,
+              "declare_contact": bool(declare_contact)}
+    with _cap_specimen_contact(declare=declare_contact), \
+         capture_scenario("contact", sets=("core",),
                           expect_s=len(tilts_deg)*len(rotations_deg)
                                    *(L/speed + 2*approach_mm/1000.0/speed + 90.0) + 120.0,
                           params=params, near_points=_cap_densify([a, b], 0.005),
