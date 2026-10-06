@@ -21,6 +21,7 @@ plan_scan = ns["plan_scan"]
 format_scan_plan = ns["format_scan_plan"]
 check_scan_outcome = ns["check_scan_outcome"]
 auto_spot_radius = ns["auto_spot_radius"]
+traces_per_spot = ns["traces_per_spot"]
 auto_projection_pixels = ns["auto_projection_pixels"]
 velocity_scaling_for = ns["velocity_scaling_for"]
 velocity_from_scaling = ns["velocity_from_scaling"]
@@ -195,6 +196,67 @@ def test_projection_defaults_follow_the_step():
 
 
 @_checked
+def test_the_spot_radius_follows_both_sample_spacings():
+    """The rule is a trace COUNT, so a square grid is unchanged and a raster
+    with closely spaced lines stops being blurred by its coarse axis.
+
+    "radius = 1.6 x step" ignored the line spacing entirely. An eddy-current
+    scan at a 1.00 mm pitch and a 0.30 mm line spacing therefore got the same
+    1.6 mm radius as a 1.00 mm square grid -- 26 traces averaged into every
+    pixel over a 3.2 mm disc, against the 8 the rule was calibrated for.
+    Measured by reprojecting a real 59-pass scan, that cost a factor of 2.2 in
+    notch SNR.
+    """
+    print("=== the spot radius follows both sample spacings ===")
+    # SQUARE GRIDS ARE UNCHANGED, which is what makes this safe to land: the one
+    # measured calibration point keeps the radius it was measured at.
+    for step_mm, want_mm in ((5.08, 8.11), (1.0, 1.60), (0.5, 0.80), (0.3, 0.48)):
+        close("a %.2f mm square grid still gets %.2f mm" % (step_mm, want_mm),
+              auto_spot_radius(step_mm*1e-3, step_mm*1e-3)*1e3, want_mm, 0.02)
+    close("and so does a caller that passes no line spacing",
+          auto_spot_radius(0.00508)*1e3, 8.11, 0.02)
+
+    # THE CASE THAT WAS WRONG.
+    close("1.00 mm step x 0.30 mm lines -> 0.87 mm, not 1.60",
+          auto_spot_radius(0.001, 0.0003)*1e3, 0.874, 0.01)
+    close("the old 1.6 mm radius was averaging 26 traces there",
+          traces_per_spot(0.0016, 0.001, 0.0003), 26.8, 0.2)
+    close("the new one averages the 8 it is meant to",
+          traces_per_spot(auto_spot_radius(0.001, 0.0003), 0.001, 0.0003), 8.0, 0.01)
+
+    # Monotone in each spacing, and never larger than the square-grid answer for
+    # the coarser axis -- closer lines may only shrink it.
+    check("closer lines shrink the spot",
+          auto_spot_radius(0.001, 0.0002) < auto_spot_radius(0.001, 0.001), True)
+    check("a line spacing of zero falls back to the step rather than to zero",
+          abs(auto_spot_radius(0.001, 0.0)*1e3 - 1.60) < 0.02, True)
+    print()
+
+
+@_checked
+def test_a_manual_spot_radius_is_judged_by_trace_count():
+    """A radius under the step is fine when the lines are close together.
+
+    The old warning fired on `radius < 1.2 x step`, which would have refused to
+    shut up about the very radius this rule now picks: 0.87 mm against a 1.00 mm
+    step. The question is how many traces land in the spot, not how the radius
+    compares with one of the two spacings.
+    """
+    print("=== a manual spot radius is judged by trace count ===")
+    p = plan_scan(step_m=0.001, velocity_mps=0.005, spot_radius_m=0.0007,
+                  line_spacing_m=0.0003, force=True, **PLATE)
+    check("0.70 mm over a 1.00 x 0.30 mm cell does not warn",
+          any("lattice of dots" in w for w in p["warnings"]), False)
+    close("because it still reaches 5 traces", p["traces_per_spot"], 5.13, 0.05)
+
+    p = plan_scan(step_m=0.001, velocity_mps=0.005, spot_radius_m=0.0007,
+                  line_spacing_m=0.001, force=True, **PLATE)
+    check("the same radius on a square grid DOES warn",
+          any("lattice of dots" in w for w in p["warnings"]), True)
+    print()
+
+
+@_checked
 def test_deferred_projection_raises_the_ceiling():
     print("=== deferred projection raises the ceiling ===")
     live = plan_scan(step_m=0.001, velocity_mps=0.050, projection_mode="live",
@@ -331,7 +393,7 @@ def _main():
     print("all scan-plan checks passed")
 
 
-_SECTIONS = ["test_the_step_size_velocity_table", "test_velocity_is_clamped_and_says_so", "test_far_over_the_ceiling_is_an_error", "test_the_measured_reference_scan_comes_back", "test_the_memory_column", "test_an_unrunnable_scan_is_refused_with_the_reason", "test_projection_defaults_follow_the_step", "test_deferred_projection_raises_the_ceiling", "test_the_timer_raster_is_bound_by_the_digitizer", "test_velocity_scaling_is_a_measured_curve", "test_the_cells_own_ceiling_is_reported", "test_the_outcome_check", "test_the_summary_a_technician_reads"]
+_SECTIONS = ["test_the_step_size_velocity_table", "test_velocity_is_clamped_and_says_so", "test_far_over_the_ceiling_is_an_error", "test_the_measured_reference_scan_comes_back", "test_the_memory_column", "test_an_unrunnable_scan_is_refused_with_the_reason", "test_projection_defaults_follow_the_step", "test_the_spot_radius_follows_both_sample_spacings", "test_a_manual_spot_radius_is_judged_by_trace_count", "test_deferred_projection_raises_the_ceiling", "test_the_timer_raster_is_bound_by_the_digitizer", "test_velocity_scaling_is_a_measured_curve", "test_the_cells_own_ceiling_is_reported", "test_the_outcome_check", "test_the_summary_a_technician_reads"]
 
 
 if __name__ == "__main__":

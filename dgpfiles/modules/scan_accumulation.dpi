@@ -516,8 +516,13 @@ def projection_settings(plan=None):
     """
     if plan is not None:
         return plan["spot_radius_m"], int(plan["projection_pixels"])
+    # SCAN_LINE_SPACING as well as the step: the radius is set by the sampling
+    # CELL, and this call used to hand SCAN_LIMITS to what is now the line
+    # spacing argument.
     radius = (PROJECTION_SPOT_RADIUS if PROJECTION_SPOT_RADIUS is not None
-              else auto_spot_radius(SCAN_STEP_SIZE, SCAN_LIMITS))
+              else auto_spot_radius(SCAN_STEP_SIZE,
+                                    globals().get("SCAN_LINE_SPACING"),
+                                    SCAN_LIMITS))
     pixels = (PROJECTION_PIXELS if PROJECTION_PIXELS is not None
               else auto_projection_pixels(radius, 0.30, SCAN_LIMITS))
     return radius, int(pixels)

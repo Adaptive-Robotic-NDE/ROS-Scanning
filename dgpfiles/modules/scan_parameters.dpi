@@ -117,15 +117,36 @@ DEFAULT_LIMITS = {
     # 1 GB, which a 0.5 mm step over the 0.31 m test plate reaches (1.2 GB).
     "max_trace_memory_bytes": 1 << 30,
 
-    # Projection spot radius as a multiple of the step, when it is auto.
+    # HOW MANY TRACES THE PROJECTION KERNEL AVERAGES INTO ONE PIXEL.
     #
-    # The splat kernel falls off smoothly and reaches zero well inside its
-    # nominal radius, so a radius near half the pitch leaves the image a lattice
-    # of dots. Measured over the 5.08 mm pitch of a 60x60: 74.9% coverage of the
-    # scanned area at a 4 mm radius against 96.6% at 8 mm, with the same defect
-    # contrast either way -- so the gaps cost coverage, not accuracy. 8/5.08 is
-    # 1.57, and that is where this number comes from.
-    "spot_radius_per_step": 1.6,
+    # The splat falls off smoothly and reaches zero at its nominal radius, so a
+    # radius near half the sample spacing leaves the image a lattice of dots.
+    # Measured over the 5.08 mm pitch of a 60x60: 74.9% coverage of the scanned
+    # area at a 4 mm radius against 96.6% at 8 mm, with the same defect contrast
+    # either way.
+    #
+    # THAT MEASUREMENT WAS READ AS A MULTIPLE OF THE STEP (8/5.08 = 1.6) and the
+    # rule stayed "radius = 1.6 x step" for two years. It is wrong as soon as the
+    # two sample spacings differ, because it never sees the line spacing at all:
+    # an eddy-current scan at a 1.00 mm pitch and a 0.30 mm line spacing got the
+    # same 1.6 mm radius as a 1.00 mm square grid, which is 5.3x its line
+    # spacing, and averaged 26 traces into every pixel over a 3.2 mm disc. The
+    # notch response is 1-1.5 mm wide and the lift-off banding is 5-10 mm wide,
+    # so that kernel removed the signal and kept the artefact. Measured by
+    # reprojecting a real 59-pass scan: notch SNR 15.0 and 13.6 at 1.6 mm
+    # against 33.1 and 26.2 at the radius this rule now gives.
+    #
+    # WHAT THE 5.08 mm MEASUREMENT ACTUALLY FIXED is the number of samples the
+    # kernel reaches, which is an area: pi r^2 / (step x line_spacing). At 8 mm
+    # over a 5.08 mm square grid that is 7.8, and sqrt(8/pi) = 1.5958 against the
+    # 1.5748 that was fitted -- so "1.6 x step" IS "8 traces per spot" for a
+    # square grid, to 0.3%. Expressed that way it generalises to a rectangular
+    # sampling cell for free, and every square-grid scan keeps the radius it had.
+    #
+    # Raise it to average harder and blur more; lower it for a feature near the
+    # size of the sample spacing. A technician who wants a specific radius sets
+    # PROJECTION_SPOT_RADIUS and bypasses this entirely.
+    "traces_per_spot": 8.0,
 
     # Parameterization pixels per projection spot DIAMETER. Below a couple of
     # pixels across the splat cannot be drawn whatever its radius says: 512 px
@@ -182,10 +203,44 @@ def _rate_ceiling(projection_mode, transaction_latency_s, limits,
             % (waits, "" if waits == 1 else "s", transaction_latency_s*1e3))
 
 
-def auto_spot_radius(step_m, limits=None):
-    """Projection spot radius that will not leave gaps at this step."""
+def auto_spot_radius(step_m, line_spacing_m=None, limits=None):
+    """Projection spot radius that averages traces_per_spot traces, in metres.
+
+    The sampling cell is step_m ALONG a pass by line_spacing_m ACROSS, and the
+    number of traces a disc of radius r reaches is pi r^2 / (step x spacing). So
+
+        r = sqrt(n x step x spacing / pi)
+
+    which is sqrt(n/pi) x spacing on a square grid -- 1.596 x at n = 8, the rule
+    this replaces, so nothing with equal spacings changes.
+
+    line_spacing_m None means "not known here", and the cell is then taken as
+    square at step_m: the old answer, for a caller that has not been given the
+    line spacing. That is a fallback and not a default -- a raster scan knows its
+    line spacing, and passing it is what stops the radius being set by the
+    coarser axis alone.
+    """
     limits = DEFAULT_LIMITS if limits is None else limits
-    return float(step_m)*float(limits["spot_radius_per_step"])
+    step_m = float(step_m)
+    spacing = step_m if line_spacing_m is None else float(line_spacing_m)
+    if not spacing > 0.0:
+        spacing = step_m
+    n = float(limits["traces_per_spot"])
+    return math.sqrt(n*step_m*spacing/math.pi)
+
+
+global traces_per_spot
+def traces_per_spot(spot_radius_m, step_m, line_spacing_m=None):
+    """How many traces a spot of this radius reaches, on this sampling grid.
+
+    The inverse of auto_spot_radius(), and the number worth printing: a radius
+    in millimetres is hard to judge against a feature size, and "26 traces
+    averaged into every pixel" is not.
+    """
+    spacing = step_m if line_spacing_m is None else float(line_spacing_m)
+    if not (spot_radius_m > 0.0 and step_m > 0.0 and spacing > 0.0):
+        return float("nan")
+    return math.pi*float(spot_radius_m)**2/(float(step_m)*spacing)
 
 
 def auto_projection_pixels(spot_radius_m, extent_m, limits=None):
@@ -262,7 +317,7 @@ def plan_scan(step_m, velocity_mps, path_length_m, passes,
               transaction_latency_s=0.02, digitizer_rate_hz=None,
               velocity_calibration=((0.05, 0.05),),
               spot_radius_m=None, projection_pixels=None,
-              projection_extent_m=None,
+              projection_extent_m=None, line_spacing_m=None,
               file_backed=False, limits=None, force=False):
     """Work out what this scan actually costs, and whether it can be run.
 
@@ -361,17 +416,27 @@ def plan_scan(step_m, velocity_mps, path_length_m, passes,
                 % _bytes(memory_bytes))
 
     if spot_radius_m is None:
-        spot_radius_m = auto_spot_radius(step_m, limits)
+        spot_radius_m = auto_spot_radius(step_m, line_spacing_m, limits)
         spot_auto = True
     else:
         spot_radius_m = float(spot_radius_m)
         spot_auto = False
-        if spot_radius_m < step_m*1.2:
+        # JUDGED AGAINST THE SAMPLING CELL, not against the step. A radius under
+        # the step is fine when the lines are close together -- there are still
+        # several traces inside it -- and a radius over the step is not enough
+        # when they are far apart. The trace count is the thing that decides,
+        # and it is the thing to say.
+        got = traces_per_spot(spot_radius_m, step_m, line_spacing_m)
+        if got < 2.0:
             warnings.append(
-                "projection spot radius %.1f mm is under 1.2x the %.2f mm step; "
-                "the image will break into a lattice of dots (74.9%% coverage "
-                "measured at 0.8x against 96.6%% at 1.6x)."
-                % (spot_radius_m*1e3, step_m*1e3))
+                "a %.2f mm projection spot reaches %.1f trace(s) at a %.2f mm "
+                "step and a %.2f mm line spacing; under about 2 the image "
+                "breaks into a lattice of dots (74.9%% coverage measured at "
+                "1.6 traces against 96.6%% at 8). %.2f mm gives %.0f."
+                % (spot_radius_m*1e3, got, step_m*1e3,
+                   (line_spacing_m if line_spacing_m else step_m)*1e3,
+                   auto_spot_radius(step_m, line_spacing_m, limits)*1e3,
+                   float(limits["traces_per_spot"])))
 
     extent = projection_extent_m if projection_extent_m else per_pass
     if projection_pixels is None:
@@ -414,6 +479,8 @@ def plan_scan(step_m, velocity_mps, path_length_m, passes,
         "file_backed": bool(file_backed),
         "spot_radius_m": spot_radius_m,
         "spot_radius_auto": spot_auto,
+        "line_spacing_m": (float(line_spacing_m) if line_spacing_m else None),
+        "traces_per_spot": traces_per_spot(spot_radius_m, step_m, line_spacing_m),
         "projection_pixels": int(projection_pixels),
         "projection_pixels_auto": pixels_auto,
         "projection_extent_m": extent,
@@ -481,11 +548,20 @@ def format_scan_plan(plan):
                  % (_bytes(plan["memory_bytes"]), plan["traces"],
                     plan["num_samples"], plan["sample_bytes"],
                     ", file-backed" if plan["file_backed"] else ", IN MEMORY"))
-    lines.append("    projection         %s, spot radius %.1f mm%s, %d px%s"
+    n = plan.get("traces_per_spot")
+    lines.append("    projection         %s, spot radius %.2f mm%s, %d px%s"
                  % (plan["projection_mode"], plan["spot_radius_m"]*1e3,
                     " (auto)" if plan["spot_radius_auto"] else "",
                     plan["projection_pixels"],
                     " (auto)" if plan["projection_pixels_auto"] else ""))
+    if n is not None and n == n:
+        # The radius alone does not say how much averaging it is: that depends
+        # on BOTH sample spacings, and it is the averaging that decides whether
+        # a feature the size of the sample spacing survives into the image.
+        lines.append("                       %.0f trace(s) averaged per pixel "
+                     "over a %.2f mm step x %.2f mm line spacing"
+                     % (n, plan["step_m"]*1e3,
+                        (plan.get("line_spacing_m") or plan["step_m"])*1e3))
     lines.append("    robot velocity scaling %.4f" % plan["velocity_scaling"])
 
     for w in plan["warnings"]:
