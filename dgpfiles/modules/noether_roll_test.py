@@ -547,6 +547,123 @@ check(np.abs(tilt(sm.quats)[:50]).max() < 1e-6 and np.abs(tilt(sm.quats)[50:] - 
       "smooth_tool_axis: no averaging across a segment boundary")
 check(sta(tp, None) is tp and sta(tp, 0.0) is tp, "smooth_tool_axis: None / 0 is off")
 
+# --- the turn-rate repair -----------------------------------------------------
+#
+# EC_MAX_TILT_DEG bounds how far the probe leans. Nothing bounded how fast the
+# lean CHANGES, and that is the one the arm feels: on 2026-10-08 ten passes of
+# eighty-six crawled at 1.74 mm/s against a 4.68 median while the arm visibly
+# rocked, pass speed against worst turn rate came out at r = -0.855, and the
+# median tilt on those passes was 0.429 deg against 0.423 elsewhere. The repair
+# has to SMOOTH, not refuse: a gate that only says no leaves an operator with a
+# scan they cannot run.
+
+def _cyl_pass(radius_m, n=121, span=0.060, noise_deg=0.0, seed=3):
+    """A pass running AROUND a cylinder, so the true normal genuinely turns."""
+    r = np.random.default_rng(seed)
+    s = np.linspace(-span/2, span/2, n)
+    th = s/radius_m
+    pos = np.column_stack([radius_m*np.sin(th), np.full(n, -0.25),
+                           0.99 + radius_m*(np.cos(th) - 1.0)])
+    true = np.column_stack([np.sin(th), np.zeros(n), np.cos(th)])
+    ax = true.copy()
+    if noise_deg:
+        ax[:, 0] += np.radians(noise_deg)*r.standard_normal(n)
+        ax[:, 1] += np.radians(noise_deg)*r.standard_normal(n)
+        ax = ax/np.linalg.norm(ax, axis=1, keepdims=True)
+    return pos, true, ax
+
+def _axis_of(q):
+    m = np.array([q2m(a) for a in q])
+    return m[:, :, 2]
+
+def _err(a, t):
+    return np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", a, t), -1.0, 1.0)))
+
+# GENERALITY: a curved surface keeps its curvature. The whole point of fitting a
+# local LINE rather than taking a mean is that a constant turn survives, so a
+# part that is smooth but not flat is not flattened.
+pos, true, ax = _cyl_pass(0.060, noise_deg=0.0)
+cu = ns["ScanPath"](pos, lqa(ax), [0], source="t")
+sm = sta(cu, 0.010, max_turn_deg_per_mm=None, quiet=True)
+check(_err(_axis_of(sm.quats), true).max() < 0.02,
+      "turn-rate repair: a 60 mm-radius curve is reproduced to %.3f deg -- the real "
+      "turn is not smoothed away" % (_err(_axis_of(sm.quats), true).max(),))
+
+# ...and it is reproduced AT THE ENDS, where the window is one-sided. This is
+# the bias that made a box mean unsafe on a normal-constrained path.
+pos, true, ax = _cyl_pass(0.060, noise_deg=1.0)
+cu = ns["ScanPath"](pos, lqa(ax), [0], source="t")
+lin = _err(_axis_of(sta(cu, 0.010, max_turn_deg_per_mm=None, quiet=True).quats), true)
+box = _err(_axis_of(sta(cu, 0.010, method="box", force=True, quiet=True).quats), true)
+ends = np.r_[0:10, len(true)-10:len(true)]
+check(lin[ends].mean() < box[ends].mean(),
+      "turn-rate repair: linear beats a box mean at the pass ENDS on a curve "
+      "(%.3f vs %.3f deg)" % (lin[ends].mean(), box[ends].mean()))
+check(lin.mean() < _err(ax, true).mean(),
+      "turn-rate repair: and it is closer to the true normal than the raw axis "
+      "(%.3f vs %.3f deg)" % (lin.mean(), _err(ax, true).mean()))
+
+# A box mean is still refused on a normal-constrained path; linear is not.
+pos, true, ax = _cyl_pass(0.060, noise_deg=1.0)
+nc = ns["ScanPath"](pos, lqa(ax), [0], source="t")
+nc.normal_constrained = True
+check(sta(nc, 0.010, method="box") is nc,
+      "turn-rate repair: a box mean is still declined on a normal-constrained path")
+out = sta(nc, 0.010, method="linear", max_turn_deg_per_mm=None, quiet=True)
+check(out is not nc and out.axis_smoothing["method"] == "linear",
+      "turn-rate repair: the unbiased estimator is allowed on one")
+
+# IT REPAIRS RATHER THAN REFUSING: a noisy flat pass over the bound comes back
+# under it, with a wider window, and says what it did.
+r = np.random.default_rng(11)
+n = 121
+pos = np.column_stack([np.linspace(0.80, 0.86, n), np.full(n, -0.25), np.full(n, 0.99)])
+ax = np.column_stack([np.radians(1.5)*r.standard_normal(n),
+                      np.radians(1.5)*r.standard_normal(n), np.ones(n)])
+ax = ax/np.linalg.norm(ax, axis=1, keepdims=True)
+noisy = ns["ScanPath"](pos, lqa(ax), [0], source="t")
+noisy.normal_constrained = True
+sm = sta(noisy, 0.004, max_turn_deg_per_mm=0.4, max_window_m=0.020, quiet=True)
+a = sm.axis_smoothing
+check(a["turn_before_max"] > 0.4 and a["turn_after_max"] <= 0.4 and a["turn_rate_met"],
+      "turn-rate repair: %.2f -> %.2f deg/mm, under the 0.40 bound"
+      % (a["turn_before_max"], a["turn_after_max"]))
+check(a["widened"] and a["window_m"] > a["requested_window_m"],
+      "turn-rate repair: the window widened from %.0f to %.0f mm to get there"
+      % (a["requested_window_m"]*1e3, a["window_m"]*1e3))
+check(np.array_equal(sm.positions, noisy.positions),
+      "turn-rate repair: and the tip still goes exactly where the mesh says")
+
+# A surface that genuinely turns faster than the bound is NOT refused -- it is
+# reported. A 10 mm radius turns at 5.7 deg/mm and is a real part, not noise.
+pos, true, ax = _cyl_pass(0.010, span=0.020, noise_deg=0.0)
+sharp = ns["ScanPath"](pos, lqa(ax), [0], source="t")
+sharp.normal_constrained = True
+sm = sta(sharp, 0.004, max_turn_deg_per_mm=0.4, max_window_m=0.020, quiet=True)
+check(sm.axis_smoothing["turn_rate_met"] is False,
+      "turn-rate repair: a genuinely sharp curve is reported as over the bound")
+check(_err(_axis_of(sm.quats), true).max() < 0.5,
+      "turn-rate repair: ...and NOT flattened to meet it (%.3f deg from the true "
+      "normal)" % (_err(_axis_of(sm.quats), true).max(),))
+check(sm.axis_smoothing["stopped_helping"] and not sm.axis_smoothing["widened"],
+      "turn-rate repair: it stopped widening at once, because a wider window "
+      "bought no reduction -- the turn is the part, not the mesh")
+
+# The mixed case, which is the one a real curved specimen gives: a sharp curve
+# WITH mesh noise on top. The noise must go and the curve must stay.
+pos, true, ax = _cyl_pass(0.010, span=0.020, noise_deg=1.0)
+mix = ns["ScanPath"](pos, lqa(ax), [0], source="t")
+mix.normal_constrained = True
+sm = sta(mix, 0.004, max_turn_deg_per_mm=0.4, max_window_m=0.020, quiet=True)
+check(_err(_axis_of(sm.quats), true).mean() < _err(ax, true).mean(),
+      "turn-rate repair: on a sharp curve WITH noise it still improves the axis "
+      "(%.3f -> %.3f deg from truth)"
+      % (_err(ax, true).mean(), _err(_axis_of(sm.quats), true).mean()))
+check(not sm.axis_smoothing["turn_rate_met"],
+      "turn-rate repair: ...and still reports the real 5.7 deg/mm turn rather "
+      "than smoothing it away to satisfy the bound")
+
+
 # --- resample_segments ---------------------------------------------------------
 rs = ns["resample_segments"]
 x = np.concatenate([[0.8], 0.8 + np.cumsum(rng.uniform(0.0, 0.0005, 400))])

@@ -818,6 +818,33 @@ EC_MAX_TILT_DEG = 45.0
 # crawled at 0.3 mm/s against 10 commanded, because at the sweep's MoveIt
 # scaling each orientation change is slow. None or 0 = off.
 EC_AXIS_SMOOTHING_M = 0.006
+# HOW the axis is smoothed. "linear" fits a local line in arc length, which
+# reproduces a constant turn exactly and therefore does not lean the axis away
+# from the surface normal at the ends of a pass -- the reason "box" is refused
+# on a normal-constrained path. See smooth_tool_axis().
+EC_AXIS_SMOOTHING_METHOD = "linear"
+# THE BOUND ON HOW FAST THE COMMANDED TOOL AXIS MAY TURN, in degrees per
+# millimetre of travel -- and it is applied as a REPAIR, not a refusal: the
+# smoothing window widens until the bound is met, up to EC_AXIS_SMOOTHING_MAX_M.
+#
+# This is the quantity that was never bounded. EC_MAX_TILT_DEG bounds how far
+# the probe leans; nothing bounded how fast the lean CHANGES, and the arm feels
+# the second one. On 2026-10-08 ten passes of eighty-six crawled at 1.74 mm/s
+# against a 4.68 median and the arm visibly rocked; pass speed against worst
+# turn rate came out at r = -0.855, while the median tilt on those passes was
+# 0.429 deg against 0.423 elsewhere -- identical. It was never about how far.
+#
+# 0.4 deg/mm is where the two populations separate on that scan: the stalled
+# passes reached 1.673 deg/mm and the rest topped out at 0.378. A real surface
+# is allowed to turn faster than this -- a 60 mm radius turns at 0.955 deg/mm --
+# which is why exceeding it widens the window rather than refusing: on a genuine
+# curve the linear fit reproduces the turn and the rate survives smoothing, and
+# only noise is removed.
+EC_AXIS_MAX_TURN_DEG_PER_MM = 0.4
+# The widest the window may grow reaching for that bound. Past this the axis is
+# being averaged over a distance comparable to real features rather than to mesh
+# noise, and the honest answer is to say the mesh is too noisy.
+EC_AXIS_SMOOTHING_MAX_M = 0.020
 # Every pass is resampled to this spacing before it is flown (None = as Noether
 # gave it). Noether's waypoints are wherever a slicing plane crossed a mesh
 # edge -- anywhere from 0.7 micrometres to 0.5 mm apart, hundreds of thousands
@@ -2754,7 +2781,10 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
             why="tilted more than EC_MAX_TILT_DEG (%.0f deg)" % (float(max_tilt),))
     sm = None
     if smooth and roll_mode == "locked":
-        path = smooth_tool_axis(path, smooth, reference=reference)
+        path = smooth_tool_axis(
+            path, smooth, reference=reference,
+            max_turn_deg_per_mm=EC_AXIS_MAX_TURN_DEG_PER_MM,
+            max_window_m=EC_AXIS_SMOOTHING_MAX_M)
         # DECLINED IS A NORMAL OUTCOME, and it must not be an AttributeError.
         # smooth_tool_axis() returns the path UNTOUCHED -- with no
         # `axis_smoothing` -- when the path is already normal-constrained
@@ -2834,6 +2864,26 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
         path.axis_smoothing = sm
         path.normal_postcondition = assert_probe_normal_to_surface(
             path, normal_surface, what="eddy-current toolpath", mode="warn")
+        # RECONCILE THE TWO NUMBERS, because otherwise they contradict each
+        # other and the reader cannot tell which to believe. The postcondition
+        # measures the probe axis against the MESH normal, and the smoothing
+        # deliberately departs from the mesh normal by up to the amount it
+        # reports. Before smoothing was allowed on a normal-constrained path
+        # this line read 0.000 deg; it now reads whatever was smoothed away, and
+        # a reader who does not know that goes looking for a bug.
+        #
+        # The departure is the repair, not an error: on 2026-10-08 the smoothed
+        # axis was CLOSER to the surface the tip actually traced than the mesh
+        # normal was (mean 0.397 -> 0.347 deg, max 2.545 -> 1.629), because the
+        # mesh normal is the noisy one.
+        if sm and sm.get("moved_max_deg", 0.0) > 1e-6:
+            _pc = path.normal_postcondition.get("max_deg", 0.0)
+            print("    that %.2f deg is the smoothing, not an error: the axis was "
+                  "moved up to %.2f deg off the MESH normal on purpose, to hold "
+                  "the turn rate to %.2f deg/mm. The mesh normal is the noisy "
+                  "quantity here -- see smooth_tool_axis()."
+                  % (_pc, sm.get("moved_max_deg", 0.0),
+                     sm.get("turn_after_max", float("nan"))))
 
     # The tooling gate, on the poses that will actually fly. Contact is allowed
     # for the probe by name -- contact is what this scan IS -- and every other

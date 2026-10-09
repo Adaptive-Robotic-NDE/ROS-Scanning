@@ -976,16 +976,37 @@ def test_the_other_smoothers_stand_down():
           acted.axis_sanity["assert_only"] is False
           and acted.axis_sanity["residual_over_bound_deg"] < 1e-6)
 
-    sm = smooth_tool_axis(path, 0.006, reference=(1.0, 0.0, 0.0))
-    check("smooth_tool_axis DECLINES on a constrained path (returns it unchanged)",
-          sm is path and not hasattr(sm, "axis_smoothing"))
-    forced = smooth_tool_axis(path, 0.006, reference=(1.0, 0.0, 0.0), force=True)
-    check("forced, it moves the axis %.2f deg OFF the normal -- which is what "
-          "declining avoids" % (forced.axis_smoothing["moved_max_deg"],),
+    # WHICH SMOOTHER STANDS DOWN IS A PROPERTY OF THE ESTIMATOR, not of
+    # smoothing. A box mean is a zeroth-order fit: on this crowned cylinder it
+    # lags the turning normal and the lag does not cancel at the ends of a pass,
+    # so it is still declined. A local LINE reproduces a constant turn exactly,
+    # has nothing to take off a smooth surface, and is allowed -- which is what
+    # makes it usable against the broadband normal noise of a real mesh without
+    # flattening a real curve.
+    boxed = smooth_tool_axis(path, 0.006, reference=(1.0, 0.0, 0.0),
+                             method="box")
+    check("a BOX mean still declines on a constrained path (returns it unchanged)",
+          boxed is path and not hasattr(boxed, "axis_smoothing"))
+    forced = smooth_tool_axis(path, 0.006, reference=(1.0, 0.0, 0.0),
+                              method="box", force=True, quiet=True)
+    check("forced, the box mean moves the axis %.2f deg OFF the normal -- which "
+          "is what declining avoids" % (forced.axis_smoothing["moved_max_deg"],),
           forced.axis_smoothing["moved_max_deg"] > 0.5)
     rf = assert_probe_normal_to_surface(forced, surf, verbose=False, mode="off")
     check("and the postcondition then reads %.2f deg instead of 0"
           % (rf["max_deg"],), rf["max_deg"] > 0.5)
+
+    lin = smooth_tool_axis(path, 0.006, reference=(1.0, 0.0, 0.0),
+                           method="linear", max_turn_deg_per_mm=None, quiet=True)
+    check("a LOCAL LINE is allowed on the same path, and on this clean crowned "
+          "cylinder it moves the axis %.3f deg -- a smooth surface is not "
+          "flattened" % (lin.axis_smoothing["moved_max_deg"],),
+          lin.axis_smoothing["moved_max_deg"] < 0.05)
+    rl = assert_probe_normal_to_surface(lin, surf, verbose=False, mode="off")
+    check("so the postcondition still reads %.3f deg after it" % (rl["max_deg"],),
+          rl["max_deg"] < 0.05,
+          "the whole point of the first-order fit is that a curved surface "
+          "survives it")
 
     # THE FLAG SURVIVES A CROP, which is what the scan config does next. The crop
     # helpers live in another file and copy only positions, quats, starts and the

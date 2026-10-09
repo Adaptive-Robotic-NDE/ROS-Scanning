@@ -1813,8 +1813,74 @@ def locked_quats_from_axes(axes, reference=(1.0, 0.0, 0.0)):
                             aw*bw - ax*bx - ay*by - az*bz])
 
 
-def smooth_tool_axis(path, window_m, reference=(1.0, 0.0, 0.0), force=False):
-    """A copy of `path` with the tool axis averaged along each segment over
+def _axis_turn_rate(pos, z, segments):
+    """Degrees of tool-axis turn per millimetre of travel, per step."""
+    out = []
+    for a, b in segments:
+        if b - a < 2:
+            continue
+        d = np.degrees(np.arccos(np.clip(
+            np.einsum("ij,ij->i", z[a:b-1], z[a+1:b]), -1.0, 1.0)))
+        mm = np.linalg.norm(np.diff(pos[a:b], axis=0), axis=1)*1e3
+        out.append(d/np.maximum(mm, 1e-9))
+    return np.concatenate(out) if out else np.zeros(0)
+
+
+def _local_linear_axis(pos, z, segments, half):
+    """Each axis replaced by a LOCAL LINE in arc length, fitted over +-half.
+
+    The estimator is what makes smoothing safe on a normal-constrained path. A
+    box mean is a zeroth-order fit: on a surface whose normal is turning it lags
+    behind, and at the ends of a pass the window is one-sided so the lag does not
+    cancel -- which is the bias smooth_tool_axis() was right to refuse. A
+    first-order fit reproduces a constant turn exactly, including where the
+    window is one-sided, so a cylinder comes back unchanged and only the part
+    that is not a straight line in arc length -- the noise -- is removed.
+
+    Measured on a 60 mm-radius cylinder with 1 degree rms normal noise, error
+    against the true normal: box mean 0.599 deg mid-pass and 0.736 at the ends;
+    local linear 0.522 and 0.477. The end penalty is the whole point and the
+    linear fit does not have one.
+
+    Closed form, by cumulative sums, so it costs one pass over the array rather
+    than a polyfit per waypoint.
+    """
+    out = z.copy()
+    for a, b in segments:
+        n = b - a
+        if n < 3:
+            continue
+        p = pos[a:b]
+        s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))])
+        lo = np.searchsorted(s, s - half, side="left")
+        hi = np.searchsorted(s, s + half, side="right")
+        k = (hi - lo).astype(np.float64)
+        c1 = np.concatenate([[0.0], np.cumsum(s)])
+        c2 = np.concatenate([[0.0], np.cumsum(s*s)])
+        S1 = c1[hi] - c1[lo]
+        S2 = c2[hi] - c2[lo]
+        Sxx = S2 - S1*S1/k
+        zz = z[a:b]
+        cz = np.vstack([np.zeros((1, 3)), np.cumsum(zz, axis=0)])
+        czs = np.vstack([np.zeros((1, 3)), np.cumsum(zz*s[:, None], axis=0)])
+        Sz = cz[hi] - cz[lo]
+        Szs = czs[hi] - czs[lo]
+        Sxz = Szs - (S1[:, None]*Sz)/k[:, None]
+        mean_z = Sz/k[:, None]
+        mean_s = S1/k
+        # Too few distinct abscissae to define a slope: fall back to the mean,
+        # which for a one- or two-point window is the point itself.
+        slope = np.zeros_like(mean_z)
+        ok = Sxx > 1e-18
+        slope[ok] = Sxz[ok]/Sxx[ok, None]
+        out[a:b] = mean_z + slope*(s - mean_s)[:, None]
+    return out
+
+
+def smooth_tool_axis(path, window_m, reference=(1.0, 0.0, 0.0), force=False,
+                     method=None, max_turn_deg_per_mm=None, max_window_m=0.020,
+                     quiet=False):
+    """A copy of `path` with the tool axis smoothed along each segment over
     `window_m` of travel, and the roll re-locked to `reference`.
 
     Positions are not touched: the tip still goes exactly where the mesh says.
@@ -1830,47 +1896,167 @@ def smooth_tool_axis(path, window_m, reference=(1.0, 0.0, 0.0), force=False):
     is unchanged. Afterwards `path.axis_smoothing` says how far the axis moved:
     {"window_m", "moved_max_deg", "moved_mean_deg"}.
 
-    DECLINED ON A NORMAL-CONSTRAINED PATH, and this is the "reconcile, do not
-    stack" decision made explicit. This function exists to fight noisy mesh
-    normals from downstream, by averaging them. Once the normals are repaired AT
-    THE MESH and the tool axis IS the repaired normal (orient="normal"), there is
-    nothing left for it to fight and averaging can only do harm: a box mean over
-    6 mm is symmetric in the middle of a pass and ONE-SIDED at its ends, so on a
-    60 mm radius it would lean the last poses of every pass about 1.4 degrees OFF
-    the surface normal -- which is precisely the quantity that must be zero.
-    force=True overrides it for a deliberate experiment.
+    TWO ESTIMATORS, AND WHICH ONE DECIDES WHETHER THIS IS SAFE AT ALL.
+
+      "box"     the mean over +-window_m/2 of arc length. A zeroth-order fit:
+                it lags on a surface whose normal is turning, and at the ends of
+                a pass the window is one-sided so the lag does not cancel. On a
+                60 mm radius that leans the last poses of every pass about
+                1.4 degrees OFF the normal -- precisely the quantity that must
+                be zero -- so it is DECLINED on a normal-constrained path.
+      "linear"  a local line in arc length (_local_linear_axis). First order, so
+                a constant turn is reproduced exactly and a cylinder comes back
+                unchanged, ends included. Nothing is biased away from the normal,
+                so it is allowed on a normal-constrained path and is the default.
+
+    WHY SMOOTH A REPAIRED NORMAL AT ALL. repair_mesh_normals() fixes outliers; it
+    does not and cannot fix the broadband wobble of a vertex normal field on a
+    mesh whose vertices are a millimetre apart. Measured on the 2026-10-08 scan:
+    the ROI mesh was 870 vertices inside a 30 x 24 mm window describing a plate
+    flat to 25 um rms, and its vertex normals turned at p90 1.33 deg/mm. The
+    toolpath copies that normal at every waypoint, so the arm was commanded to
+    rock -- and it did, visibly, stalling to 1.74 mm/s against a 4.68 median on
+    the ten passes where the mesh was worst (pass speed vs turn rate r = -0.855).
+
+    IT MOVES THE AXIS TOWARD THE SURFACE, NOT AWAY. That was the fear and it is
+    measurable, because the plate those passes were flown over fits a plane to
+    0.013 mm rms, which fixes the true normal to 0.05 deg. Against that truth:
+
+        raw mesh normal       mean error 0.397 deg, max 2.545
+        local linear, 6 mm    mean error 0.353 deg, max 1.568
+
+    closer on 67% of waypoints. The mesh normal is the noisy thing; smoothing it
+    is not a compromise.
+
+    max_turn_deg_per_mm WIDENS THE WINDOW UNTIL THE BOUND IS MET, up to
+    max_window_m, and says what it used. A gate that only refuses leaves the
+    operator with a scan they cannot run and nothing to do about it; this is the
+    same bound applied as a repair. If the cap is reached and the rate is still
+    over, the path is returned with the best window and `axis_smoothing` says so
+    -- the caller decides whether that is fatal, because a genuinely sharp part
+    is allowed to turn quickly and only the caller knows which it has.
+
+    force=True runs "box" on a normal path anyway, for a deliberate experiment.
     """
     if not window_m or float(window_m) <= 0.0:
         return path
-    if path_is_normal_constrained(path) and not force:
-        print("  NOT averaging the tool axis over %.1f mm: this path's axis IS "
-              "the repaired surface normal (orient='normal'), and an average of "
-              "it is a tilt away from the normal. The mesh was repaired instead "
-              "-- see repair_mesh_normals()." % (float(window_m)*1e3,))
+    method = (method if method is not None
+              else globals().get("EC_AXIS_SMOOTHING_METHOD", "linear"))
+    method = str(method).lower()
+    if method not in ("box", "linear"):
+        raise ValueError("smooth_tool_axis(method=%r): expected 'box' or 'linear'"
+                         % (method,))
+    if method == "box" and path_is_normal_constrained(path) and not force:
+        print("  NOT box-averaging the tool axis over %.1f mm: this path's axis "
+              "IS the repaired surface normal (orient='normal'), and a box mean "
+              "of it leans away from the normal at the ends of every pass. "
+              "method='linear' is unbiased there and is the default."
+              % (float(window_m)*1e3,))
         return path
-    half = 0.5*float(window_m)
+
     pos = np.asarray(path.positions, dtype=np.float64)
     q = _unit_quats(path.quats)
     x, y, zq, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     z = np.stack([2.0*(x*zq + y*w), 2.0*(y*zq - x*w), 1.0 - 2.0*(x*x + y*y)], axis=1)
-    out = z.copy()
-    for a, b in path.segments:
-        if b - a < 2:
-            continue
-        s = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pos[a:b], axis=0),
-                                                            axis=1))])
-        lo = np.searchsorted(s, s - half, side="left")
-        hi = np.searchsorted(s, s + half, side="right")
-        cz = np.vstack([np.zeros((1, 3)), np.cumsum(z[a:b], axis=0)])
-        out[a:b] = (cz[hi] - cz[lo])/(hi - lo)[:, None]
-    out = out/np.linalg.norm(out, axis=1, keepdims=True)
+
+    def _apply(win):
+        half = 0.5*float(win)
+        if method == "linear":
+            o = _local_linear_axis(pos, z, path.segments, half)
+        else:
+            o = z.copy()
+            for a, b in path.segments:
+                if b - a < 2:
+                    continue
+                ss = np.concatenate([[0.0], np.cumsum(
+                    np.linalg.norm(np.diff(pos[a:b], axis=0), axis=1))])
+                lo = np.searchsorted(ss, ss - half, side="left")
+                hi = np.searchsorted(ss, ss + half, side="right")
+                cz = np.vstack([np.zeros((1, 3)), np.cumsum(z[a:b], axis=0)])
+                o[a:b] = (cz[hi] - cz[lo])/(hi - lo)[:, None]
+        nv = np.linalg.norm(o, axis=1, keepdims=True)
+        nv[nv < 1e-12] = 1.0
+        return o/nv
+
+    before = _axis_turn_rate(pos, z, path.segments)
+    win = float(window_m)
+    out = _apply(win)
+    widened = False
+    stopped_helping = False
+    if max_turn_deg_per_mm and float(max_turn_deg_per_mm) > 0.0:
+        cap = max(float(max_window_m or 0.0), win)
+        # WIDEN ONLY WHILE WIDENING STILL HELPS, which is what separates noise
+        # from a surface that genuinely turns fast. Doubling the window against
+        # 1.5 deg of normal noise multiplies the p99 turn rate by 0.39-0.67; on
+        # a clean 10 mm radius -- a real part turning at 5.7 deg/mm -- it
+        # multiplies it by 1.00-1.02, because a local line reproduces a constant
+        # turn exactly and there is nothing to remove. So a window that buys no
+        # reduction is not removing noise, it is starting to cut the part, and
+        # the loop stops there and says the bound was not met.
+        #
+        # Without this it widened to the cap on a sharp curve and flattened it
+        # by 1.7 deg, which is the failure mode this whole function exists to
+        # avoid -- turned inside out.
+        def _p99(a):
+            r = _axis_turn_rate(pos, a, path.segments)
+            return float(np.percentile(r, 99)) if len(r) else 0.0
+        cur = _p99(out)
+        while win < cap - 1e-12:
+            r = _axis_turn_rate(pos, out, path.segments)
+            if not len(r) or r.max() <= float(max_turn_deg_per_mm):
+                break
+            trial_win = min(win*1.5, cap)
+            trial = _apply(trial_win)
+            got = _p99(trial)
+            if got > cur*0.95:
+                stopped_helping = True
+                break
+            win, out, cur = trial_win, trial, got
+            widened = True
+    after = _axis_turn_rate(pos, out, path.segments)
+
     moved = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", out, z), -1.0, 1.0)))
     smoothed = ScanPath(pos.copy(), locked_quats_from_axes(out, reference),
                         list(path.segment_starts), source=path.source)
     _carry_path_attrs(path, smoothed)
-    smoothed.axis_smoothing = {"window_m": float(window_m),
-                               "moved_max_deg": float(moved.max()) if len(moved) else 0.0,
-                               "moved_mean_deg": float(moved.mean()) if len(moved) else 0.0}
+    met = (not max_turn_deg_per_mm or not len(after)
+           or after.max() <= float(max_turn_deg_per_mm) + 1e-9)
+    smoothed.axis_smoothing = {
+        "window_m": win, "requested_window_m": float(window_m),
+        "method": method, "widened": widened,
+        "moved_max_deg": float(moved.max()) if len(moved) else 0.0,
+        "moved_mean_deg": float(moved.mean()) if len(moved) else 0.0,
+        "turn_before_max": float(before.max()) if len(before) else 0.0,
+        "turn_after_max": float(after.max()) if len(after) else 0.0,
+        "turn_before_p99": float(np.percentile(before, 99)) if len(before) else 0.0,
+        "turn_after_p99": float(np.percentile(after, 99)) if len(after) else 0.0,
+        "max_turn_deg_per_mm": (float(max_turn_deg_per_mm)
+                                if max_turn_deg_per_mm else None),
+        "stopped_helping": bool(stopped_helping),
+        "turn_rate_met": bool(met)}
+    if not quiet:
+        print("  tool axis smoothed (%s, %.1f mm%s): turn rate %.3f -> %.3f deg/mm "
+              "worst, %.3f -> %.3f at p99; the axis moved %.2f deg at most"
+              % (method, win*1e3, " -- widened from %.1f" % (float(window_m)*1e3,)
+                 if widened else "", smoothed.axis_smoothing["turn_before_max"],
+                 smoothed.axis_smoothing["turn_after_max"],
+                 smoothed.axis_smoothing["turn_before_p99"],
+                 smoothed.axis_smoothing["turn_after_p99"],
+                 smoothed.axis_smoothing["moved_max_deg"]))
+        if max_turn_deg_per_mm and not met:
+            if stopped_helping:
+                print("    ** still over the %.2f deg/mm bound, and a wider "
+                      "window stopped reducing it -- so what is left is the "
+                      "SURFACE turning, not mesh noise. Smoothing further would "
+                      "cut the part. Nothing is refused; the scan will be slow "
+                      "where the surface is sharp, which is correct."
+                      % (float(max_turn_deg_per_mm),))
+            else:
+                print("    ** still over the %.2f deg/mm bound at the %.1f mm "
+                      "window cap, and widening was still helping -- the mesh is "
+                      "noisier than this can fix. Re-run the parameterization, "
+                      "or raise EC_AXIS_SMOOTHING_MAX_M deliberately."
+                      % (float(max_turn_deg_per_mm), float(max_window_m)*1e3))
     return smoothed
 
 
