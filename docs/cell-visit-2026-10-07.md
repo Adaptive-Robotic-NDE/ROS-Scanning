@@ -1,5 +1,10 @@
 # Cell visit, Wednesday 2026-10-07
 
+> **SUPERSEDED by `cell-visit-next.md`.** Its section 2 assumes a serpentine
+> raster and no tool-axis smoothing; both changed after `results21`, so the
+> numbers here no longer describe what the arm will do. Section 0's
+> corrections still stand.
+
 Written 2026-10-06 from `results20`. The previous plan asked for two
 measurements and got neither, for reasons that were mostly defects in this
 pipeline rather than in the cell. Those are fixed. **This plan has one
