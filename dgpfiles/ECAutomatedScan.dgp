@@ -222,6 +222,39 @@ if not os.environ.get("TARI_TRANSACTION_LATENCY"):
 # modules/scan_parameters.dpi, and every scan prints its plan before it moves.
 
 # Distance between samples along a pass, in metres.
+#
+# IT HAS TO RESOLVE THE FLAW, NOT JUST COVER THE AREA, and 1 mm does not.
+# Measured on the 2026-10-08 scan over the 0.080" notch, which this pipeline
+# found and located correctly: the notch response is **<= 1.0 mm FWHM along the
+# pass**, and the pitch was 1.00 mm. Across the whole feature that is ONE sample
+# above half-maximum -- the best pass of eighty-six managed two.
+#
+# WHAT THAT COSTS IS THE SHAPE. The operator watched a clean figure of eight on
+# the instrument during that scan, diagonal from the upper-left to the
+# lower-right quadrant. The recorded data shows the SAME DIAGONAL -- the
+# feature's impedance axis came out at +114 deg -- but as a line of aspect 18:1,
+# because a loop cannot be drawn through two points. The direction survives
+# undersampling; the opening does not. So a flaw stays findable (its axis sits
+# 33 deg off lift-off, which is what identified it against three lift-off
+# artefacts at 4-8 deg) and stops being CLASSIFIABLE.
+#
+# 0.25 mm gives about four samples across a 1 mm feature. The cost on the
+# 30 x 24 mm patch at a 0.30 mm line spacing, 81 passes as a comb:
+#
+#     pitch     live (10 traces/s)    deferred (22 traces/s)
+#     1.00 mm   10.0 mm/s, 11.6 min    22.0 mm/s,  9.4 min
+#     0.50 mm    5.0 mm/s, 15.7 min    11.0 mm/s, 11.2 min
+#     0.25 mm    2.5 mm/s, 23.8 min     5.5 mm/s, 14.9 min
+#     0.20 mm    2.0 mm/s, 27.8 min     4.4 mm/s, 16.8 min
+#
+# 7.6 min of every one of those is per-pass overhead, which the pitch does not
+# change. PROJECTION_MODE = "deferred" buys the resolution back: 0.25 mm
+# deferred costs about what 1.00 mm live does, and the image is built at the end
+# instead of as it goes.
+#
+# 1.0 mm FWHM is an UPPER BOUND -- it was measured at 1 mm sampling, so the true
+# width may be smaller and want a finer pitch still. The first fine-pitch scan
+# settles it, and that measurement sets this number for everything after.
 SCAN_STEP_SIZE = 0.001
 
 # How fast the probe sweeps, in metres per second. The sample rate is
@@ -2213,6 +2246,82 @@ def set_ec_preload(metres):
     EC_PRELOAD_M = check_ec_preload(metres)
     print(describe_ec_preload())
     return EC_PRELOAD_M
+
+
+global set_scan_step_size
+def set_scan_step_size(metres):
+    """Set the distance between samples ALONG a pass, in metres.
+
+        set_scan_step_size(0.00025)   0.25 mm -- resolves a 1 mm feature
+        set_scan_step_size(0.001)     1.00 mm -- the old default
+
+    METRES, like set_ec_preload(). It prints the millimetre equivalent and what
+    the pitch implies, because the step is not a cosmetic setting: it decides
+    the trace rate (rate = velocity / step), the scan time, the projection spot
+    radius, and -- see SCAN_STEP_SIZE -- whether a flaw can be CLASSIFIED or
+    merely found.
+    """
+    global SCAN_STEP_SIZE
+    value = float(metres)
+    if not value > 0.0:
+        raise ValueError("the step size is a distance in metres, not %r" % (metres,))
+    if value > 0.05:
+        raise ValueError(
+            "a step size of %.3f m is %.0f mm, which is almost certainly "
+            "millimetres typed into a metres setter. set_scan_step_size(%.5f) "
+            "is %.2f mm." % (value, value*1e3, value/1e3, value))
+    SCAN_STEP_SIZE = value
+    ceiling = SCAN_LIMITS["max_trace_rate_hz"].get(PROJECTION_MODE, 10.0)
+    print("  step size %.2f mm. At the %.0f traces/s ceiling for projection %r "
+          "that caps the speed at %.1f mm/s; the plan prints the rest."
+          % (value*1e3, ceiling, PROJECTION_MODE, ceiling*value*1e3))
+    return SCAN_STEP_SIZE
+
+
+global scan_step_size
+def scan_step_size():
+    """The sample pitch along a pass, m."""
+    print("  step size %.2f mm" % (SCAN_STEP_SIZE*1e3,))
+    return SCAN_STEP_SIZE
+
+
+global set_projection_mode
+def set_projection_mode(mode):
+    """"live", "deferred" or "off". The one way to change it.
+
+    live      the image builds as the scan goes. 10 traces/s measured ceiling.
+    deferred  the traces are staged and the image is built at the end.
+              22 traces/s -- 2.2x the speed, and the reason a fine pitch is
+              affordable: 0.25 mm deferred costs about what 1.00 mm live does.
+    off       no projection at all. Same 22 traces/s.
+
+    The ceiling is a STAGING limit, not an arm speed. Asking for 22 traces/s at
+    a 0.25 mm step wants 5.5 mm/s, and the arm has been seen to deliver 3.9 when
+    commanded 10 -- so the arm may bind first and the scan take longer than the
+    ceiling implies.
+    """
+    global PROJECTION_MODE
+    mode = str(mode).lower()
+    allowed = tuple(SCAN_LIMITS["max_trace_rate_hz"])
+    if mode not in allowed:
+        raise ValueError("projection mode %r: expected one of %s"
+                         % (mode, ", ".join(repr(a) for a in allowed)))
+    PROJECTION_MODE = mode
+    ceiling = SCAN_LIMITS["max_trace_rate_hz"][mode]
+    print("  projection %s: %.0f traces/s ceiling, so %.1f mm/s at the %.2f mm "
+          "step in force.%s"
+          % (mode, ceiling, ceiling*SCAN_STEP_SIZE*1e3, SCAN_STEP_SIZE*1e3,
+             "" if mode == "live" else
+             "  The image is built at the END, so there is nothing to watch "
+             "while it runs."))
+    return PROJECTION_MODE
+
+
+global projection_mode
+def projection_mode():
+    """live / deferred / off, as it stands."""
+    print("  projection %s" % (PROJECTION_MODE,))
+    return PROJECTION_MODE
 
 
 global set_ec_serpentine

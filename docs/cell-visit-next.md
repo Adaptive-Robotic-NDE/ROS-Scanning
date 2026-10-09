@@ -51,6 +51,8 @@ ec_serpentine()
 probe_rotation()
 ec_preload()
 scan_velocity()
+scan_step_size()
+projection_mode()
 ```
 
 `ec_serpentine()` must say **comb**. If it says serpentine, `tari.bash` did not
@@ -58,25 +60,62 @@ pick up the change and nothing below is testing what it claims to.
 
 ---
 
-## 2. The scan over the 0.040/0.060/0.080" notches (~50 min)
+## 2. The scan over the 0.040/0.060/0.080" notches (~25-35 min)
 
-Same objective as last time. It is longer now: a comb pays for the return, so
-expect roughly double the per-pass overhead.
+Same objective as last time, with two changes: a comb pays for the return, and
+the sampling pitch drops from 1.00 mm to 0.25 mm because 1.00 mm cannot resolve
+a notch signature (2.1). Deferred projection roughly cancels the cost of the
+second (2.2).
 
 ### 2.1 Set up
 
 ```
 set_probe_rotation(0)
 set_ec_preload(0.002)
+set_scan_step_size(0.00025)
 ```
 
-### 2.2 Run
+**The step size must be 0.25 mm, not 1.00 mm.** This is new since the last plan
+and it is the difference between finding the notch and reading it.
+
+The 10-08 scan found and correctly located the 0.080" notch — feature 1, at
+(11, 9) mm in the patch — but the response is **≤1.0 mm FWHM along the pass**
+and the pitch was **1.00 mm**, so the whole feature got one sample above
+half-maximum. You watched a clean figure of eight on the instrument; the
+recorded data has the same diagonal (+114°, upper-left to lower-right, matching
+your instrument's rotation) but as a line, because a loop cannot be drawn
+through two points. The direction survives undersampling, the shape does not.
+
+`set_scan_step_size()` is new, and prints the speed ceiling the new pitch
+implies. Metres, like `set_ec_preload()`.
+
+### 2.2 Choose live or deferred, then run
+
+Four times the resolution is not four times the time, and **deferred projection
+buys most of it back** — the staging ceiling is 22 traces/s instead of 10:
+
+| pitch | live | deferred |
+|---|---|---|
+| 1.00 mm *(what you flew)* | 10.0 mm/s, 11.6 min | 22.0 mm/s, 9.4 min |
+| **0.25 mm** | 2.5 mm/s, **23.8 min** | 5.5 mm/s, **14.9 min** |
+
+7.6 min of each of those is per-pass overhead that the pitch does not change.
+**0.25 mm deferred costs about what 1.00 mm live did.** The trade is that the
+image is built at the end rather than as it goes, so you lose the live view —
+which is worth it once, to see whether the figure of eight comes through.
 
 ```
+set_projection_mode("deferred")
 out = run_automated_scan(line_spacing=0.0003)
 ```
 
-Capture the return — section 3 needs it.
+Capture the return — section 3 needs it. Skip the first line if you would
+rather watch the image build and can spare the extra nine minutes.
+
+**One caveat on the deferred numbers.** 22 traces/s is a *staging* ceiling, not
+an arm speed. At 0.25 mm it asks for 5.5 mm/s, and on 10-05 the arm delivered
+3.9 mm/s when commanded 10 — so the arm may bind first and the real time may
+land nearer the live column. Section 2.4's elapsed times will say.
 
 ### 2.3 Four lines to read in the plan, before confirming
 
