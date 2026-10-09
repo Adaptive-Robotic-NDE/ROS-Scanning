@@ -615,13 +615,37 @@ EC_TRAVEL_DIRECTION = (-1.0, 0.0, 0.0)
 # the transit itself is millimetres. On an 81-pass plan the per-pass overhead was
 # 6.8 minutes of a 19.5 minute scan; nearly all of it was the return.
 #
-# Set this False for a comb -- every pass running along EC_TRAVEL_DIRECTION -- if
-# the reading depends on the direction of travel. A probe dragged in contact
-# leans against its travel in the spring fixture, so alternating the direction
-# alternates the lean, and therefore the lift-off, which stripes the image line
-# by line. A comb pays for the return in order to measure every line the same
-# way.
-EC_SERPENTINE = True
+# FALSE -- A COMB -- BECAUSE THE READING DOES DEPEND ON THE DIRECTION OF TRAVEL,
+# and that is now measured rather than anticipated. The paragraph above was
+# written as a caution; the 2026-10-08 scan over the 0.080" notch settled it:
+#
+#   per-pass baseline vs travel direction      r = +0.952
+#   +x passes  +0.488 V   -x passes  -0.014 V  a 0.502 V step
+#   removing a per-direction mean drops the pass-to-pass
+#     scatter from 0.263 V to 0.080 V          70% of it is direction
+#   the scan's whole dynamic range (p1..p99)   1.46 V
+#
+# So a serpentine lays a 0.502 V checkerboard -- a third of full scale -- across
+# the image at the line pitch, and it reads as noise because it alternates at
+# the finest spatial frequency the raster has. Two samples 0.30 mm apart on
+# adjacent passes disagreed by 0.567 V sd while two 1.00 mm apart on the SAME
+# pass disagreed by 0.214 V: samples three times further apart agreeing three
+# times better is not a property of the surface, it is a property of which pass
+# they came from.
+#
+# A probe dragged in contact leans against its travel in the spring fixture, so
+# alternating the direction alternates the lean and therefore the lift-off. At
+# the measured 0.78 V/deg that 0.502 V is 0.64 deg of lean difference -- far too
+# small to see, and far too large to ignore.
+#
+# WHAT IT COSTS: the return. On an 81-pass plan the per-pass overhead was
+# 6.8 minutes of a 19.5 minute scan and nearly all of it was the return, so a
+# comb roughly doubles the overhead. That is the price of every line being
+# measured the same way, and it is worth paying until the lean is corrected for
+# rather than avoided.
+#
+# True restores the raster. set_ec_serpentine() is the way to change it.
+EC_SERPENTINE = False
 # The probe's rotation about its own axis is LOCKED for the scan: every pose is
 # one reference orientation tilted onto the surface normal, never twisted.
 # "fixed" twists with diagonal tilt and
@@ -2162,6 +2186,42 @@ def set_ec_preload(metres):
     EC_PRELOAD_M = check_ec_preload(metres)
     print(describe_ec_preload())
     return EC_PRELOAD_M
+
+
+global set_ec_serpentine
+def set_ec_serpentine(on):
+    """Raster (True) or comb (False). The one way to change it.
+
+        set_ec_serpentine(False)   a comb: every pass the same direction
+        set_ec_serpentine(True)    a raster: alternate, and pay no return
+
+    A bare `EC_SERPENTINE = False` typed at the prompt is the EC_PRELOAD_M trap
+    and may not reach the shared globals.
+
+    It takes effect at the NEXT plan_ec_path(). A toolpath already planned
+    carries the order it was planned with.
+
+    See EC_SERPENTINE for why the default is a comb: the reading depends on the
+    direction of travel by 0.502 V, a third of the scan's dynamic range, laid
+    down at the line pitch where it reads as noise.
+    """
+    global EC_SERPENTINE
+    EC_SERPENTINE = bool(on)
+    print("  %s. %s"
+          % ("SERPENTINE: passes alternate direction and the return is free"
+             if EC_SERPENTINE else
+             "COMB: every pass runs along EC_TRAVEL_DIRECTION and pays the return",
+             "Expect a direction-dependent baseline step between adjacent lines "
+             "-- 0.502 V when it was measured." if EC_SERPENTINE else
+             "Roughly doubles the per-pass overhead; re-plan to see the new time."))
+    return EC_SERPENTINE
+
+
+global ec_serpentine
+def ec_serpentine():
+    """Raster or comb, as it stands."""
+    print("  %s" % ("serpentine (raster)" if EC_SERPENTINE else "comb"))
+    return EC_SERPENTINE
 
 
 global set_scan_velocity

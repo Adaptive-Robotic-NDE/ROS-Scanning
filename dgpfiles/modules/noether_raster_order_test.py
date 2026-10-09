@@ -322,17 +322,44 @@ def test_the_comb_order_is_still_reachable():
 
 
 @_checked
-def test_the_eddy_current_config_asks_for_a_raster():
+def test_the_eddy_current_config_asks_for_a_comb():
     print("\n--- the config's own wiring ----------------------------------------")
     src = open(DGP).read()
     tree = ast.parse(src, filename="ECAutomatedScan.dgp")
-    values = [n.value for n in ast.walk(tree)
+    # MODULE LEVEL ONLY. "Set exactly once" is about the constant having one
+    # definition, not about nobody being allowed to change it: set_ec_serpentine()
+    # assigns it too, and a setter is the SUPPORTED way to change a technician
+    # control -- a bare assignment at the dgpy prompt may never reach the shared
+    # globals (see EC_PRELOAD_M). Walking the whole tree counted the setter and
+    # failed on it, which would have pushed the next person to delete the setter
+    # rather than the test.
+    values = [n.value for n in tree.body
               if isinstance(n, ast.Assign)
               and any(isinstance(t, ast.Name) and t.id == "EC_SERPENTINE"
                       for t in n.targets)]
-    check(len(values) == 1, "EC_SERPENTINE is set exactly once (%d)" % (len(values),))
-    check(bool(values) and getattr(values[0], "value", None) is True,
-          "and it defaults to the raster order")
+    check(len(values) == 1,
+          "EC_SERPENTINE is defined exactly once at module level (%d)" % (len(values),))
+    setters = [f for f in tree.body
+               if isinstance(f, ast.FunctionDef) and f.name == "set_ec_serpentine"]
+    check(len(setters) == 1,
+          "and set_ec_serpentine() is the supported way to change it (%d)" % (len(setters),))
+    # A COMB, DELIBERATELY, and this assertion is the thing that stops it being
+    # flipped back as an obvious saving. The raster's return is free and the
+    # comb pays for it, so "why are we paying for the return" is a reasonable
+    # question to ask of the code and a wrong one to answer from the code alone.
+    #
+    # Measured on the 2026-10-08 scan over the 0.080" notch: the per-pass
+    # baseline correlates with travel direction at r = +0.952, the +x passes
+    # sitting 0.502 V above the -x passes against a 1.46 V dynamic range for the
+    # whole scan. A serpentine therefore lays a third of full scale across the
+    # image as a checkerboard at the line pitch, where it reads as noise.
+    # Removing a per-direction mean drops the pass-to-pass scatter from 0.263 V
+    # to 0.080 V, so 70% of the pass-to-pass variation IS the direction.
+    #
+    # Flip it back when the lean is corrected for rather than avoided, and
+    # change this check in the same commit.
+    check(bool(values) and getattr(values[0], "value", None) is False,
+          "and it defaults to the comb order")
     calls = [c for c in ast.walk(tree)
              if isinstance(c, ast.Call) and isinstance(c.func, ast.Name)
              and c.func.id == "orient_segments_along"]
@@ -342,9 +369,10 @@ def test_the_eddy_current_config_asks_for_a_raster():
                              and getattr(k.value, "id", None) == "EC_SERPENTINE"
                              for k in calls[0].keywords),
           "and that call is the one EC_SERPENTINE steers")
-    # A comb's return is a long move between passes; a raster's is one line
-    # spacing, which is inside the short-hop threshold, so the approach must not
-    # be forced to the long one.
+    # A comb's return is a long move between passes and a raster's is one line
+    # spacing. The approach has to keep CHOOSING by distance rather than being
+    # pinned to either: a comb that took the short hop would transit the length
+    # of the part a few millimetres off the surface.
     check("EC_SHORT_HOP_M" in src and "EC_APPROACH_M" in src,
           "the between-pass approach still chooses by distance (EC_SHORT_HOP_M)")
 
