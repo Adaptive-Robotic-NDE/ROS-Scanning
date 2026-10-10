@@ -47,6 +47,7 @@ global tool_tilt_deg
 global tool_roll_report
 global locked_quats_from_axes
 global smooth_tool_axis
+global degenerate_steps
 global resample_segments
 global read_ply_mesh
 global clean_mesh_for_planning
@@ -1813,8 +1814,37 @@ def locked_quats_from_axes(axes, reference=(1.0, 0.0, 0.0)):
                             aw*bw - ax*bx - ay*by - az*bz])
 
 
-def _axis_turn_rate(pos, z, segments):
-    """Degrees of tool-axis turn per millimetre of travel, per step."""
+#: A step shorter than this carries no turn RATE. Two coincident waypoints are
+#: a defect in the path, not a surface turning infinitely fast, and dividing a
+#: real angle by a zero length is how that defect became the loudest number in
+#: the report.
+MIN_TURN_RATE_STEP_M = 1.0e-5
+
+
+def _axis_turn_rate(pos, z, segments, min_step_m=None):
+    """Degrees of tool-axis turn per millimetre of travel, per step.
+
+    STEPS SHORTER THAN `min_step_m` ARE EXCLUDED, and that is the whole reason
+    this function has an argument. A planner that emits two waypoints at the
+    same place -- noether does it where a pass meets a hole -- makes the
+    denominator zero, and `np.maximum(mm, 1e-9)` then turns a 1 degree step
+    into a million degrees per millimetre.
+
+    What that cost, measured on the 2026-10-09 scan: the worst turn rate was
+    reported as 49810 deg/mm before smoothing and 2.566 after, against a 0.40
+    bound, while the p99 was 3.407 before and 0.299 after -- i.e. the path
+    actually MET the bound everywhere it was meaningful and the gate said it
+    had failed. smooth_tool_axis() then widened its window to the 20 mm cap
+    chasing a number that no window could ever reduce, moving the axis 2.53 deg
+    off the mesh normal to no purpose, and printed "the mesh is noisier than
+    this can fix" about a single pair of duplicated points.
+
+    A rate needs a length. Where there is no length there is no rate, and the
+    honest thing is to leave the step out of the statistic and count it
+    separately -- see degenerate_steps().
+    """
+    floor_mm = float(MIN_TURN_RATE_STEP_M if min_step_m is None
+                     else min_step_m)*1e3
     out = []
     for a, b in segments:
         if b - a < 2:
@@ -1822,8 +1852,32 @@ def _axis_turn_rate(pos, z, segments):
         d = np.degrees(np.arccos(np.clip(
             np.einsum("ij,ij->i", z[a:b-1], z[a+1:b]), -1.0, 1.0)))
         mm = np.linalg.norm(np.diff(pos[a:b], axis=0), axis=1)*1e3
-        out.append(d/np.maximum(mm, 1e-9))
+        keep = mm > floor_mm
+        if not keep.any():
+            continue
+        out.append(d[keep]/mm[keep])
     return np.concatenate(out) if out else np.zeros(0)
+
+
+def degenerate_steps(pos, segments, min_step_m=None):
+    """(n_degenerate, n_steps, worst_turn_deg) over steps too short to rate.
+
+    Reported rather than silently dropped: coincident waypoints are a real
+    defect -- they are a dwell in the trajectory the planner hands the arm --
+    and the fix is to remove them from the PATH, not only from the statistic.
+    `worst_turn_deg` is how much the axis turns across them, which is what
+    makes them matter: a duplicated point with no turn is harmless.
+    """
+    floor_mm = float(MIN_TURN_RATE_STEP_M if min_step_m is None
+                     else min_step_m)*1e3
+    n_bad = n_all = 0
+    for a, b in segments:
+        if b - a < 2:
+            continue
+        mm = np.linalg.norm(np.diff(pos[a:b], axis=0), axis=1)*1e3
+        n_all += int(mm.size)
+        n_bad += int((mm <= floor_mm).sum())
+    return n_bad, n_all
 
 
 def _local_linear_axis(pos, z, segments, half):
@@ -1979,6 +2033,7 @@ def smooth_tool_axis(path, window_m, reference=(1.0, 0.0, 0.0), force=False,
         return o/nv
 
     before = _axis_turn_rate(pos, z, path.segments)
+    n_degenerate, n_steps = degenerate_steps(pos, path.segments)
     win = float(window_m)
     out = _apply(win)
     widened = False
@@ -2033,6 +2088,8 @@ def smooth_tool_axis(path, window_m, reference=(1.0, 0.0, 0.0), force=False,
         "max_turn_deg_per_mm": (float(max_turn_deg_per_mm)
                                 if max_turn_deg_per_mm else None),
         "stopped_helping": bool(stopped_helping),
+        "degenerate_steps": int(n_degenerate),
+        "steps": int(n_steps),
         "turn_rate_met": bool(met)}
     if not quiet:
         print("  tool axis smoothed (%s, %.1f mm%s): turn rate %.3f -> %.3f deg/mm "
@@ -2043,6 +2100,16 @@ def smooth_tool_axis(path, window_m, reference=(1.0, 0.0, 0.0), force=False,
                  smoothed.axis_smoothing["turn_before_p99"],
                  smoothed.axis_smoothing["turn_after_p99"],
                  smoothed.axis_smoothing["moved_max_deg"]))
+        if n_degenerate:
+            # SAID EVERY TIME, because it is a defect in the path and not a
+            # property of the surface: these steps were left out of the rate
+            # above, and they are a dwell in the trajectory the arm is handed.
+            print("    %d of %d step(s) are shorter than %.3f mm -- coincident "
+                  "waypoints from the planner. They carry no turn RATE and are "
+                  "left out of the numbers above; they are still a dwell in the "
+                  "trajectory, so drop them from the path rather than only from "
+                  "the statistic."
+                  % (n_degenerate, n_steps, MIN_TURN_RATE_STEP_M*1e3))
         if max_turn_deg_per_mm and not met:
             if stopped_helping:
                 print("    ** still over the %.2f deg/mm bound, and a wider "

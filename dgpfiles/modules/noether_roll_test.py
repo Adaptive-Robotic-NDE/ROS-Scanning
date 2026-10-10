@@ -664,6 +664,68 @@ check(not sm.axis_smoothing["turn_rate_met"],
       "than smoothing it away to satisfy the bound")
 
 
+# --- a coincident waypoint is not an infinite turn rate ------------------------
+# THE 2026-10-09 SCAN. The planner emitted two waypoints at the same place where
+# a pass met a hole in the mesh. `np.maximum(mm, 1e-9)` turned the 1 degree step
+# across them into 49810 deg/mm, and from there everything the report said was
+# wrong: the bound was declared unmet, the widening loop ran to its 20 mm cap
+# chasing a number no window can reduce, the axis was moved 2.53 deg off the
+# mesh normal for nothing, and the operator was told "the mesh is noisier than
+# this can fix" about one duplicated point. The p99 -- the statistic that never
+# saw the degenerate step -- was 0.299 deg/mm against a 0.40 bound the whole
+# time.
+print("")
+print("coincident waypoints")
+
+_dg = ns["degenerate_steps"]
+pos, true, ax = _cyl_pass(0.060, span=0.040, noise_deg=0.0)
+clean = ns["ScanPath"](pos.copy(), lqa(ax), [0], source="t")
+clean.normal_constrained = True
+sm_clean = sta(clean, 0.006, max_turn_deg_per_mm=0.4, max_window_m=0.020, quiet=True)
+
+# the SAME path with one waypoint duplicated, which is all it took
+dpos = np.insert(pos, 20, pos[20], axis=0)
+dax = np.insert(ax, 20, ax[21], axis=0)          # a real turn across a zero step
+dup = ns["ScanPath"](dpos, lqa(dax), [0], source="t")
+dup.normal_constrained = True
+
+n_bad, n_all = _dg(dpos, dup.segments)
+check(n_bad == 1 and n_all == len(dpos) - 1,
+      "one duplicated waypoint is counted as 1 degenerate step of %d" % (n_all,))
+check(_dg(pos, clean.segments)[0] == 0,
+      "...and the clean path has none")
+
+sm_dup = sta(dup, 0.006, max_turn_deg_per_mm=0.4, max_window_m=0.020, quiet=True)
+a_c, a_d = sm_clean.axis_smoothing, sm_dup.axis_smoothing
+check(a_d["turn_before_max"] < 100.0,
+      "the duplicate no longer reports an absurd turn rate (%.1f deg/mm, was "
+      "~50000 before the floor)" % (a_d["turn_before_max"],))
+check(abs(a_d["turn_after_max"] - a_c["turn_after_max"]) < 0.25,
+      "...and the smoothed worst matches the clean path's (%.3f vs %.3f deg/mm)"
+      % (a_d["turn_after_max"], a_c["turn_after_max"]))
+check(a_d["turn_rate_met"] == a_c["turn_rate_met"],
+      "...so the bound verdict is the same as the clean path's (%s)"
+      % (a_d["turn_rate_met"],))
+check(a_d["degenerate_steps"] == 1,
+      "...and the degenerate step is REPORTED rather than hidden")
+check(not a_d["widened"] or a_d["window_m"] <= a_c["window_m"] + 1e-12,
+      "...and the widening loop is no longer driven to the cap by it "
+      "(%.0f mm vs %.0f mm clean)" % (a_d["window_m"]*1e3, a_c["window_m"]*1e3))
+# The duplicate carries a real one-step jump in the axis, so SOME movement
+# there is the smoother doing its job. What must not happen again is the 2.53
+# deg of wholesale flattening that the run to the 20 mm cap bought.
+check(a_d["moved_max_deg"] < 1.0,
+      "...so the axis is not flattened wholesale chasing it (%.3f deg, was "
+      "2.53 on 2026-10-09)" % (a_d["moved_max_deg"],))
+
+# A GENUINELY SHARP SHORT STEP IS NOT A DEGENERATE ONE. The floor is 10 um; a
+# 0.25 mm step is a quarter of a trace pitch and must still be rated.
+check(_dg(np.array([[0.0, 0, 0], [0.00025, 0, 0], [0.0005, 0, 0]]), [(0, 3)])[0] == 0,
+      "a 0.25 mm step is a real step and is still rated")
+check(_dg(np.array([[0.0, 0, 0], [1e-6, 0, 0], [0.0005, 0, 0]]), [(0, 3)])[0] == 1,
+      "a 1 um step is not")
+
+
 # --- resample_segments ---------------------------------------------------------
 rs = ns["resample_segments"]
 x = np.concatenate([[0.8], 0.8 + np.cumsum(rng.uniform(0.0, 0.0005, 400))])
