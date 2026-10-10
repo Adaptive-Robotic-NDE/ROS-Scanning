@@ -1565,3 +1565,60 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_a_good_pose_set_with_bad_observations_is_not_adequate():
+    """2026-10-09: the geometry was textbook and the data was rubbish.
+
+    The failure that cost the cell its Azure calibration. The pose set was as
+    good as this procedure asks for -- 24 poses, rotation about all three axes,
+    conditioning verdict GOOD -- and the observations were corrupted (13 of 24
+    detections came back 180 degrees flipped, 76 mm rms residual). `adequate`
+    asked only about the pose set, said True, and `if save and res.adequate`
+    wrote a solve that put the camera 0.98 m below the flange over one that was
+    good to 0.39 mm.
+
+    A well-conditioned pose set with bad observations is the DANGEROUS case,
+    because the geometry gives no warning at all.
+    """
+    rng = np.random.default_rng(19)
+    G = _robot_poses(GOOD_TILTS, GOOD_ROLLS, rng=rng)
+
+    # The same poses, observed well: this is what must still be adequate.
+    good = cs.solve_handeye(G, _observations(G, t_noise=0.0004, r_noise=0.003,
+                                             rng=rng), name="azure")
+    assert good.pose_set_adequate, good.conditioning
+    assert good.adequate, good.report()
+    assert max(good.sigma[:3]) < cs.MAX_SIGMA_MM, good.report()
+
+    # The same poses, observed badly. Nothing about the GEOMETRY changes.
+    bad_obs = _observations(G, t_noise=0.040, r_noise=0.30, rng=rng)
+    bad = cs.solve_handeye(G, bad_obs, name="azure")
+
+    assert bad.pose_set_adequate, (
+        "the pose set is unchanged and must still read as adequate -- if this "
+        "fails the test is no longer about the thing it was written for")
+    assert bad.conditioning["verdict"] != "inadequate", bad.conditioning
+    assert max(bad.sigma[:3]) > cs.MAX_SIGMA_MM, (
+        "expected a large fitted uncertainty from corrupted observations, got "
+        "%.3f mm" % max(bad.sigma[:3]))
+
+    # The point of the whole test.
+    assert not bad.adequate, (
+        "a solve the report calls unusable must not be adequate to save:\n%s"
+        % bad.report())
+
+    text = bad.report()
+    assert "NOT GOOD ENOUGH TO SCAN FROM" in text, text
+    assert "NOT WRITTEN" in text, text
+    assert "DOES NOT DETERMINE" not in text, (
+        "the pose set DID determine it; the observations were the problem, and "
+        "saying otherwise sends the operator to re-plan poses that were fine\n"
+        + text)
+
+    try:
+        cs.solve_handeye(G, bad_obs, require_adequate=True)
+    except cs.PoseSetInadequate:
+        pass
+    else:
+        raise AssertionError("require_adequate saved it anyway")

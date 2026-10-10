@@ -105,7 +105,7 @@ import math
 import numpy as np
 
 __all__ = [
-    "PoseSetInadequate",
+    "PoseSetInadequate", "MAX_SIGMA_MM",
     "rt_to_T", "T_to_rt", "T_inv", "quat_to_R", "R_to_quat", "R_to_rpy",
     "rpy_to_R", "so3_log", "so3_exp", "se3_log", "se3_exp", "pose_delta",
     "handeye_pairs", "pose_set_conditioning", "solve_handeye", "refine_handeye",
@@ -124,6 +124,18 @@ __all__ = [
 
 class PoseSetInadequate(Exception):
     """The observations cannot determine the transform, whatever they fit."""
+
+
+#: 1 sigma position uncertainty, in millimetres, past which a hand-eye solve
+#: must not be written anywhere. The report has printed "THIS IS NOT GOOD
+#: ENOUGH TO SCAN FROM" at this number for as long as it has existed; what is
+#: new is that HandEyeResult.adequate now agrees with it, so `if save and
+#: res.adequate` cannot record a solve the same report calls unusable.
+#:
+#: The error the whole procedure exists to prevent is about 13 mm (the Azure
+#: range bias). A calibration worth keeping comes in near 0.4 mm. Two is the
+#: gap between them.
+MAX_SIGMA_MM = 2.0
 
 
 # ------------------------------------------------------------------------------
@@ -506,8 +518,42 @@ class HandEyeResult(object):
         return R_to_rpy(self.X[:3, :3])
 
     @property
-    def adequate(self):
+    def pose_set_adequate(self):
+        """Does the POSE SET determine this transform, as geometry?
+
+        A property of the poses alone. It answers "could any observations
+        taken from here pin the answer down", and says nothing about whether
+        the observations actually did.
+        """
         return self.conditioning.get("verdict") != "inadequate"
+
+    @property
+    def adequate(self):
+        """Is this solve fit to be WRITTEN ANYWHERE?
+
+        Two questions, and for a long time this property asked only the first:
+
+          1. does the pose set determine the transform at all, and
+          2. did the fit come out precise enough to scan from.
+
+        Asking only the first is how 2026-10-09 happened. The pose set that
+        day was textbook -- 24 poses, 86.5/29.2/21.5 deg rms about the three
+        axes, "VERDICT: GOOD" -- and the observations were rubbish: 76 mm rms
+        residual, 13 of 24 detections 180 degrees flipped, a 1 sigma position
+        uncertainty of 30.4 mm. The report printed "THIS IS NOT GOOD ENOUGH TO
+        SCAN FROM" and `adequate` said True anyway, so `if save and
+        res.adequate` wrote it, and a solve putting the camera 0.98 m below the
+        flange overwrote a calibration good to 0.39 mm.
+
+        A well-conditioned pose set with bad observations is the dangerous
+        case, not the harmless one: it is precisely the case where the
+        geometry gives no warning.
+        """
+        if not self.pose_set_adequate:
+            return False
+        if self.sigma is not None and max(self.sigma[:3]) > MAX_SIGMA_MM:
+            return False
+        return True
 
     @property
     def residual_mm(self):
@@ -579,15 +625,23 @@ class HandEyeResult(object):
             L.append("    translation  %.3f  %.3f  %.3f  mm" % tuple(self.sigma[:3]))
             L.append("    rotation     %.3f  %.3f  %.3f  mrad" % tuple(self.sigma[3:]))
             worst_t = max(self.sigma[:3])
-            if worst_t > 2.0:
+            if worst_t > MAX_SIGMA_MM:
                 L.append("    THIS IS NOT GOOD ENOUGH TO SCAN FROM: %.1f mm of "
                          "uncertainty in the sensor position. The error this "
                          "procedure exists to prevent is about 13 mm." % worst_t)
-        if not self.adequate:
+        if not self.pose_set_adequate:
             L.append("")
             L.append("  *** THE POSE SET DOES NOT DETERMINE THIS TRANSFORM. The "
                      "numbers above fit the observations and are still wrong. "
                      "Do not write them anywhere. ***")
+        elif not self.adequate:
+            L.append("")
+            L.append("  *** NOT WRITTEN: the pose set is fine and the "
+                     "OBSERVATIONS are not. %.1f mm of 1 sigma position "
+                     "uncertainty is past the %.1f mm this procedure will "
+                     "record, so nothing has been saved and the calibration "
+                     "in force is untouched. Solve again. ***"
+                     % (max(self.sigma[:3]), MAX_SIGMA_MM))
         return "\n".join(L)
 
     def __repr__(self):
