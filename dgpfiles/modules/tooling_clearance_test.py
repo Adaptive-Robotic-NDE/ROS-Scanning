@@ -1067,6 +1067,91 @@ check("a sink that throws does not take the gate down with it",
 # way back out is that it now RECEIVES a stub it did not write, so the fact that
 # the subject still runs and still discriminates has to be a test of its own.
 
+# ==============================================================================
+# A "COLLISION" DEEPER THAN THE PART IS THICK
+# ==============================================================================
+# 2026-10-09. The clearance check reported the Keyence frame 141.8 mm inside a
+# planning mesh whose entire z extent was 2 mm, and the outer shell 123.1 mm
+# inside it. The sign comes from the nearest triangle's normal, this mesh still
+# had faces wound the wrong way after repair, and so points far ABOVE the
+# surface read as far inside it.
+#
+# It was not caught because a large negative number looks exactly like a bad
+# collision. It cost 376 of 2925 waypoints, whole passes SKIPPED, 101 passes
+# split into 136 and 17.1% of the path -- which is where that run's fragmented,
+# stop-start toolpath came from.
+
+print("")
+print("impossible penetration")
+
+_depth = ns["_mesh_max_interior_depth"]
+_say_bad = ns["_say_impossible_penetration"]
+
+# a 76 x 66 x 2 mm plate, the shape of the real planning mesh
+_pv = np.array([[0.0, 0.0, 0.0], [0.076, 0.0, 0.0], [0.076, 0.066, 0.0],
+                [0.0, 0.066, 0.0], [0.0, 0.0, 0.002], [0.076, 0.0, 0.002],
+                [0.076, 0.066, 0.002], [0.0, 0.066, 0.002]])
+_pt = np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]])
+_plate = SurfaceDistance(_pv, _pt, name="2 mm plate")
+check("a 2 mm plate admits at most 1 mm of penetration",
+      abs(_depth(_plate) - 0.001) < 1e-9, _depth(_plate))
+
+_lines = []
+_print = __builtins__["print"] if isinstance(__builtins__, dict) else print
+import builtins as _b
+_orig = _b.print
+_b.print = lambda *a, **k: _lines.append(" ".join(str(x) for x in a))
+try:
+    _say_bad({"clearance": np.array([0.01, 0.02, -0.1418, -0.1231]),
+              "per_link": {"lj_v7080_frame": -0.1418, "outer_shell": -0.1231,
+                           "ec_probe": -0.0005}},
+             _plate, "eddy-current toolpath")
+finally:
+    _b.print = _orig
+_text = " ".join(_lines)
+check("a 141.8 mm penetration of a 2 mm plate is called out",
+      "IMPOSSIBLE PENETRATION" in _text, _text[:120])
+check("...counting the poses it affects", "2 of 4 pose(s)" in _text, _text[:200])
+check("...naming the links", "lj_v7080_frame" in _text and "outer_shell" in _text,
+      _text[:200])
+check("...and not a link only 0.5 mm in, which is plausible",
+      "ec_probe" not in _text, _text[:200])
+check("...and saying it is the SIGN that is wrong",
+      "SIGN of the distance being wrong" in _text, _text[:200])
+
+# A REAL penetration of a thick part must stay silent: this check must not
+# explain away a genuine collision.
+_bv = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.1, 0.0],
+                [0.0, 0.1, 0.0], [0.0, 0.0, 0.1], [0.1, 0.0, 0.1],
+                [0.1, 0.1, 0.1], [0.0, 0.1, 0.1]])
+_block = SurfaceDistance(_bv, np.array([[0, 1, 2], [0, 2, 3], [4, 5, 6],
+                                        [4, 6, 7]]), name="100 mm block")
+_lines = []
+_b.print = lambda *a, **k: _lines.append(" ".join(str(x) for x in a))
+try:
+    _say_bad({"clearance": np.array([0.01, -0.030]),
+              "per_link": {"ec_probe": -0.030}}, _block, "path")
+finally:
+    _b.print = _orig
+check("a 30 mm penetration of a 100 mm block is PLAUSIBLE and stays silent",
+      _lines == [], _lines)
+
+# AN OPEN SHEET HAS NO THICKNESS, so the bound is vacuous and the check must
+# keep quiet rather than call every genuine collision impossible.
+_fv = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.1, 0.0],
+                [0.0, 0.1, 0.0]])
+_sheet = SurfaceDistance(_fv, np.array([[0, 1, 2], [0, 2, 3]]), name="flat sheet")
+check("a flat sheet admits no bound at all", _depth(_sheet) < 1e-9, _depth(_sheet))
+_lines = []
+_b.print = lambda *a, **k: _lines.append(" ".join(str(x) for x in a))
+try:
+    _say_bad({"clearance": np.array([-0.018]), "per_link": {"ec_probe": -0.018}},
+             _sheet, "path")
+finally:
+    _b.print = _orig
+check("...so a real collision against it is NOT explained away", _lines == [], _lines)
+
+
 def test_not_blind():
     """The envelope, the surface and the gate all ran, on a positive and a negative."""
     assert callable(tooling_envelope) and callable(path_clearance)

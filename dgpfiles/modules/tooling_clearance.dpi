@@ -2289,6 +2289,114 @@ def format_clearance_report(report, limit=None, per_pass=True,
     return "\n".join(lines)
 
 
+#: Below this half-thickness a mesh is an open sheet, not a solid, and
+#: _say_impossible_penetration() has nothing to say about it.
+MIN_SOLID_HALF_THICKNESS_M = 1.0e-4
+
+#: How far past the geometric bound a penetration has to be before it is
+#: called impossible rather than merely deep.
+IMPOSSIBLE_PENETRATION_FACTOR = 5.0
+
+
+def _mesh_max_interior_depth(mesh):
+    """The deepest a point can be INSIDE this mesh, in metres.
+
+    Half the smallest bounding-box extent, which bounds the inradius of any
+    body: a point deeper than that would admit a ball of that radius, and a
+    body containing such a ball is at least twice that wide in every direction.
+    Non-convex bodies are only shallower. Returns None if the mesh has no
+    usable vertices.
+    """
+    if all(hasattr(mesh, k) for k in ("a", "b", "c")):
+        # A SurfaceDistance keeps the triangle corners, not a vertex table.
+        try:
+            v = np.concatenate([np.asarray(mesh.a, dtype=np.float64),
+                                np.asarray(mesh.b, dtype=np.float64),
+                                np.asarray(mesh.c, dtype=np.float64)], axis=0)
+        except Exception:
+            return None
+    else:
+        v = getattr(mesh, "vertices", None)
+        if v is None and isinstance(mesh, dict):
+            v = mesh.get("vertices")
+        try:
+            v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+        except Exception:
+            return None
+    if v.size == 0:
+        return None
+    extent = v.max(axis=0) - v.min(axis=0)
+    return 0.5*float(extent.min())
+
+
+def _say_impossible_penetration(rep, mesh, what):
+    """Say so when a 'collision' is deeper than the part is thick.
+
+    2026-10-09. The clearance check reported
+
+        worst clearance -141.8 mm
+        lj_v7080_frame  -141.8 mm   <-- under the limit
+        outer_shell     -123.1 mm   <-- under the limit
+
+    against a planning mesh whose whole z extent was 2 mm. Nothing can be 141
+    mm inside a 2 mm plate. The sign came from the nearest triangle's normal
+    and a handful of this mesh's normals pointed the wrong way -- the cleaner
+    had already said so, "57 face(s) REWOUND ... and 1 TURNED UP on a height
+    field (99.5% of its normals point up)" -- so points far ABOVE the surface
+    read as far inside it.
+
+    What it cost: 376 of 2925 waypoints dropped, whole passes SKIPPED, 101
+    passes split into 136, and 17.1% of the path given up, which is where the
+    scan's "super weird" fragmented toolpath came from -- every split is a lift
+    and an approach in the middle of a pass.
+
+    This only SAYS so. It does not flip the sign, and deliberately: on a mesh
+    that is a surface shell rather than a solid, "below the surface" is
+    genuinely inside the part, and a bound taken from the shell's own thickness
+    would turn a real collision into a clear pose. Naming it is safe; guessing
+    is not.
+    """
+    depth = _mesh_max_interior_depth(mesh)
+    if depth is None or not np.isfinite(depth):
+        return
+    # AN OPEN SHEET HAS NO THICKNESS AND SO NO BOUND. A planning surface that
+    # is one layer of triangles has a minimum extent of nearly zero, which
+    # would make every real collision "impossible" and this message fire on
+    # every genuine catch. Where the bound is vacuous, say nothing: the only
+    # guard there is the normal repair, and a false alarm here would teach the
+    # operator to ignore a true one.
+    if depth < MIN_SOLID_HALF_THICKNESS_M:
+        return
+    c = np.asarray(rep.get("clearance"))
+    if c.size == 0:
+        return
+    # A MARGIN, because the bound is an upper bound on a non-convex body and a
+    # pose a little past it is arithmetic, not a sign error. Five times past it
+    # is not arithmetic. The 2026-10-09 case was 141 times past.
+    impossible = -IMPOSSIBLE_PENETRATION_FACTOR*depth
+    worst = float(np.min(c))
+    if worst >= impossible:
+        return
+    n_bad = int((c < impossible).sum())
+    links = rep.get("per_link") or {}
+    named = sorted((v, k) for k, v in links.items() if v < impossible)
+    print("    ** IMPOSSIBLE PENETRATION: %d of %d pose(s) of the %s report "
+          "the tooling further inside this surface than the surface is thick. "
+          "The worst is %+.1f mm; nothing can be more than %.1f mm inside it "
+          "(half its smallest extent). That is the SIGN of the distance being "
+          "wrong, not the distance: it comes from the nearest triangle's "
+          "normal, and a mesh with a few faces still wound the wrong way makes "
+          "points far OUTSIDE read as far inside."
+          % (n_bad, int(c.size), what, worst*1e3, depth*1e3))
+    if named:
+        print("       the links it names: %s"
+              % (", ".join("%s %+.1f mm" % (k, v*1e3) for v, k in named[:4]),))
+    print("       Those poses are being dropped and the passes through them "
+          "split, so this is paid for in coverage and in a fragmented "
+          "toolpath, not in a refusal. Re-run the normal repair on the "
+          "planning mesh before trusting this check.")
+
+
 def enforce_path_clearance(path, mesh, limit=None, envelope=None, pad=None,
                            allow_links=(), outward=(0.0, 0.0, 1.0),
                            sample_m=None, what="path", min_points=4,
@@ -2332,6 +2440,7 @@ def enforce_path_clearance(path, mesh, limit=None, envelope=None, pad=None,
     # afterwards. See path_clearance() for why that is not the same as
     # forgiving a waypoint whose closest link happened to be an allowed one.
     keep = rep["clearance"] >= limit
+    _say_impossible_penetration(rep, mesh, what)
     total = float(sum(path.segment_length_m(s) for s in path.segments))
     if keep.all():
         rep.update({"dropped": 0, "kept": int(keep.sum()),
