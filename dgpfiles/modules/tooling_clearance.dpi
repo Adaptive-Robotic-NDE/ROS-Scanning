@@ -1029,6 +1029,7 @@ class SurfaceDistance(object):
         if flip.mean() > 0.5:
             n = -n
             flip = ~flip
+            agree = -agree
 
         # THE SIGN OF A HEIGHT FIELD COMES FROM THE FIELD, NOT FROM ONE FACE.
         #
@@ -1060,10 +1061,24 @@ class SurfaceDistance(object):
         # threshold, and is not touched: this repairs open sheets, which is the
         # only case where "every face points the same way" is a fact about the
         # geometry rather than an assumption about it.
-        disagree_area = (float(w[flip].sum()/w.sum())
-                         if w.sum() > 0 and flip.any() else 0.0)
+        # AGREEING IS NOT THE SAME AS NOT DISAGREEING, and the difference is a
+        # whole class of surface. A half cylinder standing on its axis has
+        # every normal PERPENDICULAR to `outward`: none of them disagrees, and
+        # it is still not a height field along that axis -- n.out is ~0, its
+        # sign is floating-point noise, and "repairing" the ones that land
+        # negative turns a random half of the surface inside out. So the test
+        # is the area that positively agrees, not the area that fails to
+        # object.
+        tot = float(w.sum()) if w.size else 0.0
+        agree_area = (float(w[agree > HEIGHT_FIELD_MIN_COS].sum()/tot)
+                      if tot > 0 else 0.0)
+        disagree_area = (float(w[flip].sum()/tot)
+                         if tot > 0 and flip.any() else 0.0)
+        self.outward_agreement_area = agree_area
         self.outward_disagreement_area = disagree_area
-        self.height_field = bool(disagree_area < HEIGHT_FIELD_MAX_DISAGREEMENT)
+        self.height_field = bool(agree_area >= HEIGHT_FIELD_MIN_AGREE_AREA
+                                 and disagree_area
+                                 < HEIGHT_FIELD_MAX_DISAGREEMENT)
         self.sign_faces_corrected = 0
         if self.height_field and flip.any():
             n = n.copy()
@@ -1075,6 +1090,10 @@ class SurfaceDistance(object):
             np.stack([self.a, self.b, self.c]) - self.centroids, axis=2).max())
         self.vertices = v
         self.triangles = t
+        #: The triangle table AFTER degenerate faces were dropped, so it lines
+        #: up with a/b/c. `triangles` above is the file's own and does not.
+        self.tri_idx = t[keep]
+        self._build_rim()
         #: The surface's own axis-aligned box. Not used to bound a distance --
         #: it would be a true lower bound, and a large one on a tool held above
         #: a part, but a bound on DISTANCE says nothing about which side, and
@@ -1310,8 +1329,8 @@ class SurfaceDistance(object):
             list(pool.map(run, spans))
         return dbest, tbest, side
 
-    def signed_distance(self, points, k=None, max_k=None, block=None,
-                        exact_within=None, exact_each=None, workers=None):
+    def _signed_distance_impl(self, points, k=None, max_k=None, block=None,
+                              exact_within=None, exact_each=None, workers=None):
         """Signed distance for each point; negative means inside the part.
 
         Exact for the triangles it considers, and it keeps widening the candidate
@@ -1393,7 +1412,12 @@ class SurfaceDistance(object):
             out = np.empty(n)
             for start in range(0, n, block):
                 sl = slice(start, start + block)
-                out[sl] = self.signed_distance(
+                # THE KERNEL, not the entry point: signed_distance() applies
+                # the rim rule on top, and applying it per block and then again
+                # to the whole makes the answer depend on the block size. That
+                # is exactly what the "outer block size does not change the
+                # answer" check is for, and it caught this.
+                out[sl] = self._signed_distance_impl(
                     points[sl], k=k, max_k=max_k, block=0,
                     exact_within=exact_within,
                     exact_each=None if far is None else far[sl],
@@ -1501,6 +1525,95 @@ class SurfaceDistance(object):
             k = min(max_k, k*4)
             prepass = False
         return signed
+
+    def _build_rim(self):
+        """The mesh's boundary edges: the ones used by exactly one triangle.
+
+        A closed body has none and everything below is a no-op on it.
+        """
+        t = self.tri_idx
+        if t.size == 0:
+            self.rim_a = np.zeros((0, 3)); self.rim_b = np.zeros((0, 3))
+            self.n_boundary_edges = 0
+            return
+        e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]], axis=0)
+        e = np.sort(e, axis=1)
+        uniq, counts = np.unique(e, axis=0, return_counts=True)
+        bnd = uniq[counts == 1]
+        self.rim_a = self.vertices[bnd[:, 0]] if bnd.size else np.zeros((0, 3))
+        self.rim_b = self.vertices[bnd[:, 1]] if bnd.size else np.zeros((0, 3))
+        self.n_boundary_edges = int(bnd.shape[0])
+
+    def _rim_distance(self, points):
+        """Distance from each point to the nearest boundary EDGE segment."""
+        if self.n_boundary_edges == 0:
+            return np.full(points.shape[0], np.inf)
+        out = np.empty(points.shape[0])
+        ab = self.rim_b - self.rim_a
+        denom = np.einsum("ij,ij->i", ab, ab)
+        denom[denom < 1e-24] = 1e-24
+        # One point at a time over the rim, which is short: a 76 x 66 mm patch
+        # has a few hundred boundary edges and this is only ever asked about
+        # the handful of points that came back negative.
+        for i in range(points.shape[0]):
+            ap = points[i] - self.rim_a
+            tpar = np.clip(np.einsum("ij,ij->i", ap, ab)/denom, 0.0, 1.0)
+            closest = self.rim_a + tpar[:, None]*ab
+            out[i] = np.sqrt(np.min(np.einsum("ij,ij->i",
+                                              points[i] - closest,
+                                              points[i] - closest)))
+        return out
+
+    def signed_distance(self, points, **kwargs):
+        """Signed distance, with the sign of an OPEN mesh taken honestly.
+
+        BEYOND THE EDGE OF A SHEET THERE IS NO INSIDE, and this is where the
+        2026-10-09 clearance numbers came from. The planning mesh that day was
+        a measured patch 76 x 66 mm across and 1.1 mm thick. The Keyence frame
+        rides about 73 mm off the probe axis, so near the ends of a raster it
+        sat OUTSIDE that patch's footprint and below its plane -- and the sign
+        of a signed distance comes from the nearest triangle, which there is
+        one on the rim, with its normal pointing up. Below a rim triangle reads
+        as inside the part:
+
+            worst clearance -141.8 mm (limit 5.0 mm)
+            lj_v7080_frame  -141.8 mm   <-- under the limit
+            outer_shell     -123.1 mm   <-- under the limit
+
+        on a plate one millimetre thick, with every face correctly wound.
+        Measured again 2026-10-10 against the same saved mesh: a point 100 mm
+        beyond the rim and 100 mm below it reads -142.4 mm, and the mesh has
+        zero inconsistently wound faces.
+
+        What it cost: 376 of 2925 waypoints dropped, whole passes skipped, 101
+        passes split into 136, 17.1% of the path given up -- and since each
+        mid-pass split is a lift and an approach, it is also where that run's
+        stop-start motion came from.
+
+        So: where the nearest point on the mesh lies on a BOUNDARY edge, the
+        query point is off the end of the sheet and no triangle there can say
+        which side of the part it is on. The magnitude is kept, because a tool
+        near the rim is still near something; only the claim to be inside is
+        dropped. A closed mesh has no boundary edges and nothing here applies
+        to it.
+        """
+        d = self._signed_distance_impl(points, **kwargs)
+        if self.n_boundary_edges == 0:
+            return d
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        neg = np.where(d < 0.0)[0]
+        if neg.size == 0:
+            return d
+        rim = self._rim_distance(pts[neg])
+        # The nearest point on the mesh is ON the rim exactly when the distance
+        # to the rim equals the distance to the surface. A tolerance, because
+        # both are floating point and the rim distance is computed a different
+        # way from the surface distance.
+        off_the_end = rim <= np.abs(d[neg])*(1.0 + 1e-9) + 1e-9
+        if off_the_end.any():
+            d = d.copy()
+            d[neg[off_the_end]] = np.abs(d[neg[off_the_end]])
+        return d
 
     def distance(self, points, **kwargs):
         """Unsigned distance -- for a report that does not care which side."""
@@ -2338,6 +2451,16 @@ def format_clearance_report(report, limit=None, per_pass=True,
 #: faces away. Nothing real sits between.
 HEIGHT_FIELD_MAX_DISAGREEMENT = 0.10
 
+#: A face counts as agreeing with `outward` when its normal is within ~84
+#: degrees of it. Anything closer to perpendicular carries no information
+#: about which side is out.
+HEIGHT_FIELD_MIN_COS = 0.1
+
+#: And this much of the AREA has to agree before the surface is treated as a
+#: height field at all. A measured patch comes in at 1.0; a half cylinder
+#: standing on its axis comes in near 0, a closed box near a sixth.
+HEIGHT_FIELD_MIN_AGREE_AREA = 0.90
+
 
 #: Below this half-thickness a mesh is an open sheet, not a solid, and
 #: _say_impossible_penetration() has nothing to say about it.
@@ -2433,18 +2556,21 @@ def _say_impossible_penetration(rep, mesh, what):
     print("    ** IMPOSSIBLE PENETRATION: %d of %d pose(s) of the %s report "
           "the tooling further inside this surface than the surface is thick. "
           "The worst is %+.1f mm; nothing can be more than %.1f mm inside it "
-          "(half its smallest extent). That is the SIGN of the distance being "
-          "wrong, not the distance: it comes from the nearest triangle's "
-          "normal, and a mesh with a few faces still wound the wrong way makes "
-          "points far OUTSIDE read as far inside."
+          "(half its smallest extent). That is the SIGN being wrong, not the "
+          "distance. The usual cause is a point off the END of an open sheet, "
+          "which SurfaceDistance.signed_distance() already corrects for; a "
+          "face still wound the wrong way will do it too. Either way the "
+          "magnitude is the real distance."
           % (n_bad, int(c.size), what, worst*1e3, depth*1e3))
     if named:
         print("       the links it names: %s"
               % (", ".join("%s %+.1f mm" % (k, v*1e3) for v, k in named[:4]),))
     print("       Those poses are being dropped and the passes through them "
           "split, so this is paid for in coverage and in a fragmented "
-          "toolpath, not in a refusal. Re-run the normal repair on the "
-          "planning mesh before trusting this check.")
+          "toolpath, not in a refusal. Check the planning mesh's winding, and "
+          "whether its boundary edges were found (%d here) -- a surface whose "
+          "rim is not known has no outside beyond it."
+          % (getattr(mesh, "n_boundary_edges", -1),))
 
 
 def enforce_path_clearance(path, mesh, limit=None, envelope=None, pad=None,

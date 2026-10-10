@@ -691,7 +691,12 @@ kern = SurfaceDistance(cv, ct, name="kernel")
 _rng = np.random.default_rng(11)
 _lo, _hi = cv.min(axis=0) - 0.05, cv.max(axis=0) + 0.05
 probe_pts = _rng.uniform(_lo, _hi, size=(4000, 3))
-exact_all = kern.signed_distance(probe_pts)
+# THE KERNEL, not the public entry point. signed_distance() applies the rim
+# rule on top -- a point off the end of an open sheet has no inside -- and the
+# brute force below is the definition of what the KERNEL computes, which is the
+# nearest triangle and the side of it. The rim rule is checked on its own, in
+# "the edge of an open sheet" above.
+exact_all = kern._signed_distance_impl(probe_pts)
 
 # Brute force, no tree and no candidate set at all: the definition.
 _brute = np.empty(probe_pts.shape[0])
@@ -705,31 +710,51 @@ check("the kernel agrees with brute force over every triangle",
       np.allclose(exact_all, _brute, atol=1e-9),
       float(np.abs(exact_all - _brute).max()))
 
+# AND THE PUBLIC METHOD differs from the kernel only where the rim rule says it
+# should: same magnitude everywhere, sign flipped only for points whose nearest
+# point on the mesh is on a boundary edge.
+_public = kern.signed_distance(probe_pts)
+_differs = _public != exact_all
+check("the rim rule changes only the sign, never the magnitude",
+      np.allclose(np.abs(_public), np.abs(exact_all)), float(np.abs(
+          np.abs(_public) - np.abs(exact_all)).max()))
+check("...and only ever from inside to outside (%d of %d points)"
+      % (int(_differs.sum()), _differs.size),
+      bool(np.all(exact_all[_differs] < 0)) and bool(np.all(_public[_differs] > 0)))
+check("...on an OPEN patch there are some (%d boundary edges)"
+      % (kern.n_boundary_edges,), kern.n_boundary_edges > 0)
+
 for _w in (1, 2, 8):
-    got = kern.signed_distance(probe_pts, workers=_w)
+    got = kern._signed_distance_impl(probe_pts, workers=_w)
     if not np.array_equal(got, exact_all):
         break
 check("threads do not change the answer",
-      np.array_equal(kern.signed_distance(probe_pts, workers=1),
-                     kern.signed_distance(probe_pts, workers=8)))
+      np.array_equal(kern._signed_distance_impl(probe_pts, workers=1),
+                     kern._signed_distance_impl(probe_pts, workers=8)))
 
 _keep = ns["SURFACE_KERNEL_BYTES"]
 try:
     ns["SURFACE_KERNEL_BYTES"] = 4096          # one tiny slab per handful
-    tiny = kern.signed_distance(probe_pts)
+    tiny = kern._signed_distance_impl(probe_pts)
 finally:
     ns["SURFACE_KERNEL_BYTES"] = _keep
 check("the cache-slab size does not change the answer",
       np.array_equal(tiny, exact_all),
       float(np.abs(tiny - exact_all).max()))
 
+_blocked = kern._signed_distance_impl(probe_pts, block=137)
 check("the outer block size does not change the answer",
-      np.array_equal(kern.signed_distance(probe_pts, block=137), exact_all))
+      np.array_equal(_blocked, exact_all),
+      "max|diff| %.3g, %d differ, %d are sign-only"
+      % (float(np.abs(_blocked - exact_all).max()),
+         int((_blocked != exact_all).sum()),
+         int(np.isclose(np.abs(_blocked), np.abs(exact_all))[
+             _blocked != exact_all].sum())))
 
 # exact_within is a RELAXATION and has to be a sound one: exact below the line
 # the caller drew, and never an over-report above it.
 for _far in (0.005, 0.020, 0.080):
-    rel = kern.signed_distance(probe_pts, exact_within=_far)
+    rel = kern._signed_distance_impl(probe_pts, exact_within=_far)
     below = (exact_all < _far) & (exact_all > 0.0)
     ok_exact = np.allclose(rel[below], exact_all[below], atol=1e-12)
     outside = exact_all > 0.0
@@ -746,7 +771,7 @@ for _far in (0.005, 0.020, 0.080):
 # be MORE exact than asking one at a time, and is: points are grouped by their
 # threshold and a group is asked the loosest question in it.)
 _each = _rng.choice([0.004, 0.015, 0.060], size=probe_pts.shape[0])
-batched = kern.signed_distance(probe_pts, exact_each=_each)
+batched = kern._signed_distance_impl(probe_pts, exact_each=_each)
 _out = exact_all > 0.0
 check("exact_each never reports more clearance than the truth",
       bool((batched[_out] <= exact_all[_out] + 1e-9).all()),
@@ -772,10 +797,10 @@ check("a settled bound is about distance, not side -- which is why nothing may "
 # a contact scan hands this the running minimum, which is negative.
 for _neg in (-0.010, 0.0):
     check("exact_within=%+.3f measures rather than settling" % _neg,
-          np.array_equal(kern.signed_distance(probe_pts, exact_within=_neg),
+          np.array_equal(kern._signed_distance_impl(probe_pts, exact_within=_neg),
                          exact_all))
 check("and the same per point",
-      np.array_equal(kern.signed_distance(
+      np.array_equal(kern._signed_distance_impl(
           probe_pts, exact_each=np.full(probe_pts.shape[0], -0.01)), exact_all))
 
 # ------------------------------------------------------------------------------
@@ -1141,6 +1166,73 @@ check("...so none of its faces are turned", _box.sign_faces_corrected == 0,
 
 
 # ==============================================================================
+# BEYOND THE EDGE OF A SHEET THERE IS NO INSIDE
+# ==============================================================================
+# THE ACTUAL CAUSE of the 2026-10-09 clearance numbers, found by replaying that
+# day's saved mesh and tool poses on 2026-10-10.
+#
+# The planning mesh was a measured patch 76 x 66 mm across and 1.1 mm thick,
+# with EVERY FACE CORRECTLY WOUND -- 0.000% disagreement when the saved file is
+# read back. The Keyence frame rides about 73 mm off the probe axis, so near the
+# ends of a raster it sat outside that patch's footprint and below its plane.
+# Its nearest triangle is then one on the rim, whose normal points up, and a
+# point below a rim triangle reads as inside the part:
+#
+#     worst clearance -141.8 mm (limit 5.0 mm)
+#     lj_v7080_frame  -141.8 mm   <-- under the limit
+#
+# Replayed with the real poses and the real mesh: 24 of 404 waypoints dropped,
+# 77 passes cut to 42, 14.6% of the path given up -- against the 17.1% the run
+# itself reported. With the rim correction: 0 dropped, 77 passes, 0% lost.
+
+print("")
+print("the edge of an open sheet")
+
+# a 100 x 100 mm patch, 1 mm of relief, on a 11 x 11 grid
+_rx, _ry = np.meshgrid(np.linspace(0.0, 0.1, 11), np.linspace(0.0, 0.1, 11))
+_rv = np.c_[_rx.ravel(), _ry.ravel(), 0.001*np.sin(12*_rx.ravel())]
+_rt = []
+for _r in range(10):
+    for _c in range(10):
+        _i = _r*11 + _c
+        _rt.append([_i, _i+1, _i+12]); _rt.append([_i, _i+12, _i+11])
+_sheet = SurfaceDistance(_rv, np.array(_rt), name="measured patch")
+
+check("the patch's rim is found (%d boundary edges)" % (_sheet.n_boundary_edges,),
+      _sheet.n_boundary_edges == 40, _sheet.n_boundary_edges)
+
+# 100 mm beyond the +x rim and 100 mm below the plane -- the 10-09 geometry
+_beyond = np.array([[0.200, 0.05, -0.100]])
+_d = float(_sheet.signed_distance(_beyond)[0])
+check("a point beyond the rim and below the plane is OUTSIDE (%+.1f mm)"
+      % (1e3*_d,), _d > 0, _d)
+check("...and keeps its magnitude -- still %.0f mm from the part" % (1e3*_d,),
+      abs(_d - float(np.hypot(0.100, 0.100))) < 0.003, _d)
+
+# directly under the middle it IS inside, and must stay so
+_under = float(_sheet.signed_distance(np.array([[0.05, 0.05, -0.004]]))[0])
+check("a point under the MIDDLE of the patch is still inside (%+.2f mm)"
+      % (1e3*_under,), _under < 0, _under)
+
+# just inside the rim, just below: nearest point is a face, not the rim
+_edge_in = float(_sheet.signed_distance(np.array([[0.092, 0.05, -0.0005]]))[0])
+check("just inside the rim and just below is still inside (%+.2f mm)"
+      % (1e3*_edge_in,), _edge_in < 0, _edge_in)
+
+# a grazing contact mid-patch must not be explained away
+_graze = float(_sheet.signed_distance(np.array([[0.045, 0.045, -0.0005]]))[0])
+check("a 0.5 mm graze mid-patch is still a collision (%+.2f mm)" % (1e3*_graze,),
+      _graze < 0, _graze)
+
+# A CLOSED BODY HAS NO RIM, so none of this touches it.
+check("a closed box has no boundary edges", _box.n_boundary_edges == 0,
+      _box.n_boundary_edges)
+_deep = float(_box.signed_distance(np.array([[0.05, 0.05, 0.05]]))[0])
+check("...and its centre is still 50 mm inside (%+.1f mm)" % (1e3*_deep,),
+      _deep < 0, _deep)
+
+
+# ==============================================================================
 # A "COLLISION" DEEPER THAN THE PART IS THICK
 # ==============================================================================
 # 2026-10-09. The clearance check reported the Keyence frame 141.8 mm inside a
@@ -1190,7 +1282,7 @@ check("...naming the links", "lj_v7080_frame" in _text and "outer_shell" in _tex
 check("...and not a link only 0.5 mm in, which is plausible",
       "ec_probe" not in _text, _text[:200])
 check("...and saying it is the SIGN that is wrong",
-      "SIGN of the distance being wrong" in _text, _text[:200])
+      "SIGN being wrong" in _text, _text[:200])
 
 # A REAL penetration of a thick part must stay silent: this check must not
 # explain away a genuine collision.

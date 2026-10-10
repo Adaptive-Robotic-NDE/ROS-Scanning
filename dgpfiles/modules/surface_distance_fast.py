@@ -630,7 +630,7 @@ def install(cls, required=False, verbose=False, nthreads=0):
     if getattr(cls, "_sd_fast_installed", False):
         return cls
 
-    original = cls.signed_distance
+    original = cls._signed_distance_impl
     try:
         import inspect
         original_params = set(
@@ -674,7 +674,11 @@ def install(cls, required=False, verbose=False, nthreads=0):
 
     signed_distance.__doc__ = _FAST_DOC
     signed_distance.__name__ = "signed_distance"
-    cls.signed_distance = signed_distance
+    # THE IMPLEMENTATION, NOT THE ENTRY POINT. SurfaceDistance.signed_distance()
+    # is a thin wrapper that corrects the sign of points off the end of an open
+    # sheet (see its docstring), and that correction has to apply to whichever
+    # backend computed the number. Replacing the wrapper would skip it.
+    cls._signed_distance_impl = signed_distance
     cls.signed_distance_numpy = original
     cls._sd_fast_installed = True
     cls.accelerated = True
@@ -696,7 +700,7 @@ def uninstall(cls):
     """Put the numpy signed_distance() back.  For A/B measurement."""
     if not getattr(cls, "_sd_fast_installed", False):
         return cls
-    cls.signed_distance = cls.signed_distance_numpy
+    cls._signed_distance_impl = cls.signed_distance_numpy
     del cls.signed_distance_numpy
     cls._sd_fast_installed = False
     cls.accelerated = False
