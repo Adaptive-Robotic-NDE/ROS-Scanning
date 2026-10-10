@@ -1068,6 +1068,79 @@ check("a sink that throws does not take the gate down with it",
 # the subject still runs and still discriminates has to be a test of its own.
 
 # ==============================================================================
+# THE SIGN OF A HEIGHT FIELD COMES FROM THE FIELD
+# ==============================================================================
+# The 2026-10-09 planning mesh was a reconstructed plate, 99.5% of its normals
+# pointing up, and the half-percent that did not inverted the clearance for
+# every point nearest to them. The Keyence frame, 141 mm ABOVE the part, was
+# reported 141.8 mm inside it.
+
+print("")
+print("height-field sign")
+
+# A 100 x 100 mm patch on a 11 x 11 grid: 200 triangles, the real thing's
+# shape. One of them is wound the wrong way -- 0.5%, the same share the
+# 2026-10-09 mesh had left after repair.
+_gx, _gy = np.meshgrid(np.linspace(0.0, 0.1, 11), np.linspace(0.0, 0.1, 11))
+_hv = np.c_[_gx.ravel(), _gy.ravel(), np.zeros(_gx.size)]
+_tri = []
+for _r in range(10):
+    for _c in range(10):
+        _i = _r*11 + _c
+        _tri.append([_i, _i+1, _i+12])
+        _tri.append([_i, _i+12, _i+11])
+_good = np.array(_tri)
+_bad = _good.copy()
+_BADFACE = 2*(5*10 + 5)                      # one triangle near the middle
+_bad[_BADFACE] = _bad[_BADFACE][::-1]
+_clean = SurfaceDistance(_hv, _good, name="patch")
+_broken = SurfaceDistance(_hv, _bad, name="patch with one face reversed")
+
+check("a clean patch is a height field with nothing to correct",
+      _clean.height_field and _clean.sign_faces_corrected == 0,
+      (_clean.height_field, _clean.sign_faces_corrected))
+check("1 reversed face of 200 is still a height field, and is corrected",
+      _broken.height_field and _broken.sign_faces_corrected == 1,
+      (_broken.height_field, _broken.sign_faces_corrected))
+check("...and the measured disagreement is still reported as it was (%.3f)"
+      % (_broken.normal_disagreement,),
+      abs(_broken.normal_disagreement - 1.0/200.0) < 1e-9,
+      _broken.normal_disagreement)
+
+# A POINT 141 mm ABOVE THE PATCH, over the broken half. This is the one that
+# mattered: before the repair it read -0.141.
+_above = np.array([[0.0525, 0.0525, 0.141]])
+_d_clean = float(_clean.signed_distance(_above)[0])
+_d_broken = float(_broken.signed_distance(_above)[0])
+check("a point 141 mm above a reversed face no longer reads as inside",
+      _d_broken > 0, _d_broken)
+check("...and agrees with the clean patch (%.4f vs %.4f m)"
+      % (_d_broken, _d_clean), abs(_d_broken - _d_clean) < 1e-9,
+      (_d_broken, _d_clean))
+
+# A POINT BELOW the surface is still inside. The repair must not make
+# everything positive.
+_below = np.array([[0.0525, 0.0525, -0.004]])
+check("a point below the surface is still negative",
+      float(_broken.signed_distance(_below)[0]) < 0,
+      float(_broken.signed_distance(_below)[0]))
+
+# A CLOSED BODY IS NOT A HEIGHT FIELD and must not be touched: half its faces
+# legitimately point away from `outward`.
+_cv = np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.1, 0.0],
+                [0.0, 0.1, 0.0], [0.0, 0.0, 0.1], [0.1, 0.0, 0.1],
+                [0.1, 0.1, 0.1], [0.0, 0.1, 0.1]])
+_ct = np.array([[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
+                [0, 1, 5], [0, 5, 4], [2, 3, 7], [2, 7, 6],
+                [1, 2, 6], [1, 6, 5], [0, 4, 7], [0, 7, 3]])
+_box = SurfaceDistance(_cv, _ct, name="closed box")
+check("a closed box is NOT a height field", not _box.height_field,
+      _box.outward_disagreement_area)
+check("...so none of its faces are turned", _box.sign_faces_corrected == 0,
+      _box.sign_faces_corrected)
+
+
+# ==============================================================================
 # A "COLLISION" DEEPER THAN THE PART IS THICK
 # ==============================================================================
 # 2026-10-09. The clearance check reported the Keyence frame 141.8 mm inside a

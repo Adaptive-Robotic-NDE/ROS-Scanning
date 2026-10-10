@@ -1017,15 +1017,58 @@ class SurfaceDistance(object):
         keep = area > 1e-14
         self.a, self.b, self.c = self.a[keep], self.b[keep], self.c[keep]
         n = n[keep]/area[keep, None]
+        w = area[keep]
         out = np.asarray(outward, dtype=np.float64)
         out = out/np.linalg.norm(out)
         agree = n.dot(out)
         flip = agree < 0.0
         share = float(np.minimum(flip.mean(), 1.0 - flip.mean()))
+        #: The fraction of faces that disagree with their neighbours about
+        #: which way is out, AS MEASURED -- before the repair below.
         self.normal_disagreement = share
         if flip.mean() > 0.5:
             n = -n
             flip = ~flip
+
+        # THE SIGN OF A HEIGHT FIELD COMES FROM THE FIELD, NOT FROM ONE FACE.
+        #
+        # The sign of every clearance number is the nearest triangle's own
+        # normal, which is right for a closed solid and wrong for a surface
+        # that is single-valued along `outward`: there, every face points the
+        # same way by construction, so a face that does not is simply broken,
+        # and the only thing it can do is invert the answer for every point
+        # nearest to it.
+        #
+        # 2026-10-09, on a reconstructed plate whose whole z extent was 2 mm
+        # and 99.5% of whose normals pointed up:
+        #
+        #     worst clearance -141.8 mm (limit 5.0 mm)
+        #     lj_v7080_frame  -141.8 mm   <-- under the limit
+        #     outer_shell     -123.1 mm   <-- under the limit
+        #
+        # Nothing can be 141 mm inside a 2 mm plate. Those links were 141 mm
+        # ABOVE it, nearest to one of the few faces still wound the wrong way.
+        # It cost 376 of 2925 waypoints, whole passes skipped, 101 passes split
+        # into 136, and 17.1% of the path -- and because each split is a lift
+        # and an approach in the middle of a pass, it is also where that run's
+        # stop-start toolpath came from.
+        #
+        # So where the surface IS a height field -- area-weighted, because a
+        # sliver must not get a vote proportional to a facet -- the minority
+        # are turned to agree with it. A closed part disagrees about half the
+        # time (its underside legitimately faces down), falls far outside the
+        # threshold, and is not touched: this repairs open sheets, which is the
+        # only case where "every face points the same way" is a fact about the
+        # geometry rather than an assumption about it.
+        disagree_area = (float(w[flip].sum()/w.sum())
+                         if w.sum() > 0 and flip.any() else 0.0)
+        self.outward_disagreement_area = disagree_area
+        self.height_field = bool(disagree_area < HEIGHT_FIELD_MAX_DISAGREEMENT)
+        self.sign_faces_corrected = 0
+        if self.height_field and flip.any():
+            n = n.copy()
+            n[flip] = -n[flip]
+            self.sign_faces_corrected = int(flip.sum())
         self.normals = n
         self.centroids = (self.a + self.b + self.c)/3.0
         self.triangle_radius = float(np.linalg.norm(
@@ -2287,6 +2330,13 @@ def format_clearance_report(report, limit=None, per_pass=True,
             lines.append("    (the %d worst of %d passes; the rest are clearer)"
                          % (len(shown), len(rows)))
     return "\n".join(lines)
+
+
+#: Area fraction of faces that may disagree with `outward` before a surface
+#: stops being treated as a height field. A reconstructed patch comes in under
+#: a percent; a closed body comes in near a half, because half of it genuinely
+#: faces away. Nothing real sits between.
+HEIGHT_FIELD_MAX_DISAGREEMENT = 0.10
 
 
 #: Below this half-thickness a mesh is an open sheet, not a solid, and
