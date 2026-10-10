@@ -1773,11 +1773,33 @@ def set_rotation(degrees):
     re-scanning. Called before the first scan it sets the value the scan starts
     with.
     """
+    global EC_ROTATION_DEG
     val = ec_conditioning_parameters(rotation_deg=float(degrees), cond=ec_cond)
+    # AND IT HAS TO STICK TO THE CONSTANT, not only to the live conditioning.
+    # run_automated_scan() calls setup_ec() when ec_source is None -- the first
+    # scan of a session -- and setup_ec() defaults rotation_deg to
+    # EC_ROTATION_DEG. Setting only the live value meant the rotation the
+    # operator dialled in at the prompt was replaced by 0.0 the moment the scan
+    # started, and the only evidence was `"rotation_deg": 0.0` in the saved
+    # metadata, read afterwards. That is how the 2026-10-09 scan came to run
+    # with no lift-off rejection at all: its per-pass baseline wandered 0.765 V
+    # against a 0.9 V notch, and the image was mostly lift-off.
+    EC_ROTATION_DEG = float(val["rotation"])
     print("  rotation %.1f degrees%s"
           % (val["rotation"],
              "" if val["live"] else " (held until the scan wires it)"))
     return val["rotation"]
+
+
+global ec_rotation
+def ec_rotation():
+    """The conditioning rotation the next scan will start with, in degrees.
+
+    Measured, not chosen: turn it until lift-off lies along the horizontal
+    axis. 83.8 deg on 2026-10-08 and 86.5 on 2026-10-09, both measured from
+    the recorded traces after the fact.
+    """
+    return float(EC_ROTATION_DEG)
 
 
 global set_gain

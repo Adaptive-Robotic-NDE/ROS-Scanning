@@ -658,3 +658,60 @@ def _main():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+def test_the_conditioning_rotation_survives_the_first_scan():
+    """set_rotation() has to reach EC_ROTATION_DEG, not only the live math.
+
+    `run_automated_scan()` calls `setup_ec()` when `ec_source is None` -- the
+    first scan of a session -- and `setup_ec()` defaults its rotation to
+    `EC_ROTATION_DEG`. A setter that touched only the live conditioning was
+    therefore undone the instant the scan started, and the only evidence was
+    `"rotation_deg": 0.0` in the saved per-pass metadata, read afterwards.
+
+    That is how the 2026-10-09 scan came to run with no lift-off rejection at
+    all. Its per-pass baseline wandered 0.765 V against a 0.9 V notch, so the
+    recorded image was mostly lift-off; re-conditioning the same traces
+    off-line at the measured 86.5 deg cut the drift to 0.088 V and brought the
+    notch out at SNR 20.
+    """
+    tree = dgp_tree()
+
+    defs = [n.value for n in tree.body
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "EC_ROTATION_DEG"
+                    for t in n.targets)]
+    assert len(defs) == 1, \
+        "EC_ROTATION_DEG should be defined exactly once at module level, got %d" \
+        % (len(defs),)
+
+    setter = [f for f in tree.body
+              if isinstance(f, ast.FunctionDef) and f.name == "set_rotation"]
+    assert len(setter) == 1, "set_rotation() should be defined once"
+    fn = setter[0]
+
+    assert any(isinstance(n, ast.Global) and "EC_ROTATION_DEG" in n.names
+               for n in ast.walk(fn)), \
+        ("set_rotation() must declare `global EC_ROTATION_DEG` -- without it "
+         "the assignment is local and setup_ec() resets the rotation to 0.0 "
+         "on the first scan of the session")
+    assert any(isinstance(n, ast.Assign)
+               and any(isinstance(t, ast.Name) and t.id == "EC_ROTATION_DEG"
+                       for t in n.targets)
+               for n in ast.walk(fn)), \
+        "set_rotation() must assign EC_ROTATION_DEG"
+
+    # And it must be readable back, or the operator cannot check it before a
+    # scan that takes half an hour.
+    assert [f for f in tree.body
+            if isinstance(f, ast.FunctionDef) and f.name == "ec_rotation"], \
+        "ec_rotation() should report what the next scan will use"
+
+    # setup_ec() still has to be the thing that reads it, or the setter is
+    # writing to a constant nobody consults.
+    setup = [f for f in tree.body
+             if isinstance(f, ast.FunctionDef) and f.name == "setup_ec"]
+    assert setup, "setup_ec() should exist"
+    assert any(isinstance(n, ast.Name) and n.id == "EC_ROTATION_DEG"
+               for n in ast.walk(setup[0])), \
+        "setup_ec() should default its rotation from EC_ROTATION_DEG"

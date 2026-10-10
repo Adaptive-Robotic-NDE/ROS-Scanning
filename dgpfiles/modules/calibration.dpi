@@ -201,6 +201,7 @@ global solve_keyence_from_take
 global solve_azure_from_take
 global verify_calibration
 global write_calibration
+global CalibrationOverwriteDeclined
 global deploy_calibration
 global check_calibration_applied
 global load_calibration
@@ -2477,11 +2478,19 @@ def calibrate_azure(point="cal_board", poses=None, distances=None, tilts=None,
                 dataset=data.get("dir"), report=res.report())
             _CAL["azure"] = res
             if save and res.adequate:
-                take.results["files"] = write_calibration(
-                    "azure", res, cam_frame, take=take)
+                try:
+                    take.results["files"] = write_calibration(
+                        "azure", res, cam_frame, take=take)
+                except CalibrationOverwriteDeclined as decline:
+                    take.results["not_written"] = str(decline)
             elif save:
-                _cal_say("  NOT SAVED: the pose set does not determine this "
-                         "transform. Nothing has been written.")
+                _cal_say("  NOT SAVED: %s Nothing has been written."
+                         % ("the pose set does not determine this transform."
+                            if not res.pose_set_adequate else
+                            "the fit is not precise enough to scan from "
+                            "(%.1f mm, 1 sigma)."
+                            % (max(res.sigma[:3]) if res.sigma is not None
+                               else float("nan"),)))
         except Exception as e:                                # noqa: BLE001
             # Anything, not only CalibrationRefused -- see the note on the same
             # clause in calibrate_keyence(). Nothing is swallowed.
@@ -4411,7 +4420,92 @@ def _cal_fmt_xyz(v):
     return "(" + " ".join("%+.2f" % (x*1e3) for x in v) + ") mm"
 
 
-def write_calibration(sensor, res, frame, take=None):
+#: A re-solve that moves the recorded mount further than this is not a
+#: refinement of the same fixture, and the operator is asked before it
+#: replaces what is on record.
+CAL_OVERWRITE_CONFIRM_MM = 5.0
+CAL_OVERWRITE_CONFIRM_MRAD = 50.0
+
+
+class CalibrationOverwriteDeclined(Exception):
+    """The operator did not confirm replacing the calibration on record."""
+
+
+def _cal_overwrite_reasons(prev, res, mc):
+    """Why this write needs asking about. Empty list means it does not."""
+    why = []
+    move_mm = float(mc.get("move_mm") or 0.0)
+    move_mrad = float(mc.get("move_mrad") or 0.0)
+    if move_mm > CAL_OVERWRITE_CONFIRM_MM:
+        why.append("it moves the mount %.1f mm, and a fixture that has not "
+                   "been touched re-solves to a millimetre or two"
+                   % (move_mm,))
+    if move_mrad > CAL_OVERWRITE_CONFIRM_MRAD:
+        why.append("it turns the mount %.1f mrad (%.1f deg)"
+                   % (move_mrad, math.degrees(move_mrad/1000.0)))
+    old_sigma = (prev or {}).get("sigma_mm_mrad")
+    new_sigma = None if res.sigma is None else [float(v) for v in res.sigma]
+    if old_sigma and new_sigma:
+        o, n = max(old_sigma[:3]), max(new_sigma[:3])
+        if n > o:
+            why.append("the solve on record is more certain than this one "
+                       "(%.2f mm against %.2f mm, 1 sigma)" % (o, n))
+    return why
+
+
+def _confirm_calibration_overwrite(sensor, prev, res, mc, why):
+    """Ask, in as many words, before replacing a calibration on record.
+
+    WHY THIS EXISTS. On 2026-10-09 a solve putting the Azure 0.977 m below the
+    flange -- 1299.17 mm and 171 degrees from the fixture on record, 76 mm rms
+    residual, 1 sigma 30.4 mm -- replaced a calibration good to 0.39 mm, and
+    the operator found out by reading the log afterwards. `adequate` has since
+    been taught to ask about the fit and not only the pose set, which would
+    have stopped that one; this is the second line, for the solve that is
+    merely wrong rather than obviously broken.
+
+    IT IS NOT confirm(). That helper has an `r` key that stops it asking for
+    the rest of a take, which is right for repeating the same arm motion and
+    exactly wrong here: an operator who pressed it an hour ago has not agreed
+    to this. The answer must be typed in full, every time.
+
+    No answer, or no console to ask on, means NO. A calibration that is not
+    written costs a re-run; one that is written over a good one costs a day
+    and is only found by someone reading a log.
+    """
+    _cal_say("")
+    _cal_say("  REPLACING THE %s CALIBRATION ON RECORD -- confirmation needed"
+             % (sensor.upper(),))
+    if prev:
+        _cal_say("    on record   %s  1 sigma %s"
+                 % (prev.get("measured", "unknown"),
+                    ("%.2f mm" % max(prev["sigma_mm_mrad"][:3]))
+                    if prev.get("sigma_mm_mrad") else "not recorded"))
+    _cal_say("    this solve  %s  1 sigma %s"
+             % (datetime.datetime.now().isoformat(timespec="seconds"),
+                ("%.2f mm" % max(res.sigma[:3])) if res.sigma is not None
+                else "not recorded"))
+    _cal_say("    the move    %.1f mm and %.1f mrad"
+             % (float(mc.get("move_mm") or 0.0),
+                float(mc.get("move_mrad") or 0.0)))
+    for w in why:
+        _cal_say("    ** %s" % (w,))
+    _cal_say("")
+    _cal_say("    Type OVERWRITE to replace it. Anything else keeps what is on")
+    _cal_say("    record; the solve stays in this session either way and")
+    _cal_say("    solve_azure_from_take() can write it later.")
+    try:
+        answer = input("    replace the recorded calibration? ").strip()
+    except (EOFError, OSError):
+        answer = ""
+    if answer == "OVERWRITE":
+        _cal_say("    confirmed.")
+        return True
+    _cal_say("    NOT WRITTEN -- the calibration on record is unchanged.")
+    return False
+
+
+def write_calibration(sensor, res, frame, take=None, force=False):
     """Record a solved transform AND write the file that deploys it.
 
     WHAT THE OPERATOR GETS, and it is deliberately a file rather than text to
@@ -4448,6 +4542,14 @@ def write_calibration(sensor, res, frame, take=None):
             doc = {}
 
     mc = _cal_mount_correction(sensor, res.X, frame)
+    prev = (doc.get(CELL_MODE) or {}).get(sensor)
+    if prev and not force:
+        why = _cal_overwrite_reasons(prev, res, mc)
+        if why and not _confirm_calibration_overwrite(sensor, prev, res, mc,
+                                                      why):
+            raise CalibrationOverwriteDeclined(
+                "the %s calibration on record was kept; this solve was not "
+                "written" % (sensor,))
     entry = {
         "cell": CELL_NAME, "mode": CELL_MODE, "frame": frame,
         "parent": "probe_end",

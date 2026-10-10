@@ -1,50 +1,200 @@
 # Cell visit, next session
 
-Written 2026-10-08 from `results21`. **Supersedes `cell-visit-2026-10-07.md`**,
-whose section 2 assumed a serpentine raster and no axis smoothing; both of those
-have changed and the old numbers in it no longer describe what the arm will do.
+Written 2026-10-10 from `results22` and `results23`. **Supersedes the
+2026-10-08 version**, whose section 2 assumed the scan would simply run; it
+did not, twice, and the reasons are now understood and fixed.
 
-Undated because I do not know when you are next at the cell. Nothing here goes
-stale with time — only with the next run.
+Undated because I do not know when you are next at the cell. Nothing here
+goes stale with time — only with the next run.
 
-`results21` answered three questions and the answers are in the code now. **This
-visit is mostly about confirming that on hardware**, because every one of those
-fixes was derived from saved files and none has flown.
+**Section 1 comes before the arm moves at all.** It is a repair, not a
+measurement.
 
 ---
 
-## 0. What changed, and how much to trust it
+## 0. What changed since 10-09, and how much to trust it
 
 | change | evidence behind it | flown? |
 |---|---|---|
-| **Comb instead of serpentine** | per-pass baseline vs travel direction r = +0.952, a 0.502 V step on a 1.46 V range | **no** |
-| **Tool-axis turn rate bounded and smoothed** | pass speed vs turn rate r = −0.855; 3.120 → 0.350 deg/mm on your own path | **no** |
-| Projection surface proved loadable at plan time | three runs lost to it after the null | **no** |
-| Projection spot radius from both spacings | notch SNR 15.0 → 33.1 reprojected | yes, 10-08 |
-| `capture_contact()` declares its own contact | the 14–86% truncations | partly |
+| **Azure calibration on record is WRONG** | a 1299 mm solve overwrote a 0.39 mm one | section 1 |
+| A bad solve can no longer be saved | `adequate` graded the pose set, not the fit | no |
+| Replacing a calibration asks first | nothing asked on 10-09 | no |
+| Keyence sweep no longer refuses over an overhanging line | three refusals on a flat plate | no |
+| Clearance sign taken from the height field | 141.8 mm "inside" a 2 mm plate | no |
+| Turn rate ignores coincident waypoints | 49810 deg/mm from one duplicated point | no |
+| Correlator cannot wait forever for a globalrev | both freezes, 3517 DAQ overruns | no |
+| mtc drains its goal threads before shutdown | the SIGINT segfault | no |
 
-**The two in bold are the ones to watch.** They are the largest behavioural
-changes this pipeline has had in a fortnight and both were tuned against one
-scan's worth of saved data.
+Everything except the first is derived from saved files and none of it has
+flown.
 
 ---
 
-## 1. Bring up
+## 1. REPAIR THE AZURE CALIBRATION — before anything else
 
-```bash
-cd ~/tari && ./tari.bash --layer site
-source ~/tari/tari_setup.bash
-ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=hardware
+### 1.1 What happened
+
+The calibration run at 18:08 on 10-09 produced a solve that is physically
+impossible: the camera 0.977 m **below** the flange, the mount moved 1299.17
+mm and 2984 mrad (171°), 76.0 mm rms residual, 1 sigma 30.4 mm, and 13 of 24
+detections 180° flipped. Its own report said `THIS IS NOT GOOD ENOUGH TO SCAN
+FROM`.
+
+It was written anyway, over the 2026-09-18 calibration that was good to 0.39
+mm, to **both** of these:
+
+```
+/data/scandata/capture/cell_override/ex-ur10e-1.sensor_calibration.json
+/data/scandata/capture/cell_override/sensor_calibration.urdf.xacro
 ```
 
-Second terminal:
+It was almost certainly **not deployed** — deploying needs a copy into the
+cell package plus a colcon build, which is a separate step you would have had
+to run. Section 1.2 settles that rather than assuming it.
 
-```bash
-source ~/tari/tari_setup.bash
-cd ~/tari/ROS-Scanning && dataguzzler-python --ipython dgpfiles/ECAutomatedScan.dgp
+### 1.2 First: find out what is actually in force
+
+Start the cell normally, then in dgpy:
+
+```
+check_calibration_applied()
 ```
 
-Confirm the settings before anything moves:
+Read the `azure` line. There are two outcomes:
+
+- **It reports a correction near (+0.67, +0.52, +0.08) mm** — the good 09-18
+  numbers are still in the robot description. The damage is confined to the
+  recorded file and 1.3 fixes it. **This is what I expect.**
+- **It reports anything near (+44, +62, +1297) mm** — the bad solve reached
+  the URDF. Do 1.3 *and* re-deploy (1.4) before the arm goes anywhere near
+  the part, because every planned standoff is 1.3 m wrong.
+
+Either way, write down what it said.
+
+### 1.3 Restore the recorded calibration
+
+The numbers to restore are inside the bad file itself — the calibration
+machinery records what it replaced, as `mount_cal.old_xyz` and
+`mount_cal.old_rpy`. Confirm them first:
+
+```bash
+python3 -c "import json;d=json.load(open('/data/scandata/capture/cell_override/ex-ur10e-1.sensor_calibration.json'));m=d['hardware']['azure']['mount_cal'];print('old_xyz',m['old_xyz']);print('old_rpy',m['old_rpy'])"
+```
+
+That must print:
+
+```
+old_xyz [0.00066854, 0.00051648, 8.197e-05]
+old_rpy [-0.005456480000000001, -0.009277000000000004, -0.008982210000000004]
+```
+
+Keep the bad file rather than deleting it — it is the only record of the run:
+
+```bash
+cd /data/scandata/capture/cell_override && cp -a ex-ur10e-1.sensor_calibration.json ex-ur10e-1.sensor_calibration.json.bad-2026-10-09 && cp -a sensor_calibration.urdf.xacro sensor_calibration.urdf.xacro.bad-2026-10-09 && ls -la
+```
+
+Now put the good numbers back into the drop-in. Edit
+`/data/scandata/capture/cell_override/sensor_calibration.urdf.xacro` so the
+two azure lines read **exactly**:
+
+```xml
+  <xacro:property name="azure_mount_cal_xyz" value="0.00066854 0.00051648 0.00008197"/>
+  <xacro:property name="azure_mount_cal_rpy" value="-0.00545648 -0.00927700 -0.00898221"/>
+```
+
+Leave the keyence properties and `keyence_ref_dist_cal` alone — they are
+zero and they were not touched.
+
+Check it took:
+
+```bash
+grep azure_mount_cal /data/scandata/capture/cell_override/sensor_calibration.urdf.xacro
+```
+
+The `z` value must be **0.00008197**, not 1.29705095. That one digit is the
+whole bug.
+
+### 1.4 Only if 1.2 said the bad numbers reached the URDF
+
+```bash
+cp /data/scandata/capture/cell_override/sensor_calibration.urdf.xacro /home/labuser/tari/ros_ws/src/tari_site/tari_cell_ex_ur10e_1/urdf/
+```
+
+```bash
+cd /home/labuser/tari/ros_ws && colcon build --packages-select tari_cell_ex_ur10e_1
+```
+
+Restart the bring-up, then in dgpy:
+
+```
+check_calibration_applied()
+```
+
+It must now report the (+0.67, +0.52, +0.08) mm correction.
+
+### 1.5 The JSON record
+
+The JSON still holds the bad entry. It is not read by the robot description —
+the xacro is what deploys — so it does not endanger anything, but the next
+`calibrate_azure()` will compare against it and report a 1.3 m "move" that is
+not real. Simplest honest fix is to let the next good solve replace it, which
+now asks you first (1.6).
+
+### 1.6 What is different if you re-calibrate
+
+Two changes, both aimed at this failure:
+
+- **A solve this bad can no longer be saved at all.** `adequate` used to grade
+  only the pose set — which was textbook that day, 24 poses with rotation
+  about all three axes — and said nothing about whether the observations
+  actually pinned anything down. It now also requires the fit's own 1 sigma
+  position uncertainty to be under 2.0 mm, which is the threshold the report
+  has always printed `THIS IS NOT GOOD ENOUGH TO SCAN FROM` at. The 10-09
+  solve was 30.4 mm.
+- **Replacing a calibration on record asks you, in as many words.** If the new
+  solve moves the mount more than 5 mm or 50 mrad, or is less certain than the
+  one it would replace, you get a side-by-side and a prompt:
+
+  ```
+  REPLACING THE AZURE CALIBRATION ON RECORD -- confirmation needed
+      on record   2026-09-18T10:20  1 sigma 0.39 mm
+      this solve  2026-10-10T...    1 sigma 30.43 mm
+      the move    1299.2 mm and 2984.5 mrad
+      ** it moves the mount 1299.2 mm, and a fixture that has not been
+         touched re-solves to a millimetre or two
+      ** the solve on record is more certain than this one
+
+      Type OVERWRITE to replace it.
+  ```
+
+  You have to type `OVERWRITE` in full. Enter, `y`, and anything else all keep
+  what is on record. It is deliberately not the `confirm()` you use during a
+  capture run, because that has an `r` key that stops it asking for the rest
+  of the take — and an operator who pressed that an hour ago has not agreed to
+  this.
+
+**If you do re-calibrate, watch the flip count.** The 10-09 run reported `13
+detection(s) were 180 degrees flipped and were corrected`. A 6x9 checkerboard
+is genuinely 180°-ambiguous and some correction is normal, but more than half
+the set is not, and it is the best single indicator that the detections
+themselves were bad. The machine was running an on-demand antivirus scan at
+the time; if you re-run, make sure it is not.
+
+---
+
+## 2. The scan over the 0.040/0.060/0.080" notches (~25-35 min)
+
+Settings are unchanged from the last plan — 0.25 mm pitch, comb, preload 2 mm,
+probe rotation 0.
+
+```
+set_probe_rotation(0)
+set_ec_preload(0.002)
+set_scan_step_size(0.00025)
+```
+
+Confirm before anything moves:
 
 ```
 ec_serpentine()
@@ -55,150 +205,131 @@ scan_step_size()
 projection_mode()
 ```
 
-`ec_serpentine()` must say **comb**. If it says serpentine, `tari.bash` did not
-pick up the change and nothing below is testing what it claims to.
+### 2.1 Set the conditioning rotation BEFORE the scan, not after
 
----
+This is new and it is the single biggest improvement available to this run.
 
-## 2. The scan over the 0.040/0.060/0.080" notches (~25-35 min)
+The 10-09 scan ran with conditioning rotation **0.0**, which is no lift-off
+rejection at all, so the live image was almost entirely lift-off: the
+per-pass baseline wandered over 0.765 V while the notch itself is 0.9 V. Re-
+conditioning the saved traces off-line at the measured **86.5°** dropped that
+drift to 0.088 V — 8.7× — and the notch came out at SNR 20.1 against a flat
+field.
 
-Same objective as last time, with two changes: a comb pays for the return, and
-the sampling pitch drops from 1.00 mm to 0.25 mm because 1.00 mm cannot resolve
-a notch signature (2.1). Deferred projection roughly cancels the cost of the
-second (2.2).
-
-### 2.1 Set up
-
-```
-set_probe_rotation(0)
-set_ec_preload(0.002)
-set_scan_step_size(0.00025)
-```
-
-**The step size must be 0.25 mm, not 1.00 mm.** This is new since the last plan
-and it is the difference between finding the notch and reading it.
-
-The 10-08 scan found and correctly located the 0.080" notch — feature 1, at
-(11, 9) mm in the patch — but the response is **≤1.0 mm FWHM along the pass**
-and the pitch was **1.00 mm**, so the whole feature got one sample above
-half-maximum. You watched a clean figure of eight on the instrument; the
-recorded data has the same diagonal (+114°, upper-left to lower-right, matching
-your instrument's rotation) but as a line, because a loop cannot be drawn
-through two points. The direction survives undersampling, the shape does not.
-
-`set_scan_step_size()` is new, and prints the speed ceiling the new pitch
-implies. Metres, like `set_ec_preload()`.
-
-### 2.2 Choose live or deferred, then run
-
-Four times the resolution is not four times the time, and **deferred projection
-buys most of it back** — the staging ceiling is 22 traces/s instead of 10:
-
-| pitch | live | deferred |
-|---|---|---|
-| 1.00 mm *(what you flew)* | 10.0 mm/s, 11.6 min | 22.0 mm/s, 9.4 min |
-| **0.25 mm** | 2.5 mm/s, **23.8 min** | 5.5 mm/s, **14.9 min** |
-
-7.6 min of each of those is per-pass overhead that the pitch does not change.
-**0.25 mm deferred costs about what 1.00 mm live did.** The trade is that the
-image is built at the end rather than as it goes, so you lose the live view —
-which is worth it once, to see whether the figure of eight comes through.
+86.5° is close to the 83.8° measured on 10-08, so it is a property of the
+probe and the material and not of that scan. Set it up front:
 
 ```
-set_projection_mode("deferred")
-out = run_automated_scan(line_spacing=0.0003)
+set_rotation(86.5)
 ```
 
-Capture the return — section 3 needs it. Skip the first line if you would
-rather watch the image build and can spare the extra nine minutes.
+```
+ec_rotation()
+```
 
-**One caveat on the deferred numbers.** 22 traces/s is a *staging* ceiling, not
-an arm speed. At 0.25 mm it asks for 5.5 mm/s, and on 10-05 the arm delivered
-3.9 mm/s when commanded 10 — so the arm may bind first and the real time may
-land nearer the live column. Section 2.4's elapsed times will say.
+`set_rotation()` already existed; what is new is that it now **sticks**. It
+used to set only the live conditioning, and `run_automated_scan()` calls
+`setup_ec()` on the first scan of a session, which defaults the rotation back
+to `EC_ROTATION_DEG` — 0.0. So a rotation dialled in at the prompt was
+silently replaced by zero the moment the scan started, and the only evidence
+was `"rotation_deg": 0.0` in the saved metadata. That is why 10-09 ran with no
+lift-off rejection. `ec_rotation()` reads back what the next scan will use.
 
-### 2.3 Four lines to read in the plan, before confirming
+### 2.2 Read these lines in the plan before confirming
 
 | line | what it should say | if it doesn't |
 |---|---|---|
-| `projection surface checked at plan time: … loads` | the mesh gate ran **here**, not after the null | send me the refusal; the arm has not moved |
-| `tool axis smoothed (linear, N mm): turn rate X -> Y deg/mm` | **Y under 0.40** | see 2.5 |
-| `8 trace(s) averaged per pixel over a 1.00 mm step x 0.30 mm line spacing` | the projection fix is live | — |
-| `probe rotation: +0.0 deg … wrist 3 at +166.1 deg` | in band | — |
+| `projection surface checked at plan time: … loads` | the mesh gate ran here | send me the refusal; the arm has not moved |
+| `tool axis smoothed (linear, N mm): turn rate X -> Y deg/mm` | **Y under 0.40**, and **no** "still over the bound" | see 2.4 |
+| `… step(s) are shorter than 0.010 mm` | **absent**. If present, the planner is emitting coincident waypoints again | tell me the count |
+| `IMPOSSIBLE PENETRATION` | **absent** | tell me; the sign repair did not take |
+| `coverage given up to keep the tool clear` | **0%**, or a few percent at the edges | more than ~5% means the clearance sign is still wrong |
 
-You will also see the normal postcondition read something like **1.9 deg**
-instead of the `0.000` it used to. **That is expected and the next line explains
-it**: the postcondition measures the probe axis against the *mesh* normal, and
-the smoothing departs from the mesh normal deliberately, because the mesh normal
-is the noisy quantity. It warns; it does not refuse.
+The last two are the ones to watch. On 10-09 the clearance check reported the
+Keyence frame 141.8 mm *inside* a 2 mm plate, dropped 376 of 2925 waypoints,
+skipped whole passes, split 101 passes into 136 and gave up 17.1% of the path.
+Each mid-pass split is a lift and an approach, which is where the stop-start
+toolpath came from.
 
-### 2.4 Watch for the stall — this is the real test
+### 2.3 Watch the pass times — this is the real test
 
-On 2026-10-08, passes 18–27 crawled at **1.74–2.98 mm/s** against a **4.68
-median**, and you watched the arm rock. The turn-rate repair is supposed to have
-removed the cause.
+On 10-09 the same 29 mm pass took **50 s** where a clean mesh took **16 s**,
+with the UR's own speed scaling pinned at 100% the whole time. The arm did
+exactly what it was told; TOTG had priced a path whose p99 tool-axis turn rate
+was 3.4× higher, and the smoothing that should have fixed it was chasing a
+49810 deg/mm reading that came from two waypoints at the same place.
 
-**Note the elapsed time on a dozen passes**, especially any where the arm looks
-unhappy. Three outcomes:
+**Note the elapsed time on a dozen passes.** A ~29 mm pass should be around
+16–20 s. Three outcomes:
 
-- **No slow band, no rocking** → the diagnosis and the fix both hold. This is
-  what I expect.
-- **Still slow, but the plan reported a turn rate under 0.4** → the turn rate
-  was not the whole story. Tell me; that is a real and useful negative, and it
-  means something else is loading the joints in that region.
-- **Slow and the plan reported `still over the … bound`** → read which of the
-  two messages it printed. "A wider window stopped reducing it" means the
-  surface genuinely turns that fast there; "the mesh is noisier than this can
-  fix" means re-run `reconstruct_fine()`.
+- **~16-20 s, no rocking** → the turn-rate metric fix and the mesh are both
+  good. This is what I expect.
+- **40 s or more, but the plan reported a turn rate under 0.40 and no
+  degenerate steps** → it is not the turn rate. Tell me; that is a real and
+  useful negative.
+- **40 s or more and the plan said "still over the … bound"** → read which of
+  the two messages it printed. "A wider window stopped reducing it" means the
+  surface genuinely turns that fast; "the mesh is noisier than this can fix"
+  means re-run `reconstruct_fine()`.
 
-### 2.5 If the smoothing says it could not meet the bound
+### 2.4 If the smoothing says it could not meet the bound
 
-Nothing is refused — the scan runs either way. The message distinguishes the two
-causes. Do not raise `EC_AXIS_SMOOTHING_MAX_M` to force it under: past 20 mm the
-axis is being averaged over a distance comparable to real features, and on a
-genuinely sharp part that would flatten the part to satisfy a number.
+Nothing is refused — the scan runs either way. Do not raise
+`EC_AXIS_SMOOTHING_MAX_M` to force it under: past 20 mm the axis is being
+averaged over a distance comparable to real features.
 
 ---
 
-## 3. Condition the image — do not skip this (~2 min, at the prompt)
+## 3. If it freezes again
 
-`results21` ran with **conditioning rotation 0.0**, which is no lift-off
-rejection at all. `EC_AUTO_ROTATION` *measures* the rotation after the scan but
-does not re-project, so the image you looked at was unconditioned.
+Both 10-09 freezes were the same thing and it is fixed, but if it recurs the
+symptom will be different, so here is what to look for.
 
-After the scan finishes:
+The cause was the correlator thread waiting forever for a globalrev that was
+never going to exist, on the one thread that drains the DAQ — which is why the
+first run ended in 3517 copies of `NI-DAQmx -200279`. That wait is now bounded
+at 20 s (normal is 50–150 ms).
+
+**What you should see now instead of a freeze:**
+
+```
+** staging timed out after 20.0 s on trace N -- the globalrev for that pose
+   never arrived. The trace is given up and the scan continues; 1 lost so far.
+```
+
+The scan carries on with a hole. If forty time out in a row it stops with a
+fault naming the count, because by then it is the pipeline and not a trace.
+
+**If you see that message even once, tell me.** It means the underlying
+globalrev problem is still there and only its consequence has been contained.
+Bring back `dataguzzler.log`; the per-pass `trigger_report` in each
+`pass*.npz` now carries `staging_timeouts`.
+
+---
+
+## 4. Condition the image — do not skip this (~2 min)
+
+If 2.1 worked, this is already done and you can skip it. If you ran at
+rotation 0 again:
 
 ```
 out["report"].get("rotation_measured_deg")
 ```
 
-Then re-project with it:
-
 ```
 replay_ec_scan(rotation_deg=out["report"]["rotation_measured_deg"])
 ```
 
-(If `rotation_measured_deg` is `None`, the measurement failed and
-`rotation_error` says why — send me that; the traces are unaffected and on
-disk.)
-
-**Write down the measured rotation.** On the 10-08 data the direction-dependent
-lift-off sat at +83.8° in the impedance plane and the notch features at +96.0°
-— **12.2° apart**, which is close to the 8.5° the simulation table predicted and
-is the number that decides how much of the flaw survives conditioning. A second
-measurement of it is worth as much as the scan.
+**Write down the measured rotation.** 10-08 gave 83.8°, 10-09 gave 86.5°.
+A third number tells us how stable it is, which decides whether it can be a
+configured constant rather than a per-scan measurement.
 
 ---
 
-## 4. The acquisition lag — still one speed, still open (~25 min, optional)
+## 5. The acquisition lag — still one speed, still open (~25 min, optional)
 
-Unchanged from the last plan and still the oldest open question: **0.140 s at
-3.93 mm/s, from one scan.** One speed cannot separate a time lag from a fixed
-distance offset.
-
-It needs a second raster at a different speed, and the contact-line route is
-dead — on the larger-notch region, repeats of one line at one speed and
-direction disagreed by up to 8 mm.
+Unchanged and still the oldest open question: **0.140 s at 3.93 mm/s, from one
+scan.** One speed cannot separate a time lag from a fixed distance offset.
 
 ```
 set_scan_velocity(0.004)
@@ -206,67 +337,37 @@ scan_velocity()
 out2 = run_automated_scan(line_spacing=0.0003)
 ```
 
-**Check the printed plan's `velocity` line before confirming.** If it still says
-10.0 mm/s the setter did not reach the planner — tell me and use the settings
-panel. `set_scan_velocity()` is still unproven at the cell.
-
-Slower rather than faster, deliberately: the 10-05 scan was commanded at 10 mm/s
-and flew at **3.9**, so asking for 20 would probably give 3.9 again. If this run
-also lands near 3.9 whatever is asked, stop — the velocity question has to be
-answered before the lag one.
-
-I extract the lag from the saved `pass*.npz`; nothing to analyse at the cell.
+**Check the printed plan's `velocity` line before confirming.** Note that the
+10-09 runs commanded 2.5 mm/s and the arm averaged 0.41 mm/s — but that was
+TOTG pricing the path, not a velocity-calibration error, so if section 2 comes
+in at 16-20 s per pass the commanded speed is being honoured and this
+experiment is finally worth running.
 
 ---
 
-## 5. Optional
+## 6. Optional
 
-**RViz memory.** The 10-06 session ground to a halt. Your yolo hypothesis does
-not match the log (three `yolo enabled` / four `yolo disabled` pairs — it is
-being released). Before you start:
+**RViz memory.** It grew 5.28 → 6.82 GB over 70 minutes on 10-09 and then
+plateaued when the scan stopped, so the growth tracks scan activity. It did
+not cause either freeze. Still worth a log:
 
 ```bash
-( while true; do date +%s; ps -o rss=,comm= -C rviz2 -C gzserver -C move_group -C python3 --sort=-rss | head -8; sleep 60; done ) > ~/mem.log 2>&1 &
+( while true; do date +%s; \ps -eo rss,comm --sort=-rss | head -6; sleep 60; done ) > ~/mem.log 2>&1 &
 ```
 
-Kill it at the end and bring `~/mem.log` back.
+(Note the `\ps` — there is an alias on this machine that breaks `-o`.)
 
-**Keyence comb return leg.** You noticed the return accumulating points while
-moving faster. Still not investigated. If it is easy to see whether
-`/stop_recording` lands before or after the return, that tells me where to look.
+**Keyence comb return leg.** Still not investigated.
 
 ---
 
-## 6. What to bring back
+## 7. What to bring back
 
-1. The four plan lines from 2.3, verbatim, whatever they said.
-2. Elapsed times for a dozen passes, and whether the arm rocked anywhere.
-3. The measured conditioning rotation from section 3.
-4. The `ec_scan_*` directories, `dataguzzler.log`, `ros.log`.
-5. `~/mem.log` if you ran section 5.
-
-**And please keep `dataguzzler.log` and `ros.log` separate if you can** — last
-time they were interleaved into one file. It cost nothing on 10-08 because I
-worked from the `.npz` files, but the ROS half is where the joint-level evidence
-would be if the stall comes back.
-
----
-
-## 7. If the stall comes back
-
-The one thing I could not get from `results21` is what the *joints* were doing,
-because the EC trigger fires on distance: when the arm stops advancing there are
-no traces, so a stall is a region with no samples and the rocking is unsampled
-by construction. The EC scan path also records no bag and, unlike a capture
-take, runs no in-flight speed monitor.
-
-So if it recurs, the next measurement is instrumentation rather than analysis:
-
-```bash
-ros2 bag record -o ~/stall_bag /joint_states /tf /speed_scaling_state_broadcaster/speed_scaling
-```
-
-started before the scan and stopped after. At 500 Hz that makes the rocking
-directly visible — amplitude, frequency, which joints move, and whether the UR's
-own speed scaling is pulling it down. That is a ~2 GB bag for a 50-minute scan,
-so only run it if the stall is still there.
+1. What `check_calibration_applied()` said, before and after section 1.
+2. The five plan lines from 2.2, verbatim.
+3. Elapsed times for a dozen passes, and whether the arm rocked anywhere.
+4. The measured conditioning rotation.
+5. The `ec_scan_*` directories, `dataguzzler.log`, `ros.log` — **separate
+   files** if you can.
+6. Anything that printed `staging timed out`, `IMPOSSIBLE PENETRATION`, or
+   `step(s) are shorter than`.
