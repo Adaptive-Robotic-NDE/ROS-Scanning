@@ -1354,6 +1354,39 @@ def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
     # uniform mesh error is one fact, not seventeen, and a paragraph repeated
     # seventeen times is how a real finding becomes noise.
     why, kinds = [], []
+
+    # CURVATURE IS DECIDED FIRST, because it changes how every clause below is
+    # read. A statistic taken over the WHOLE laser line is not a statement
+    # about the point the plan commanded, and the line is 31 mm wide.
+    rep["line_spread"] = float(rep["spread"])
+    flat_line = float(globals().get("KEYENCE_LINE_FLAT_SPREAD_M",
+                                    KEYENCE_LINE_FLAT_SPREAD_M))
+    curved = bool(rep["spread"] > flat_line)
+    in_range = bool(commanded is not None and np.isfinite(commanded)
+                    and rep["min"] - rep["margin"] <= float(commanded)
+                    <= rep["max"] + rep["margin"])
+    rep["curved"] = curved
+    rep["commanded_in_returns"] = in_range
+
+    # THE RE-AIM, which is what to DO about a line that does not fit rather
+    # than a reason to refuse. Moving the head by delta moves every return by
+    # delta, so the whole span fits the guarded window whenever the span is
+    # narrower than the window, and the delta that centres it is arithmetic.
+    # This is computed whatever the verdict: it is the number the operator and
+    # the plan both want, and it costs nothing.
+    span = rep["max"] - rep["min"]
+    if span <= (hi - lo):
+        delta = 0.5*((lo + hi) - (rep["min"] + rep["max"]))
+        rep["reaim_delta"] = float(delta)
+        rep["reaim_standoff"] = (float(commanded) + delta
+                                 if commanded is not None
+                                 and np.isfinite(commanded) else None)
+        rep["reaim_possible"] = True
+    else:
+        rep["reaim_delta"] = None
+        rep["reaim_standoff"] = None
+        rep["reaim_possible"] = False
+
     if near >= warn:
         kinds.append("near")
         why.append("%.1f%% of these points are within %.0f mm of the NEAR "
@@ -1361,9 +1394,33 @@ def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
                    "returning the surface and starts returning noise"
                    % (100.0*near, 1e3*rep["margin"], 1e3*hard_lo))
     if far >= warn:
-        kinds.append("far")
-        why.append("%.1f%% of these points are within %.0f mm of the FAR "
-                   "limit (%.0f mm)" % (100.0*far, 1e3*rep["margin"], 1e3*hard_hi))
+        # THE SAME MISTAKE THE BIAS CLAUSE WAS TAUGHT NOT TO MAKE. On a surface
+        # that curves across the line the far end of the line hangs off the
+        # part, so a far-limit fraction counts the EDGES OF THE LINE and not
+        # the point being measured. Measured 2026-10-09: a line spanning
+        # 82.2..101.5 mm put 22.6% of its points within 5 mm of the 103 mm far
+        # limit and refused three sweeps in a row, while the commanded 80 mm
+        # sat squarely inside what the sensor returned and the sweep was fine.
+        #
+        # Near is NOT stood down with it, and the asymmetry is deliberate: the
+        # far end costs data at the edge of the line, the near end is the head
+        # approaching the part.
+        if curved and in_range:
+            rep["far_from_curvature"] = True
+            rep["far_note"] = (
+                "%.1f%% of these points are within %.0f mm of the FAR limit "
+                "(%.0f mm), but the line spans %.1f mm and the commanded %s "
+                "lies inside the %.1f..%.1f mm the sensor returns -- so that "
+                "fraction is the far EDGE of the laser line hanging off a "
+                "curved surface, not the measured point running out of range"
+                % (100.0*far, 1e3*rep["margin"], 1e3*hard_hi,
+                   1e3*rep["spread"], _fmt_mm(commanded),
+                   1e3*rep["min"], 1e3*rep["max"]))
+        else:
+            kinds.append("far")
+            why.append("%.1f%% of these points are within %.0f mm of the FAR "
+                       "limit (%.0f mm)" % (100.0*far, 1e3*rep["margin"],
+                                            1e3*hard_hi))
     if commanded is not None and np.isfinite(commanded):
         bias = float(commanded) - float(np.median(d))
         rep["commanded"] = float(commanded)
@@ -1388,12 +1445,6 @@ def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
         # what the sensor actually sees? If it is, the plan agrees with the sensor
         # about where the surface is and the spread is the part's own shape. If it
         # is not, the disagreement is real and survives the curvature.
-        rep["line_spread"] = float(rep["spread"])
-        flat_line = float(globals().get("KEYENCE_LINE_FLAT_SPREAD_M",
-                                        KEYENCE_LINE_FLAT_SPREAD_M))
-        curved = rep["spread"] > flat_line
-        in_range = (rep["min"] - rep["margin"] <= float(commanded)
-                    <= rep["max"] + rep["margin"])
         rep["bias_from_curvature"] = bool(curved and in_range)
         if curved and in_range:
             rep["bias_note"] = (
@@ -1441,6 +1492,8 @@ def describe_range_report(rep, what="this pass", skip=()):
                 1e3*rep["hard_lo"], 1e3*rep["hard_hi"])]
     if rep.get("bias_note") and "bias" not in skip:
         lines.append("    ** %s" % (rep["bias_note"],))
+    if rep.get("far_note") and "far" not in skip:
+        lines.append("    ** %s" % (rep["far_note"],))
     if rep.get("bias") is not None:
         lines[0] += ("; commanded %.1f mm, so the planning surface is %.1f mm "
                      "%s" % (1e3*rep["commanded"], 1e3*abs(rep["bias"]),
@@ -1450,7 +1503,31 @@ def describe_range_report(rep, what="this pass", skip=()):
         if kind in skip:
             continue
         lines.append("    ** %s" % (reason,))
+    if rep.get("why") and rep.get("reaim_standoff") is not None:
+        lines.append("    -> %s" % (describe_reaim(rep),))
     return lines
+
+
+def describe_reaim(rep):
+    """The one-line correction for a line that does not fit the window.
+
+    Says what to command instead, not that something is wrong. A sweep that
+    can be re-aimed is not a sweep that has to be refused.
+    """
+    d = rep.get("reaim_delta")
+    s_new = rep.get("reaim_standoff")
+    if d is None or s_new is None:
+        return ("the laser line spans %.1f mm and the guarded window is only "
+                "%.1f mm wide, so NO standoff fits all of it; the middle of "
+                "the line is still measurable and the edges are not"
+                % (1e3*rep.get("spread", float("nan")),
+                   1e3*(rep["hi"] - rep["lo"])))
+    return ("commanding %s instead of %s centres what the sensor is actually "
+            "returning inside the %.0f..%.0f mm guarded window (move the head "
+            "%.1f mm %s)"
+            % (_fmt_mm(s_new), _fmt_mm(rep.get("commanded")),
+               1e3*rep["lo"], 1e3*rep["hi"], abs(1e3*d),
+               "further away" if d > 0 else "closer"))
 
 
 def keyence_range_gate(standoff, commanded=None, margin=None, allow=None,
@@ -1485,10 +1562,17 @@ def keyence_range_gate(standoff, commanded=None, margin=None, allow=None,
         return rep
     if allow is None:
         allow = bool(globals().get("KEYENCE_ALLOW_BAD_STANDOFF", False))
-    fix = ("Re-seat and re-calibrate the camera and reconstruct the rough "
-           "surface again, or plan this raster over a better surface. The "
-           "sensor is telling you where the part is; the mesh is the thing "
-           "that is wrong.")
+    if rep.get("reaim_standoff") is not None:
+        fix = ("FIRST TRY THE CORRECTION, not the rebuild: %s. Re-plan the "
+               "raster at that standoff. Only if the correction does not hold "
+               "across the whole raster is the surface itself wrong, and then: "
+               "re-seat and re-calibrate the camera and reconstruct the rough "
+               "surface again." % (describe_reaim(rep),))
+    else:
+        fix = ("Re-seat and re-calibrate the camera and reconstruct the rough "
+               "surface again, or plan this raster over a better surface. The "
+               "sensor is telling you where the part is; the mesh is the thing "
+               "that is wrong.")
     if allow:
         _standoff_say("    ** SWEEPING ANYWAY (KEYENCE_ALLOW_BAD_STANDOFF). %s"
                       % (fix,))

@@ -173,6 +173,7 @@ standoff_gate = ns["keyence_standoff_gate"]
 range_report = ns["keyence_range_report"]
 range_gate = ns["keyence_range_gate"]
 describe_range = ns["describe_range_report"]
+describe_reaim = ns["describe_reaim"]
 Monitor = ns["KeyenceStandoffMonitor"]
 REF = ns["KEYENCE_REF_DIST_M"]
 HARD_LO, HARD_HI = ns["KEYENCE_RANGE_M"]
@@ -1032,6 +1033,99 @@ check("bias" in rep["why_kinds"],
 check("near" in range_report(crest - 0.005, commanded=0.080)["why_kinds"]
       or range_report(crest - 0.005, commanded=0.080)["ok"],
       "the near-limit check is unaffected by the curvature reading")
+
+
+# ==============================================================================
+# THE FAR LIMIT MAKES THE SAME MISTAKE, AND IT COST THREE SWEEPS
+# ==============================================================================
+# The bias clause learned that a whole-line statistic is not a statement about
+# the point the plan commanded. The far-limit FRACTION never learned it, and on
+# 2026-10-09 it refused the fine keyence sweep three times in a row with
+#
+#   22.6% of these points are within 5 mm of the FAR limit (103 mm)
+#
+# while the line spanned 82.2..101.5 mm around a commanded 80.0 mm. The run's
+# own report said, two lines above the refusal, that the spread was curvature --
+# and then refused on a clause that was counting the far EDGE of the laser line
+# hanging off that same curve. The operator turned the check off to get a day's
+# work done, which is the outcome a false refusal always buys.
+#
+# NEAR IS NOT STOOD DOWN WITH IT. The far end costs data at the edge of the
+# line; the near end is the head approaching the part.
+
+print("")
+print("the far limit under curvature")
+
+# THE REAL DISTRIBUTION from 2026-10-09: a convex crest, most of the line near
+# 82 mm, a tail out to 101.5, commanded 80.0.
+_t = np.random.default_rng(7).random(4000)
+real = 0.0822 + (0.1015 - 0.0822)*(_t**2.2)
+real[0], real[-1] = 0.0822, 0.1015
+rep = range_report(real, commanded=0.080)
+check(rep["far_fraction"] > 0.02,
+      "the 2026-10-09 line really does put %.1f%% of its points near the far "
+      "limit" % (100.0*rep["far_fraction"],))
+check(rep["ok"],
+      "...and the sweep is no longer refused for it")
+check(rep.get("far_from_curvature") is True,
+      "...because the far fraction is attributed to the curve")
+check("far" not in rep["why_kinds"], "...so 'far' is not a reason to refuse")
+check(rep.get("far_note") and "EDGE of the laser line" in rep["far_note"],
+      "...and the report says which edge it is")
+
+# THE CORRECTION, which is the point: a line narrower than the window always
+# fits somewhere, and the gate now says where.
+check(rep["reaim_possible"] is True, "a 19 mm line fits a 36 mm window")
+check(rep["reaim_delta"] < 0,
+      "...by moving the head CLOSER (%.1f mm)" % (1e3*rep["reaim_delta"],))
+check(abs(rep["reaim_standoff"] - 0.0681) < 0.002,
+      "...to about 68 mm, which centres 82.2..101.5 inside 62..98 "
+      "(got %.1f mm)" % (1e3*rep["reaim_standoff"],))
+_lines = " ".join(describe_range(rep, what="x"))
+check("centres what the sensor is actually returning" in _lines
+      or rep["ok"], "the re-aim is reported to the operator")
+
+# A FLAT line genuinely out at the far limit is NOT curvature and must still
+# refuse: this is the case the clause was written for.
+_flat_far = np.random.default_rng(11).normal(0.1005, 0.0003, 800)
+rep = range_report(_flat_far, commanded=0.1005)
+check(not rep.get("far_from_curvature"),
+      "a flat line sitting at the far limit is not excused as curvature "
+      "(spread %.2f mm)" % (1e3*rep["spread"],))
+check("far" in rep["why_kinds"] and not rep["ok"],
+      "...and it still refuses")
+
+# CURVED, but the commanded standoff is nowhere in what the sensor returns:
+# the disagreement survives the curvature, exactly as for the bias clause.
+rep = range_report(real + 0.004, commanded=0.040)
+check(not rep.get("far_from_curvature"),
+      "a curved line whose range does not contain the commanded standoff is "
+      "not excused on the far limit either")
+
+# THE NEAR LIMIT IS UNTOUCHED BY ALL OF THIS.
+_crest_near = np.linspace(0.0, 0.019, 800) + 0.058
+rep = range_report(_crest_near, commanded=0.060)
+check("near" in rep["why_kinds"] and not rep["ok"],
+      "a curved line that reaches the NEAR limit still refuses -- curvature "
+      "excuses the far end only")
+
+# A line WIDER than the window cannot be re-aimed, and says so rather than
+# offering an impossible number.
+_wide = np.linspace(0.058, 0.102, 800)
+rep = range_report(_wide, commanded=0.080)
+check(rep["reaim_possible"] is False and rep["reaim_standoff"] is None,
+      "a 44 mm line does not fit a 36 mm window and no re-aim is invented")
+check("NO standoff fits all of it" in describe_reaim(rep),
+      "...and describe_reaim() says that rather than returning nonsense")
+
+
+def test_the_far_limit_is_not_fooled_by_a_curve():
+    """The 2026-10-09 refusal flies, and the cases it guards still refuse."""
+    r = range_report(real, commanded=0.080)
+    assert r["ok"] and r["far_from_curvature"] is True
+    assert r["reaim_standoff"] is not None
+    assert not range_report(_flat_far, commanded=0.1005)["ok"]
+    assert "near" in range_report(_crest_near, commanded=0.060)["why_kinds"]
 
 
 def test_not_blind():
