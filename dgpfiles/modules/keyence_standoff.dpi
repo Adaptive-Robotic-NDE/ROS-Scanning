@@ -1305,6 +1305,47 @@ def keyence_profile_standoff(msg, ref_dist=None):
     return ref - z
 
 
+def _surface_cluster(d, commanded, flat_m):
+    """Which returns are THE PART. (mask, off_fraction, step_m).
+
+    A laser line 31 mm long does not always land entirely on the thing being
+    measured. Where it runs off an edge, the returns split into groups with a
+    clear gap between them, and the group that matters is the one the plan
+    commanded a standoff into.
+
+    2026-10-09, the sweep's first pose over a FLAT plate 20 mm above its
+    support: returns 82.2..101.5 mm, median 82.3, with 22.6% of them out near
+    the 103 mm far limit. 82.3 + 20 = 102.3. The far group was the bench, and
+    the gate refused the sweep three times over it.
+
+    A gap wider than a flat surface's own spread is a step; narrower, and the
+    returns are one surface -- curved, perhaps, but one -- and the whole line
+    is the part. `step_m` is None in that case.
+    """
+    d = np.asarray(d, dtype=np.float64).reshape(-1)
+    if d.size < 2:
+        return np.ones(d.size, dtype=bool), 0.0, None
+    order = np.argsort(d)
+    srt = d[order]
+    gaps = np.diff(srt)
+    cut = np.where(gaps > flat_m)[0]
+    if cut.size == 0:
+        return np.ones(d.size, dtype=bool), 0.0, None
+    bounds = np.concatenate([[0], cut + 1, [d.size]])
+    groups = [(bounds[i], bounds[i+1]) for i in range(len(bounds) - 1)]
+    meds = [float(np.median(srt[a:b])) for a, b in groups]
+    if commanded is not None and np.isfinite(commanded):
+        pick = int(np.argmin([abs(m - float(commanded)) for m in meds]))
+    else:
+        pick = int(np.argmax([b - a for a, b in groups]))
+    a, b = groups[pick]
+    mask = np.zeros(d.size, dtype=bool)
+    mask[order[a:b]] = True
+    others = [m for i, m in enumerate(meds) if i != pick]
+    step = min(abs(m - meds[pick]) for m in others) if others else None
+    return mask, float(1.0 - mask.mean()), step
+
+
 def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
                          n_profiles=0, n_empty=0, warn_fraction=None):
     """What the sensor is measuring, against the window and against the plan.
@@ -1355,28 +1396,74 @@ def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
     # seventeen times is how a real finding becomes noise.
     why, kinds = [], []
 
-    # CURVATURE IS DECIDED FIRST, because it changes how every clause below is
-    # read. A statistic taken over the WHOLE laser line is not a statement
-    # about the point the plan commanded, and the line is 31 mm wide.
-    rep["line_spread"] = float(rep["spread"])
+    # WHICH OF THESE RETURNS ARE THE PART, decided before anything is judged.
+    # A statistic over the WHOLE laser line is not a statement about the point
+    # the plan commanded, and the line is 31 mm wide, so there are two ways it
+    # can be measuring something other than the thing being measured:
+    #
+    #   A STEP. The line runs off the edge of the part and the far portion is
+    #   whatever is behind it. A flat plate 20 mm above its support gives two
+    #   tight clusters 20 mm apart, and the distribution is BIMODAL.
+    #
+    #   A CURVE. The surface turns across the line, the commanded point sits
+    #   at one end of a CONTINUOUS range, and on a convex crest it is the
+    #   nearest return. Measured on a 131 x 65 x 67 mm cylinder.
+    #
+    # They are told apart by whether there is a gap: a step leaves one, a curve
+    # does not. Both are read the same way afterwards -- judge the cluster the
+    # commanded standoff falls in, and say what the rest of the line was
+    # looking at.
     flat_line = float(globals().get("KEYENCE_LINE_FLAT_SPREAD_M",
                                     KEYENCE_LINE_FLAT_SPREAD_M))
-    curved = bool(rep["spread"] > flat_line)
+    rep["line_spread"] = float(rep["spread"])
+    on, off_frac, step_m = _surface_cluster(d, commanded, flat_line)
+    rep["on_surface_fraction"] = float(on.mean())
+    rep["off_surface_fraction"] = float(off_frac)
+    rep["surface_step_m"] = (None if step_m is None else float(step_m))
+    rep["overhanging"] = bool(step_m is not None)
+
+    don = d[on]
+    rep["surface_min"] = float(don.min())
+    rep["surface_max"] = float(don.max())
+    rep["surface_median"] = float(np.median(don))
+    rep["surface_spread"] = float(np.percentile(don, 95)
+                                  - np.percentile(don, 5))
+    # FAR is asked of the part; NEAR is asked of the whole line, and the
+    # asymmetry is the same one that runs through this file. A far return is
+    # data we do not have. A near return is something close to the head, and
+    # whether it is the part we meant to measure or the fixture it is sitting
+    # on does not make it less close.
+    near = float((d < lo).mean())
+    far = float((don > hi).mean())
+    rep["near_fraction"], rep["far_fraction"] = near, far
+    rep["tight_fraction"] = near + far
+
+    curved = bool(step_m is None and rep["spread"] > flat_line)
     in_range = bool(commanded is not None and np.isfinite(commanded)
                     and rep["min"] - rep["margin"] <= float(commanded)
                     <= rep["max"] + rep["margin"])
     rep["curved"] = curved
     rep["commanded_in_returns"] = in_range
+    if step_m is not None:
+        rep["overhang_note"] = (
+            "%.1f%% of this line is not on the part: the returns fall into two "
+            "groups %.1f mm apart, which is the line running off the edge onto "
+            "whatever is behind it. The part is the %.1f mm group (%.1f%% of "
+            "the line); everything below is judged against that and not "
+            "against the whole line."
+            % (100.0*off_frac, 1e3*step_m, 1e3*rep["surface_median"],
+               100.0*on.mean()))
 
     # THE RE-AIM, which is what to DO about a line that does not fit rather
     # than a reason to refuse. Moving the head by delta moves every return by
-    # delta, so the whole span fits the guarded window whenever the span is
-    # narrower than the window, and the delta that centres it is arithmetic.
-    # This is computed whatever the verdict: it is the number the operator and
-    # the plan both want, and it costs nothing.
-    span = rep["max"] - rep["min"]
+    # delta, so the delta that centres the PART in the guarded window is
+    # arithmetic. It is computed from the part's own returns and from nothing
+    # else -- centring a span that is two different surfaces would walk the
+    # head towards whichever one it is not measuring. On 2026-10-09 that would
+    # have been 68 mm against a plate already sitting at a perfect 82.
+    span = rep["surface_max"] - rep["surface_min"]
     if span <= (hi - lo):
-        delta = 0.5*((lo + hi) - (rep["min"] + rep["max"]))
+        delta = 0.5*((lo + hi) - (rep["surface_min"] + rep["surface_max"]))
         rep["reaim_delta"] = float(delta)
         rep["reaim_standoff"] = (float(commanded) + delta
                                  if commanded is not None
@@ -1405,7 +1492,7 @@ def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
         # Near is NOT stood down with it, and the asymmetry is deliberate: the
         # far end costs data at the edge of the line, the near end is the head
         # approaching the part.
-        if curved and in_range:
+        if (curved or rep["overhanging"]) and in_range:
             rep["far_from_curvature"] = True
             rep["far_note"] = (
                 "%.1f%% of these points are within %.0f mm of the FAR limit "
@@ -1422,7 +1509,7 @@ def keyence_range_report(standoff, commanded=None, margin=None, range_m=None,
                        "limit (%.0f mm)" % (100.0*far, 1e3*rep["margin"],
                                             1e3*hard_hi))
     if commanded is not None and np.isfinite(commanded):
-        bias = float(commanded) - float(np.median(d))
+        bias = float(commanded) - float(rep["surface_median"])
         rep["commanded"] = float(commanded)
         rep["bias"] = bias
         # A MEDIAN IS THE RIGHT SUMMARY ONLY WHERE THE SURFACE IS FLAT ACROSS THE
@@ -1492,6 +1579,8 @@ def describe_range_report(rep, what="this pass", skip=()):
                 1e3*rep["hard_lo"], 1e3*rep["hard_hi"])]
     if rep.get("bias_note") and "bias" not in skip:
         lines.append("    ** %s" % (rep["bias_note"],))
+    if rep.get("overhang_note") and "far" not in skip:
+        lines.append("    ** %s" % (rep["overhang_note"],))
     if rep.get("far_note") and "far" not in skip:
         lines.append("    ** %s" % (rep["far_note"],))
     if rep.get("bias") is not None:

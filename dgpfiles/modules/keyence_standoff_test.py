@@ -1036,96 +1036,110 @@ check("near" in range_report(crest - 0.005, commanded=0.080)["why_kinds"]
 
 
 # ==============================================================================
-# THE FAR LIMIT MAKES THE SAME MISTAKE, AND IT COST THREE SWEEPS
+# THE LINE WAS NOT ON THE PART, AND IT COST THREE SWEEPS
 # ==============================================================================
-# The bias clause learned that a whole-line statistic is not a statement about
-# the point the plan commanded. The far-limit FRACTION never learned it, and on
-# 2026-10-09 it refused the fine keyence sweep three times in a row with
+# 2026-10-09. The fine keyence sweep was refused three times in a row with
 #
 #   22.6% of these points are within 5 mm of the FAR limit (103 mm)
 #
-# while the line spanned 82.2..101.5 mm around a commanded 80.0 mm. The run's
-# own report said, two lines above the refusal, that the spread was curvature --
-# and then refused on a clause that was counting the far EDGE of the laser line
-# hanging off that same curve. The operator turned the check off to get a day's
-# work done, which is the outcome a false refusal always buys.
+# over a FLAT PLATE. The laser line is 31 mm long, the plate sat 20 mm above
+# its support, and about a quarter of the line was hanging off the edge and
+# reading the bench: returns 82.2..101.5 mm, median 82.3, and 82.3 + 20 =
+# 102.3. The far group was never the part.
 #
-# NEAR IS NOT STOOD DOWN WITH IT. The far end costs data at the edge of the
-# line; the near end is the head approaching the part.
+# Every clause here had been taken over the WHOLE line. The part was at a
+# perfect 82 mm with a 0.5 mm spread and nothing was wrong with it.
+#
+# (The run's own report called the spread curvature, which it was not; that
+# clause is right about a cylinder and wrong about a step. They are told apart
+# by whether the returns have a GAP in them.)
 
 print("")
-print("the far limit under curvature")
+print("a line that is not all on the part")
 
-# THE REAL DISTRIBUTION from 2026-10-09: a convex crest, most of the line near
-# 82 mm, a tail out to 101.5, commanded 80.0.
-_t = np.random.default_rng(7).random(4000)
-real = 0.0822 + (0.1015 - 0.0822)*(_t**2.2)
-real[0], real[-1] = 0.0822, 0.1015
+_rng = np.random.default_rng(3)
+_n = 14552
+_k = int(0.774*_n)
+real = np.concatenate([_rng.normal(0.0823, 0.00025, _k),          # the plate
+                       _rng.normal(0.1023, 0.0006, _n - _k)])     # the bench
+real = np.clip(real, 0.0822, 0.1015)
 rep = range_report(real, commanded=0.080)
-check(rep["far_fraction"] > 0.02,
-      "the 2026-10-09 line really does put %.1f%% of its points near the far "
-      "limit" % (100.0*rep["far_fraction"],))
-check(rep["ok"],
-      "...and the sweep is no longer refused for it")
-check(rep.get("far_from_curvature") is True,
-      "...because the far fraction is attributed to the curve")
-check("far" not in rep["why_kinds"], "...so 'far' is not a reason to refuse")
-check(rep.get("far_note") and "EDGE of the laser line" in rep["far_note"],
-      "...and the report says which edge it is")
 
-# THE CORRECTION, which is the point: a line narrower than the window always
-# fits somewhere, and the gate now says where.
-check(rep["reaim_possible"] is True, "a 19 mm line fits a 36 mm window")
-check(rep["reaim_delta"] < 0,
-      "...by moving the head CLOSER (%.1f mm)" % (1e3*rep["reaim_delta"],))
-check(abs(rep["reaim_standoff"] - 0.0681) < 0.002,
-      "...to about 68 mm, which centres 82.2..101.5 inside 62..98 "
-      "(got %.1f mm)" % (1e3*rep["reaim_standoff"],))
-_lines = " ".join(describe_range(rep, what="x"))
-check("centres what the sensor is actually returning" in _lines
-      or rep["ok"], "the re-aim is reported to the operator")
+check(float((real > 0.098).mean()) > 0.02,
+      "the far fraction over the whole line is real (%.1f%%)"
+      % (100.0*float((real > 0.098).mean()),))
+check(rep["overhanging"] is True, "the step is found")
+check(abs(rep["surface_step_m"] - 0.020) < 0.002,
+      "...and measured at the part's height above its support (%.1f mm)"
+      % (1e3*rep["surface_step_m"],))
+check(abs(rep["off_surface_fraction"] - 0.226) < 0.02,
+      "...with the right share of the line off it (%.1f%%)"
+      % (100.0*rep["off_surface_fraction"],))
+check(rep["surface_spread"] < 0.002,
+      "the PART is flat -- %.2f mm of spread, not 19"
+      % (1e3*rep["surface_spread"],))
+check(rep["curved"] is False, "...and it is NOT called curved")
+check(rep["near_fraction"] < 0.02 and rep["far_fraction"] < 0.02,
+      "near and far are clean once asked of the part (%.1f%%, %.1f%%)"
+      % (100.0*rep["near_fraction"], 100.0*rep["far_fraction"]))
+check(abs(abs(rep["bias"]) - 0.0023) < 0.001,
+      "the bias is against the PART, so %.1f mm and not 20"
+      % (1e3*abs(rep["bias"]),))
+check(rep["ok"] is True, "THE SWEEP FLIES")
 
-# A FLAT line genuinely out at the far limit is NOT curvature and must still
-# refuse: this is the case the clause was written for.
+# THE RE-AIM MUST COME FROM THE PART. Centring a span that is two different
+# surfaces walks the head towards the one it is not measuring: here that would
+# have been 68 mm against a plate already sitting at a perfect 82.
+check(abs(rep["reaim_standoff"] - 0.080) < 0.008,
+      "the re-aim is small and sane (%.1f mm)" % (1e3*rep["reaim_standoff"],))
+check(rep["reaim_standoff"] > 0.070,
+      "...and nothing like the 68 mm the whole-line span would have given")
+
+# A GENUINE OUT-OF-RANGE PART still refuses: no gap, flat, sitting at the far
+# limit. This is the case the clause was written for.
 _flat_far = np.random.default_rng(11).normal(0.1005, 0.0003, 800)
-rep = range_report(_flat_far, commanded=0.1005)
-check(not rep.get("far_from_curvature"),
-      "a flat line sitting at the far limit is not excused as curvature "
-      "(spread %.2f mm)" % (1e3*rep["spread"],))
-check("far" in rep["why_kinds"] and not rep["ok"],
-      "...and it still refuses")
+rep_ff = range_report(_flat_far, commanded=0.1005)
+check(not rep_ff.get("far_from_curvature"),
+      "a flat line sitting at the far limit is not excused")
+check("far" in rep_ff["why_kinds"] and not rep_ff["ok"],
+      "...and still refuses")
 
-# CURVED, but the commanded standoff is nowhere in what the sensor returns:
-# the disagreement survives the curvature, exactly as for the bias clause.
-rep = range_report(real + 0.004, commanded=0.040)
-check(not rep.get("far_from_curvature"),
-      "a curved line whose range does not contain the commanded standoff is "
-      "not excused on the far limit either")
+# THE NEAR LIMIT IS ASKED OF THE WHOLE LINE, deliberately: something close to
+# the head is close to the head whether or not it is the part.
+_near_mix = np.concatenate([np.full(600, 0.080), np.full(200, 0.0585)])
+rep_nm = range_report(_near_mix, commanded=0.080)
+check("near" in rep_nm["why_kinds"] and not rep_nm["ok"],
+      "a second surface near the HEAD is still a near-limit refusal")
 
-# THE NEAR LIMIT IS UNTOUCHED BY ALL OF THIS.
-_crest_near = np.linspace(0.0, 0.019, 800) + 0.058
-rep = range_report(_crest_near, commanded=0.060)
-check("near" in rep["why_kinds"] and not rep["ok"],
-      "a curved line that reaches the NEAR limit still refuses -- curvature "
-      "excuses the far end only")
+# A CURVED surface -- one continuous range, no gap -- is still read as
+# curvature. Measured on a 131 x 65 x 67 mm cylinder.
+_x = np.linspace(-0.0155, 0.0155, 800)
+_crest = 0.080 - (0.0335 - np.sqrt(np.maximum(0.0335**2 - _x**2, 0.0)))
+rep_c = range_report(_crest, commanded=0.080)
+check(rep_c["curved"] is True and not rep_c["overhanging"],
+      "a continuous spread with no gap is curvature, not a step")
+check(rep_c["off_surface_fraction"] == 0.0,
+      "...and the whole line is treated as the part")
+check(rep_c.get("bias_from_curvature") is True,
+      "...and the cylinder's sagitta is still not read as a mesh error")
 
-# A line WIDER than the window cannot be re-aimed, and says so rather than
-# offering an impossible number.
+# A line WIDER than the window cannot be re-aimed and says so.
 _wide = np.linspace(0.058, 0.102, 800)
-rep = range_report(_wide, commanded=0.080)
-check(rep["reaim_possible"] is False and rep["reaim_standoff"] is None,
-      "a 44 mm line does not fit a 36 mm window and no re-aim is invented")
-check("NO standoff fits all of it" in describe_reaim(rep),
+rep_w = range_report(_wide, commanded=0.080)
+check(rep_w["reaim_possible"] is False and rep_w["reaim_standoff"] is None,
+      "a 44 mm continuous line does not fit a 36 mm window")
+check("NO standoff fits all of it" in describe_reaim(rep_w),
       "...and describe_reaim() says that rather than returning nonsense")
 
 
-def test_the_far_limit_is_not_fooled_by_a_curve():
+def test_the_line_is_judged_on_the_part_it_is_measuring():
     """The 2026-10-09 refusal flies, and the cases it guards still refuse."""
     r = range_report(real, commanded=0.080)
-    assert r["ok"] and r["far_from_curvature"] is True
-    assert r["reaim_standoff"] is not None
+    assert r["ok"] and r["overhanging"] and not r["curved"]
+    assert abs(r["surface_median"] - 0.0823) < 0.001
+    assert abs(r["reaim_standoff"] - 0.080) < 0.008
     assert not range_report(_flat_far, commanded=0.1005)["ok"]
-    assert "near" in range_report(_crest_near, commanded=0.060)["why_kinds"]
+    assert "near" in range_report(_near_mix, commanded=0.080)["why_kinds"]
 
 
 def test_not_blind():
