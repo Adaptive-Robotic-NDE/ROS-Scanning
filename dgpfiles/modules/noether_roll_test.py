@@ -726,6 +726,47 @@ check(_dg(np.array([[0.0, 0, 0], [1e-6, 0, 0], [0.0005, 0, 0]]), [(0, 3)])[0] ==
       "a 1 um step is not")
 
 
+# --- dropping coincident waypoints --------------------------------------------
+# Confirmed against the real planner on 2026-10-10: re-planning the 2026-10-09
+# ROI mesh through principal_axis_noether gives 16719 waypoints of which 299
+# steps are shorter than 10 um. Those are dwells in the trajectory, not places
+# the tool goes.
+_dcw = ns["drop_coincident_waypoints"]
+
+pos, true, ax = _cyl_pass(0.060, span=0.040, noise_deg=0.0)
+_dp = np.insert(pos, [20, 20, 55], [pos[20], pos[20], pos[55]], axis=0)
+_da = np.insert(ax, [20, 20, 55], [ax[20], ax[20], ax[55]], axis=0)
+_dup = ns["ScanPath"](_dp, lqa(_da), [0, 60], source="t")
+_dup.normal_constrained = True
+_cleaned = _dcw(_dup, quiet=True)
+
+check(_dg(_dp, _dup.segments)[0] == 3,
+      "three duplicated waypoints are there to start with")
+check(_dg(np.asarray(_cleaned.positions), _cleaned.segments)[0] == 0,
+      "...and none survives")
+check(len(_cleaned.positions) == len(_dp) - 3,
+      "...exactly three waypoints fewer (%d -> %d)"
+      % (len(_dp), len(_cleaned.positions)))
+check(len(_cleaned.segments) == len(_dup.segments),
+      "...and the pass count is unchanged (%d)" % (len(_cleaned.segments),))
+check(np.allclose(_cleaned.positions[0], _dp[0]),
+      "...the first waypoint of a pass is never the one dropped")
+check(np.allclose(np.asarray(_cleaned.positions)[-1], _dp[-1]),
+      "...and the last is kept too")
+
+# A CLEAN PATH IS RETURNED UNTOUCHED -- the same object, so nothing downstream
+# that compares identity is disturbed.
+_clean_path = ns["ScanPath"](pos, lqa(ax), [0], source="t")
+check(_dcw(_clean_path, quiet=True) is _clean_path,
+      "a path with no coincident waypoints is returned unchanged")
+
+# A real 0.25 mm step is not coincident and must survive.
+_fine = np.c_[np.arange(10)*0.00025, np.zeros(10), np.zeros(10)]
+_fp = ns["ScanPath"](_fine, lqa(np.tile([0.0, 0.0, 1.0], (10, 1))), [0], source="t")
+check(len(_dcw(_fp, quiet=True).positions) == 10,
+      "a pass stepping 0.25 mm keeps every waypoint")
+
+
 # --- resample_segments ---------------------------------------------------------
 rs = ns["resample_segments"]
 x = np.concatenate([[0.8], 0.8 + np.cumsum(rng.uniform(0.0, 0.0005, 400))])

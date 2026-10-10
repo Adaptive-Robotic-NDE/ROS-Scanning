@@ -48,6 +48,7 @@ global tool_roll_report
 global locked_quats_from_axes
 global smooth_tool_axis
 global degenerate_steps
+global drop_coincident_waypoints
 global resample_segments
 global read_ply_mesh
 global clean_mesh_for_planning
@@ -1349,7 +1350,7 @@ def _quats_from_surface_normals(pos, quats, surface, up=(0.0, 0.0, 1.0)):
 def scanpath_from_noether(response, offset=(0.0, 0.0, 0.0), orient="surface",
                           fixed_quat=None, up=(0.0, 0.0, 1.0), roll="fixed",
                           roll_reference=(1.0, 0.0, 0.0), max_tilt_deg=None,
-                          surface=None):
+                          surface=None, quiet_coincident=False):
     """ScanPath from a Noether response, ready to hand to the acquisition.
 
     offset translates the whole path, which is how a mesh gets placed in the
@@ -1493,6 +1494,11 @@ def scanpath_from_noether(response, offset=(0.0, 0.0, 0.0), orient="surface",
     path.orient_mode = orient
     path.max_tilt_deg = (float(max_tilt_deg) if orient == "capped" else None)
     path.roll_reference = tuple(float(v) for v in np.asarray(roll_reference).reshape(-1))
+    # COINCIDENT WAYPOINTS GO HERE, at the source, because every consumer below
+    # this point treats a waypoint as a place the tool goes -- and two of them
+    # at one place is a dwell in the trajectory, not a place. Measured on the
+    # 2026-10-09 ROI mesh re-planned 2026-10-10: 299 of 16535 steps under 10 um.
+    path = drop_coincident_waypoints(path, quiet=quiet_coincident)
     return path
 
 
@@ -1857,6 +1863,57 @@ def _axis_turn_rate(pos, z, segments, min_step_m=None):
             continue
         out.append(d[keep]/mm[keep])
     return np.concatenate(out) if out else np.zeros(0)
+
+
+def drop_coincident_waypoints(path, min_step_m=None, quiet=True):
+    """A copy of `path` with consecutive waypoints at the same place removed.
+
+    MEASURED ON THE REAL THING. Re-planning the 2026-10-09 ROI mesh through
+    principal_axis_noether on 2026-10-10 gives 16719 waypoints with 299 steps
+    shorter than 10 um -- 1.8% of them, at the same place as their predecessor.
+
+    They are not a statistic problem, they are a DWELL. TOTG is handed a
+    trajectory with two points at one position and times the move between them;
+    the tool stops while the orientation carries on changing, which is what an
+    operator sees as the arm halting and rocking before it moves off again.
+    Leaving them out of the turn-rate statistic (see _axis_turn_rate) stops
+    them corrupting the numbers; only taking them out of the PATH stops them
+    reaching the arm.
+
+    The first waypoint of every segment is always kept, so a pass never loses
+    its start, and a segment reduced below two waypoints is dropped whole.
+    """
+    floor = float(MIN_TURN_RATE_STEP_M if min_step_m is None else min_step_m)
+    pos = np.asarray(path.positions, dtype=np.float64)
+    keep = np.ones(len(pos), dtype=bool)
+    for a, b in path.segments:
+        last = a                      # the first of a pass is always kept
+        for i in range(a + 1, b):
+            if np.linalg.norm(pos[i] - pos[last]) <= floor:
+                keep[i] = False
+            else:
+                last = i
+    n_dropped = int((~keep).sum())
+    if n_dropped == 0:
+        return path
+    new_pos, new_quats, starts = [], [], []
+    for a, b in path.segments:
+        idx = [i for i in range(a, b) if keep[i]]
+        if len(idx) < 2:
+            continue
+        starts.append(len(new_pos))
+        new_pos.extend(path.positions[i] for i in idx)
+        new_quats.extend(path.quats[i] for i in idx)
+    if not new_pos:
+        return path
+    out = ScanPath(new_pos, new_quats, starts, source=path.source)
+    _carry_path_attrs(path, out)
+    if not quiet:
+        print("  dropped %d coincident waypoint(s) of %d (steps under %.3f mm); "
+              "%d passes -> %d"
+              % (n_dropped, len(pos), floor*1e3, len(path.segments),
+                 len(out.segments)))
+    return out
 
 
 def degenerate_steps(pos, segments, min_step_m=None):
