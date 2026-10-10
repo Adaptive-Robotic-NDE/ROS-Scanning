@@ -240,10 +240,14 @@ def test_the_flaw_shows_up_in_the_published_channels(table, built, SimECSource):
     f = a_notch(model)
     pose = {"v": None}
     db = recdb()
+    # start=False, because this test drives the source BY HAND and a seeded
+    # source that has been free-running for an unknown number of blocks is not
+    # a seeded source: the loop draws from the same generator, so where it has
+    # got to by the time stop() lands depends on how busy the machine is.
     sim = SimECSource(db, None, "/sim/x", "/sim/y",
                       position_fn=lambda: (pose["v"] or ((0, 0, 0),))[0],
                       pose_fn=lambda: pose["v"], model=model,
-                      sample_rate=1000.0, block_hz=100.0, seed=5)
+                      sample_rate=1000.0, block_hz=100.0, seed=5, start=False)
     try:
         # DRIVEN SYNCHRONOUSLY, not by waiting on the free-running thread.
         # publish_once() is one pose, one transaction, and returns when the
@@ -265,8 +269,20 @@ def test_the_flaw_shows_up_in_the_published_channels(table, built, SimECSource):
                              .reshape(-1).mean()))
         # The lobes either side of the notch differ from the null on it, and
         # differ from each other in the opposite sense.
-        assert abs(got[0] - got[1]) > 3.0*P.NOISE_V
-        assert abs(got[2] - got[1]) > 3.0*P.NOISE_V
+        #
+        # AGAINST THE NOISE OF THE STATISTIC, which is a block MEAN and not one
+        # sample. NOISE_V is the per-sample figure, so the error on a mean of
+        # `block_samples` of them is smaller by its square root, and comparing
+        # the difference of two means against 3*NOISE_V asks for a signal
+        # sqrt(10) larger than the test is entitled to require.
+        #
+        # It mattered: the lobe is about 0.0135 V and 3*NOISE_V is 0.012, so
+        # the threshold sat inside the noise band of the quantity it was
+        # judging and the test failed about one run in twenty on a loaded
+        # machine -- 0.011962 against 0.012 the time it was caught.
+        sem = P.NOISE_V/math.sqrt(sim.block_samples)
+        assert abs(got[0] - got[1]) > 3.0*sem
+        assert abs(got[2] - got[1]) > 3.0*sem
         assert (got[0] - got[1])*(got[2] - got[1]) < 0.0
     finally:
         sim.stop()

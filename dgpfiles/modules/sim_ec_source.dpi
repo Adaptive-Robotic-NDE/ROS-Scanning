@@ -192,7 +192,7 @@ class SimECSource(object):
     NOISE_V = 0.004
 
     def __init__(self, recdb, clock, real_path, imag_path, position_fn=None,
-                 sample_rate=1000.0, block_hz=50.0, seed=None,
+                 sample_rate=1000.0, block_hz=50.0, seed=None, start=True,
                  model=None, pose_fn=None):
         self.recdb = recdb
         self.clock = clock
@@ -235,8 +235,30 @@ class SimECSource(object):
             self.real_chan = trans.define_channel(self.real_path, "main")
             self.imag_chan = trans.define_channel(self.imag_path, "main")
 
+        # START=FALSE EXISTS FOR A DETERMINISTIC CALLER, and it is not only a
+        # test convenience. publish_once() is already the hand-driven entry
+        # point, so a constructor that unconditionally starts a free-running
+        # thread means every such caller races it: between __init__ returning
+        # and stop() being called, the loop publishes an arbitrary number of
+        # blocks, each of which draws from self._rng. A SEEDED source is then
+        # not reproducible, because where the generator has got to depends on
+        # how busy the machine was.
+        #
+        # Measured 2026-10-10: sim_ec_model_test's synchronous test passed 24
+        # of 24 on an idle machine and failed 1 in 20 with the cores loaded,
+        # for exactly this reason.
+        self._thread = None
+        if start:
+            self.start()
+
+    def start(self):
+        """Run free, publishing a block every 1/block_hz. Idempotent."""
+        if self._thread is not None and self._thread.is_alive():
+            return self._thread
+        self._quit = False
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        return self._thread
 
     # -- the signal --------------------------------------------------------
 
