@@ -150,6 +150,12 @@ class TimestampedTriggerSource(object):
         self.last_error = None
         self.correlation_waits = 0
         self.max_correlation_wait = 0.0
+        # Correlations abandoned because the globalrev never arrived. See
+        # _correlator_loop: a trace lost here is a hole in the image; a trace
+        # WAITED for here is the whole scan stopped.
+        self.staging_timeouts = 0
+        self.consecutive_staging_timeouts = 0
+        self.max_consecutive_staging_timeouts = 0
         # Crossings whose timestamp was interpolated within a poll interval
         # rather than taken at the moment the poll noticed them, and the worst
         # number of crossings that shared one poll. See _watch_loop.
@@ -299,6 +305,9 @@ class TimestampedTriggerSource(object):
                 "burst_dropped": self._detector.burst_dropped,
                 "correlation_waits": self.correlation_waits,
                 "max_correlation_wait_s": self.max_correlation_wait,
+                "staging_timeouts": self.staging_timeouts,
+                "max_consecutive_staging_timeouts":
+                    self.max_consecutive_staging_timeouts,
                 "interpolated_timestamps": self.interpolated_timestamps,
                 "uninterpolated_timestamps": self.uninterpolated_timestamps,
                 "max_crossings_per_poll": self.max_crossings_per_poll,
@@ -380,6 +389,88 @@ class TimestampedTriggerSource(object):
         ref.rec.mark_data_and_metadata_ready()
         return trans.end_transaction()
 
+    #: How long one correlation may wait for its globalrev before the trace is
+    #: given up. Normal is 50-150 ms: measured over 5648 traces on 2026-10-09
+    #: the worst wait was 0.080 s, and over 2348 traces that afternoon, 0.154 s.
+    #: Twenty seconds is two orders of magnitude past anything ever observed,
+    #: so a timeout here is never a slow machine -- it is a globalrev that is
+    #: not coming.
+    staging_timeout_s = 20.0
+
+    #: Consecutive timeouts before the scan is told. One lost trace is a hole
+    #: in the image and the scan should carry on through it; forty in a row is
+    #: the pipeline, and carrying on would record an empty scan to the end.
+    staging_timeout_fault_after = 40
+
+    @staticmethod
+    def _globalrev_within(ended, timeout_s, poll_s=0.005):
+        """ended.globalrev(), but with a deadline. None if it never arrives.
+
+        WHY THIS IS NOT ended.globalrev(). That call waits forever, on the one
+        thread that must never stop: this is the thread that drains the
+        digitizer. On 2026-10-09 it stopped twice, and both times the whole
+        cell went with it --
+
+          Thread-5 (_correlator_loop), timestamped_trigger.dpi:399
+            snde::transaction::globalrev_wait()
+              snde::promise_channel_notify::wait_interruptable()
+
+        -- and behind it 3517 copies of NI-DAQmx -200279, "the application is
+        not able to keep up with the hardware acquisition", because nothing was
+        reading the card any more. The scan had completed 81 of 123 passes and
+        simply stopped, with no error of its own; disarm() was waiting on
+        _pending.join(), which can only finish when this loop does.
+
+        A transaction ENDED under the timed manager is not committed until the
+        manager commits it in timestamp order, so its globalrev may never come
+        into existence at all. globalrev_nowait() answers "has it yet" without
+        blocking, and `ready` says whether it is complete -- so a deadline can
+        be built out of the two without ever entering an unbounded wait.
+        """
+        deadline = time.monotonic() + float(timeout_s)
+        while True:
+            gr = ended.globalrev_nowait()
+            if gr is not None and gr.ready:
+                return gr
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_s)
+
+    def _staging_timed_out(self, waited, index):
+        """One correlation given up. The scan continues; the trace does not.
+
+        DROPPING IS THE CORRECT BEHAVIOUR and it is worth being plain about
+        why. The alternative on offer is not "keep the trace" -- the globalrev
+        is not coming -- it is "stop the scan, stop reading the digitizer, and
+        leave the arm running over a part recording nothing". A hole in the
+        image is recoverable by rescanning a pass. The freeze costs the run,
+        the DAQ buffer, and an hour of the operator's day.
+        """
+        self.staging_timeouts += 1
+        self.consecutive_staging_timeouts += 1
+        if (self.consecutive_staging_timeouts
+                > self.max_consecutive_staging_timeouts):
+            self.max_consecutive_staging_timeouts = \
+                self.consecutive_staging_timeouts
+        if self.staging_timeouts == 1 or self.consecutive_staging_timeouts == 5:
+            print("  ** staging timed out after %.1f s on trace %s -- the "
+                  "globalrev for that pose never arrived. The trace is given "
+                  "up and the scan continues; %d lost so far. The digitizer is "
+                  "still being read, which is the point."
+                  % (waited, index, self.staging_timeouts))
+        if (self.fault is None
+                and self.consecutive_staging_timeouts
+                >= self.staging_timeout_fault_after):
+            self.fault = RuntimeError(
+                "%d correlations in a row timed out after %.0f s each: the "
+                "recording database is no longer producing globalrevs for "
+                "this source, so every trace from here would be lost. The "
+                "scan is stopping rather than flying the rest of the part "
+                "recording nothing. %d trace(s) lost in total."
+                % (self.consecutive_staging_timeouts, self.staging_timeout_s,
+                   self.staging_timeouts))
+            print("  timestamped trigger: %s" % (self.fault,))
+
     def _correlator_loop(self):
         from dataguzzler_python import context
         context.InitFreeThread()
@@ -396,11 +487,15 @@ class TimestampedTriggerSource(object):
                 # none stamped after it, because the manager committed them in
                 # timestamp order -- so reading the digitizer's channel out of
                 # it gives the shot that was current at the crossing.
-                gr = ended.globalrev()
+                gr = self._globalrev_within(ended, self.staging_timeout_s)
                 waited = time.monotonic() - t0
                 self.correlation_waits += 1
                 if waited > self.max_correlation_wait:
                     self.max_correlation_wait = waited
+                if gr is None:
+                    self._staging_timed_out(waited, index)
+                    continue
+                self.consecutive_staging_timeouts = 0
                 ascan, self._last_metadata = self._sample_tracked(gr.get_ndarray_ref)
                 if sink is not None and self.fault is None:
                     sink(ascan, pos, s_m, index)

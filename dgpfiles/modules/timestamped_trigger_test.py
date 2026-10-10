@@ -20,6 +20,7 @@ import ast
 import functools
 import os
 import sys
+import traceback
 import types
 import threading
 import numpy as np
@@ -54,8 +55,27 @@ except ImportError:
     sys.modules["dataguzzler_python"] = dgp
     sys.modules["dataguzzler_python.context"] = ctx
 
+class _Clock(object):
+    """A monotonic clock that ADVANCES, because the code under test has
+    deadlines now. A stub that always returns 0.0 makes every timeout
+    unreachable and a timeout loop spin forever."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def sleep(self, s):
+        self.t += float(s)
+
+    def monotonic(self):
+        self.t += 1e-6
+        return self.t
+
+
+_clock = _Clock()
 ns = {"np": np, "threading": threading, "queue": queue,
-      "time": types.SimpleNamespace(sleep=lambda s: None, monotonic=lambda: 0.0)}
+      "traceback": traceback,
+      "time": types.SimpleNamespace(sleep=_clock.sleep,
+                                    monotonic=_clock.monotonic)}
 for path, name in ((DET, "PitchCrossingDetector"), (SRC, "TimestampedTriggerSource")):
     tree = ast.parse(open(path).read())
     cls = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name][0]
@@ -298,6 +318,8 @@ def test_a_dead_digitizer_stops_the_scan():
                                              metadata=None)
 
     class FakeGlobalrev(object):
+        ready = True
+
         def __init__(self, rev):
             self.rev = rev
         def get_ndarray_ref(self, path):
@@ -307,6 +329,8 @@ def test_a_dead_digitizer_stops_the_scan():
         def __init__(self, rev):
             self.rev = rev
         def globalrev(self):
+            return FakeGlobalrev(self.rev)
+        def globalrev_nowait(self):
             return FakeGlobalrev(self.rev)
 
     h = Harness(pitch=0.001, length_m=0.0, velocity_mps=0.0, poll_hz=10.0)
@@ -351,3 +375,91 @@ _SECTIONS = ["test_one_crossing_per_poll", "test_five_crossings_per_poll_are_sta
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+def test_a_globalrev_that_never_arrives_does_not_stop_the_scan():
+    """2026-10-09, twice: the correlator waited forever and took the cell down.
+
+    Both freezes that day were this thread, parked in
+
+        snde::transaction::globalrev_wait()
+          snde::promise_channel_notify::wait_interruptable()
+
+    on a transaction the timed manager had never committed, so its globalrev
+    did not exist and never would. Behind it: 3517 copies of NI-DAQmx -200279,
+    because this loop is what drains the card. 81 of 123 passes done, no error
+    of its own, and disarm() stuck on _pending.join() which only finishes when
+    this loop does.
+
+    A trace whose globalrev is not coming is a HOLE IN THE IMAGE. Waiting for
+    it is the whole run.
+    """
+    class Never(object):
+        """A transaction whose globalrev is never realised."""
+        def globalrev_nowait(self):
+            return None
+
+        def globalrev(self):                       # pragma: no cover
+            raise AssertionError(
+                "the correlator must never call the unbounded globalrev()")
+
+    class Fine(object):
+        class _GR(object):
+            ready = True
+            def get_ndarray_ref(self, path):
+                r = types.SimpleNamespace()
+                r.data = np.zeros(4, dtype=np.float32)
+                r.rec = types.SimpleNamespace(
+                    info=types.SimpleNamespace(revision=Fine._rev),
+                    metadata=None)
+                return r
+
+        _rev = 0
+
+        def globalrev_nowait(self):
+            Fine._rev += 1
+            return Fine._GR()
+
+    h = Harness(pitch=0.001, length_m=0.0, velocity_mps=0.0, poll_hz=10.0)
+    h.ascan_path = "/CS_CH1"
+    h.staging_timeout_s = 0.05
+    delivered = []
+    sink = lambda ascan, pos, s, i: delivered.append(i)
+
+    # good, good, DEAD, good, good -- one unrealised transaction in the middle
+    for k, t in ((0, Fine()), (1, Fine()), (2, Never()), (3, Fine()), (4, Fine())):
+        h._pending.put((t, (0, 0, 0), k*0.001, k, sink))
+    h._pending.put(None)
+    h._correlator_loop()
+
+    check("the loop RETURNED instead of parking", True, True)
+    check("the dead trace was dropped", 2 in delivered, False)
+    check("every other trace was delivered", delivered, [0, 1, 3, 4])
+    check("the timeout was counted", h.staging_timeouts, 1)
+    check("one timeout is not a fault", h.fault, None)
+    check("the run of consecutive timeouts reset", h.consecutive_staging_timeouts, 0)
+
+    # A pipeline that has genuinely stopped producing globalrevs must stop the
+    # scan rather than fly the rest of the part recording nothing.
+    h2 = Harness(pitch=0.001, length_m=0.0, velocity_mps=0.0, poll_hz=10.0)
+    h2.ascan_path = "/CS_CH1"
+    h2.staging_timeout_s = 0.01
+    h2.staging_timeout_fault_after = 6
+    got = []
+    for k in range(20):
+        h2._pending.put((Never(), (0, 0, 0), k*0.001, k,
+                         lambda a, p, s, i: got.append(i)))
+    h2._pending.put(None)
+    h2._correlator_loop()
+    check("a dead pipeline eventually raises a fault", h2.fault is not None, True)
+    check("...raised AT the threshold, not at the end of the queue",
+          "6 correlations in a row" in str(h2.fault), True)
+    check("...naming how many were lost by then",
+          "6 trace(s) lost" in str(h2.fault), True)
+    check("...and it still drained the queue rather than parking",
+          h2._pending.unfinished_tasks, 0)
+    check("...having given up on all 20", h2.staging_timeouts, 20)
+    check("...delivering nothing", got, [])
+
+    assert h2.fault is not None and h2.staging_timeouts == 20 and got == []
+    assert delivered == [0, 1, 3, 4] and h.fault is None
