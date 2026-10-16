@@ -313,7 +313,14 @@ def build_scan_plan(path_length_m, passes, step_m=None, velocity_mps=None,
         projection_pixels=PROJECTION_PIXELS,
         line_spacing_m=globals().get("SCAN_LINE_SPACING"),
         projection_extent_m=projection_extent_m,
-        file_backed=(scan_storage_manager is not None),
+        # WHETHER THE TRACES ARE ON DISK, not whether a storage manager was
+        # constructed. setup_file_storage_manager() returns one; a channel is
+        # file-backed only if it was handed it, and the eddy-current
+        # accumulator is not. A config that knows better says so by declaring
+        # TRACE_STORAGE_IS_FILE_BACKED, because only the config knows which of
+        # its accumulators got the manager.
+        file_backed=bool(globals().get("TRACE_STORAGE_IS_FILE_BACKED",
+                                       scan_storage_manager is not None)),
         limits=SCAN_LIMITS,
         force=force)
 

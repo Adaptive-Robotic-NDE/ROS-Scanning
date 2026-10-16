@@ -124,6 +124,8 @@ global path_step_travel
 global sampled_path_clearance
 global TOOLING_GATE_RESOLUTION_M
 global TOOLING_GATE_SAMPLE_ABOVE
+global TOOLING_GATE_PROGRESS_ABOVE
+global TOOLING_GATE_PROGRESS_BLOCKS
 global TOOLING_GATE_MAX_ROUNDS
 global TOOLING_POSE_BLOCK
 global SURFACE_QUERY_BYTES
@@ -261,6 +263,31 @@ TOOLING_GATE_COARSE_M = 0.250
 #: minutes, and silence for that long is indistinguishable from a hang to an
 #: operator watching a cell. 0 turns the lines off.
 TOOLING_GATE_PROGRESS_S = 5.0
+
+#: Poses above which path_clearance() reports progress on its own.
+#:
+#: THIS USED TO BE DERIVED FROM THE BLOCK SIZE (4 x TOOLING_POSE_BLOCK = 16384
+#: poses), and the two thresholds were mutually exclusive: a path over
+#: TOOLING_GATE_SAMPLE_ABOVE (2000) poses never takes this path at all, and one
+#: under it can never reach 16384 -- so the exact gate was silent by
+#: construction, for every path that could possibly run it. On 2026-10-15 a
+#: 1749-pose eddy-current toolpath over a 24 x 18 mm region sat here for 231
+#: seconds with nothing printed, after a plan that had predicted 3.
+#:
+#: 120 poses is about 16 s at the 0.13 s/pose this cell measures, so anything
+#: that could be mistaken for a hang says something and anything quick stays
+#: quiet.
+TOOLING_GATE_PROGRESS_ABOVE = 120
+
+#: The fewest progress lines a reporting gate will manage to emit.
+#:
+#: Progress is reported per BLOCK, and a path shorter than TOOLING_POSE_BLOCK is
+#: one block -- so it ticks once, at zero, and says nothing again until it is
+#: finished. When progress is wanted the block is therefore divided down until
+#: there are at least this many of them. The block size cannot change the
+#: answer (see path_clearance), only the peak working set, and dividing it only
+#: ever lowers that.
+TOOLING_GATE_PROGRESS_BLOCKS = 20
 
 #: A failing window with no more than this many unmeasured poses inside it is
 #: measured out completely instead of bisected. Bisecting the last handful
@@ -1730,7 +1757,11 @@ def path_clearance(path, mesh, envelope=None, segments=None, pad=None,
     # poses, so the block size cannot change the answer -- only the peak
     # working set, which is what ran this out of memory on a long path.
     if progress is None:
-        progress = checked.size > 4*block
+        progress = checked.size > TOOLING_GATE_PROGRESS_ABOVE
+    if progress and checked.size > TOOLING_GATE_PROGRESS_BLOCKS:
+        # Enough blocks to tick between. See TOOLING_GATE_PROGRESS_BLOCKS.
+        block = max(1, min(block, int(checked.size
+                                      // TOOLING_GATE_PROGRESS_BLOCKS)))
     tick = _gate_progress(checked.size) if progress else None
     for start in range(0, checked.size, block):
         sel = checked[start:start + block]

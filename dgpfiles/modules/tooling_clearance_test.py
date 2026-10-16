@@ -1083,6 +1083,67 @@ check("a sink that throws does not take the gate down with it",
 
 
 # ==============================================================================
+# THE EXACT GATE USED TO BE SILENT BY CONSTRUCTION
+# ==============================================================================
+# path_clearance() turned its own progress on at `checked.size > 4*block`, i.e.
+# above 16384 poses -- and enforce_path_clearance() hands it a path only when
+# that path is UNDER TOOLING_GATE_SAMPLE_ABOVE (2000). The two conditions could
+# not both hold, so the exact gate never reported anything, whatever its length.
+# A 1749-pose eddy-current toolpath over a 24 x 18 mm region then sat silent at
+# the cell for 231 s on 2026-10-15, after a plan that had priced it at 3.
+#
+# Two things had to change: the threshold has to be a POSE COUNT, and the block
+# has to be divided, because a path shorter than one block ticks once, at zero,
+# and never again.
+
+_prog_mesh = plane_mesh(z=0.0)
+_prog_path = long_path(n=400)
+
+
+def _gate_lines(path, mesh, **kwargs):
+    """path_clearance()'s own progress output over `path`."""
+    import contextlib as _c2
+    saved = ns["TOOLING_GATE_PROGRESS_S"]
+    ns["TOOLING_GATE_PROGRESS_S"] = 1e-6      # every tick prints
+    buf = io.StringIO()
+    try:
+        with _c2.redirect_stdout(buf):
+            path_clearance(path, mesh, envelope=env, **kwargs)
+    finally:
+        ns["TOOLING_GATE_PROGRESS_S"] = saved
+    return [l for l in buf.getvalue().splitlines() if "gate:" in l]
+
+
+_lines = _gate_lines(_prog_path, _prog_mesh)
+check("a 400-pose exact gate reports progress without being asked",
+      len(_lines) >= 2, "%d line(s): %s" % (len(_lines), _lines[:2]))
+check("and it reports often enough to be watched, not once at the start",
+      len(_lines) >= ns["TOOLING_GATE_PROGRESS_BLOCKS"] - 1,
+      "%d line(s) for %d blocks asked"
+      % (len(_lines), ns["TOOLING_GATE_PROGRESS_BLOCKS"]))
+check("the lines count the poses of THIS path",
+      all("/400 poses" in l for l in _lines), _lines[:2])
+
+_short = _gate_lines(long_path(n=40), _prog_mesh)
+check("a short gate stays quiet", _short == [], _short)
+
+_off = _gate_lines(_prog_path, _prog_mesh, progress=False)
+check("progress=False is still obeyed", _off == [], _off)
+
+# AND THE ANSWER IS UNCHANGED. Dividing the block changes the peak working set
+# and nothing else; that is the premise the division rests on, so it is checked
+# rather than asserted.
+_rep_block = path_clearance(_prog_path, _prog_mesh, envelope=env, block=4096,
+                            progress=False)
+_rep_div = path_clearance(_prog_path, _prog_mesh, envelope=env, block=20,
+                          progress=False)
+check("dividing the block does not change the clearance it reports",
+      np.allclose(_rep_block["clearance"], _rep_div["clearance"], atol=1e-12),
+      float(np.abs(np.asarray(_rep_block["clearance"])
+                   - np.asarray(_rep_div["clearance"])).max()))
+
+
+# ==============================================================================
 # THE TEST IS NOT BLIND
 # ==============================================================================
 # Every check above runs at IMPORT time, which is what lets one pytest test stand
