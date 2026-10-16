@@ -220,22 +220,105 @@ def test_the_measured_values_are_the_measured_values(tmp_path):
     assert float(c["Peak Flaw SNR"]["Value"]) > 5.0, "the planted flaw should stand out"
 
 
-def test_the_image_exists_before_the_plugin_exits_and_is_declared(tmp_path):
+def test_both_figures_exist_before_the_plugin_exits_and_are_declared(tmp_path):
     """NORMS looks for declared files immediately after writing the .norms and
     never comes back for one that was not there; an undeclared file in the right
-    folder is not hashed or backed up either."""
+    folder is not hashed or backed up either.
+
+    TWO figures: the raw impedance as acquired, and the same traces rotated onto
+    the measured lift-off axis. The conditioned one is where a flaw is visible
+    at all -- until lift-off is separated out it is a small feature on a large
+    varying background -- and the raw one is the record of what was measured.
+    """
     scan = make_scan(str(tmp_path))
     doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
-    declared = [v for k, v in doc.items() if k.startswith("Plugin File")]
-    assert declared, "nothing declared: the image would never be hashed or backed up"
-    name = declared[0]["Properties"]["File Name"]["Value"]
-    rel = declared[0]["Properties"]["Relative Path"]["Value"]
-    assert not os.path.isabs(name) and ".." not in rel
-    produced = os.path.join(scan, rel, name) if rel else os.path.join(scan, name)
-    assert os.path.isfile(produced), "declared %r but it is not in the scan folder" % name
-    assert os.path.getsize(produced) > 1000
-    # and it must be INSIDE the folder the .norms will be written to
-    assert os.path.realpath(produced).startswith(os.path.realpath(scan))
+    declared = [(k, v) for k, v in doc.items() if k.startswith("Plugin File")]
+    assert len(declared) == 2, \
+        "expected the raw and the conditioned figure, got %r" % ([k for k, _ in declared],)
+
+    # Numbered from 1 with no gaps: a key with no [n] is index 1, so a gap
+    # silently overwrites.
+    assert sorted(k for k, _ in declared) == ["Plugin File[1]", "Plugin File[2]"]
+
+    names = []
+    for key, entry in declared:
+        name = entry["Properties"]["File Name"]["Value"]
+        rel = entry["Properties"]["Relative Path"]["Value"]
+        assert not os.path.isabs(name) and ".." not in rel, (key, name, rel)
+        produced = os.path.join(scan, rel, name) if rel else os.path.join(scan, name)
+        assert os.path.isfile(produced), \
+            "%s declared %r but it is not in the scan folder" % (key, name)
+        assert os.path.getsize(produced) > 1000, (key, name)
+        # and it must be INSIDE the folder the .norms will be written to
+        assert os.path.realpath(produced).startswith(os.path.realpath(scan))
+        names.append(name)
+
+    assert any(n.endswith("_ec_raw.png") for n in names), names
+    assert any(n.endswith("_ec_conditioned.png") for n in names), names
+    # Named after the measurement, so two scans in one folder cannot overwrite
+    # each other's figures.
+    assert all(n.startswith(os.path.basename(scan)) for n in names), names
+
+
+def test_the_two_figures_are_different_pictures(tmp_path):
+    """A raw figure and a conditioned figure that come out byte-identical would
+    mean the rotation never happened -- which is the failure the single old
+    figure actually had: it was labelled "Real" and "Imaginary" and plotted the
+    CONDITIONED components under those names, so the raw data had no picture at
+    all and the pane an operator read as in-phase was the lift-off channel."""
+    scan = make_scan(str(tmp_path))
+    doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
+    paths = [os.path.join(scan, v["Properties"]["File Name"]["Value"])
+             for k, v in doc.items() if k.startswith("Plugin File")]
+    blobs = [open(p, "rb").read() for p in paths]
+    assert blobs[0] != blobs[1], "the two figures are the same image"
+
+
+def test_a_figure_that_cannot_be_written_leaves_nothing_behind(tmp_path):
+    """Half a figure set is worse than none.
+
+    A file written into the scan folder but NOT declared is not hashed and not
+    backed up -- it stays in EASEL's modified-files list and is offered to the
+    NEXT measurement on its wait-for-files form, so one scan's debris ends up
+    attached to another scan's record. Simulated by making the folder
+    unwritable, which is also a real failure mode: the data root is a shared,
+    group-writable tree.
+    """
+    scan = make_scan(str(tmp_path))
+    before = set(os.listdir(scan))
+    mode = os.stat(scan).st_mode
+    os.chmod(scan, 0o500)                     # readable, not writable
+    try:
+        out, _err = run("--files", os.path.join(scan, "pass000.npz"))
+    finally:
+        os.chmod(scan, mode)
+    doc = one_object(out)                     # still exactly one JSON object
+    assert not [k for k in doc if k.startswith("Plugin File")], \
+        "declared a file it could not write: EASEL records that as an error"
+    assert set(os.listdir(scan)) == before, "left debris in the scan folder"
+    # and the metadata it could measure is still there
+    assert doc["Eddy Current Scan"]["Properties"]["Passes"]["Value"] == "12"
+
+
+def test_the_flaw_the_record_reports_is_marked_on_the_figure(tmp_path):
+    """The peak is a millimetre across in a field of tens, and on the
+    2026-10-15 scan it sat 0.55 mm from the top edge of the strip. The number
+    alone does not make it findable, and a label pinned above-right of a peak
+    that close to the edge lands outside the frame."""
+    scan = make_scan(str(tmp_path))
+    doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
+    c = doc["Eddy Current Conditioning"]["Properties"]
+    assert c["Peak Position Across"]["Value"], c
+    assert c["Peak Position Along"]["Value"], c
+    cond = [os.path.join(scan, v["Properties"]["File Name"]["Value"])
+            for k, v in doc.items() if k.startswith("Plugin File")
+            and v["Properties"]["File Name"]["Value"].endswith("_ec_conditioned.png")]
+    assert len(cond) == 1, cond
+    # The mark is drawn by the same branch that writes the peak properties, so
+    # what is checked here is that the figure was produced at all with them
+    # present; the placement is checked by eye against two real scans and the
+    # offsets are chosen from the pane's own extent in _pane().
+    assert os.path.getsize(cond[0]) > 1000
 
 
 # ==============================================================================
@@ -269,9 +352,10 @@ def test_placeholders_easel_cannot_fill_are_passed_through_literally(tmp_path):
     doc = one_object(run("--norms", "%n", "--folder", "%f", "--hfiles", "%h",
                          "--files", os.path.join(scan, "pass000.npz"))[0])
     assert doc["Eddy Current Scan"]["Properties"]["Passes"]["Value"] == "12"
-    assert os.path.isfile(os.path.join(
-        scan, doc["Plugin File[1]"]["Properties"]["File Name"]["Value"])), \
-        "with %f literal the folder has to come from the data files"
+    for key in ("Plugin File[1]", "Plugin File[2]"):
+        assert os.path.isfile(os.path.join(
+            scan, doc[key]["Properties"]["File Name"]["Value"])), \
+            "with %f literal the folder has to come from the data files"
 
 
 @pytest.mark.parametrize("what", ["missing", "corrupt", "empty_dir", "too_few"])

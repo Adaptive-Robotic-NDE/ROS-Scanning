@@ -1,8 +1,8 @@
 # NORMS metadata plug-in for eddy-current scans
 
 `ec_scan_plugin.py` turns one `ec_scan_*` directory written by `run_ec_scan()` into the
-metadata NORMS records for the measurement, plus a two-pane Real/Imaginary image of the
-conditioned response that NORMS hashes and backs up with the data.
+metadata NORMS records for the measurement, plus two figures that NORMS hashes and backs up
+with the data.
 
 It is the only path by which anything *inside* the data files reaches the `.norms` record.
 
@@ -10,7 +10,7 @@ It is the only path by which anything *inside* the data files reaches the `.norm
 
 ## What it produces
 
-Three sections of metadata, and one generated file.
+Three sections of metadata, and two generated files.
 
 | Section | What it carries |
 |---|---|
@@ -18,15 +18,47 @@ Three sections of metadata, and one generated file.
 | `Eddy Current Conditioning` | the null, rotation and gain the scan ran with, and the things only measurement can give: the **measured lift-off angle**, the lift-off to flaw ratio, the flaw-channel noise, and the peak flaw response, its SNR and where it is |
 | `Eddy Current Surface` | the planning mesh, the projection surface, the spot radius and the image size |
 
-`<scan directory name>_ec_real_imag.png` — the response rotated so that lift-off lies along
-the real axis. **Real** is then the lift-off channel and **Imaginary** is the flaw channel.
-It is declared as `Plugin File[1]`, which is what makes NORMS hash it into `.hfiles` and
-copy it to the backup; a generated file that is not declared is silently left behind.
+### The two figures
 
-Four of those values are measured by the plug-in and exist nowhere in the scan's own output:
-the lift-off angle, the flaw-channel noise, the peak SNR and the line spacing. The 2026-10-09
-scan ran with conditioning rotation 0, so its recorded image was almost entirely lift-off;
-the plug-in's rotation to the measured 86.5 deg is what shows the notch.
+| File | Panes | What it is for |
+|---|---|---|
+| `<scan dir>_ec_raw.png` | **Real (in-phase)**, **Imaginary (quadrature)** | the impedance exactly as the instrument delivered it. Every other picture of the scan is derived from this one, and it is the only one that cannot be wrong about what was measured. |
+| `<scan dir>_ec_conditioned.png` | **Lift-off channel**, **Flaw channel** | the same traces rotated onto the lift-off axis the plug-in measures from the data. This is where a flaw is visible. |
+
+They are declared as `Plugin File[1]` and `Plugin File[2]`, which is what makes NORMS hash
+them into `.hfiles` and copy them to the backup; a generated file that is not declared is
+silently left behind.
+
+**Read the flaw channel, not the raw panes.** Lift-off is what the probe does riding over an
+imperfect surface and it is far larger than any flaw, so in the raw figure a notch is a small
+feature on a large varying background. On the 2026-10-15 scan the flaw was 0.84 V against
+±0.65 V of raw banding and a millimetre across in a 23 × 8 mm field — present, and not
+findable by eye. In the conditioned figure's flaw channel it is the only thing there, and the
+plug-in circles it and labels it with the response and the SNR it reported.
+
+There used to be **one** figure, with its panes labelled `Real` and `Imaginary` — and it
+plotted the *conditioned* components under those names. So the pane an operator read as the
+in-phase signal was the lift-off channel, and the raw data had no picture at all.
+
+Each pane is scaled to the 99.5th percentile of |value − median| rather than to the extremes,
+so one strong indication cannot flatten the field around it into a single colour: the texture
+of the noise stays readable and the flaw saturates, which is the right way round for deciding
+whether an indication is real.
+
+Both figures are drawn with `aspect="equal"` — a scan is a picture of a part, and squashing it
+lies about where things are — and the figure height follows the scanned area's own shape.
+
+### What only the plug-in knows
+
+Four values are measured by the plug-in and exist nowhere in the scan's own output: the
+lift-off angle, the flaw-channel noise, the peak SNR and the line spacing. The 2026-10-09 scan
+ran with conditioning rotation 0, so its recorded image was almost entirely lift-off; the
+plug-in's rotation to the measured 86.5 deg is what shows the notch.
+
+The rotation in the conditioned figure is **measured from the data** and is not necessarily
+the one the instrument was set to during the scan. The record carries both — `Measured
+Lift-off Angle` against `Conditioning Rotation` — and they should agree to a degree or two.
+Measured: 86.5 deg on 2026-10-09, 84.6 deg on 2026-10-15 against a set 86.5.
 
 ---
 
@@ -133,5 +165,5 @@ empty values and a completed measurement. Diagnostics never go to stdout.
 
 NORMS records will eventually be written directly, without EASEL driving a plug-in. Nothing
 here depends on EASEL beyond the argument handling and the stdout contract: `extract()`
-returns a plain dictionary and `render_real_imag()` writes a file, so the same module can be
-imported and called when that happens.
+returns a plain dictionary and `render_raw()` / `render_conditioned()` each write one file, so
+the same module can be imported and called when that happens.

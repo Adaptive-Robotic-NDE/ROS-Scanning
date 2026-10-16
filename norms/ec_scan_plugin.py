@@ -83,7 +83,15 @@ PROPERTIES = [
     (SURF, "Projection Pixels", ""),
 ]
 
-IMAGE_SUFFIX = "_ec_real_imag.png"
+# TWO FIGURES, BECAUSE THEY ANSWER DIFFERENT QUESTIONS. The raw pair is what
+# the instrument put out and is the record of the measurement; the conditioned
+# pair is the same data rotated so that lift-off and flaw are separated, and is
+# where a flaw is actually visible. There used to be one figure, labelled "Real"
+# and "Imaginary", which showed the CONDITIONED components under the raw ones'
+# names -- so the pane an operator read as the in-phase signal was the lift-off
+# channel, and the raw data had no picture at all.
+RAW_IMAGE_SUFFIX = "_ec_raw.png"
+COND_IMAGE_SUFFIX = "_ec_conditioned.png"
 
 
 def log(msg):
@@ -272,32 +280,112 @@ def grid_of(u_mm, v_mm, values, cell_mm):
     return out
 
 
-def render_real_imag(path, along, perp, u_mm, v_mm, cell_mm):
-    """The two-pane figure: Real is the lift-off axis, Imaginary is the flaw
-    axis perpendicular to it. One colormap, each pane on its own symmetric
-    scale, units on the axes, and nothing else on the plot."""
+def _figure_height(G):
+    """Inches, from the scanned area's own shape.
+
+    The panes are drawn with aspect="equal" because a scan is a picture of a
+    part and squashing it lies about where things are. A fixed figure height
+    then leaves most of the figure empty for a long thin strip -- 23 x 8 mm is
+    the usual shape here -- so the height follows the data instead, bounded so
+    that a nearly-square scan does not produce a poster.
+    """
+    nu, nv = G.shape
+    aspect = float(nu)/float(max(1, nv))
+    return max(3.0, min(9.0, 1.8 + 4.3/max(aspect, 0.4)))
+
+
+def _pane(fig, ax, G, title, cell_mm, mark=None, note=None):
+    """One pane: robust symmetric scale about the median, units on both axes.
+
+    The scale comes from the 99.5th percentile of |G - median| rather than from
+    the extremes, so a single flaw indication cannot flatten the field around
+    it into one colour -- the texture of the noise stays readable and the flaw
+    saturates, which is the right way round for deciding whether an indication
+    is real. `mark` is the measured peak, which is small enough on a real part
+    to be missed if it is not pointed at.
+    """
+    import numpy as np
+    nu, nv = G.shape
+    mid = float(np.nanmedian(G))
+    lim = float(np.nanpercentile(np.abs(G - mid), 99.5))
+    if not np.isfinite(lim) or lim <= 0:
+        lim = 1.0
+    im = ax.imshow(G.T, origin="lower", aspect="equal", cmap="RdBu_r",
+                   extent=[0, nu*cell_mm, 0, nv*cell_mm],
+                   vmin=mid - lim, vmax=mid + lim)
+    ax.set_title(title)
+    ax.set_xlabel("mm")
+    ax.set_ylabel("mm")
+    if mark is not None:
+        x, y = mark
+        ax.plot([x], [y], marker="o", markersize=13, markerfacecolor="none",
+                markeredgecolor="k", markeredgewidth=1.2)
+        if note:
+            # INSIDE THE AXES WHEREVER THE PEAK IS. A flaw at the edge of the
+            # scanned strip is the normal case, not the exception -- the one on
+            # the 2026-10-15 scan sat 0.55 mm from the top -- and a label
+            # pinned above-right of it lands outside the frame and is cropped.
+            above = y < 0.8*nv*cell_mm
+            right = x < 0.75*nu*cell_mm
+            ax.annotate(note, xy=(x, y),
+                        xytext=(9 if right else -9, 10 if above else -14),
+                        textcoords="offset points", fontsize=8, color="k",
+                        ha="left" if right else "right",
+                        va="bottom" if above else "top")
+    fig.colorbar(im, ax=ax, label="V", fraction=0.046, pad=0.04)
+
+
+def render_raw(path, impedance, u_mm, v_mm, cell_mm):
+    """The impedance as the instrument delivered it: in-phase and quadrature.
+
+    No rotation, no null beyond whatever the instrument itself was carrying.
+    This is the figure that belongs with the record, because every other
+    picture of this scan is derived from it and it is the only one that cannot
+    be wrong about what was measured.
+    """
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    GR = grid_of(u_mm, v_mm, along, cell_mm)
-    GI = grid_of(u_mm, v_mm, perp, cell_mm)
-    nu, nv = GR.shape
+    GR = grid_of(u_mm, v_mm, np.asarray(impedance).real, cell_mm)
+    GI = grid_of(u_mm, v_mm, np.asarray(impedance).imag, cell_mm)
+    fig, axes = plt.subplots(1, 2, figsize=(11, _figure_height(GR)))
+    _pane(fig, axes[0], GR, "Real (in-phase)", cell_mm)
+    _pane(fig, axes[1], GI, "Imaginary (quadrature)", cell_mm)
+    fig.suptitle("raw impedance, as acquired")
+    fig.tight_layout()
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 6.2))
-    for ax, G, title in ((axes[0], GR, "Real"), (axes[1], GI, "Imaginary")):
-        mid = np.nanmedian(G)
-        lim = np.nanpercentile(np.abs(G - mid), 99.5)
-        if not np.isfinite(lim) or lim <= 0:
-            lim = 1.0
-        im = ax.imshow(G.T, origin="lower", aspect="equal", cmap="RdBu_r",
-                       extent=[0, nu*cell_mm, 0, nv*cell_mm],
-                       vmin=mid - lim, vmax=mid + lim)
-        ax.set_title(title)
-        ax.set_xlabel("mm")
-        ax.set_ylabel("mm")
-        fig.colorbar(im, ax=ax, label="V", fraction=0.046, pad=0.04)
+
+def render_conditioned(path, along, perp, angle_deg, u_mm, v_mm, cell_mm,
+                       mark=None, note=None):
+    """The same traces rotated onto the measured lift-off axis.
+
+    Lift-off is the dominant direction of the trace cloud and is far larger
+    than any flaw, so until it is separated out a flaw is a small feature on a
+    large varying background -- which is exactly what the single old figure
+    showed. `along` is lift-off, `perp` is the flaw channel, and every
+    conditioning number in the record (noise, peak, SNR, peak position) is
+    measured on `perp`, so this figure and those numbers describe one thing.
+
+    The rotation here is MEASURED FROM THE DATA and is not necessarily the one
+    the instrument was set to during the scan; the record carries both
+    ("Measured Lift-off Angle" against "Conditioning Rotation") and they should
+    agree to a degree or two.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    GA = grid_of(u_mm, v_mm, along, cell_mm)
+    GP = grid_of(u_mm, v_mm, perp, cell_mm)
+    fig, axes = plt.subplots(1, 2, figsize=(11, _figure_height(GP)))
+    _pane(fig, axes[0], GA, "Lift-off channel", cell_mm)
+    _pane(fig, axes[1], GP, "Flaw channel", cell_mm, mark=mark, note=note)
+    fig.suptitle("conditioned: rotated %.1f deg onto the measured lift-off axis"
+                 % (angle_deg,))
     fig.tight_layout()
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -350,12 +438,18 @@ def last(metas, *keys):
     return value
 
 
-def extract(folder, passes, image_path):
+def extract(folder, passes, raw_path, cond_path):
+    """(values, [paths of the figures written]).
+
+    Both figures or neither: a declared file that is missing is reported as an
+    error by EASEL and written into the .hfiles as one, so the list this
+    returns is what main() declares and nothing else.
+    """
     import numpy as np
     pos, imp, metas, per_pass = load_scan(passes)
     v = {}
     if not metas:
-        return v, None
+        return v, []
 
     v["Scan Name"] = os.path.basename(folder.rstrip(os.sep))
     starts = [m.get("wall_time") for m in metas if isinstance(m.get("wall_time"), (int, float))]
@@ -415,8 +509,8 @@ def extract(folder, passes, image_path):
         v["Projection Spot Radius"] = 1e3*float(radius)
     v["Projection Pixels"] = first(metas, "projection_pixels")
 
-    # The measured part: the lift-off axis, the flaw channel, and the image.
-    made_image = None
+    # The measured part: the lift-off axis, the flaw channel, and the figures.
+    made = []
     angle, along, perp, ratio = liftoff_axis(imp) if len(imp) else (None, None, None, None)
     if angle is not None:
         v["Measured Lift-off Angle"] = angle
@@ -425,6 +519,7 @@ def extract(folder, passes, image_path):
         u_mm = 1e3*(pos[:, 0] - pos[:, 0].min())
         v_mm = 1e3*(pos[:, 1] - pos[:, 1].min())
         cell = 1e3*float(pitch) if pitch else 0.25
+        mark = note = None
         try:
             GI = grid_of(u_mm, v_mm, perp, cell)
             med = float(np.nanmedian(GI))
@@ -439,12 +534,37 @@ def extract(folder, passes, image_path):
                     v["Peak Flaw SNR"] = float(dev[ju, jv]/mad)
                 v["Peak Position Across"] = ju*cell
                 v["Peak Position Along"] = jv*cell
-            render_real_imag(image_path, along, perp, u_mm, v_mm, cell)
-            made_image = image_path
+                # THE SAME PEAK THE RECORD REPORTS, drawn on the pane it was
+                # measured on. On a real part it is a millimetre across in a
+                # field of tens, and the number alone does not make it findable.
+                mark = (ju*cell, jv*cell)
+                note = ("%.2f V" % v["Peak Flaw Response"]
+                        + ("  SNR %.0f" % v["Peak Flaw SNR"]
+                           if "Peak Flaw SNR" in v else ""))
         except Exception:                                          # noqa: BLE001
             traceback.print_exc(file=sys.stderr)
+        try:
+            render_raw(raw_path, imp, u_mm, v_mm, cell)
+            render_conditioned(cond_path, along, perp, angle, u_mm, v_mm, cell,
+                               mark=mark, note=note)
+            made = [raw_path, cond_path]
+        except Exception:                                          # noqa: BLE001
+            # NEITHER IS DECLARED IF EITHER FAILED, and the half that did get
+            # written is removed. A file left in the scan folder and not
+            # declared is not hashed and not backed up -- it just stays in
+            # EASEL's modified-files list and is offered to the NEXT
+            # measurement on its wait-for-files form, which is how one scan's
+            # debris ends up attached to another's record.
+            traceback.print_exc(file=sys.stderr)
+            made = []
+            for orphan in (raw_path, cond_path):
+                try:
+                    if os.path.isfile(orphan):
+                        os.remove(orphan)
+                except OSError:
+                    log("could not remove %s" % (orphan,))
     else:
-        log("fewer than 8 traces, or no impedance: no rotation and no image")
+        log("fewer than 8 traces, or no impedance: no rotation and no figures")
 
     # Line spacing, measured from the traces rather than taken from the plan.
     try:
@@ -454,7 +574,7 @@ def extract(folder, passes, image_path):
     except Exception:                                              # noqa: BLE001
         traceback.print_exc(file=sys.stderr)
 
-    return v, made_image
+    return v, made
 
 
 # ---------------------------------------------------------------------------
@@ -499,24 +619,35 @@ def main(argv):
     elif not placeholder(args.norms):
         folder = os.path.dirname(os.path.abspath(args.norms))
     stem = os.path.basename(folders[0].rstrip(os.sep)) or "ec_scan"
-    image_path = os.path.join(folder, stem + IMAGE_SUFFIX)
+    raw_path = os.path.join(folder, stem + RAW_IMAGE_SUFFIX)
+    cond_path = os.path.join(folder, stem + COND_IMAGE_SUFFIX)
 
     try:
-        values, made_image = extract(folders[0], passes, image_path)
+        values, made = extract(folders[0], passes, raw_path, cond_path)
     except Exception:                                              # noqa: BLE001
         # Emit the empty record rather than a partial one: EASEL records the
         # run as "JSON Valid" with empty values and the measurement still
         # completes, with the reason in the log beside this script.
         traceback.print_exc(file=sys.stderr)
-        values, made_image = {}, None
+        values, made = {}, []
 
     for section, name, unit in PROPERTIES:
         if name in values:
             out[section]["Properties"][name] = {"Value": clean(values[name]), "Unit": unit}
 
-    if made_image and os.path.isfile(made_image):
-        out["Plugin File[1]"] = {"Properties": {
-            "File Name": {"Value": os.path.basename(made_image)},
+    # ONE "Plugin File[n]" SECTION PER FIGURE, numbered from 1 with no gaps --
+    # a key without [n] is index 1, so a gap would silently overwrite. Only
+    # files that are on disk NOW are declared: EASEL looks for a declared file
+    # immediately after it writes the .norms and records a missing one as an
+    # error in the .hfiles.
+    try:
+        on_disk = [p for p in (made or []) if os.path.isfile(p)]
+    except Exception:                                              # noqa: BLE001
+        traceback.print_exc(file=sys.stderr)
+        on_disk = []
+    for n, image in enumerate(on_disk, start=1):
+        out["Plugin File[%d]" % n] = {"Properties": {
+            "File Name": {"Value": os.path.basename(image)},
             "Relative Path": {"Value": ""},
         }}
 
