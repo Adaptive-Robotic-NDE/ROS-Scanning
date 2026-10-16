@@ -1540,6 +1540,47 @@ def test_the_generated_file_cannot_carry_yaml_breaking_text():
             raise AssertionError("accepted %r" % bad)
 
 
+def test_the_generated_file_is_well_formed_xml():
+    """XML forbids '--' inside a comment, with no escape. The header said
+    "Do not hand-edit -- re-run the calibration", so every file this has ever
+    written was malformed: deployed on 2026-10-15 it took the whole robot
+    description down, and the fix at the cell was vim, a rebuild and a restart
+    of the bring-up. Notes and headers come from callers, so the generator
+    rewrites the hyphens and then parses what it produced."""
+    from xml.etree import ElementTree
+    Cal = cs.mount_cal(X_TRUE, A_CHAIN, B_CHAIN)
+    text = cs.render_calibration_xacro(
+        {"azure": Cal},
+        notes=["azure measured 2026-10-15T18, (+0.67) mm in force -> "
+               "(-0.42) mm, 1.18 mm"],
+        header=["cell ex-ur10e-1, mode hardware"])
+    ElementTree.fromstring(text)          # the statement under test
+
+    # a caller cannot smuggle one in through a note or a header either
+    for bad in ("re-run -- do not hand-edit", "a -- b -- c", "trailing --"):
+        for kwargs in ({"notes": [bad]}, {"header": [bad]}):
+            out = cs.render_calibration_xacro({}, **kwargs)
+            ElementTree.fromstring(out)
+            body = out.replace("<!--", "").replace("-->", "")
+            assert "--" not in body, (bad, out)
+
+    # and the hyphens are the only thing rewritten: the numbers still arrive
+    props = cs.parse_calibration_xacro(text)
+    p_xyz, p_rpy = cs.CAL_XACRO_PROPERTIES["azure"]
+    back = cs.properties_to_cal(props[p_xyz], props[p_rpy])
+    assert cs.pose_delta(Cal, back)[0]*1e3 < 1e-4
+
+
+def test_comment_text_keeps_a_comment_closable():
+    """A comment may not end in '-' either, so '<!-- note - -->' is as
+    malformed as the double hyphen and has to be dropped too."""
+    assert cs._xml_comment_text("plain note") == "plain note"
+    assert cs._xml_comment_text("note -") == "note"
+    assert cs._xml_comment_text("note --") == "note"
+    assert cs._xml_comment_text("a--b") == "a-b"
+    assert cs._xml_comment_text("a-b") == "a-b"
+
+
 # ------------------------------------------------------------------------------
 
 def main():

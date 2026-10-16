@@ -184,6 +184,8 @@ global _cal_site_package
 global _cal_site_urdf_dir
 global _cal_mount_correction
 global _cal_fmt_xyz
+global _cal_correction_in_force
+global _cal_deployed_file
 global cal_board
 global set_board_square
 global cal_artifact
@@ -4390,6 +4392,21 @@ def calibration_xacro(record=None, header=None):
     disk is a merge of two runs and the record is a third thing; regenerating
     from one source of truth means the file always says exactly what the record
     says, and a half-finished calibration cannot leave a stale half behind.
+
+    EXCEPT THAT THE RECORD IS NOT THE ONLY SOURCE. A correction can reach the
+    description without passing through this record -- the Keyence's lateral
+    pair was solved offline and written into the cell's file by hand -- and
+    for three weeks this function answered "keyence not calibrated" and wrote
+    identity over it. Deploying an Azure calibration therefore un-calibrated
+    the Keyence, silently, because nothing downstream compares a sensor with
+    no record against anything. On 2026-10-15 that is what shipped: +0.57 and
+    +1.72 mm of measured lateral offset replaced by zero, and the fine mesh of
+    that visit was reconstructed without it.
+
+    So a sensor with NO RECORD now keeps whatever the description in force
+    carries, read from TF, and the file says where that number came from.
+    Nothing is invented: with no record and no TF the result is still
+    identity, which is also what an uncalibrated cell should get.
     """
     g = _cal_geom()
     doc = load_calibration() if record is None else record
@@ -4399,7 +4416,14 @@ def calibration_xacro(record=None, header=None):
         e = doc.get(sensor) or {}
         mc = e.get("mount_cal")
         if not mc:
-            notes.append("%s not calibrated" % sensor)
+            kept, why = _cal_correction_in_force(sensor)
+            if kept is not None:
+                cals[sensor] = kept
+                xyz = [float(v) for v in kept[:3, 3]]
+                notes.append("%s NOT calibrated; %s carried over from %s"
+                             % (sensor, _cal_fmt_xyz(xyz), why))
+            else:
+                notes.append("%s not calibrated (%s)" % (sensor, why))
             continue
         cals[sensor] = g.properties_to_cal(
             " ".join("%.9f" % v for v in mc["xyz"]),
@@ -4412,6 +4436,49 @@ def calibration_xacro(record=None, header=None):
     head += list(header or [])
     return g.render_calibration_xacro(cals, ref_dist_cal=0.0,
                                       notes=notes, header=head)
+
+
+def _cal_correction_in_force(sensor):
+    """(4x4, where it came from) for a correction this record does not hold.
+
+    TF FIRST, because TF is what the arm is actually using. The deployed file
+    is the second-best answer: it is what TF would say after a rebuild and a
+    restart, which is true often enough to be dangerous and not always true.
+    Returns (None, reason) when neither can answer, and the caller then writes
+    identity -- an uncalibrated cell and an unreachable one get the same file,
+    but the note says which.
+    """
+    g = _cal_geom()
+    m = CAL_MOUNTS.get(sensor)
+    if not m:
+        return None, "no mount is declared for it"
+    try:
+        return _cal_tf(m["parent"], m["cal_link"]), "the description in force"
+    except Exception:                                    # noqa: BLE001
+        pass
+    path = _cal_deployed_file()
+    if path and os.path.exists(path):
+        try:
+            props = g.parse_calibration_xacro(open(path).read())
+            p_xyz, p_rpy = g.CAL_XACRO_PROPERTIES[sensor]
+            if p_xyz in props and p_rpy in props:
+                C = g.properties_to_cal(props[p_xyz], props[p_rpy])
+                if not np.allclose(C, np.eye(4), atol=1e-12):
+                    return C, "the deployed file (TF unreachable)"
+        except Exception:                                # noqa: BLE001
+            pass
+    return None, "nothing in force to carry over"
+
+
+def _cal_deployed_file():
+    """The cell package's own sensor_calibration.urdf.xacro, or None."""
+    try:
+        d, _how = _cal_site_urdf_dir()
+    except Exception:                                    # noqa: BLE001
+        return None
+    if not d:
+        return None
+    return os.path.join(d, "sensor_calibration.urdf.xacro")
 
 
 def _cal_fmt_xyz(v):
