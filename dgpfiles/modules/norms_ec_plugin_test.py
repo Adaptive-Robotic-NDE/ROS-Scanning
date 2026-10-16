@@ -229,6 +229,11 @@ def test_both_figures_exist_before_the_plugin_exits_and_are_declared(tmp_path):
     the measured lift-off axis. The conditioned one is where a flaw is visible
     at all -- until lift-off is separated out it is a small feature on a large
     varying background -- and the raw one is the record of what was measured.
+
+    The raw pair is the instrument's HORIZONTAL and VERTICAL analog outputs,
+    carrying whatever rotation its front panel was set to. They are not
+    in-phase and quadrature against any reference, and the panes used to claim
+    they were.
     """
     scan = make_scan(str(tmp_path))
     doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
@@ -258,6 +263,64 @@ def test_both_figures_exist_before_the_plugin_exits_and_are_declared(tmp_path):
     # Named after the measurement, so two scans in one folder cannot overwrite
     # each other's figures.
     assert all(n.startswith(os.path.basename(scan)) for n in names), names
+
+
+def test_the_figures_are_report_ready_and_carry_no_interpretation(tmp_path):
+    """Titled panes and complete axes -- and nothing the plug-in merely thinks.
+
+    What belongs on the figure is what it IS: which component, which axis,
+    what unit. What does not is the plug-in's reading of it -- a circled peak,
+    a rotation angle written across the top. Those are already in the .norms
+    properties, named and attributed, and a reading drawn onto the picture is
+    indistinguishable from the measurement once the picture is in a report.
+    These go into one as they are; anything else is added later, deliberately,
+    by whoever is making the argument.
+
+    Checked on the SOURCE, because the alternative is OCR on a PNG.
+    """
+    src = open(PLUGIN).read()
+    i = src.index("def _pane(")
+    plotting = src[i:src.index("def extract(", i)]
+
+    for banned in ("suptitle", "annotate", "ax.text(", "ax.plot(",
+                   "axvline", "axhline", "legend(", "arrow("):
+        assert banned not in plotting, \
+            "the figures draw %r on top of the data" % (banned,)
+
+    # and what has to be there
+    assert "ax.set_title(title)" in plotting, "the panes need naming"
+    assert 'ax.set_xlabel("x (mm)")' in plotting, "axes need a quantity and a unit"
+    assert 'ax.set_ylabel("y (mm)")' in plotting
+    assert 'label="V"' in plotting, "the colorbar needs its unit"
+
+
+def test_the_panes_are_titled_for_what_they_hold(tmp_path):
+    """Horizontal and vertical for the raw pair, lift-off and flaw for the
+    conditioned one -- and in the same order, because the flaw channel is the
+    component perpendicular to lift-off, so it sits where vertical sits."""
+    src = open(PLUGIN).read()
+    raw = src[src.index("def render_raw("):src.index("def render_conditioned(")]
+    assert '"Horizontal"' in raw and '"Vertical"' in raw, raw
+    for wrong in ('"Real"', '"Imaginary"', "in-phase", "quadrature"):
+        assert wrong not in raw.split('"""')[2], \
+            "render_raw still titles a pane %r" % (wrong,)
+
+    cond = src[src.index("def render_conditioned("):src.index("def first(")]
+    assert '"Lift-off"' in cond and '"Flaw"' in cond, cond
+
+
+def test_the_pane_order_matches_between_the_two_figures(tmp_path):
+    """Horizontal then vertical, lift-off then flaw, so the same position in
+    both figures holds the same component of the same traces."""
+    src = open(PLUGIN).read()
+    raw = src[src.index("def render_raw("):src.index("def render_conditioned(")]
+    assert raw.index("GR = ") < raw.index("GI = ")
+    assert raw.index(".real") < raw.index(".imag")
+    assert raw.index("axes[0], GR") < raw.index("axes[1], GI")
+
+    cond = src[src.index("def render_conditioned("):src.index("def first(")]
+    assert cond.index("axes[0], GA") < cond.index("axes[1], GP"), \
+        "lift-off (along) must be the left pane, as horizontal is in the raw figure"
 
 
 def test_the_two_figures_are_different_pictures(tmp_path):
@@ -300,25 +363,43 @@ def test_a_figure_that_cannot_be_written_leaves_nothing_behind(tmp_path):
     assert doc["Eddy Current Scan"]["Properties"]["Passes"]["Value"] == "12"
 
 
-def test_the_flaw_the_record_reports_is_marked_on_the_figure(tmp_path):
-    """The peak is a millimetre across in a field of tens, and on the
-    2026-10-15 scan it sat 0.55 mm from the top edge of the strip. The number
-    alone does not make it findable, and a label pinned above-right of a peak
-    that close to the edge lands outside the frame."""
+def test_the_flaw_the_record_reports_is_in_the_record_not_on_the_figure(tmp_path):
+    """The peak position, response and SNR are properties, not drawings.
+
+    They are the plug-in's reading of the data and they are worth having --
+    the flaw on the 2026-10-15 scan is a millimetre across in a 23 x 8 mm field
+    -- but a reading drawn onto the picture is indistinguishable from the
+    measurement once the picture is in a report. In the record it is named,
+    attributed as auto-generated, and machine-readable.
+    """
     scan = make_scan(str(tmp_path))
     doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
     c = doc["Eddy Current Conditioning"]["Properties"]
-    assert c["Peak Position Across"]["Value"], c
-    assert c["Peak Position Along"]["Value"], c
-    cond = [os.path.join(scan, v["Properties"]["File Name"]["Value"])
-            for k, v in doc.items() if k.startswith("Plugin File")
-            and v["Properties"]["File Name"]["Value"].endswith("_ec_conditioned.png")]
-    assert len(cond) == 1, cond
-    # The mark is drawn by the same branch that writes the peak properties, so
-    # what is checked here is that the figure was produced at all with them
-    # present; the placement is checked by eye against two real scans and the
-    # offsets are chosen from the pane's own extent in _pane().
-    assert os.path.getsize(cond[0]) > 1000
+    for name in ("Peak Position Across", "Peak Position Along",
+                 "Peak Flaw Response", "Peak Flaw SNR", "Flaw Channel Noise"):
+        assert c[name]["Value"], "%s is empty: the reading has to survive" % name
+    assert float(c["Peak Flaw SNR"]["Value"]) > 5.0
+
+
+def test_the_daq_channels_are_named_horizontal_and_vertical(tmp_path):
+    """/PXI1Slot2/ai0 and ai1 are the instrument's X and Y analog outputs, and
+    it has already applied its own front-panel rotation to produce them. They
+    are not in-phase and quadrature against any reference, and the record used
+    to call them Real Channel and Imaginary Channel.
+
+    The scan's OWN metadata still says real_path and imag_path -- that is not
+    changed, because old runs have to keep reading -- so what is pinned here is
+    that the plug-in translates on the way out.
+    """
+    scan = make_scan(str(tmp_path))
+    doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
+    s_ = doc["Eddy Current Scan"]["Properties"]
+    assert "Horizontal Channel" in s_ and "Vertical Channel" in s_, sorted(s_)
+    assert "Real Channel" not in s_ and "Imaginary Channel" not in s_, sorted(s_)
+    # and the no-argument run advertises the same pair, or EASEL's cached
+    # property list and the real run's would disagree
+    empty = one_object(run()[0])["Eddy Current Scan"]["Properties"]
+    assert "Horizontal Channel" in empty and "Vertical Channel" in empty
 
 
 # ==============================================================================

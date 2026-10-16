@@ -22,28 +22,66 @@ Three sections of metadata, and two generated files.
 
 | File | Panes | What it is for |
 |---|---|---|
-| `<scan dir>_ec_raw.png` | **Real (in-phase)**, **Imaginary (quadrature)** | the impedance exactly as the instrument delivered it. Every other picture of the scan is derived from this one, and it is the only one that cannot be wrong about what was measured. |
-| `<scan dir>_ec_conditioned.png` | **Lift-off channel**, **Flaw channel** | the same traces rotated onto the lift-off axis the plug-in measures from the data. This is where a flaw is visible. |
+| `<scan dir>_ec_raw.png` | **Horizontal**, **Vertical** | the instrument's own X and Y analog outputs, exactly as it delivered them. Every other picture of the scan is derived from this one, and it is the only one that cannot be wrong about what was measured. |
+| `<scan dir>_ec_conditioned.png` | **Lift-off**, **Flaw** | the same traces rotated onto the lift-off axis the plug-in measures from the data. This is where a flaw is visible. |
+
+The panes are in the same order in both figures: the flaw channel is the component
+perpendicular to lift-off, so it sits where vertical sits.
 
 They are declared as `Plugin File[1]` and `Plugin File[2]`, which is what makes NORMS hash
 them into `.hfiles` and copy them to the backup; a generated file that is not declared is
 silently left behind.
 
-**Read the flaw channel, not the raw panes.** Lift-off is what the probe does riding over an
-imperfect surface and it is far larger than any flaw, so in the raw figure a notch is a small
-feature on a large varying background. On the 2026-10-15 scan the flaw was 0.84 V against
-±0.65 V of raw banding and a millimetre across in a 23 × 8 mm field — present, and not
-findable by eye. In the conditioned figure's flaw channel it is the only thing there, and the
-plug-in circles it and labels it with the response and the SNR it reported.
+**These are meant to go into a report as they are.** Each pane carries what the figure *is* —
+a title naming the component, `x (mm)` and `y (mm)` on the axes, `V` on the colorbar — and
+nothing the plug-in merely *thinks* about it. No circled peak, no rotation angle written
+across the top, no callouts.
+
+That is a deliberate line. A reading drawn onto the picture is indistinguishable from the
+measurement once the picture is in a report, and these go into permanent NDE records. The
+readings are still made and still recorded, in the properties, where they are named and
+attributed `A` for auto-generated: `Peak Position Across` / `Along`, `Peak Flaw Response`,
+`Peak Flaw SNR`, `Flaw Channel Noise`, `Measured Lift-off Angle`. Highlighting, cropping and
+callouts get added afterwards, deliberately, by whoever is making the argument.
+
+`x` and `y` are the world x and y of each trace with the origin moved to the scanned area's
+minimum corner, so they read as distances across the scan.
+
+**Read the flaw channel, not the raw panes.** Lift-off
+is what the probe does riding over an imperfect surface and it is far larger than any flaw, so
+in the raw figure a notch is a small feature on a large varying background. On the 2026-10-15
+scan the flaw was 0.84 V against ±0.65 V of raw banding and a millimetre across in a 23 × 8 mm
+field — present, and not findable by eye. In the flaw pane it is the only thing there, and
+`Peak Position Across` / `Along` in the record say where to look.
 
 There used to be **one** figure, with its panes labelled `Real` and `Imaginary` — and it
 plotted the *conditioned* components under those names. So the pane an operator read as the
 in-phase signal was the lift-off channel, and the raw data had no picture at all.
 
+**The raw pair is horizontal and vertical, not real and imaginary.** What arrives on
+`/PXI1Slot2/ai0` and `ai1` is the instrument's X and Y analog outputs, and the instrument has
+already applied its **own** phase rotation to produce them — set on its front panel, not here.
+They are not in-phase and quadrature against any reference this plug-in holds. They are packed
+into a complex number because that is the convenient container for a point in the impedance
+plane; `.real` is horizontal and `.imag` is vertical, and that is all the packing means. The
+rest of the tree has always used horizontal/vertical — `set_gain(h, v)`, the null pair,
+`/ec/cond/{horizontal,vertical}` — and these panes now agree with it.
+
+It follows that `Measured Lift-off Angle` is a rotation **on top of** the instrument's own,
+measured from its horizontal output, not an absolute phase. Comparing it between scans is only
+meaningful while the instrument's front-panel rotation is unchanged.
+
+The two DAQ channel paths are recorded as `Horizontal Channel` and `Vertical Channel`. They
+were `Real Channel` and `Imaginary Channel` until 2026-10-15 and carried the same misreading;
+the `.norms` written at the cell on that date still uses the old names, and nothing rewrites
+it. The scan's own saved metadata still calls them `real_path` and `imag_path` — that is
+deliberately left alone, so the plug-in keeps reading scans recorded before the rename, and
+the translation happens on the way out.
+
 Each pane is scaled to the 99.5th percentile of |value − median| rather than to the extremes,
 so one strong indication cannot flatten the field around it into a single colour: the texture
-of the noise stays readable and the flaw saturates, which is the right way round for deciding
-whether an indication is real.
+of the noise stays readable and the indication saturates, which is the right way round for
+deciding whether an indication is real.
 
 Both figures are drawn with `aspect="equal"` — a scan is a picture of a part, and squashing it
 lies about where things are — and the figure height follows the scanned area's own shape.
@@ -126,6 +164,10 @@ EASEL watch *that* extension instead, only the two EASEL fields change.
 arguments when the Setup form is accepted, and caches that answer per executable path for the
 life of the process; the cached list is what the documentation forms offer on their
 "Auto-Generated" tab.
+
+This applies to the 2026-10-15 rename of `Real Channel` / `Imaginary Channel` to
+`Horizontal Channel` / `Vertical Channel`: a running EASEL will keep offering the old pair
+until it is restarted.
 
 ---
 

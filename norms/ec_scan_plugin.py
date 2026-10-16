@@ -49,8 +49,8 @@ PROPERTIES = [
     (SCAN, "Travel In Contact", "mm"),
     (SCAN, "Mean Pass Speed", "mm/s"),
     (SCAN, "Trigger Mode", ""),
-    (SCAN, "Real Channel", ""),
-    (SCAN, "Imaginary Channel", ""),
+    (SCAN, "Horizontal Channel", ""),
+    (SCAN, "Vertical Channel", ""),
     (SCAN, "Samples Per Trace", ""),
     (SCAN, "Sample Reduction", ""),
     (SCAN, "Duplicate Traces", ""),
@@ -90,6 +90,17 @@ PROPERTIES = [
 # and "Imaginary", which showed the CONDITIONED components under the raw ones'
 # names -- so the pane an operator read as the in-phase signal was the lift-off
 # channel, and the raw data had no picture at all.
+#
+# AND THE RAW PAIR IS HORIZONTAL AND VERTICAL, NOT REAL AND IMAGINARY. What
+# arrives on /PXI1Slot2/ai0 and ai1 is the instrument's own X and Y analog
+# outputs, and the instrument has already applied its OWN phase rotation to
+# produce them -- set on its front panel, not here. So they are not in-phase
+# and quadrature in any absolute sense, and calling them that claims a
+# reference phase nobody holds. They are packed into a complex number because
+# that is the convenient container for a point in the impedance plane; .real
+# is horizontal and .imag is vertical, and that is all the packing means. The
+# rest of this tree has always used horizontal/vertical (set_gain(h, v), the
+# null pair, /ec/cond/{horizontal,vertical}); these panes now agree with it.
 RAW_IMAGE_SUFFIX = "_ec_raw.png"
 COND_IMAGE_SUFFIX = "_ec_conditioned.png"
 
@@ -225,7 +236,11 @@ def pass_spacing_m(per_pass):
 
 def liftoff_axis(impedance):
     """(angle_deg, along, perp, ratio) -- the impedance plane rotated so that
-    lift-off lies along the real axis.
+    lift-off lies along the horizontal axis.
+
+    The angle is measured from the instrument's own horizontal output, which
+    already carries whatever rotation its front panel was set to -- so it is a
+    rotation ON TOP of the instrument's, not an absolute phase.
 
     Lift-off is the dominant direction of the trace cloud: it is what the probe
     does as it rides over an imperfect surface, and it is far larger than any
@@ -294,15 +309,23 @@ def _figure_height(G):
     return max(3.0, min(9.0, 1.8 + 4.3/max(aspect, 0.4)))
 
 
-def _pane(fig, ax, G, title, cell_mm, mark=None, note=None):
-    """One pane: robust symmetric scale about the median, units on both axes.
+def _pane(fig, ax, G, title, cell_mm):
+    """One pane: the image, titled, with complete axes and a colorbar.
 
-    The scale comes from the 99.5th percentile of |G - median| rather than from
-    the extremes, so a single flaw indication cannot flatten the field around
-    it into one colour -- the texture of the noise stays readable and the flaw
-    saturates, which is the right way round for deciding whether an indication
-    is real. `mark` is the measured peak, which is small enough on a real part
-    to be missed if it is not pointed at.
+    WHAT BELONGS ON IT is what the figure IS -- which component, which axis,
+    what unit. What does not is what the plug-in THINKS of it: no marked peak,
+    no rotation angle written across the top, no callouts. Those are readings,
+    they are already in the .norms properties where they are named and
+    attributed, and a reading drawn onto the picture is indistinguishable from
+    the measurement once the picture is in a report. These figures are meant to
+    go into one as they are; anything else is added deliberately, later, by
+    whoever is making the argument.
+
+    The scale is the 99.5th percentile of |G - median| rather than the
+    extremes, so a single strong indication cannot flatten the field around it
+    into one colour: the texture of the noise stays readable and the
+    indication saturates, which is the right way round for judging whether an
+    indication is real.
     """
     import numpy as np
     nu, nv = G.shape
@@ -314,34 +337,27 @@ def _pane(fig, ax, G, title, cell_mm, mark=None, note=None):
                    extent=[0, nu*cell_mm, 0, nv*cell_mm],
                    vmin=mid - lim, vmax=mid + lim)
     ax.set_title(title)
-    ax.set_xlabel("mm")
-    ax.set_ylabel("mm")
-    if mark is not None:
-        x, y = mark
-        ax.plot([x], [y], marker="o", markersize=13, markerfacecolor="none",
-                markeredgecolor="k", markeredgewidth=1.2)
-        if note:
-            # INSIDE THE AXES WHEREVER THE PEAK IS. A flaw at the edge of the
-            # scanned strip is the normal case, not the exception -- the one on
-            # the 2026-10-15 scan sat 0.55 mm from the top -- and a label
-            # pinned above-right of it lands outside the frame and is cropped.
-            above = y < 0.8*nv*cell_mm
-            right = x < 0.75*nu*cell_mm
-            ax.annotate(note, xy=(x, y),
-                        xytext=(9 if right else -9, 10 if above else -14),
-                        textcoords="offset points", fontsize=8, color="k",
-                        ha="left" if right else "right",
-                        va="bottom" if above else "top")
+    # The world x and y of each trace, with the origin moved to the scanned
+    # area's minimum corner -- so these are distances across the scan, not
+    # cell coordinates.
+    ax.set_xlabel("x (mm)")
+    ax.set_ylabel("y (mm)")
     fig.colorbar(im, ax=ax, label="V", fraction=0.046, pad=0.04)
 
 
 def render_raw(path, impedance, u_mm, v_mm, cell_mm):
-    """The impedance as the instrument delivered it: in-phase and quadrature.
+    """The impedance as the instrument delivered it: horizontal and vertical.
 
-    No rotation, no null beyond whatever the instrument itself was carrying.
-    This is the figure that belongs with the record, because every other
-    picture of this scan is derived from it and it is the only one that cannot
-    be wrong about what was measured.
+    The instrument's own X and Y analog outputs, read on two DAQ channels.
+    Whatever rotation and null the instrument was set to on its front panel is
+    already in them; nothing here has been applied on top. This is the figure
+    that belongs with the record, because every other picture of this scan is
+    derived from it and it is the only one that cannot be wrong about what was
+    measured.
+
+    `impedance` is complex only as a container: .real is the horizontal output
+    and .imag the vertical one. Neither is in-phase or quadrature against any
+    reference this plug-in knows.
     """
     import numpy as np
     import matplotlib
@@ -351,16 +367,14 @@ def render_raw(path, impedance, u_mm, v_mm, cell_mm):
     GR = grid_of(u_mm, v_mm, np.asarray(impedance).real, cell_mm)
     GI = grid_of(u_mm, v_mm, np.asarray(impedance).imag, cell_mm)
     fig, axes = plt.subplots(1, 2, figsize=(11, _figure_height(GR)))
-    _pane(fig, axes[0], GR, "Real (in-phase)", cell_mm)
-    _pane(fig, axes[1], GI, "Imaginary (quadrature)", cell_mm)
-    fig.suptitle("raw impedance, as acquired")
+    _pane(fig, axes[0], GR, "Horizontal", cell_mm)
+    _pane(fig, axes[1], GI, "Vertical", cell_mm)
     fig.tight_layout()
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
 
 
-def render_conditioned(path, along, perp, angle_deg, u_mm, v_mm, cell_mm,
-                       mark=None, note=None):
+def render_conditioned(path, along, perp, u_mm, v_mm, cell_mm):
     """The same traces rotated onto the measured lift-off axis.
 
     Lift-off is the dominant direction of the trace cloud and is far larger
@@ -382,10 +396,12 @@ def render_conditioned(path, along, perp, angle_deg, u_mm, v_mm, cell_mm,
     GA = grid_of(u_mm, v_mm, along, cell_mm)
     GP = grid_of(u_mm, v_mm, perp, cell_mm)
     fig, axes = plt.subplots(1, 2, figsize=(11, _figure_height(GP)))
-    _pane(fig, axes[0], GA, "Lift-off channel", cell_mm)
-    _pane(fig, axes[1], GP, "Flaw channel", cell_mm, mark=mark, note=note)
-    fig.suptitle("conditioned: rotated %.1f deg onto the measured lift-off axis"
-                 % (angle_deg,))
+    # Same order as the raw figure's horizontal and vertical: the flaw channel
+    # is the component perpendicular to lift-off, so it sits where vertical
+    # sits. The rotation that produced them is "Measured Lift-off Angle" in the
+    # record, and is deliberately not written across the figure.
+    _pane(fig, axes[0], GA, "Lift-off", cell_mm)
+    _pane(fig, axes[1], GP, "Flaw", cell_mm)
     fig.tight_layout()
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
@@ -475,8 +491,11 @@ def extract(folder, passes, raw_path, cond_path):
             v["Mean Pass Speed"] = 1e3*travelled/swept
 
     v["Trigger Mode"] = first(metas, "trigger_report", "mode")
-    v["Real Channel"] = first(metas, "trigger_report", "real_path")
-    v["Imaginary Channel"] = first(metas, "trigger_report", "imag_path")
+    # The scan's own metadata still calls these real_path and imag_path, and
+    # that is not changed here: old runs have to keep reading. What is recorded
+    # is what they are -- the instrument's horizontal and vertical outputs.
+    v["Horizontal Channel"] = first(metas, "trigger_report", "real_path")
+    v["Vertical Channel"] = first(metas, "trigger_report", "imag_path")
     v["Samples Per Trace"] = first(metas, "trigger_report", "block_samples")
     v["Sample Reduction"] = first(metas, "trigger_report", "reduce")
     v["Duplicate Traces"] = last(metas, "trigger_report", "duplicate_traces")
@@ -519,7 +538,6 @@ def extract(folder, passes, raw_path, cond_path):
         u_mm = 1e3*(pos[:, 0] - pos[:, 0].min())
         v_mm = 1e3*(pos[:, 1] - pos[:, 1].min())
         cell = 1e3*float(pitch) if pitch else 0.25
-        mark = note = None
         try:
             GI = grid_of(u_mm, v_mm, perp, cell)
             med = float(np.nanmedian(GI))
@@ -532,21 +550,17 @@ def extract(folder, passes, raw_path, cond_path):
                 v["Peak Flaw Response"] = float(GI[ju, jv] - med)
                 if mad > 0:
                     v["Peak Flaw SNR"] = float(dev[ju, jv]/mad)
+                # WHERE THE PEAK IS, in the record and not on the picture.
+                # The figure stays a picture of the measurement; this is the
+                # plug-in's reading of it, and it belongs where it is named
+                # and attributed.
                 v["Peak Position Across"] = ju*cell
                 v["Peak Position Along"] = jv*cell
-                # THE SAME PEAK THE RECORD REPORTS, drawn on the pane it was
-                # measured on. On a real part it is a millimetre across in a
-                # field of tens, and the number alone does not make it findable.
-                mark = (ju*cell, jv*cell)
-                note = ("%.2f V" % v["Peak Flaw Response"]
-                        + ("  SNR %.0f" % v["Peak Flaw SNR"]
-                           if "Peak Flaw SNR" in v else ""))
         except Exception:                                          # noqa: BLE001
             traceback.print_exc(file=sys.stderr)
         try:
             render_raw(raw_path, imp, u_mm, v_mm, cell)
-            render_conditioned(cond_path, along, perp, angle, u_mm, v_mm, cell,
-                               mark=mark, note=note)
+            render_conditioned(cond_path, along, perp, u_mm, v_mm, cell)
             made = [raw_path, cond_path]
         except Exception:                                          # noqa: BLE001
             # NEITHER IS DECLARED IF EITHER FAILED, and the half that did get
