@@ -910,9 +910,21 @@ EC_CLEAN_PLANNING_MESH = True
 #     runs close to the limit, since that is what the sampler refines into. The
 #     cell PC is slower than the dev host, so leave headroom. Re-measure it if
 #     the tooling changes; it is a rate, not a law.
+#
+#     THAT RATE IS THE SAMPLER'S, and only paths over
+#     TOOLING_GATE_SAMPLE_ABOVE poses get the sampler. A SHORTER path is
+#     measured pose by pose, with nothing certified, and costs about 80x as
+#     much per pose. A 1749-pose toolpath over a 24 x 18 mm region was priced
+#     at 3 s on 2026-10-15 and took 231, in silence, which is what the
+#     operator saw. The silence is fixed in tooling_clearance.dpi
+#     (TOOLING_GATE_PROGRESS_ABOVE); the price is fixed here. EC_GATE_SECONDS_PER_POSE_EXACT is that path's own measured
+#     rate: 231 s / 1749 poses over an 8254-triangle mesh with the probe in
+#     contact, on the cell's 48-thread Xeon. The estimate below picks the rate
+#     that matches the gate that will actually run.
 NOETHER_POSE_SPACING_M = 0.00042
 NOETHER_POSE_REPLY_BYTES = 316
 EC_GATE_SECONDS_PER_POSE = 0.0017
+EC_GATE_SECONDS_PER_POSE_EXACT = 0.132
 
 # What a plan has to fit in before plan_ec_path() will build it. These bound the
 # PLANNING stage; SCAN_LIMITS bounds the scan that follows. Separate because
@@ -1193,6 +1205,25 @@ if SCAN_STORAGE_DIR is not None:
     scan_storage_manager = snde.setup_file_storage_manager(recdb, SCAN_STORAGE_DIR)
 else:
     scan_storage_manager = None
+
+# BUT THE EDDY-CURRENT PATH DOES NOT USE IT, and the plan used to say it did.
+#
+# setup_file_storage_manager() only CONSTRUCTS a storage manager; it does not
+# become the database's default (recstore_setup.cpp -- setup_storage_manager()
+# is what sets that, to POSIX shared memory). A channel gets it only by being
+# handed it, and the ultrasound accumulator is the only thing here that is:
+# scan_accumulation.dpi passes it, ec_acquisition.dpi does not. So every
+# eddy-current trace, pose and conditioning output lives in /dev/shm, which is
+# tmpfs and therefore RAM.
+#
+# Which is right -- a whole eddy-current run's trace store is a few hundred kB
+# and what survives the process is the per-pass .npz -- but the PLAN claimed
+# "file-backed" purely because the object had been constructed, so it told the
+# operator the traces were on disk while they were in memory, and its memory
+# limit downgraded an over-limit trace store from an error to a warning on the
+# same false premise. Verified 2026-10-15 by measurement: 200 transactions
+# through a recdb set up this way leave zero files in the storage directory.
+TRACE_STORAGE_IS_FILE_BACKED = False
 
 # Read by the shared plane-scan code, which an eddy-current scan does not use.
 RASTER_MIN_FRACTION = 1.0
@@ -3183,7 +3214,16 @@ def ec_plan_cost(region=None, line_spacing=None, mesh=None, step_m=None,
     # this is a constant. Taken from the module so there is one copy of it.
     gate_bytes = int(globals().get("SURFACE_QUERY_BYTES", 256 << 20))
     plan_bytes = reply_bytes + path_bytes + gate_bytes
-    gate_seconds = waypoints*EC_GATE_SECONDS_PER_POSE
+    # WHICH GATE WILL RUN. enforce_path_clearance() samples above
+    # TOOLING_GATE_SAMPLE_ABOVE poses and measures every pose below it, and the
+    # two cost about 80x different per pose -- so one rate cannot price both.
+    # The counter-intuitive consequence is that a SMALLER region can plan for
+    # far longer than a bigger one, and that is worth printing rather than
+    # discovering at the cell.
+    gate_sampled = waypoints > int(globals().get("TOOLING_GATE_SAMPLE_ABOVE",
+                                                 2000))
+    gate_seconds = waypoints*(EC_GATE_SECONDS_PER_POSE if gate_sampled
+                              else EC_GATE_SECONDS_PER_POSE_EXACT)
     plan_seconds = gate_seconds
 
     scan = build_scan_plan(travel, passes, step_m=step_m,
@@ -3202,7 +3242,8 @@ def ec_plan_cost(region=None, line_spacing=None, mesh=None, step_m=None,
         errors.append("planning would take about %s, over the %s limit"
                       % (_ec_hms(plan_seconds), _ec_hms(lim["max_plan_seconds"])))
 
-    out = {"region": (xmin, ymin, xmax, ymax), "region_source": source,
+    out = {"gate_sampled": gate_sampled,
+           "region": (xmin, ymin, xmax, ymax), "region_source": source,
            "width_m": width, "height_m": height, "line_spacing_m": line_spacing,
            "passes": passes, "travel_m": travel, "waypoints": waypoints,
            "raw_poses": raw_poses, "reply_bytes": reply_bytes,
@@ -3225,8 +3266,14 @@ def ec_plan_cost(region=None, line_spacing=None, mesh=None, step_m=None,
               "%s the clearance gate)"
               % (_ec_bytes(plan_bytes), _ec_bytes(reply_bytes), _ec_bytes(path_bytes),
                  _ec_bytes(gate_bytes)))
-        print("    planning time      %s  (the clearance gate, sampled)"
-              % (_ec_hms(plan_seconds),))
+        print("    planning time      %s  (the clearance gate, %s)"
+              % (_ec_hms(plan_seconds),
+                 "sampled and certified" if gate_sampled
+                 else "every pose measured -- under the %d-pose sampling "
+                      "threshold, so it costs ~%.0f ms each; it reports its "
+                      "own progress while it runs"
+                      % (int(globals().get("TOOLING_GATE_SAMPLE_ABOVE", 2000)),
+                         EC_GATE_SECONDS_PER_POSE_EXACT*1e3)))
         print("    then the scan      %s, %d traces, %s of trace data"
               % (_ec_hms(scan["scan_time_s"]), scan["traces"],
                  _ec_bytes(scan["memory_bytes"])))
@@ -4268,6 +4315,11 @@ if EC_SOURCE == "sim":
 # source is the last thing anybody wants to be doing.
 print("  on disk: every completed pass is written to %s/ec_scan_<time>/"
       % (SCAN_STORAGE_DIR,))
+# AND WHERE THE TRACES THEMSELVES LIVE, which is a different question. They are
+# in shared memory, not under this path -- see TRACE_STORAGE_IS_FILE_BACKED.
+# Said on the prompt because the plan line used to claim the opposite.
+print("           the traces are in shared memory while the scan runs (/dev/shm);"
+      " only the per-pass files above outlive the process")
 print("           ec_save_status() says how much has reached it; list_ec_runs()")
 print("           lists saved runs; replay_ec_scan() rebuilds the image from one")
 print("           -- replay_ec_scan(rotation_deg=40) tries a different rotation")

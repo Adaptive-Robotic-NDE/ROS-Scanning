@@ -22,6 +22,8 @@
 # staging a trace, so this module can be unit-tested and so the ROS dependency
 # stays in the config where it belongs.
 
+import os
+import sys
 import time
 import threading
 import traceback
@@ -62,6 +64,10 @@ class TraceStager:
         self.last_error = None
         self.print_errors = print_errors
         self.max_depth = 0
+        self.stalls = 0
+        self._last_depth = 0
+        self._last_staged = 0
+        self._worker_tid = None
         self._thread = threading.Thread(target=self._run)
         self._thread.daemon = True
         self._thread.start()
@@ -69,6 +75,10 @@ class TraceStager:
     def _run(self):
         from dataguzzler_python import context
         context.InitFreeThread()
+        # Recorded so _stalled_note() can print THIS thread's stack. The id is
+        # the only handle sys._current_frames() takes, and the worker is the
+        # only thread whose position answers the question.
+        self._worker_tid = threading.get_ident()
         while True:
             item = self._q.get()
             if item is None:
@@ -124,15 +134,34 @@ class TraceStager:
         which that run never reached.
 
         So it still waits indefinitely -- abandoning a half-staged trace would
-        be worse -- but it now SAYS SO, once, with the state needed to tell the
-        three candidate causes apart.
+        be worse -- but it now SAYS SO, with the state needed to tell the
+        candidate causes apart.
+
+        AND IT SAYS SO AGAIN, every `timeout` seconds. Once was not enough.
+        On 2026-10-15 this printed its one note at pass 31 of 74 and then went
+        quiet for the seven minutes the operator spent deciding what to do,
+        which left no way to tell a worker that was crawling from one that was
+        dead -- the single most useful fact about a stall, and the cheapest to
+        record. Each note carries the queue depth and the worker's own Python
+        stack, so consecutive notes answer "is it moving?" and "where is it?"
+        without a debugger and without anyone being at the keyboard.
+
+        CTRL-C CANNOT GET YOU OUT OF HERE, and the note says so rather than
+        letting the operator find out. dataguzzler-python runs the GUI loop on
+        the process's real main thread and the console in another, so SIGINT is
+        delivered to a thread that is inside Qt's C++ event loop with the GIL
+        released: the handler never runs and no KeyboardInterrupt is ever
+        raised. ^Z and `kill %1` is what the operator fell back on.
         """
-        deadline = time.monotonic() + timeout
-        while self._unfinished() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if self._unfinished():
-            self._stalled_note(timeout)
-        self._q.join()
+        waited = 0.0
+        step = 0.01
+        while self._unfinished():
+            time.sleep(step)
+            waited += step
+            if waited >= timeout:
+                self.stalls += 1
+                self._stalled_note(timeout*self.stalls)
+                waited = 0.0
         return self.staged
 
     def _unfinished(self):
@@ -143,10 +172,20 @@ class TraceStager:
         return getattr(self._q, "unfinished_tasks", self._q.qsize())
 
     def _stalled_note(self, waited):
-        """Everything that tells the candidate causes apart, printed once."""
+        """Everything that tells the candidate causes apart."""
         print("  ** STAGING STALLED: still waiting after %.0f s -- %d trace(s) "
               "queued, %d staged, %d error(s)"
               % (waited, self._unfinished(), self.staged, self.errors))
+        if self.stalls > 1:
+            print("     note %d; last note said %d queued and %d staged, so "
+                  "the worker %s"
+                  % (self.stalls, self._last_depth, self._last_staged,
+                     "is still moving, only slowly"
+                     if self.staged != self._last_staged
+                     else "has not staged a single trace since"))
+        self._last_depth = self._unfinished()
+        self._last_staged = self.staged
+        self._say_worker_stack()
         # The recording database is a dgpy global owned by the .dgp rather than
         # something this module is handed, so ask for it rather than requiring
         # it. str(recdb) is "latest ready/latest defined", and ready lagging
@@ -169,6 +208,46 @@ class TraceStager:
                   "that has not returned rather than one that failed.")
         print("     the scan is NOT abandoning the trace; it will continue if "
               "the stage completes.")
+        print("     CTRL-C WILL NOT WORK HERE -- the GUI loop owns this "
+              "process's main thread, so SIGINT reaches a thread sitting in "
+              "C++ with the GIL released and no KeyboardInterrupt is raised. "
+              "To gather everything about this state at once, from another "
+              "terminal:")
+        print("       ROS-Scanning/tools/capture_stall.sh %d" % (os.getpid(),))
+        print("     To get out: Ctrl-Z, then `kill %1`. That loses the pass in "
+              "flight and nothing else -- every completed pass is already on "
+              "disk.")
+
+    def _say_worker_stack(self):
+        """Where the staging worker is, in Python, right now.
+
+        THE ONE FACT THE COUNTERS CANNOT GIVE. "37 queued, 0 errors" says a
+        stage has not returned; it does not say whether it is in
+        start_transaction(), in the globalrev wait after end_transaction(), or
+        in the projection that follows -- and those are three different faults
+        with three different fixes. sys._current_frames() answers it from
+        another thread, with no debugger, no signal and no cooperation from the
+        code that is stuck. It stops at the C extension boundary, which is
+        exactly where the answer is needed: the last Python line is the call
+        into spatialnde2 that has not come back.
+        """
+        tid = self._worker_tid
+        if tid is None:
+            print("     the staging worker has not started")
+            return
+        try:
+            frame = sys._current_frames().get(tid)
+            if frame is None:
+                print("     the staging worker thread is gone -- nothing will "
+                      "drain this queue. That is a different fault.")
+                return
+            stack = traceback.format_stack(frame)
+        except Exception as e:                           # noqa: BLE001
+            print("     could not read the worker's stack (%s)" % (e,))
+            return
+        print("     the staging worker is here (innermost last):")
+        for line in "".join(stack[-6:]).rstrip().split("\n"):
+            print("       %s" % (line,))
 
     def stop(self):
         self._q.put(None)

@@ -274,6 +274,100 @@ def test_drain_says_so_when_it_stalls_rather_than_waiting_in_silence():
         stager.stop()
 
 
+def test_the_stall_note_says_where_the_worker_is():
+    """The counters say a stage has not returned; only the stack says WHICH.
+
+    On 2026-10-15 the note read "37 trace(s) queued, 2845 staged, 0 error(s)"
+    and that was the whole evidence base. stage_ec_reading() has three places
+    it can park -- start_transaction(), the globalrev wait after
+    end_transaction(), and the projection after that -- and they are three
+    different faults. sys._current_frames() tells them apart from another
+    thread with no debugger and no signal.
+    """
+    ns, printed = load()
+    release = threading.Event()
+
+    def _inner_wait():
+        release.wait(30.0)
+
+    def stage(_trace):
+        _inner_wait()
+
+    stager = ns["TraceStager"](stage)
+    try:
+        stager.submit("trace-0")
+        t = threading.Thread(target=lambda: stager.drain(timeout=0.2))
+        t.daemon = True
+        t.start()
+        time.sleep(1.0)
+        text = "\n".join(printed)
+        assert "the staging worker is here" in text, text
+        assert "_inner_wait" in text, (
+            "the stack must reach the call that is actually blocked:\n%s" % text)
+        release.set()
+        t.join(10.0)
+    finally:
+        release.set()
+        stager.stop()
+
+
+def test_the_stall_note_repeats_and_says_whether_anything_moved():
+    """One note cannot distinguish a crawl from a death.
+
+    Consecutive notes can, and that is the first question anyone asks. The
+    2026-10-15 stall printed once and then nothing for seven minutes.
+    """
+    ns, printed = load()
+    release = threading.Event()
+
+    def stage(_trace):
+        release.wait(30.0)
+
+    stager = ns["TraceStager"](stage)
+    try:
+        stager.submit("trace-0")
+        t = threading.Thread(target=lambda: stager.drain(timeout=0.2))
+        t.daemon = True
+        t.start()
+        time.sleep(1.5)
+        text = "\n".join(printed)
+        assert text.count("STAGING STALLED") >= 2, (
+            "%d note(s) in 1.5 s at a 0.2 s timeout" % text.count("STAGING STALLED"))
+        assert "has not staged a single trace since" in text, text
+        release.set()
+        t.join(10.0)
+    finally:
+        release.set()
+        stager.stop()
+
+
+def test_the_stall_note_says_ctrl_c_will_not_work():
+    """Because it will not, and the operator spent three of them finding out.
+
+    dataguzzler-python runs the GUI loop on the real main thread; SIGINT is
+    delivered there, inside Qt, with the GIL released, so no handler runs. The
+    note has to name the way out instead of implying the usual one.
+    """
+    ns, printed = load()
+    release = threading.Event()
+    stager = ns["TraceStager"](lambda _t: release.wait(30.0))
+    try:
+        stager.submit("trace-0")
+        t = threading.Thread(target=lambda: stager.drain(timeout=0.2))
+        t.daemon = True
+        t.start()
+        time.sleep(1.0)
+        text = "\n".join(printed)
+        assert "CTRL-C WILL NOT WORK" in text, text
+        assert "capture_stall.sh" in text, text
+        assert "kill %1" in text, text
+        release.set()
+        t.join(10.0)
+    finally:
+        release.set()
+        stager.stop()
+
+
 def test_the_stall_note_reports_a_recorded_error_when_there_is_one():
     """The discriminator: a stuck stage behind an EARLIER swallowed error."""
     ns, printed = load()
