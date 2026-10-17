@@ -146,6 +146,8 @@ class ECTimestampedSource(TimestampedTriggerSource):
         self.imag_path = imag_path
         self.reduce = reduce
         self.block_samples = 0
+        self.sample_rate_hz = None
+        self._rate_for = None
         self.mismatched_blocks = 0
         # ascan_path is inherited and is what the base class would read for a
         # single-channel instrument. Point it at the real channel so anything
@@ -171,6 +173,21 @@ class ECTimestampedSource(TimestampedTriggerSource):
             idata = idata.reshape(-1)[:n]
 
         self.block_samples = int(rdata.size)
+        # AND THE RATE THOSE SAMPLES WERE TAKEN AT, read off the card's own
+        # channel. Without it `block_samples` cannot be turned into a time or a
+        # distance, so the saved record could not say whether a trace averages
+        # over 4% of the trace pitch or 40% of it -- and report_smear(), which
+        # exists to answer exactly that, had to be handed a rate nobody held.
+        # Read every block rather than once: a card reconfigured mid-session
+        # would otherwise be described by the rate it had at the first trace.
+        if self.sample_rate_hz is None or self.block_samples != self._rate_for:
+            try:
+                dt = float(rref.rec.metadata.GetMetaDatumDbl(
+                    "ande_array-axis0_scale", 0.0))
+                self.sample_rate_hz = (1.0/dt) if dt > 0 else None
+            except Exception:                                  # noqa: BLE001
+                self.sample_rate_hz = None
+            self._rate_for = self.block_samples
         if self.reduce == "mean":
             re = float(np.mean(rdata)) if rdata.size else 0.0
             im = float(np.mean(idata)) if idata.size else 0.0
@@ -186,13 +203,15 @@ class ECTimestampedSource(TimestampedTriggerSource):
         # an EC trace list as an ultrasound trace list with nsamples=1.
         return np.array([re + 1j*im], dtype=np.complex128), rref.rec.metadata
 
-    def report_smear(self, velocity_mps, sample_rate_hz):
+    def report_smear(self, velocity_mps, sample_rate_hz=None):
         """How far the probe moved during one averaged block, in metres.
 
         Not decorative. If this approaches the trace pitch, adjacent traces
         overlap in space and the scan's resolution is set by the block length
         rather than by the pitch that was asked for.
         """
+        sample_rate_hz = (self.sample_rate_hz if sample_rate_hz is None
+                          else sample_rate_hz)
         if not sample_rate_hz or not self.block_samples:
             return None
         span_s = self.block_samples/float(sample_rate_hz)
@@ -212,6 +231,10 @@ class ECTimestampedSource(TimestampedTriggerSource):
                        "imag_path": self.imag_path,
                        "reduce": self.reduce,
                        "block_samples": self.block_samples,
+                       "sample_rate_hz": self.sample_rate_hz,
+                       "block_span_s": (
+                           self.block_samples/self.sample_rate_hz
+                           if self.sample_rate_hz else None),
                        "mismatched_blocks": self.mismatched_blocks})
         return report
 

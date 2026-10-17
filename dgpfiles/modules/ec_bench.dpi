@@ -1,0 +1,328 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+# File:  ec_bench.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-10-17
+# Description:
+#   bench_ec(): characterise the eddy-current instrument and digitizer
+#   from a stationary record, with nothing moving.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-10-17:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+#
+# WHAT THIS IS FOR. The 2026-10-16 scan took 43.6 minutes to cover 18 x 29 mm
+# and nobody could say whether that was right. Three independent things cap the
+# speed and only one of them had ever been measured:
+#
+#   the instrument   its analog output filter decides how fast the probe may
+#                    cross a flaw before the flaw is smeared. NEVER MEASURED --
+#                    the US-454A's settings are made on its front panel and
+#                    this config reads none of them back.
+#   the pipeline     MAX_TRACE_RATE_HZ["live"] = 10 Hz, which caps the
+#                    commanded speed at 2.5 mm/s at a 0.25 mm pitch. Measured
+#                    on an ULTRASOUND scan, whose trace is a 16000-point
+#                    waveform; an eddy-current trace is one complex number. It
+#                    has never been measured for this instrument.
+#   the trajectory   measured, 2026-10-16: TOTG's time-parameterisation of a
+#                    surface-following pass holds a mean of only 0.39x its own
+#                    peak. That one needs the arm and is not what this file is.
+#
+# This file measures the first, and it needs NOTHING to move: the probe sits on
+# the part, the instrument runs, the card streams, and twenty seconds of that is
+# enough to answer it. Run it before the scan, while the operator is still at
+# the pendant.
+#
+#     bench_ec()                 20 s, prints the report
+#     bench_ec(seconds=60)       quieter corner estimate, finer spectrum
+#     bench_ec(feature_m=0.0005) against a 0.5 mm flaw instead of 1 mm
+#
+# The arithmetic is in ec_bench.py and is testable on a laptop. This file is
+# the part that reads the recording database.
+
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global bench_ec
+global ec_daq_geometry
+global EC_BENCH_FEATURE_M
+
+#: The narrowest flaw the scan has to characterise rather than merely detect,
+#: metres. The speed limit the instrument imposes is proportional to it, so it
+#: is stated once here instead of being buried in a default argument. 1 mm is
+#: the smallest notch in the current test plate.
+EC_BENCH_FEATURE_M = 0.001
+
+
+def ec_daq_geometry(timeout=10.0, require=True):
+    """What the card is actually delivering on the two EC channels. -> dict
+
+    THE SAMPLE RATE IS NOT RECORDED ANYWHERE ELSE. A scan records
+    `block_samples` -- 100 on every run so far -- and `reduce`, and without a
+    rate neither can be turned into a time or a distance. So the saved record
+    cannot say whether a trace averages over 4% of the trace pitch or over 40%
+    of it, and report_smear() has to be handed a rate nobody holds.
+
+    The card publishes it as the axis scale on its own channel, which is where
+    ascan_geometry() already reads it for the ultrasound path.
+    """
+    deadline = time.monotonic() + float(timeout)
+    while True:
+        try:
+            ref = recdb.latest.ref[EC_REAL_PATH]
+            n = int(np.asarray(ref.data).shape[0])
+            if n > 0:
+                md = ref.rec.metadata
+                dt = float(md.GetMetaDatumDbl("ande_array-axis0_scale", 0.0))
+                return {"block_samples": n,
+                        "dt_s": dt or None,
+                        "sample_rate_hz": (1.0/dt) if dt > 0 else None,
+                        "block_span_s": (n*dt) if dt > 0 else None,
+                        "real_path": EC_REAL_PATH,
+                        "imag_path": EC_IMAG_PATH}
+        except Exception:                                      # noqa: BLE001
+            pass
+        if time.monotonic() >= deadline:
+            if require:
+                raise RuntimeError(
+                    "nothing on %s after %.1f s. Is the DAQ task running? "
+                    "setup_ec() starts it." % (EC_REAL_PATH, timeout))
+            return None
+
+
+def _collect_blocks(seconds, poll_s=0.002):
+    """Distinct DAQ blocks from both EC channels, with arrival times.
+
+    POLLED, NOT SUBSCRIBED, and deliberately so: this has to work against
+    whatever is publishing those channels without being wired into it. A block
+    is counted once, by the globalrev it arrived in, so polling faster than the
+    card publishes costs CPU and nothing else -- and polling SLOWER than the
+    card publishes shows up as gaps in block_timing(), which is a result and
+    not a silent loss.
+    """
+    t_end = time.monotonic() + float(seconds)
+    seen = None
+    times, re_blocks, im_blocks = [], [], []
+    missed_imag = 0
+    while time.monotonic() < t_end:
+        try:
+            gr = recdb.latest
+            key = int(gr.globalrev)
+        except Exception:                                      # noqa: BLE001
+            time.sleep(poll_s)
+            continue
+        if key == seen:
+            time.sleep(poll_s)
+            continue
+        seen = key
+        try:
+            r = np.asarray(gr.ref[EC_REAL_PATH].data, dtype=np.float64).copy()
+        except Exception:                                      # noqa: BLE001
+            time.sleep(poll_s)
+            continue
+        try:
+            i = np.asarray(gr.ref[EC_IMAG_PATH].data, dtype=np.float64).copy()
+        except Exception:                                      # noqa: BLE001
+            i = None
+            missed_imag += 1
+        times.append(time.monotonic())
+        re_blocks.append(r)
+        im_blocks.append(i)
+    return times, re_blocks, im_blocks, missed_imag
+
+
+def bench_ec(seconds=20.0, feature_m=None, mains_hz=None, quiet=False):
+    """Characterise the instrument and the digitizer. Nothing moves. -> dict
+
+    PUT THE PROBE ON THE PART FIRST and leave the arm still. The measurement is
+    of a STATIONARY record: everything it reports -- the noise, the averaging
+    efficiency, the output filter's corner -- is a property of the instrument
+    and the card, and probe motion would add a signal that is none of those.
+
+    What comes back, and what each part decides:
+
+      block rate        is the card delivering what it was asked for, and is
+                        anything being dropped
+      averaging gain    is the 100-sample block average buying its sqrt(100),
+                        or is the instrument's filter slower than the block and
+                        98 of those samples redundant
+      mains fraction    is the noise floor hum (fixable: grounding, routing,
+                        the instrument's own filter) or broadband (not)
+      corner frequency  the instrument's output bandwidth
+      v_max             the scan speed that bandwidth allows against
+                        EC_BENCH_FEATURE_M
+
+    THE LAST NUMBER IS THE POINT. Compare it against the 2.5 mm/s the scan
+    commands. Near or below it, the scan is already at the instrument's limit
+    and the robot and the pipeline are not worth optimising. Far above it, the
+    instrument is not what is making a 43-minute scan take 43 minutes.
+    """
+    g = _ec_bench_core()
+    feature_m = EC_BENCH_FEATURE_M if feature_m is None else float(feature_m)
+    mains_hz = g.MAINS_HZ if mains_hz is None else float(mains_hz)
+
+    geom = ec_daq_geometry()
+    say = (lambda *a: None) if quiet else print
+    say("  benchmarking the eddy-current instrument and digitizer for %.0f s "
+        "-- nothing moves" % (seconds,))
+    say("    %s and %s, %d samples per block%s"
+        % (geom["real_path"], geom["imag_path"], geom["block_samples"],
+           "" if not geom["sample_rate_hz"]
+           else ", %.0f Hz sample rate (%.1f ms per block)"
+                % (geom["sample_rate_hz"], 1e3*geom["block_span_s"])))
+
+    times, re_b, im_b, missed = _collect_blocks(seconds)
+    report = {"seconds": float(seconds), "feature_m": feature_m,
+              "block_samples": geom["block_samples"],
+              "sample_rate_hz": geom["sample_rate_hz"],
+              "sample_rate_from": "the channel's axis scale",
+              "missed_imag": missed, "channels": {}, "verdict": []}
+
+    nominal = (geom["sample_rate_hz"]/geom["block_samples"]
+               if geom["sample_rate_hz"] and geom["block_samples"] else None)
+    report["timing"] = g.block_timing(times, nominal_hz=nominal)
+
+    # NO AXIS SCALE ON THE CHANNEL is survivable: a contiguous card's sample
+    # rate is its block rate times its block length, and saying so is better
+    # than refusing. It is reported as derived, because the two are not the
+    # same claim -- a card that drops blocks makes the derived number wrong in
+    # exactly the way block_timing() has already flagged.
+    fs = geom["sample_rate_hz"]
+    if not fs and report["timing"].get("rate_hz"):
+        fs = report["timing"]["rate_hz"]*geom["block_samples"]
+        report["sample_rate_hz"] = fs
+        report["sample_rate_from"] = ("derived from the block rate x %d "
+                                      "samples; the channel carries no axis "
+                                      "scale" % (geom["block_samples"],))
+
+    for name, blocks in (("horizontal", re_b), ("vertical", im_b)):
+        usable = [b for b in blocks if b is not None and b.size]
+        if len(usable) < 4:
+            report["channels"][name] = {"why": "fewer than 4 blocks arrived"}
+            continue
+        x = np.concatenate(usable)
+        ch = dict(g.averaging_gain(x, geom["block_samples"]))
+        ch["blocks"] = len(usable)
+        ch["samples"] = int(x.size)
+        ch["mean_v"] = float(np.mean(x))
+        ch["ptp_v"] = float(np.ptp(x))
+        if fs:
+            f, pxx = g.noise_spectrum(x, fs)
+            exclude = tuple(mains_hz*k for k in (1, 2, 3))
+            ch["mains"] = g.mains_content(f, pxx, mains_hz=mains_hz)
+            ch["corner"] = g.corner_frequency(f, pxx, exclude_hz=exclude)
+        report["channels"][name] = ch
+
+    corners = [(report["channels"].get(n) or {}).get("corner", {}).get("corner_hz")
+               for n in ("horizontal", "vertical")]
+    corners = [c for c in corners if c]
+    # THE SLOWER CHANNEL GOVERNS. A trace is a point in the impedance plane and
+    # both coordinates have to be current for it to mean anything, so the
+    # instrument is as fast as its slower output and not as fast as its faster
+    # one.
+    corner = min(corners) if corners else None
+    report["corner_hz"] = corner
+    report["limit"] = g.speed_limit_from_bandwidth(corner, feature_m)
+
+    v_max = report["limit"].get("v_max_mps")
+    asked = globals().get("SCAN_VELOCITY")
+    plan_v = None
+    try:
+        plan = globals().get("scan_plan")
+        plan_v = plan.get("effective_velocity_mps") if plan else None
+    except Exception:                                          # noqa: BLE001
+        plan_v = None
+    v_now = plan_v or asked
+    if v_max and v_now:
+        ratio = v_max/float(v_now)
+        if ratio < 1.5:
+            report["verdict"].append(
+                "THE INSTRUMENT IS THE LIMIT: it allows %.1f mm/s and the scan "
+                "already runs at %.1f. Speeding up the robot or the staging "
+                "pipeline would smear the flaw, not shorten the scan."
+                % (v_max*1e3, float(v_now)*1e3))
+        else:
+            report["verdict"].append(
+                "THE INSTRUMENT IS NOT THE LIMIT: it allows %.1f mm/s against "
+                "the %.1f the scan runs at -- %.0fx of headroom. What the scan "
+                "is waiting for is the trace-rate ceiling "
+                "(MAX_TRACE_RATE_HZ) or the trajectory, not this."
+                % (v_max*1e3, float(v_now)*1e3, ratio))
+    for name in ("horizontal", "vertical"):
+        ch = report["channels"].get(name) or {}
+        eff = ch.get("efficiency")
+        if eff is not None and eff < 0.5 and geom["block_samples"] > 1:
+            report["verdict"].append(
+                "%s: the %d-sample block average is mostly redundant (%.0f%% "
+                "of its sqrt(n)). A shorter block would smear less for almost "
+                "the same noise -- EC_BLOCK_REDUCE and the card's block length "
+                "are the two knobs."
+                % (name, geom["block_samples"], 100.0*eff))
+        m = (ch.get("mains") or {}).get("fraction")
+        if m is not None and m > 0.25:
+            report["verdict"].append(
+                "%s: %.0f%% of the noise floor is mains hum. That is a "
+                "grounding or cable-routing fault and it is costing SNR "
+                "directly." % (name, 100.0*m))
+    if not quiet:
+        print(g.describe_bench(report))
+    return report
+
+
+def _ec_bench_core():
+    """ec_bench.py, imported from beside this file.
+
+    A .dpi's imports are LOCAL to it (see [[dpi-module-imports-are-local]]), so
+    the module is resolved here rather than relied on from the config.
+    """
+    import importlib
+    import sys
+    here = globals().get("SCAN_MODULE_DIR")
+    if here and here not in sys.path:
+        sys.path.insert(0, here)
+    return importlib.import_module("ec_bench")

@@ -1296,6 +1296,10 @@ include(None, os.path.join(SCAN_MODULE_DIR, "timestamped_trigger.dpi"))
 # BEFORE ec_acquisition.dpi, which is what drives it.
 include(None, os.path.join(SCAN_MODULE_DIR, "ec_trace_store.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "ec_acquisition.dpi"))
+# AFTER it, because bench_ec() reads the channels ec_acquisition.dpi names.
+# Nothing in a scan calls it; it is run by hand before one, and it moves
+# nothing. See the header there for which of the three speed limits it settles.
+include(None, os.path.join(SCAN_MODULE_DIR, "ec_bench.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_parameters.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
@@ -4293,6 +4297,12 @@ print("           plan_ec_path()  preview_ec_scan()")
 print("  motion:  dry_run_ec_scan()  ec_joint_report()  ec_touch_down()  ec_lift()")
 print("           park_arm()")
 print("  setup:   setup_ec()  null_here()  set_rotation(deg)  set_gain(h, v)")
+print("  bench:   bench_ec() -- 20 s with the probe on the part and NOTHING")
+print("           moving. What the INSTRUMENT's own output bandwidth allows,")
+print("           whether the block average is buying anything, and how much")
+print("           of the noise floor is mains hum. The one speed limit that")
+print("           had never been measured; run it before a long scan and")
+print("           compare its mm/s against the plan's.")
 # NAMED ONLY IN SIMULATION, because on hardware there is nothing to place and a
 # prompt offering it invites somebody to try.
 if EC_SOURCE == "sim":
