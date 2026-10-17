@@ -1,196 +1,224 @@
 # Cell visit, next session
 
-Written 2026-10-15 from `results24`. **Supersedes the 2026-10-10 version**,
-whose section 1 was the Azure calibration repair — that is done and verified,
-and nothing of it is left to do.
+Written 2026-10-17 from `results25`. **Supersedes the 2026-10-15 version.**
+That one was built around the stall and the Azure calibration; both of those
+are now either fixed or instrumented, and what is left is a scan that works
+and takes 43 minutes to cover 18 x 29 mm.
 
-Undated because I do not know when you are next at the cell. Nothing here goes
-stale with time, only with the next run.
-
-**Section 1 is not about the robot and should happen before you are at the
-cell at all.**
+Undated. Nothing here goes stale with time, only with the next run.
 
 ---
 
-## 0. What 10-15 settled, and what it did not
+## 0. What 10-16 settled
 
 | | |
 |---|---|
-| **Azure calibration** | SOLVED. 0.822 mm rms over 23 of 25 poses, 1.18 mm from the 09-29 solve, deployed, and `check_calibration_applied()` says APPLIED to 0.000 mm. It is in the cell package now (§5). |
-| **The mesh** | Clean. 0 non-manifold edges, 3 faces rewound, 0 of 1177 normals repaired, normals turning 0.72° at p99.9, 100% of the ROI inside the work volume. |
-| **The toolpath** | Clean. 126 passes, turn rate 0.7 deg/mm at p99, 0 degenerate steps, 0 waypoints facing away, clearance gave up nothing. The 10-09 failures are all gone. |
-| **Pass times** | 34.0 s, dead steady, for passes 4 through 10 — against 50 s on 10-09 for a comparable pass. The turn-rate work held. |
-| **The correlator** | Healthy. 2791 globalrev waits, worst 99 ms, **0 staging timeouts** over 31 passes. The 10-09 freeze mechanism did not recur. |
-| **THE STALL** | **NOT SOLVED.** Different place, and now localised. §2. |
-| The planning pause | Explained and fixed. §4. |
-| The machine | Throwing a corrected PCIe error every six seconds, all day. §1. |
+| **No stall** | 72 of 72 passes, 8469 of 8496 traces, `Fault none`, `Acquisition Errors 0`, `Staging Timeouts 0`, worst correlation wait **71 ms**. The scan ran to the end with the antivirus running and the disk still erroring. |
+| **The clearance gate reports** | `gate: 2171/2171 poses, 0:00:01 elapsed`. It also took the SAMPLED path this time (2171 poses, over the 2000 threshold) and measured only 144 of them, in one second. §4 is the case that does not. |
+| **The NORMS plug-in works at the cell** | `JSON Valid`, 41 properties, both figures hashed and backed up, `Horizontal Channel` / `Vertical Channel`. |
+| **Scan quality** | the notch is a clean dipole at (5.5, 7.75) mm, peak 0.944 V, SNR 18.4. |
+| **The disk is worse** | `RxErr` has reached **16 630** and was climbing by 7 between two consecutive commands. §1. |
+| **Speed** | measured, explained, and NOT what the end-of-scan message said. §2 is the whole of it. |
 
 ---
 
-## 1. BEFORE THE CELL: the PC itself
+## 1. The NVMe, again
 
-Two things were wrong with the computer on 10-15, independent of any of our
-code, and both of them are in the path of a real-time scan. Neither needs the
-robot, so do them first and separately.
-
-### 1.1 The NVMe link is erroring continuously
-
-`dmesg.log` from that session holds **943 corrected PCIe receiver errors** on
+`tmp.log` from 10-16:
 
 ```
-nvme 0000:89:00.0    vendor 0x1dbe  device 0x5220  class 010802
+== /sys/bus/pci/devices/0000:89:00.0
+RxErr 16623   ...   TOTAL_ERR_COR 16623
+(seconds later)
+RxErr 16630
 ```
 
-— `RxErr`, Physical Layer, Receiver ID — spread evenly from 17:27 to 18:54 at
-between 3 and 30 a minute, with no gap anywhere. 312 of them came up through
-APEI/GHES, which means the firmware took an SMI for each one, and an SMI
-freezes every core while it runs. They are *corrected*, so nothing is
-mis-reading data; what they cost is retries and latency, and they were the
-only thing in that kernel log in any quantity. They had pushed the ring buffer
-down to 86 minutes of history.
+Seven corrected receiver errors between two consecutive shell commands. It has
+not caused a failure yet and it is not why the scan is slow — but it is a
+hardware fault that has been running for at least three sessions and it is the
+thing that will eventually corrupt a run. `lspci -s 89:00.0 -vv` printed
+nothing in that log, which means it needs `sudo`:
 
 ```bash
-# which device, and is it still counting
-for d in /sys/bus/pci/devices/*/aer_dev_correctable; do
-  grep -qvE ' 0$' "$d" && { echo "== ${d%/*}"; cat "$d"; }
-done
-lspci -s 89:00.0 -vv | grep -iE 'LnkSta|LnkCap|Correctable'
+sudo lspci -s 89:00.0 -vv | grep -iE 'LnkSta|LnkCap'
 ```
 
-What to try, roughly in order of cost: reseat the drive, try a different M.2
-socket, check the slot is not sharing lanes with something newly installed,
-and look at whether the link has fallen below its capable width or speed
-(`LnkSta` vs `LnkCap`). If it is a riser or a cable, that is the usual answer.
-If it will not come clean, **move `/data/scandata` to a different disk** —
-it is one path and nothing else depends on where it is.
-
-### 1.2 The antivirus on-demand scan
-
-It was running during the scan, consuming "considerable CPU" by your account,
-over the same tree the scan writes to.
-
-Two separate costs, and the second is the one that can stall a scan outright:
-
-* **CPU.** The clearance gate runs 48 threads and the trace staging has a
-  10 traces/s budget it has to meet trace by trace. Anything competing eats
-  directly into both.
-* **On-access hooks.** A scanner that registers fanotify *permission* events
-  intercepts file opens and page faults and holds them until it decides. That
-  wait is in the kernel, uninterruptible, and invisible to Python — exactly
-  the shape of what §2 describes, and it applies to `/dev/shm` as much as to a
-  real filesystem, because tmpfs is a filesystem.
-
-So: **exclude `/data/scandata`, `/dev/shm` and the ROS/dgpy install trees from
-on-access scanning, and schedule on-demand scans outside scanning hours.** If
-the product cannot be configured that way, stopping its service for the
-duration of a run is a legitimate answer and worth proving once.
+If `LnkSta` is below `LnkCap` in width or speed, the link has already
+degraded. Reseat it, try another socket, or move `/data/scandata` to a
+different disk — it is one path and nothing depends on where it points.
 
 ---
 
-## 2. THE STALL — what we now know, and the one thing to do when it happens
+## 2. SPEED: what is actually limiting the scan
 
-### 2.1 It is not where it was
-
-It stalled at **pass 32 of 74**, 18 minutes in, and printed:
+The 43.6-minute scan breaks down exactly:
 
 ```
-** STAGING STALLED: still waiting after 120 s -- 37 trace(s) queued,
-   2845 staged, 0 error(s)
-   recdb: spatialnde2 recording database latest ready/defined = 30074/30074
-   no staging error has been recorded, so this is a stage that has not
-   returned rather than one that failed.
+72 passes x 27.0 s of sweep   = 32.4 min     TOTG's trajectory
+72 passes x  8.5 s of overhead = 10.2 min    lift, transit, descend, plan
+                                 -------
+                                  42.6 min   (43.6 observed)
 ```
 
-Read against the per-pass metadata, that narrows a long way:
+### 2.1 The arm is doing exactly what it was told
 
-* **It is the trace STAGER, not the correlator.** `trigger_report` for pass 30
-  says `staging_timeouts: 0`, `max_consecutive_staging_timeouts: 0`,
-  `max_correlation_wait_s: 0.099`, `errors: 0`, `fault: None`. The 10-09
-  mechanism — a correlator waiting forever on a globalrev — is bounded now and
-  never fired. Something inside `stage_ec_reading()` did not come back.
-* **It had not got as far as committing.** `ready == defined == 30074`. A
-  transaction that had been ended would have pushed `defined` past `ready`. So
-  it was parked *before* `end_transaction()`, which rules out the globalrev
-  wait on line 907 and points at `start_transaction()`, the storage
-  allocation, or the array write.
-* **0 errors**, so it is not an exception retained mid-transaction. That trap
-  is fixed and it stayed fixed.
-* **The cost per trace was already creeping.** Passes 4–10 took 34.0 s each,
-  to within 0.4 s. Pass 11 took **45.9 s**. Passes 12 onward then settled into
-  a slow climb — 35.5, 36.3, 36.4, 37.7 — and never came back to 34. That is
-  something growing with the number of traces already staged, and it is the
-  same shape as the "minor slowdowns" you saw.
+The end-of-scan report said:
 
-### 2.2 Ctrl-C cannot get you out, and that is not a surprise any more
+> observed probe speed 1.1 mm/s over 72 passes (asked for 2.5)
+> that is 0.43x what was asked for: ROBOT_VELOCITY_CALIBRATION is wrong here.
 
-You pressed it three times and then fell back to `^Z` and `kill %1`. That is
-the only thing that works. dataguzzler-python runs the GUI loop on the
-process's **real** main thread and the console in another one
-(`main_thread.py`), so SIGINT is delivered to a thread sitting inside Qt's C++
-event loop with the GIL released: the Python handler never runs and no
-`KeyboardInterrupt` is ever raised, anywhere. The stall note now says this
-instead of letting you find out.
+**It is not.** mtc prints a trajectory check for every pass, and over all 72:
 
-`^Z` then `kill %1` costs **the pass in flight and nothing else** — every
-completed pass is already written to `ec_scan_<time>/passNNN.npz`, and 31 of
-them were, which is why the notch image could still be made afterwards.
-
-### 2.3 What to run when it stalls
-
-```bash
-ROS-Scanning/tools/capture_stall.sh
-```
-
-No arguments: it finds the dataguzzler-python process itself. It collects
-everything non-invasive first and attaches gdb last, because attaching gdb
-suspends the process — `--no-gdb` skips that step, and if it is interrupted
-anyway the script sends SIGCONT on the way out. It writes a directory and a
-tarball and prints what to read first. **Run it before killing anything.**
-
-The stall note prints the exact command with the pid filled in.
-
-Install `py-spy` first if you can — it reads Python stacks out of a live
-process with no debugger and no cooperation, and it is the single most useful
-thing the script can collect:
-
-```bash
-pip3 install --user py-spy
-```
-
-The script's own `threads.txt` is the discriminator even without it:
-
-| the staging worker's `wchan` | what it means |
+| | |
 |---|---|
-| `io_schedule`, `folio_wait_bit`, `wait_on_page_bit`, state `D` | **storage.** §1 is the cause, not our code |
-| `fanotify_*`, and an AV daemon alive in `scanners.txt` | **the scanner is holding a page fault.** §1.2 |
-| `futex_wait` / `rwsem` | a lock another thread holds — then `native.txt` says which |
-| `do_sys_poll`, `ep_poll` | it is idle, and the fault is upstream of it |
+| peak tool speed | **2.80 mm/s** median (asked for 2.5) |
+| mean tool speed | **1.09 mm/s** median |
+| mean / peak | **0.39** |
+| worst joint at peak | 91% of its scaled limit |
+| duration | 26.95 s median, 24.96 min, 37.32 max |
 
-### 2.4 What the process now tells you by itself
+The calibration maps a scaling to a **peak** and the peak is right. The arm
+then executes that trajectory faithfully — pass duration tracks the planned
+duration to within the 8.5 s of per-pass overhead, including the one 45.8 s
+outlier, which was a planned 37.3 s trajectory and not a stall. That message
+has been rewritten to name both causes and say which line of mtc's output
+tells them apart.
 
-Three changes, all in the scan's own output, so the next stall is diagnosable
-from `dataguzzler.log` alone even if nobody is at the keyboard:
+### 2.2 What costs the other 61%
 
-* the note **repeats** every 120 s, and each repeat says whether anything was
-  staged since the last one — a crawl and a death look identical in one note
-  and obvious in two;
-* each note prints the **staging worker's own Python stack**, which separates
-  `start_transaction()` from the globalrev wait from the projection — the
-  three candidates §2.1 leaves open;
-* the note names `capture_stall.sh` with the pid, and says Ctrl-C will not
-  work.
+Compare the same arm on different paths in the same session:
 
-**If it stalls again, the stack in the log is the answer.** Bring back
-`dataguzzler.log` and the `capture_stall.sh` tarball and that is enough.
+| path | waypoints | tool axis | mean / peak |
+|---|---|---|---|
+| transit | 2 | fixed | **0.94** |
+| Azure sweep row | 5 | locked to world z | 0.98 |
+| Keyence raster row | 21 | locked to world z | 0.86 |
+| **EC scan pass** | **30** | **follows the surface normal** | **0.39** |
+
+The EC pass is the only one that tracks the surface normal, and it is the only
+one that loses most of its speed. This is the mechanism from the 10-09 stall
+([[ec-stall-is-totg-pricing-turn-rate]]) still alive at a much smaller
+magnitude: TOTG decelerates through orientation changes.
+
+**And on this part the orientation change buys nothing.** The whole toolpath
+tilts **up to 1.0 degree from vertical, mean 0.4** (18 x 29 mm, 10.7 mm of
+relief). The smoother is already at its cap and says so:
+
+> tool axis smoothed (linear, 20.0 mm -- widened from 6.0): turn rate
+> 0.763 -> 0.818 deg/mm worst, 0.540 -> 0.182 at p99
+> ** still over the 0.40 deg/mm bound at the 20.0 mm window cap, and widening
+> was still helping -- the mesh is noisier than this can fix.
+
+So the axis is being made to chase mesh noise across a surface that is flat to
+one degree, and paying 2.5x the scan time for it.
+
+### 2.3 The experiment, and it is cheap
+
+**Fly one pass with the tool axis locked to vertical, and compare.** Nothing
+else changes — same mesh, same region, same pitch, same instrument.
+
+```
+dry_run_ec_scan()          # note the per-pass trajectory duration mtc prints
+```
+
+Then lock the axis and do it again. If mean/peak goes from 0.39 to ~0.86, the
+orientation tracking is proven to be the cost and the remedy is a rule — lock
+the axis where the surface is flatter than some threshold, follow it where it
+is not. If it does not move, the cost is the waypoint spacing instead and the
+next knob is `EC_WAYPOINT_SPACING_M` (1.0 mm now, 30 waypoints per pass).
+
+Bring back mtc's `Trajectory check:` line for both, verbatim. The numbers to
+compare are `N points, T s` and `at up to X mm/s`.
+
+### 2.4 The ceiling above it
+
+Even at 0.39, the commanded 2.5 mm/s is not the robot's choice. It comes from
+
+```
+velocity 10.0 mm/s REQUESTED -> 2.5 mm/s USED
+         scaled down to hold 10.0 traces/s; the ceiling is 10.0 traces/s
+```
+
+`MAX_TRACE_RATE_HZ["live"] = 10.0`, and that number was measured on an
+**ultrasound** scan whose trace is a 16000-point waveform. An eddy-current
+trace is one complex number. It has never been measured for this instrument,
+and the evidence says it is far too low: the staging queue **peaked at 2** all
+run, and the hard floor from the transaction window is 25 Hz, not 10.
+
+Raising it to 25 would command 6.25 mm/s, which is also back inside the range
+the arm was actually calibrated over (5.1–32.7 mm/s) instead of extrapolated
+below it. **Two problems, one change.**
+
+Measure it rather than assume it — §3 and §5.2.
 
 ---
 
-## 3. The scan
+## 3. FIRST, AND IT NEEDS NOTHING TO MOVE: `bench_ec()`
 
-Settings unchanged, and 10-15 confirmed they are right. Rotation 86.5° again
-(83.8° on 10-08, 86.5° on 10-09, 86.5° set deliberately on 10-15 — it is a
-property of the probe and the material, and a third agreeing number would let
-it become a configured constant).
+Put the probe on the part, leave the arm still, and run:
+
+```
+bench_ec()
+```
+
+Twenty seconds. It answers the question nobody has ever asked of this cell:
+**what does the instrument itself allow?** The US-454A's frequency, drive,
+gain, filter and phase are all set on its front panel and this config reads
+none of them back, so its output bandwidth — which decides how fast the probe
+may cross a flaw before the flaw is smeared — has never been measured.
+
+It reports four things and the last is the point:
+
+| | |
+|---|---|
+| block rate and gaps | is the card delivering what it was asked for |
+| averaging efficiency | is the 100-sample block average buying its sqrt(100), or is the instrument's filter slower than the block and 98 of those samples redundant |
+| mains fraction | is the noise floor hum (fixable) or broadband (not) |
+| **v_max** | **the scan speed the instrument's own bandwidth allows** |
+
+Read `v_max` against the 2.5 mm/s the scan commands:
+
+* **near or below it** — the scan is already at the instrument's limit, §2 is
+  not worth doing, and the 43 minutes is the right answer. (A 10 Hz output
+  filter gives 2.0 mm/s against a 1 mm flaw, which is almost exactly what the
+  scan runs at. This outcome is entirely possible and it would settle the
+  question.)
+* **far above it** — the instrument is not what the scan is waiting for, and
+  §2.3 and §2.4 are where the 43 minutes actually goes.
+
+It prints a verdict line saying which. Bring the whole report back.
+
+The estimators are checked against filters of known corner in
+`ec_bench_test.py` — within about 15% from 25 Hz to 400 Hz, biased high at
+5–10 Hz. Good enough for a decision with a factor-of-1.5 threshold on it, not
+good enough to quote as an instrument specification.
+
+---
+
+## 4. The clearance gate, if the region is smaller
+
+10-16 planned 2171 poses, which is over `TOOLING_GATE_SAMPLE_ABOVE` (2000), so
+the gate sampled and took **1 second**. 10-15 planned 1749, which is under it,
+so the gate measured every pose and took **231 seconds in silence**.
+
+Both are fixed as far as reporting goes — the gate now prints progress at any
+length over 120 poses — but the 80x cost difference across that threshold is
+real and still there. A smaller region can plan for far longer than a big one.
+If the plan says
+
+> planning time 0:04:49 (the clearance gate, every pose measured -- under the
+> 2000-pose sampling threshold, so it costs ~132 ms each; it reports its own
+> progress while it runs)
+
+that is now expected, announced, and not a hang.
+
+---
+
+## 5. The run
+
+### 5.1 Settings
+
+Unchanged. Rotation 86.5 again — but see 5.3.
 
 ```
 set_probe_rotation(0)
@@ -200,169 +228,82 @@ set_rotation(86.5)
 ```
 
 ```
-ec_serpentine()
-probe_rotation()
-ec_preload()
-scan_velocity()
-scan_step_size()
-projection_mode()
-ec_rotation()
+ec_serpentine()   probe_rotation()   ec_preload()
+scan_velocity()   scan_step_size()   projection_mode()   ec_rotation()
 ```
 
-Then:
+### 5.2 One short scan with projection off
+
+Before the real one, and only if §3 says the instrument has headroom:
 
 ```
-run_automated_scan(line_spacing=0.00025)
+set_projection_mode("deferred")
 ```
 
-### 3.1 Note the pass times, in writing
+`MAX_TRACE_RATE_HZ["deferred"]` is 22 Hz, so the same scan commands 5.5 mm/s
+instead of 2.5. Run **four passes** of it and read three things:
 
-This is still the measurement that matters most, and now there is a baseline
-to compare against: **34.0 s for a 94-trace pass**, from passes 4 through 10
-of the 10-15 run.
+* the staging queue depth in the end-of-scan report (anything under 16 is fine)
+* `Max Correlation Wait` in the pass metadata (71 ms on 10-16; it is the margin)
+* mtc's per-pass peak and duration
 
-* **34 s and flat** → nothing has regressed and §2's creep is gone.
-* **34 s climbing past 37** → the creep is real and reproducible, which is a
-  result. Note the pass numbers where it steps.
-* **One pass far longer than its neighbours** → that is pass 11's 45.9 s. Note
-  when it happens and whether anything was printed around it.
+If that holds, the live ceiling is the thing to raise and the image can be
+rebuilt afterwards with `replay_ec_scan()` — deferred records the same traces
+and projects them at the end for an identical picture.
 
-### 3.2 Lines to read in the plan before confirming
+### 5.3 Watch for the lift-off angle being refused
+
+10-16 ended with:
+
+> could not measure the lift-off rotation (anisotropy 2.86, under 3.00, so
+> there is no lift-off direction to find and any angle would be arbitrary.
+> That is what a scan over a part with no lift-off variation looks like —
+> and also what a dead instrument looks like.)
+
+The scan was fine, so it is the first of those two. But the ratio has been
+falling — 6.45 on 10-15, 4.14 on 10-09, **2.30** on 10-16 — while the flaw
+channel noise has been rising, 0.032 → 0.051 V. Both point the same way: the
+signal is getting smaller relative to the noise floor. **`bench_ec()` is the
+measurement that says whether that is the instrument's gain.**
+
+The NORMS plug-in now applies the same threshold, so the record says
+`Lift-off Angle Determinate: no` and withholds the angle rather than writing
+down a number the pipeline calls arbitrary.
+
+### 5.4 Lines to read in the plan
 
 | line | expect |
 |---|---|
-| `planning time` | now honest — a few minutes for a small region, not 3 s. §4 |
-| `the traces are in shared memory while the scan runs` | new, and true. It used to claim "file-backed", which it was not |
-| `tool axis smoothed … turn rate X -> Y deg/mm` | on 10-15 this said `0.844 -> 2.047` and warned "the mesh is noisier than this can fix" — and the scan still ran at 34 s a pass and produced a clean path. Note it; do not act on it |
+| `planning time` | honest now; minutes for a small region, seconds for a big one (§4) |
+| `Sample Rate` / `Block Span` in the record | **NEW and the point of §3.** The card's rate is recorded now, so `Block Smear` says how far the probe moved during one trace's average. If the smear approaches the 0.25 mm pitch, the resolution is set by the block and not by the step size |
+| `tool axis smoothed ... still over the ... bound` | expected on this mesh; §2.2 |
+| `region_coverage` | 77% on 10-16 — the ROI was drawn wider than the fine sweep measured. Draw inside the swept area |
 | `IMPOSSIBLE PENETRATION` | absent |
-| `coverage given up to keep the tool clear` | absent (10-15 gave up nothing) |
-| `region_coverage` warning | 10-15 reported 83%. The ROI was drawn slightly wider than the fine sweep measured. Harmless; draw inside the swept area or sweep wider |
-
----
-
-## 4. The planning pause is explained
-
-The 10-15 run went silent for **231 seconds** between
-
-```
-[18:25:45] resampling to 1.0 mm: 3552 -> 1749 waypoints, 76 passes in 0.2 s
-[18:29:36] applying the planning scene diff: starting
-```
-
-after a plan that had priced the whole of planning at **3 s**. It was the
-tooling clearance gate, and it was two thresholds that cannot both be
-satisfied:
-
-* `enforce_path_clearance()` SAMPLES only above `TOOLING_GATE_SAMPLE_ABOVE`
-  (2000) poses. 1749 is under it, so every pose was measured exactly, with
-  nothing certified — about 80× the per-pose cost the estimate was calibrated
-  on, which came from a run where 16.2% of poses were measured and the rest
-  certified. 1749 × 0.132 s = 231 s. The arithmetic closes.
-* `path_clearance()` turned its progress lines on above `4 × TOOLING_POSE_BLOCK`
-  — 16384 poses. Nothing that takes the exact path can ever reach that, so the
-  exact gate was silent **by construction**, at every length. And a path
-  shorter than one block is one block, so it would have ticked once, at zero,
-  even if the threshold had been met.
-
-Both are fixed: progress is a pose count now (120), the block is divided so
-there is something to tick between, and the estimate picks its rate from which
-gate will actually run and says which. The counter-intuitive part is worth
-knowing at the cell: **a smaller region can plan for far longer than a big
-one**, because a big one gets the sampler.
-
-Nothing was wrong with the gate's answer. It gave up no coverage and found no
-collision.
-
----
-
-## 5. The Keyence lateral correction was zeroed, and is back
-
-`deploy_calibration()` writes a file **regenerated in full from the JSON
-record**, and the Keyence's lateral pair is not in that record — it was solved
-offline and written into the cell file by hand. So deploying the Azure
-calibration replaced
-
-```
-keyence_mount_cal_xyz = 0.00056576 0.00172072 0
-```
-
-with `0 0 0`, and the fine Keyence mesh of 10-15 was reconstructed with the
-head 1.8 mm from where it is. Nothing downstream could see it:
-`check_calibration_applied()` iterates the record, so a sensor with no record
-is not checked at all.
-
-Two changes. `calibration_xacro()` now carries a correction it has no record
-for forward out of TF, saying in the file where the number came from; and the
-cell package's own `sensor_calibration.urdf.xacro` carries the new Azure
-numbers **and** the Keyence block, with the reasoning for both.
-
-**So the file in `tari_cell_ex_ur10e_1/urdf/` is correct and complete now.**
-It is not what the cell is running: the cell is running the generated file
-that `deploy_calibration()` copied there on 10-15, which has the Keyence
-zeroed. Put the repository's version back:
-
-```bash
-cd ~/tari && git -C ros_ws/src/tari_site pull
-git -C ros_ws/src/tari_site diff --stat         # expect the one urdf file
-cd ros_ws && colcon build --packages-select tari_cell_ex_ur10e_1
-# restart the bring-up, then in dgpy:
-```
-
-```
-check_calibration_applied()
-```
-
-Expect `azure APPLIED, off by 0.000 mm`. Then confirm the Keyence came with
-it — it has no record, so nothing checks it for you:
-
-```bash
-ros2 run tf2_ros tf2_echo keyence_metal lj_v7080_mount_cal
-```
-
-Expect translation `[0.00057, 0.00172, 0.000]`. Zeros mean the generated file
-is still in force.
-
-### 5.1 And the `--` is gone
-
-The generated xacro's header said `Do not hand-edit -- re-run the
-calibration`. XML forbids `--` inside a comment, so **every file that
-generator has ever written was malformed**, and deploying it took the whole
-robot description down — which is why 10-15 cost a vim session, a rebuild and
-a second restart of the bring-up. The generator now rewrites hyphens in every
-comment it emits and parses the finished file before returning it, so a
-malformed one cannot leave the function.
 
 ---
 
 ## 6. Still open, unchanged
 
-**The acquisition lag.** 0.140 s at 3.93 mm/s, from one scan, one speed. One
-speed cannot separate a time lag from a fixed distance offset. Worth 25
-minutes only once §2 is closed:
+**The acquisition lag.** 0.140 s at 3.93 mm/s, one scan, one speed. Still the
+oldest open question and still worth 25 minutes once §2 and §3 are settled —
+and §5.2's faster scan would give the second speed for free.
 
-```
-set_scan_velocity(0.004)
-scan_velocity()
-out2 = run_automated_scan(line_spacing=0.0003)
-```
+**The per-pass overhead.** 8.5 s x 72 passes = 10.2 min of the 43.6. Two
+2-pose moves at 2.54 mm/s plus a planning round trip. Not yet looked at.
 
-**The rare spatialnde2 background-thread interpreter crash.** Two sightings,
-never reproduced in ~35 attempts. `capture_stall.sh` is not the tool for it;
-a core is. It did not happen on 10-15.
-
-**The Keyence comb return leg.** Still not investigated.
+**The rare spatialnde2 background-thread crash.** Two sightings, never
+reproduced. Did not happen on 10-16.
 
 ---
 
 ## 7. What to bring back
 
-1. Whether `check_calibration_applied()` says APPLIED, and what
-   `tf2_echo keyence_metal lj_v7080_mount_cal` prints (§5).
-2. Elapsed time for every pass, or at least the first fifteen and any that
-   stood out (§3.1).
-3. **If it stalls: the `capture_stall.sh` tarball, and `dataguzzler.log`.**
-   The log now carries the staging worker's own stack, which is the answer.
-4. The plan lines from §3.2, verbatim.
-5. The `ec_scan_*` directory, `dataguzzler.log`, `ros.log`, `dmesg.log` —
-   separate files if you can.
-6. Whether the AER counters in §1.1 were still climbing, and what you changed.
+1. **The whole `bench_ec()` report.** It is the one measurement that has never
+   been made and it decides whether anything else in §2 is worth doing.
+2. mtc's `Trajectory check:` line for a normal pass, and for a pass flown with
+   the tool axis locked to vertical (§2.3).
+3. The end-of-scan report, verbatim — it now names both causes of a slow scan
+   instead of asserting one.
+4. The `ec_scan_*` directory, `dataguzzler.log`, `ros.log`, `dmesg.log`.
+5. `sudo lspci -s 89:00.0 -vv | grep -iE 'LnkSta|LnkCap'` and the AER counters.
+6. Whether the lift-off ratio is still falling (§5.3).
