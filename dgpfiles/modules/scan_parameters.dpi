@@ -629,13 +629,32 @@ def check_scan_outcome(plan, report, limits=None):
                       plan["effective_velocity_mps"]*1e3))
         ratio = mean/plan["effective_velocity_mps"] if plan["effective_velocity_mps"] else 0.0
         if ratio and plan["velocity_scaling"] and (ratio > 1.15 or ratio < 0.85):
-            # The calibration table is what maps a scaling to a speed, so a
-            # mismatch says the table is stale for this cell -- and gives the
-            # replacement entry outright.
-            out.append("  that is %.2fx what was asked for: ROBOT_VELOCITY_"
-                       "CALIBRATION is wrong here. Replace or add the entry "
-                       "(%.4f, %.4f)."
-                       % (ratio, plan["velocity_scaling"], mean))
+            # TWO CAUSES, AND THIS LINE USED TO NAME ONLY ONE. The calibration
+            # table maps a scaling to a PEAK tool speed; what is measured here
+            # is the MEAN over a pass. They are the same number only on a path
+            # that holds its speed, and a surface-following toolpath does not:
+            # on 2026-10-16 mtc's own trajectory check reported a peak of
+            # 2.80 mm/s against the 2.5 asked for -- the calibration was right
+            # -- while the mean over the same trajectory was 1.09, because
+            # TOTG decelerates through every waypoint. This line said
+            # "ROBOT_VELOCITY_CALIBRATION is wrong here" and sent the next
+            # reader to re-measure a table that was fine.
+            #
+            # The discriminator is already printed, by mtc, once per pass, and
+            # it costs nothing to say where to look.
+            out.append("  that is %.2fx what was asked for. TWO THINGS DO "
+                       "THAT and they need different fixes:" % (ratio,))
+            out.append("    the calibration -- if mtc's 'Trajectory check' "
+                       "line for a pass reports a PEAK near %.1f mm/s, the "
+                       "table is fine; if it reports a peak near %.1f, the "
+                       "table is stale and the entry to add is (%.4f, %.4f)."
+                       % (plan["effective_velocity_mps"]*1e3, mean*1e3,
+                          plan["velocity_scaling"], mean))
+            out.append("    the trajectory  -- a peak at the commanded speed "
+                       "with a mean well under it is TOTG decelerating "
+                       "through the waypoints, not the arm running slow. The "
+                       "tool-axis turn rate and the waypoint spacing are what "
+                       "move it; the velocity scaling does not.")
 
     late = report.get("late_transactions")
     if late:

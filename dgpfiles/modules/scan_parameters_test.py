@@ -357,10 +357,19 @@ def test_the_outcome_check():
                              "sweep_s": 2*0.31/p["effective_velocity_mps"]}]*30}
     lines = check_scan_outcome(p, slow)
     check("half speed is called out",
-          any("CALIBRATION is wrong" in l for l in lines), True)
-    check("and it hands back the table entry to add",
-          any("Replace or add the entry (%.4f," % p["velocity_scaling"] in l
-              for l in lines), True)
+          any("TWO THINGS DO THAT" in l for l in lines), True)
+    # IT NAMES BOTH CAUSES, not one. The calibration maps a scaling to a PEAK
+    # tool speed and this measures the MEAN over a pass; on a surface-following
+    # toolpath those differ by 2.5x with the table perfectly correct. The old
+    # line asserted the calibration was wrong and sent the next reader to
+    # re-measure a table that was fine -- 2026-10-16, where mtc's own
+    # trajectory check reported a peak of 2.80 mm/s against 2.5 commanded.
+    check("it names the calibration as one cause, with the entry to add",
+          any("(%.4f," % p["velocity_scaling"] in l for l in lines), True)
+    check("and the trajectory as the other",
+          any("TOTG decelerating" in l for l in lines), True)
+    check("and says which line of mtc's output tells them apart",
+          any("Trajectory check" in l for l in lines), True)
     check("a queue of 40 is called out as backpressure",
           any("ran BEHIND" in l for l in lines), True)
 
