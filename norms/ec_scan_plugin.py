@@ -324,15 +324,15 @@ def scan_coordinates(per_pass_pos, per_pass_arc):
 
     THE SCAN ALREADY HAS BETTER COORDINATES AND SAVES THEM.
 
-      along   `s_m`, the arc length the probe travelled ALONG the surface
-              since this pass began. Exact by construction -- the trigger
-              fires every `pitch` of travel -- so traces sit on a uniform
-              lattice whatever the surface does underneath them. Each pass is
-              shifted by where its own start sits along the pass direction, so
-              the rows register to each other.
-      across  the cumulative distance from pass to pass, measured
-              perpendicular to the pass direction between consecutive pass
-              centroids. It follows the surface too, and it is monotone.
+      along   the SCAN AXIS: `s_m`, the arc length the probe travelled along
+              the surface since this pass began. Exact by construction -- the
+              trigger fires every `pitch` of travel -- so traces sit on a
+              uniform lattice whatever the surface does underneath them. Each
+              pass is shifted by where its own start sits along the pass
+              direction, so the rows register to each other.
+      across  the INDEX AXIS: the cumulative distance from pass to pass,
+              measured perpendicular to the pass direction between consecutive
+              pass centroids. It follows the surface too, and it is monotone.
 
     In those coordinates the samples ARE on the lattice: the same scan grids
     with 0.00% empty cells and 0 collisions. Nothing has to be interpolated,
@@ -556,8 +556,12 @@ def _pane(fig, ax, img, along_edges, across_edges, title):
                          vmin=mid - lim, vmax=mid + lim, shading="flat")
     ax.set_aspect("equal")
     ax.set_title(title)
-    ax.set_xlabel("along the pass (mm)")
-    ax.set_ylabel("across the passes (mm)")
+    # THE STANDARD NAMES. The scan axis is the direction of continuous
+    # motion, the index axis is the one stepped between passes. "along the
+    # pass" and "across the passes" said the same thing in words nobody else
+    # uses.
+    ax.set_xlabel("Scan Axis (mm)")
+    ax.set_ylabel("Index Axis (mm)")
     fig.colorbar(mesh, ax=ax, label="V", fraction=0.046, pad=0.04)
 
 

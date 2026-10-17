@@ -398,9 +398,14 @@ def test_the_figures_are_report_ready_and_carry_no_interpretation(tmp_path):
 
     # and what has to be there
     assert "ax.set_title(title)" in plotting, "the panes need naming"
-    assert 'ax.set_xlabel("along the pass (mm)")' in plotting, \
-        "the axes name the SCAN's coordinates, not world x and y"
-    assert 'ax.set_ylabel("across the passes (mm)")' in plotting
+    # The standard names: the scan axis is the direction of continuous
+    # motion, the index axis is the one stepped between passes. Not world x
+    # and y, which is what they used to say.
+    assert 'ax.set_xlabel("Scan Axis (mm)")' in plotting, plotting[:300]
+    assert 'ax.set_ylabel("Index Axis (mm)")' in plotting
+    for gone in ("x (mm)", "y (mm)", "along the pass (mm)",
+                 "across the passes (mm)"):
+        assert gone not in plotting, "an axis is still labelled %r" % (gone,)
     assert 'label="V"' in plotting, "the colorbar needs its unit"
     # pcolormesh over the real row edges, never imshow onto an even grid: the
     # across spacing scatters a few percent and stretching it onto an even

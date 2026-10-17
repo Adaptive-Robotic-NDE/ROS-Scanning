@@ -34,8 +34,9 @@ silently left behind.
 
 ### The axes are the scan's own, not world x and y
 
-`along the pass (mm)` and `across the passes (mm)`, and that is a correctness choice rather
-than a presentation one.
+`Scan Axis (mm)` and `Index Axis (mm)` — the scan axis is the direction of continuous motion
+along a pass, the index axis is the one stepped between passes. That is a correctness choice
+rather than a presentation one.
 
 A plan view is a projection, and a projection of a surface scan is wrong twice. On curved
 geometry it foreshortens — equal steps along the surface become unequal steps in x-y, and a
@@ -52,12 +53,12 @@ none. Measured on the 2026-10-16 scan, which is flat to 0.11 mm:
 
 Those two numbers in the first column are the same thousand events counted from both ends.
 
-The scan already has better coordinates and already saves them. **Along** is `s_m`, the arc
-length the probe travelled along the surface since the pass began — exact by construction,
-because the trigger fires every `pitch` of travel, whatever the surface does underneath.
-**Across** is the cumulative distance from pass to pass, measured perpendicular to the pass
-direction. Both follow the surface, so distances on the figure are arc lengths over it, which
-is the unit you would size an indication in anyway.
+The scan already has better coordinates and already saves them. The **scan axis** is `s_m`,
+the arc length the probe travelled along the surface since the pass began — exact by
+construction, because the trigger fires every `pitch` of travel, whatever the surface does
+underneath. The **index axis** is the cumulative distance from pass to pass, measured
+perpendicular to the pass direction. Both follow the surface, so distances on the figure are
+arc lengths over it, which is the unit you would size an indication in anyway.
 
 The image is then **one row per pass**. That is not an approximation — it is what the scan
 did — and it is what makes an across-collision impossible: there is exactly one row per pass,
@@ -112,9 +113,9 @@ attributed `A` for auto-generated: `Peak Position Across` / `Along`, `Peak Flaw 
 `Peak Flaw SNR`, `Flaw Channel Noise`, `Measured Lift-off Angle`. Highlighting, cropping and
 callouts get added afterwards, deliberately, by whoever is making the argument.
 
-`Peak Position Along` and `Peak Position Across` are in those same axes now. In the old world
-grid they meant x and y, and which of those was "along" depended on how the part happened to
-be lying.
+`Peak Position Along` and `Peak Position Across` are in those same axes now — along is the
+scan axis, across is the index axis. In the old world grid they meant x and y, and which of
+those was "along" depended on how the part happened to be lying.
 
 **Read the flaw channel, not the raw panes.** Lift-off
 is what the probe does riding over an imperfect surface and it is far larger than any flaw, so
