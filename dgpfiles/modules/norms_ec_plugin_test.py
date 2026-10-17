@@ -70,11 +70,16 @@ def properties(doc):
 
 
 def make_scan(tmpdir, passes=12, per_pass=40, pitch=0.00025, spacing=0.00025,
-              flaw_at=(6, 20), ragged=True):
+              flaw_at=(6, 20), ragged=True, liftoff_v=0.30, sample_rate_hz=None,
+              serpentine=False):
     """A synthetic ec_scan_* directory: passes along +y, stepping in -x.
 
     `ragged` shortens alternate passes, which is what a clearance crop or a hole
     does to a real scan and what the pass-spacing measurement has to survive.
+
+    `liftoff_v` is how much lift-off the traces carry. Zero makes the cloud
+    round, which is the 2026-10-16 case: there is then no principal direction
+    and the angle between the axes is whatever the noise says.
     """
     rng = np.random.default_rng(4)
     scan = os.path.join(tmpdir, "ec_scan_2026-10-12_000000")
@@ -83,10 +88,21 @@ def make_scan(tmpdir, passes=12, per_pass=40, pitch=0.00025, spacing=0.00025,
         n = per_pass - (7 if (ragged and p % 2) else 0)
         x = np.full(n, 0.85 - p*spacing)
         y = 0.10 + np.arange(n)*pitch
+        # A REAL PASS WANDERS. This is what defeated the world x-y grid: a
+        # sub-cell wander along the pass is enough to snap neighbouring traces
+        # into one cell and leave the next empty.
+        x = x + 0.4*pitch*np.sin(np.linspace(0.0, 3.0, n))
+        if serpentine and p % 2:
+            y = y[::-1]
         pos = np.c_[x, y, np.full(n, 0.94)]
+        s_m = np.arange(n)*pitch                  # arc length from the start
         # lift-off along ~86 deg in the impedance plane, plus a local flaw
-        t = rng.normal(0.0, 0.30, n)
+        t = rng.normal(0.0, float(liftoff_v), n)
         z = t*np.exp(1j*np.radians(86.0))
+        if liftoff_v <= 0.0:
+            # Round, not empty: a dead instrument and a flat part look the same
+            # from here, and both must refuse rather than invent an angle.
+            z = z + rng.normal(0.0, 0.02, n) + 1j*rng.normal(0.0, 0.02, n)
         if p == flaw_at[0] and flaw_at[1] < n:
             z[flaw_at[1]] += 0.9*np.exp(1j*np.radians(86.0 + 90.0))
         meta = {
@@ -99,13 +115,16 @@ def make_scan(tmpdir, passes=12, per_pass=40, pitch=0.00025, spacing=0.00025,
             "segment_report": {"observed_m": float(n*pitch), "sweep_s": 10.0},
             "trigger_report": {"mode": "timestamped-ec", "real_path": "/PXI1Slot2/ai0",
                                "imag_path": "/PXI1Slot2/ai1", "block_samples": 100,
+                               "sample_rate_hz": sample_rate_hz,
+                               "block_span_s": (100.0/sample_rate_hz
+                                                if sample_rate_hz else None),
                                "reduce": "mean", "duplicate_traces": p, "errors": 0,
                                "dropped_crossings": 0, "over_budget": 2*p,
                                "staging_timeouts": 0, "fault": None,
                                "max_correlation_wait_s": 0.08},
         }
         np.savez(os.path.join(scan, "pass%03d.npz" % p), position=pos, impedance=z,
-                 conditioned=z.imag, s_m=np.arange(n)*pitch, index=np.arange(n),
+                 conditioned=z.imag, s_m=s_m, index=np.arange(n),
                  pose=np.zeros((n, 7)), meta=json.dumps(meta))
     return scan
 
@@ -265,6 +284,96 @@ def test_both_figures_exist_before_the_plugin_exits_and_are_declared(tmp_path):
     assert all(n.startswith(os.path.basename(scan)) for n in names), names
 
 
+def test_the_image_has_one_row_per_pass_and_no_holes(tmp_path):
+    """The reason the plug-in left holes, and the reason it no longer does.
+
+    A world x-y grid at the trace pitch cannot reconstruct the scan, because
+    the traces are not on that grid: a pass wanders in x along its own length
+    and the across spacing scatters, so neighbouring traces snap into one cell
+    and the next cell gets none. Measured on the 2026-10-16 scan: 838 cells
+    held two or more traces (10.2% of all of them) while 1012 cells (11.7%)
+    were empty -- the same thousand events counted from both ends.
+
+    In the scan's own coordinates the samples ARE on the lattice: `s_m` is
+    exact arc length so the along axis is uniform by construction, and one
+    image row per pass makes an across-collision impossible. The same traces
+    then grid with no holes and no collisions at all.
+    """
+    scan = make_scan(str(tmp_path))
+    doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
+    s_ = doc["Eddy Current Scan"]["Properties"]
+    assert s_["Image Rows"]["Value"] == "12", "one row per pass"
+    assert float(s_["Image Gaps"]["Value"]) == 0.0, \
+        "a hole inside the measured coverage means the binning is aliasing again"
+    assert s_["Scan Coordinates"]["Value"] == "arc length along the pass"
+
+
+def test_a_pass_that_was_cut_short_still_leaves_a_hole(tmp_path):
+    """Filling every cell is not the goal -- not INVENTING cells is.
+
+    A clearance crop or a dropped region is a real gap in the coverage and the
+    figure has to show it. What the change removed was holes that were an
+    artifact of the grid; a hole that is a missing measurement must survive.
+    """
+    scan = make_scan(str(tmp_path), ragged=True)
+    doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
+    s_ = doc["Eddy Current Scan"]["Properties"]
+    # the ragged fixture shortens alternate passes, so the image is wider than
+    # the short passes reach -- and those cells must be blank, not filled
+    assert int(s_["Image Columns"]["Value"]) > 0
+    assert float(s_["Image Gaps"]["Value"]) == 0.0, \
+        "gaps are counted INSIDE each pass's own span; a short pass is not a gap"
+    # TWO DIFFERENT BLANKS. The short passes leave the rectangle part empty,
+    # and THAT is the number that says how much of the part was scanned. On
+    # the 2026-10-09 run, where the clearance gate cut most of the passes
+    # short, it reads 60%.
+    cov = float(s_["Image Coverage"]["Value"])
+    assert 0.0 < cov < 100.0, cov
+    full = make_scan(str(tmp_path / "full"), ragged=False)
+    cov2 = float(one_object(run("--files", os.path.join(full, "pass000.npz"))[0])[
+        "Eddy Current Scan"]["Properties"]["Image Coverage"]["Value"])
+    assert cov2 > cov, "a scan with no cropped passes must cover more (%g vs %g)" % (cov2, cov)
+
+
+def test_the_record_says_which_coordinates_the_figure_is_in(tmp_path):
+    """A figure in scan coordinates and a figure in world coordinates are
+    different pictures, and a record that does not say which it holds cannot
+    be read later. `Pass Straightness` is how far the arm's own positions
+    departed from the model -- the pass's wander, not an error."""
+    scan = make_scan(str(tmp_path))
+    s_ = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])[
+        "Eddy Current Scan"]["Properties"]
+    assert s_["Scan Coordinates"]["Value"]
+    assert s_["Pass Straightness"]["Value"], s_
+    assert float(s_["Pass Straightness"]["Value"]) >= 0.0
+
+
+def test_a_serpentine_is_folded_out_rather_than_mirrored(tmp_path):
+    """Alternate passes run the other way, so their `s_m` increases in the
+    opposite world direction. Taken at face value the rows would be mirrored
+    against each other and a flaw would appear twice, a few millimetres apart
+    -- which is exactly the shape of a real fault
+    ([[ec-position-lags-by-a-tenth-of-a-second]]) and must not be manufactured
+    by the plotting."""
+    # ON AN ODD PASS, which is the one the serpentine reverses. With the flaw
+    # on an even pass this test passes whether the folding works or not --
+    # that was the first version of it.
+    flaw = (7, 20)
+    scan = make_scan(str(tmp_path), serpentine=True, ragged=False, flaw_at=flaw)
+    doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
+    c = doc["Eddy Current Conditioning"]["Properties"]
+    along = float(c["Peak Position Along"]["Value"])
+    # The fixture plants one flaw at a known fraction along one pass; after
+    # folding, it must land there and not at the mirror image of it.
+    scan2 = make_scan(str(tmp_path / "comb"), serpentine=False, ragged=False,
+                      flaw_at=flaw)
+    c2 = one_object(run("--files", os.path.join(scan2, "pass000.npz"))[0])[
+        "Eddy Current Conditioning"]["Properties"]
+    assert abs(along - float(c2["Peak Position Along"]["Value"])) < 0.6, \
+        "the serpentine put the flaw %.2f mm from where the comb put it" % (
+            abs(along - float(c2["Peak Position Along"]["Value"])),)
+
+
 def test_the_figures_are_report_ready_and_carry_no_interpretation(tmp_path):
     """Titled panes and complete axes -- and nothing the plug-in merely thinks.
 
@@ -280,7 +389,7 @@ def test_the_figures_are_report_ready_and_carry_no_interpretation(tmp_path):
     """
     src = open(PLUGIN).read()
     i = src.index("def _pane(")
-    plotting = src[i:src.index("def extract(", i)]
+    plotting = src[i:src.index("def first(", i)]
 
     for banned in ("suptitle", "annotate", "ax.text(", "ax.plot(",
                    "axvline", "axhline", "legend(", "arrow("):
@@ -289,9 +398,15 @@ def test_the_figures_are_report_ready_and_carry_no_interpretation(tmp_path):
 
     # and what has to be there
     assert "ax.set_title(title)" in plotting, "the panes need naming"
-    assert 'ax.set_xlabel("x (mm)")' in plotting, "axes need a quantity and a unit"
-    assert 'ax.set_ylabel("y (mm)")' in plotting
+    assert 'ax.set_xlabel("along the pass (mm)")' in plotting, \
+        "the axes name the SCAN's coordinates, not world x and y"
+    assert 'ax.set_ylabel("across the passes (mm)")' in plotting
     assert 'label="V"' in plotting, "the colorbar needs its unit"
+    # pcolormesh over the real row edges, never imshow onto an even grid: the
+    # across spacing scatters a few percent and stretching it onto an even
+    # grid misplaces every indication by up to half a line.
+    assert "ax.pcolormesh(" in plotting, plotting[:200]
+    assert ".imshow(" not in plotting, "imshow would even out the row spacing"
 
 
 def test_the_panes_are_titled_for_what_they_hold(tmp_path):
@@ -314,13 +429,12 @@ def test_the_pane_order_matches_between_the_two_figures(tmp_path):
     both figures holds the same component of the same traces."""
     src = open(PLUGIN).read()
     raw = src[src.index("def render_raw("):src.index("def render_conditioned(")]
-    assert raw.index("GR = ") < raw.index("GI = ")
     assert raw.index(".real") < raw.index(".imag")
-    assert raw.index("axes[0], GR") < raw.index("axes[1], GI")
+    assert raw.index("axes[0], H") < raw.index("axes[1], V")
 
     cond = src[src.index("def render_conditioned("):src.index("def first(")]
-    assert cond.index("axes[0], GA") < cond.index("axes[1], GP"), \
-        "lift-off (along) must be the left pane, as horizontal is in the raw figure"
+    assert cond.index("axes[0], L") < cond.index("axes[1], F"), \
+        "lift-off must be the left pane, as horizontal is in the raw figure"
 
 
 def test_the_two_figures_are_different_pictures(tmp_path):
@@ -379,6 +493,63 @@ def test_the_flaw_the_record_reports_is_in_the_record_not_on_the_figure(tmp_path
                  "Peak Flaw Response", "Peak Flaw SNR", "Flaw Channel Noise"):
         assert c[name]["Value"], "%s is empty: the reading has to survive" % name
     assert float(c["Peak Flaw SNR"]["Value"]) > 5.0
+
+
+def test_an_arbitrary_lift_off_angle_is_withheld_rather_than_recorded(tmp_path):
+    """A cloud that is not elongated has no principal direction.
+
+    On 2026-10-16 the scan's own ec_liftoff_rotation_from_traces() refused --
+    "anisotropy 2.86, under 3.00, so there is no lift-off direction to find and
+    any angle would be arbitrary" -- while this plug-in wrote 86.7729 deg into
+    the permanent record of the same measurement with no qualification. The two
+    now use the same threshold, and the record says which it was.
+    """
+    scan = make_scan(str(tmp_path), liftoff_v=0.0)     # no lift-off to find
+    doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
+    c = doc["Eddy Current Conditioning"]["Properties"]
+    ratio = c["Lift-off To Flaw Ratio"]["Value"]
+    assert ratio, "the ratio itself is always recorded; it is the evidence"
+    assert float(ratio) < 3.0, ratio
+    assert c["Lift-off Angle Determinate"]["Value"] == "no", c
+    assert c["Measured Lift-off Angle"]["Value"] == "", \
+        "an arbitrary angle must not reach the record"
+
+    # and the ordinary case still records it
+    ok = make_scan(str(tmp_path / "elongated"))
+    doc2 = one_object(run("--files", os.path.join(ok, "pass000.npz"))[0])
+    c2 = doc2["Eddy Current Conditioning"]["Properties"]
+    assert float(c2["Lift-off To Flaw Ratio"]["Value"]) >= 3.0, c2
+    assert c2["Lift-off Angle Determinate"]["Value"] == "yes", c2
+    assert c2["Measured Lift-off Angle"]["Value"], c2
+
+
+def test_the_block_is_recorded_in_time_and_distance_not_just_in_samples(tmp_path):
+    """100 samples is not a measurement until you know the rate.
+
+    At 0.25 mm pitch and the 1.1 mm/s the 2026-10-16 scan achieved, a
+    100-sample block is 4% of the trace pitch at 10 kHz and 43% of it at 1 kHz
+    -- the difference between a trace that is a point and a trace that is a
+    quarter of the step. The record held the 100 and not the rate, so it could
+    not tell those apart.
+    """
+    scan = make_scan(str(tmp_path), sample_rate_hz=1000.0)
+    s_ = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])[
+        "Eddy Current Scan"]["Properties"]
+    assert s_["Sample Rate"]["Value"] == "1000"
+    assert abs(float(s_["Block Span"]["Value"]) - 100.0) < 1e-6, s_   # ms
+    # smear = block span x the speed ACHIEVED, not the one commanded
+    speed = float(s_["Mean Pass Speed"]["Value"])                     # mm/s
+    assert abs(float(s_["Block Smear"]["Value"]) - 0.1*speed) < 1e-6, s_
+
+    # A scan recorded before the rate was saved reports none of the three,
+    # rather than guessing one.
+    old = make_scan(str(tmp_path / "old"))
+    o = one_object(run("--files", os.path.join(old, "pass000.npz"))[0])[
+        "Eddy Current Scan"]["Properties"]
+    assert o["Sample Rate"]["Value"] == ""
+    assert o["Block Span"]["Value"] == ""
+    assert o["Block Smear"]["Value"] == ""
+    assert o["Samples Per Trace"]["Value"] == "100", "that part was always known"
 
 
 def test_the_daq_channels_are_named_horizontal_and_vertical(tmp_path):

@@ -32,8 +32,76 @@ They are declared as `Plugin File[1]` and `Plugin File[2]`, which is what makes 
 them into `.hfiles` and copy them to the backup; a generated file that is not declared is
 silently left behind.
 
+### The axes are the scan's own, not world x and y
+
+`along the pass (mm)` and `across the passes (mm)`, and that is a correctness choice rather
+than a presentation one.
+
+A plan view is a projection, and a projection of a surface scan is wrong twice. On curved
+geometry it foreshortens — equal steps along the surface become unequal steps in x-y, and a
+steep flank collapses towards a line. And even on a *flat* part it **aliases**, because the
+samples are not on the grid it bins them onto: a pass wanders along its own length and the
+across spacing scatters, so two neighbouring traces snap into one cell and the next cell gets
+none. Measured on the 2026-10-16 scan, which is flat to 0.11 mm:
+
+| | world x-y grid at the pitch | the scan's own coordinates |
+|---|---|---|
+| cells holding 2+ traces | 838 (10.2% of all traces) | **0** |
+| empty cells inside the coverage | 1012 (11.7%) | **0** |
+| peak retained | 0.944 V | 0.944 V |
+
+Those two numbers in the first column are the same thousand events counted from both ends.
+
+The scan already has better coordinates and already saves them. **Along** is `s_m`, the arc
+length the probe travelled along the surface since the pass began — exact by construction,
+because the trigger fires every `pitch` of travel, whatever the surface does underneath.
+**Across** is the cumulative distance from pass to pass, measured perpendicular to the pass
+direction. Both follow the surface, so distances on the figure are arc lengths over it, which
+is the unit you would size an indication in anyway.
+
+The image is then **one row per pass**. That is not an approximation — it is what the scan
+did — and it is what makes an across-collision impossible: there is exactly one row per pass,
+so two passes can never land on each other and none can be skipped. Nothing is interpolated,
+smoothed, or given a footprint, which matters for a record figure where an invented value is
+indistinguishable from a measured one. A blank cell means no trace reached it, and after this
+it only ever means that: a pass cropped short by the clearance gate leaves a real hole and
+the figure shows it.
+
+Rows are drawn with `pcolormesh` over their **real** edges, not `imshow` onto an even grid:
+the across spacing scatters a few percent, and evening it out would misplace every indication
+by up to half a line with nothing on the figure saying so.
+
+A serpentine is folded out first. Alternate passes run the other way, so their `s_m`
+increases in the opposite world direction; taken at face value the rows would mirror against
+each other and one flaw would appear twice a few millimetres apart — which is the shape of a
+real fault, and must not be manufactured by the plotting.
+
+`Scan Coordinates`, `Pass Straightness`, `Image Rows`, `Image Columns`, `Image Gaps` and
+`Image Coverage` in the record say which coordinates were used, how far the arm's own
+positions departed from them (the pass's wander, not an error), and what is blank.
+
+**The two kinds of blank mean opposite things.** `Image Gaps` is blanks *inside* a pass's own
+span — it should read 0, and anything else says the binning is aliasing again.
+`Image Coverage` is how much of the whole rectangle was measured at all, and a low number is
+a real result rather than a defect in the figure:
+
+| scan | gaps | coverage | |
+|---|---|---|---|
+| 2026-10-16 | 0% | 97% | a clean run |
+| 2026-10-15 | 0% | 93% | partial — stalled at pass 31 of 74 |
+| 2026-10-09 | 0% | **60%** | the clearance gate cut most of the passes short |
+
+**Where this still has to grow.** The along axis is exact for any geometry. The across axis
+is a cumulative perpendicular distance between pass centroids, which is right while the
+passes are roughly parallel and degrades on a surface that twists between them. And on a
+surface that genuinely *folds* — a fillet, a blade root — no single 2-D figure is honest at
+all; the plug-in should then emit patches rather than a plausible flattened picture. It does
+not detect that case yet.
+
+### What is on them
+
 **These are meant to go into a report as they are.** Each pane carries what the figure *is* —
-a title naming the component, `x (mm)` and `y (mm)` on the axes, `V` on the colorbar — and
+a title naming the component, the two axes with their unit, `V` on the colorbar — and
 nothing the plug-in merely *thinks* about it. No circled peak, no rotation angle written
 across the top, no callouts.
 
@@ -44,8 +112,9 @@ attributed `A` for auto-generated: `Peak Position Across` / `Along`, `Peak Flaw 
 `Peak Flaw SNR`, `Flaw Channel Noise`, `Measured Lift-off Angle`. Highlighting, cropping and
 callouts get added afterwards, deliberately, by whoever is making the argument.
 
-`x` and `y` are the world x and y of each trace with the origin moved to the scanned area's
-minimum corner, so they read as distances across the scan.
+`Peak Position Along` and `Peak Position Across` are in those same axes now. In the old world
+grid they meant x and y, and which of those was "along" depended on how the part happened to
+be lying.
 
 **Read the flaw channel, not the raw panes.** Lift-off
 is what the probe does riding over an imperfect surface and it is far larger than any flaw, so
