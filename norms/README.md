@@ -23,10 +23,17 @@ Three sections of metadata, and two generated files.
 | File | Panes | What it is for |
 |---|---|---|
 | `<scan dir>_ec_raw.png` | **Horizontal**, **Vertical** | the instrument's own X and Y analog outputs, exactly as it delivered them. Every other picture of the scan is derived from this one, and it is the only one that cannot be wrong about what was measured. |
-| `<scan dir>_ec_conditioned.png` | **Lift-off**, **Flaw** | the same traces rotated onto the lift-off axis the plug-in measures from the data. This is where a flaw is visible. |
+| `<scan dir>_ec_conditioned.png` | **Horizontal (rotated)**, **Vertical (rotated)** | the same traces rotated onto the lift-off axis the plug-in measures from the data. This is where a flaw is visible. |
 
-The panes are in the same order in both figures: the flaw channel is the component
-perpendicular to lift-off, so it sits where vertical sits.
+The panes are in the same order in both figures — the rotation does not reorder them. After
+it, the horizontal pane holds lift-off and the vertical pane holds the flaw channel, but the
+titles do not say so: which channel holds what is the plug-in's *reading*, and the readings
+live in the properties where they are named and attributed.
+
+Each colorbar is exactly as tall as the image beside it. `fig.colorbar(ax=...)` sizes itself
+from the axes' allotted space, and an `aspect="equal"` pane over data far wider than it is
+tall shrinks inside that allotment while the colorbar does not — measured on the real
+118 × 30 cell shape, a 100 px image beside a 317 px colorbar.
 
 They are declared as `Plugin File[1]` and `Plugin File[2]`, which is what makes NORMS hash
 them into `.hfiles` and copy them to the backup; a generated file that is not declared is
@@ -119,12 +126,12 @@ x and y — where which of them was "along" depended on how the part happened to
 EASEL caches the property list per executable path, so it keeps offering the old pair until
 it is restarted, and the `.norms` files already written at the cell keep the old names.
 
-**Read the flaw channel, not the raw panes.** Lift-off
+**Read the conditioned figure's right pane, not the raw ones.** Lift-off
 is what the probe does riding over an imperfect surface and it is far larger than any flaw, so
 in the raw figure a notch is a small feature on a large varying background. On the 2026-10-15
 scan the flaw was 0.84 V against ±0.65 V of raw banding and a millimetre across in a 23 × 8 mm
-field — present, and not findable by eye. In the flaw pane it is the only thing there, and
-`Peak Position Scan` / `Index` in the record say where to look.
+field — present, and not findable by eye. In the rotated vertical pane it is the only thing
+there, and `Peak Position Scan` / `Index` in the record say where to look.
 
 There used to be **one** figure, with its panes labelled `Real` and `Imaginary` — and it
 plotted the *conditioned* components under those names. So the pane an operator read as the

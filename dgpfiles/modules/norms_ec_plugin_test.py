@@ -55,6 +55,17 @@ def run(*args, **kw):
     return p.stdout, p.stderr
 
 
+def load_plugin_module():
+    """The plug-in as an importable module, for the few checks that have to
+    RENDER rather than read the source. It is an executable script, so this is
+    an explicit load by path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("ec_scan_plugin", PLUGIN)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def one_object(stdout):
     """Parse stdout the way NORMS does, and fail the way NORMS would."""
     assert stdout.strip(), "stdout was empty: NORMS records this as JSON Missing"
@@ -415,9 +426,11 @@ def test_the_figures_are_report_ready_and_carry_no_interpretation(tmp_path):
 
 
 def test_the_panes_are_titled_for_what_they_hold(tmp_path):
-    """Horizontal and vertical for the raw pair, lift-off and flaw for the
-    conditioned one -- and in the same order, because the flaw channel is the
-    component perpendicular to lift-off, so it sits where vertical sits."""
+    """Horizontal and Vertical for the raw pair, the same two "(rotated)" for
+    the conditioned one -- in the same order, because the rotation does not
+    reorder them. Naming the conditioned panes "Lift-off" and "Flaw" asserted
+    which channel held which, which is the plug-in's reading rather than the
+    measurement; the readings live in the properties."""
     src = open(PLUGIN).read()
     raw = src[src.index("def render_raw("):src.index("def render_conditioned(")]
     assert '"Horizontal"' in raw and '"Vertical"' in raw, raw
@@ -426,7 +439,7 @@ def test_the_panes_are_titled_for_what_they_hold(tmp_path):
             "render_raw still titles a pane %r" % (wrong,)
 
     cond = src[src.index("def render_conditioned("):src.index("def first(")]
-    assert '"Lift-off"' in cond and '"Flaw"' in cond, cond
+    assert '"Horizontal (rotated)"' in cond and '"Vertical (rotated)"' in cond, cond
 
 
 def test_the_pane_order_matches_between_the_two_figures(tmp_path):
@@ -440,6 +453,56 @@ def test_the_pane_order_matches_between_the_two_figures(tmp_path):
     cond = src[src.index("def render_conditioned("):src.index("def first(")]
     assert cond.index("axes[0], L") < cond.index("axes[1], F"), \
         "lift-off must be the left pane, as horizontal is in the raw figure"
+
+
+def test_the_colorbar_is_exactly_as_tall_as_the_image(tmp_path):
+    """fig.colorbar(ax=...) sizes itself from the axes' ALLOTTED space, and
+    these panes are aspect="equal" over data far wider than it is tall -- so
+    the drawn image shrinks inside that allotment and the colorbar does not.
+    Measured on the real 118 x 30 cell shape: a 100 px image beside a 317 px
+    colorbar, overhanging top and bottom by more than the image's own height.
+
+    An inset in AXES coordinates is tied to the drawn box, so this is exact
+    rather than approximately right -- and it is checked by rendering, because
+    the first version was approximately right and looked wrong.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    plug = load_plugin_module()
+    img = np.random.default_rng(0).normal(size=(118, 30))
+    ae = np.arange(119)*0.25
+    ce = np.arange(31)*0.25
+    fig, axes = plt.subplots(1, 2, figsize=(11, plug._figure_height(ae, ce)))
+    plug._pane(fig, axes[0], img, ae, ce, "A")
+    plug._pane(fig, axes[1], img, ae, ce, "B")
+    fig.tight_layout()
+    fig.canvas.draw()
+    try:
+        for i, ax in enumerate(axes):
+            insets = [c for c in ax.get_children() if isinstance(c, plt.Axes)]
+            assert len(insets) == 1, "pane %d has %d inset axes" % (i, len(insets))
+            a = ax.get_window_extent()
+            c = insets[0].get_window_extent()
+            assert abs(c.height - a.height) < 1.0, \
+                "pane %d: image %.1f px, colorbar %.1f px" % (i, a.height, c.height)
+            assert abs(c.y0 - a.y0) < 1.0 and abs(c.y1 - a.y1) < 1.0, \
+                "pane %d: colorbar is the right height but not aligned" % (i,)
+    finally:
+        plt.close(fig)
+
+
+def test_the_figures_use_tight_layout(tmp_path):
+    """Both of them. An equal-aspect pane leaves a lot of slack in its
+    allotment and the figure is otherwise mostly margin."""
+    src = open(PLUGIN).read()
+    for name in ("def render_raw(", "def render_conditioned("):
+        i = src.index(name)
+        body = src[i:src.index("\ndef ", i + 10)]
+        assert "fig.tight_layout()" in body, "%s does not tighten its layout" % name
+        assert 'bbox_inches="tight"' in body, "%s does not crop on save" % name
 
 
 def test_the_two_figures_are_different_pictures(tmp_path):

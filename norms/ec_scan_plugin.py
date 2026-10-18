@@ -562,7 +562,17 @@ def _pane(fig, ax, img, along_edges, across_edges, title):
     # uses.
     ax.set_xlabel("Scan Axis (mm)")
     ax.set_ylabel("Index Axis (mm)")
-    fig.colorbar(mesh, ax=ax, label="V", fraction=0.046, pad=0.04)
+    # THE COLORBAR IS AS TALL AS THE IMAGE, EXACTLY. fig.colorbar(ax=...)
+    # takes its height from the axes' ALLOTTED space, and these panes are
+    # aspect="equal" over data far wider than it is tall -- so the drawn image
+    # shrinks inside that allotment while the colorbar does not. Measured on
+    # the real 118 x 30 cell shape: a 100 px image beside a 317 px colorbar,
+    # overhanging it top and bottom by more than the image's own height.
+    # An inset in AXES coordinates is tied to the drawn box instead, and
+    # [1.02, 0, 0.03, 1] is 1.00 of its height with the tops and bottoms
+    # aligned to the pixel.
+    cax = ax.inset_axes([1.02, 0.0, 0.03, 1.0])
+    fig.colorbar(mesh, cax=cax, label="V")
 
 
 def render_raw(path, per_along, per_values, across_mm, pitch_mm):
@@ -628,8 +638,8 @@ def render_conditioned(path, per_along, per_lift, per_flaw, across_mm,
     # is the component perpendicular to lift-off, so it sits where vertical
     # sits. The rotation that produced them is "Measured Lift-off Angle" in the
     # record, and is deliberately not written across the figure.
-    _pane(fig, axes[0], L, ae, ce, "Lift-off")
-    _pane(fig, axes[1], F, ae, ce, "Flaw")
+    _pane(fig, axes[0], L, ae, ce, "Horizontal (rotated)")
+    _pane(fig, axes[1], F, ae, ce, "Vertical (rotated)")
     fig.tight_layout()
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
