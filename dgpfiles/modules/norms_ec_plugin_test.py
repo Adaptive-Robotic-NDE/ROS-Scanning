@@ -362,16 +362,16 @@ def test_a_serpentine_is_folded_out_rather_than_mirrored(tmp_path):
     scan = make_scan(str(tmp_path), serpentine=True, ragged=False, flaw_at=flaw)
     doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
     c = doc["Eddy Current Conditioning"]["Properties"]
-    along = float(c["Peak Position Along"]["Value"])
+    along = float(c["Peak Position Scan"]["Value"])
     # The fixture plants one flaw at a known fraction along one pass; after
     # folding, it must land there and not at the mirror image of it.
     scan2 = make_scan(str(tmp_path / "comb"), serpentine=False, ragged=False,
                       flaw_at=flaw)
     c2 = one_object(run("--files", os.path.join(scan2, "pass000.npz"))[0])[
         "Eddy Current Conditioning"]["Properties"]
-    assert abs(along - float(c2["Peak Position Along"]["Value"])) < 0.6, \
+    assert abs(along - float(c2["Peak Position Scan"]["Value"])) < 0.6, \
         "the serpentine put the flaw %.2f mm from where the comb put it" % (
-            abs(along - float(c2["Peak Position Along"]["Value"])),)
+            abs(along - float(c2["Peak Position Scan"]["Value"])),)
 
 
 def test_the_figures_are_report_ready_and_carry_no_interpretation(tmp_path):
@@ -494,10 +494,20 @@ def test_the_flaw_the_record_reports_is_in_the_record_not_on_the_figure(tmp_path
     scan = make_scan(str(tmp_path))
     doc = one_object(run("--files", os.path.join(scan, "pass000.npz"))[0])
     c = doc["Eddy Current Conditioning"]["Properties"]
-    for name in ("Peak Position Across", "Peak Position Along",
+    for name in ("Peak Position Index", "Peak Position Scan",
                  "Peak Flaw Response", "Peak Flaw SNR", "Flaw Channel Noise"):
         assert c[name]["Value"], "%s is empty: the reading has to survive" % name
     assert float(c["Peak Flaw SNR"]["Value"]) > 5.0
+    # NAMED FOR THE AXES THE FIGURE IS DRAWN IN. They were "Along" and
+    # "Across" until 2026-10-17, and before that they were the world grid's x
+    # and y -- where which of them was "along" depended on how the part
+    # happened to be lying.
+    for gone in ("Peak Position Along", "Peak Position Across"):
+        assert gone not in c, "the old name %r is still emitted" % (gone,)
+    # and the no-argument run advertises the new pair, or EASEL's cached
+    # property list and the real run's would disagree
+    empty = one_object(run()[0])["Eddy Current Conditioning"]["Properties"]
+    assert "Peak Position Scan" in empty and "Peak Position Index" in empty
 
 
 def test_an_arbitrary_lift_off_angle_is_withheld_rather_than_recorded(tmp_path):

@@ -109,20 +109,22 @@ across the top, no callouts.
 That is a deliberate line. A reading drawn onto the picture is indistinguishable from the
 measurement once the picture is in a report, and these go into permanent NDE records. The
 readings are still made and still recorded, in the properties, where they are named and
-attributed `A` for auto-generated: `Peak Position Across` / `Along`, `Peak Flaw Response`,
+attributed `A` for auto-generated: `Peak Position Scan` / `Index`, `Peak Flaw Response`,
 `Peak Flaw SNR`, `Flaw Channel Noise`, `Measured Lift-off Angle`. Highlighting, cropping and
 callouts get added afterwards, deliberately, by whoever is making the argument.
 
-`Peak Position Along` and `Peak Position Across` are in those same axes now — along is the
-scan axis, across is the index axis. In the old world grid they meant x and y, and which of
-those was "along" depended on how the part happened to be lying.
+`Peak Position Scan` and `Peak Position Index` are in those same axes. They were
+`Peak Position Along` / `Across` until 2026-10-17, and before that they were the world grid's
+x and y — where which of them was "along" depended on how the part happened to be lying.
+EASEL caches the property list per executable path, so it keeps offering the old pair until
+it is restarted, and the `.norms` files already written at the cell keep the old names.
 
 **Read the flaw channel, not the raw panes.** Lift-off
 is what the probe does riding over an imperfect surface and it is far larger than any flaw, so
 in the raw figure a notch is a small feature on a large varying background. On the 2026-10-15
 scan the flaw was 0.84 V against ±0.65 V of raw banding and a millimetre across in a 23 × 8 mm
 field — present, and not findable by eye. In the flaw pane it is the only thing there, and
-`Peak Position Across` / `Along` in the record say where to look.
+`Peak Position Scan` / `Index` in the record say where to look.
 
 There used to be **one** figure, with its panes labelled `Real` and `Imaginary` — and it
 plotted the *conditioned* components under those names. So the pane an operator read as the
@@ -235,9 +237,15 @@ arguments when the Setup form is accepted, and caches that answer per executable
 life of the process; the cached list is what the documentation forms offer on their
 "Auto-Generated" tab.
 
-This applies to the 2026-10-15 rename of `Real Channel` / `Imaginary Channel` to
-`Horizontal Channel` / `Vertical Channel`: a running EASEL will keep offering the old pair
-until it is restarted.
+Two renames so far, and both need it. 2026-10-15: `Real Channel` / `Imaginary Channel` to
+`Horizontal Channel` / `Vertical Channel`. 2026-10-17: `Peak Position Across` /
+`Peak Position Along` to `Peak Position Index` / `Peak Position Scan`. A running EASEL keeps
+offering the old names until it is restarted, and records already written keep them for good
+— nothing rewrites a `.norms`.
+
+The property list has also GROWN since the first cell run, which needs the same restart:
+`Sample Rate`, `Block Span`, `Block Smear`, `Lift-off Angle Determinate`, `Scan Coordinates`,
+`Pass Straightness`, `Image Rows`, `Image Columns`, `Image Gaps` and `Image Coverage`.
 
 ---
 

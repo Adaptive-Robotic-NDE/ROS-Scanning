@@ -96,8 +96,8 @@ PROPERTIES = [
     (COND, "Flaw Channel Noise", "V"),
     (COND, "Peak Flaw Response", "V"),
     (COND, "Peak Flaw SNR", ""),
-    (COND, "Peak Position Across", "mm"),
-    (COND, "Peak Position Along", "mm"),
+    (COND, "Peak Position Scan", "mm"),
+    (COND, "Peak Position Index", "mm"),
 
     (SURF, "Planning Mesh", ""),
     (SURF, "Projection Surface", ""),
@@ -834,16 +834,18 @@ def extract(folder, passes, raw_path, cond_path):
                 v["Peak Flaw Response"] = float(perp[k] - med)
                 if mad > 0:
                     v["Peak Flaw SNR"] = float(dev[k]/mad)
-                # WHERE THE PEAK IS, in the record and not on the picture, and
-                # in the figure's own axes -- "across" and "along" now mean
-                # across the passes and along a pass, which is what they say.
-                # In the world x-y grid they meant x and y, and which of those
-                # was which depended on how the part happened to be lying.
+                # WHERE THE PEAK IS, in the record and not on the picture,
+                # and in the figure's own axes. They were "Along" and "Across"
+                # until 2026-10-17 and before that they were the world grid's
+                # x and y -- where which of them was "along" depended on how
+                # the part happened to be lying. They are the scan and index
+                # axes now, named the way the figures and the rest of the
+                # trade name them.
                 if per_along is not None:
                     which = int(np.searchsorted(bounds, k, side="right") - 1)
-                    v["Peak Position Along"] = float(
+                    v["Peak Position Scan"] = float(
                         per_along[which][k - bounds[which]])
-                    v["Peak Position Across"] = float(across_mm[which])
+                    v["Peak Position Index"] = float(across_mm[which])
         except Exception:                                          # noqa: BLE001
             traceback.print_exc(file=sys.stderr)
         try:
