@@ -255,7 +255,12 @@ if not os.environ.get("TARI_TRANSACTION_LATENCY"):
 # 1.0 mm FWHM is an UPPER BOUND -- it was measured at 1 mm sampling, so the true
 # width may be smaller and want a finer pitch still. The first fine-pitch scan
 # settles it, and that measurement sets this number for everything after.
-SCAN_STEP_SIZE = 0.001
+#
+# 0.25 mm since 2026-10-22, because it is what the last two sessions typed at
+# the prompt before every scan (set_scan_step_size(0.00025), 10-16 and 10-19)
+# and a default nobody uses is not a default. A >= 1 mm notch sampled at 1 mm
+# gives ONE point above the noise: findable, not classifiable.
+SCAN_STEP_SIZE = 0.00025
 
 # How fast the probe sweeps, in metres per second. The sample rate is
 # velocity/step, so once the step is chosen this is a rate request: above the
@@ -263,8 +268,16 @@ SCAN_STEP_SIZE = 0.001
 #
 # 10 mm/s is a limit, not a preference: the probe is IN CONTACT for the whole
 # sweep, and the limit near the part is 10 mm/s (NEAR_PART_SPEED below).
-# run_ec_scan() refuses anything faster. It is also exactly the live staging
-# ceiling at a 1 mm step (10 traces/s), so nothing gets clamped.
+# run_ec_scan() refuses anything faster.
+#
+# AT THE 0.25 mm STEP ABOVE THIS IS CLAMPED, and deliberately left as the limit
+# rather than lowered to match: 10 mm/s / 0.25 mm asks for 40 traces/s, the
+# 'live' ceiling is 10, and the plan scales the speed to 2.5 mm/s and says so.
+# Writing 0.0025 here instead would hard-code today's pipeline ceiling into the
+# config, so the scan would not speed up when the ceiling moves -- and moving it
+# is the open work (the digitizer now does 100 blocks/s, see
+# dgpython-nidaqmx). The clamp is the mechanism for "as fast as the pipeline
+# allows"; a request 10x over the ceiling still raises rather than clamping.
 SCAN_VELOCITY = 0.010
 
 # ==============================================================================
@@ -431,12 +444,23 @@ EC_NULL_REQUIRED = EC_SOURCE == "hardware"
 EC_AUTO_ROTATION = True
 
 # Impedance-plane conditioning -- the SOFTWARE offset, rotation and gain, applied
-# to recorded traces. NONE OF THESE ARE MEANINGFUL DEFAULTS: the null depends on
-# the part and the probe, and the rotation is chosen during setup by turning it
-# until lift-off flattens onto the horizontal axis. Identity values give a
-# readable but unconditioned display. Use null_here() and set_rotation().
+# to recorded traces. THE NULL IS STILL NOT A MEANINGFUL DEFAULT: it depends on
+# the part and the probe in front of it today, and null_here() is the only way
+# to get one. Identity gives a readable but un-nulled display.
+#
+# THE ROTATION IS MEASURED, and is now the default rather than 0. 83.8 deg on
+# 2026-10-08 and 86.5 on 2026-10-09, both from the recorded traces after the
+# fact; 86.5 is what 10-16 and 10-19 set by hand (set_rotation(86.5)) and what
+# both scans ran at. At 0 the projected channel is the standing offset plus tilt
+# rather than the part -- the 2026-10-09 scan ran that way and its per-pass
+# baseline wandered 0.765 V against a 0.9 V notch.
+#
+# It is a property of this probe, this frequency and this instrument TODAY, so
+# it is still measured per session: EC_AUTO_ROTATION re-measures it from the
+# scan's own traces at the end and re-paints, and set_rotation() overrides it at
+# the prompt. This value is the one a scan STARTS with.
 EC_NULL = (0.0, 0.0)
-EC_ROTATION_DEG = 0.0
+EC_ROTATION_DEG = 86.5
 EC_GAIN = (1.0, 1.0)
 
 # Where the trace list and the conditioned channels live.
@@ -448,8 +472,8 @@ EC_COND_PREFIX = "/ec/cond"
 # ==============================================================================
 # Segments shorter than this are link moves between raster lines, not scanning
 # passes. Noether reports its own segment boundaries, so this only has to
-# separate "line" from "hop between lines" -- and at a 0.3 mm line spacing a
-# hop is 0.3 mm. 5 mm rather than the ultrasound scan's 20 mm: real-cell
+# separate "line" from "hop between lines" -- and at the 0.25 mm line spacing a
+# hop is 0.25 mm. 5 mm rather than the ultrasound scan's 20 mm: real-cell
 # eddy-current regions are 10-30 mm across, and at 20 mm every pass across such
 # a region would be thrown away as a link move.
 PATH_MIN_SEGMENT_M = 0.005
@@ -613,11 +637,18 @@ DETECT_POSE = "over_table"
 PARK_POSE = "over_table"
 
 # --- toolpath -----------------------------------------------------------------
-# Between passes. 0.3 mm is the real-cell eddy-current value (0.1 mm for higher
-# resolution); the ultrasound transducer's was 10 mm. At 0.3 mm a whole part is
-# hours: preview_ec_scan() says how many, and EC_SCAN_REGION is how to scan an
-# area that fits in the time the plan allows.
-SCAN_LINE_SPACING = 0.0003
+# Between passes, in metres. 0.3 mm was the real-cell eddy-current value (0.1 mm
+# for higher resolution); the ultrasound transducer's was 10 mm. A whole part at
+# this spacing is hours: preview_ec_scan() says how many, and EC_SCAN_REGION is
+# how to scan an area that fits in the time the plan allows.
+#
+# 0.25 mm since 2026-10-22 -- SQUARE with SCAN_STEP_SIZE, and what the last two
+# sessions passed by hand (run_automated_scan(line_spacing=0.00025)). Square
+# matters for the projection: the spot radius is derived from the line spacing,
+# and a pitch much finer than the spacing averages many traces into one pixel
+# (at 0.25 x 0.30 it was 8 per pixel, which is a low-pass filter nobody asked
+# for). It costs 1.2x the passes of 0.3 mm: 72 passes over the 10-16 region.
+SCAN_LINE_SPACING = 0.00025
 NOETHER_LINE_SPACING = SCAN_LINE_SPACING
 NOETHER_MESH = None              # None asks obtain_specimen_mesh()
 NOETHER_MESH_OFFSET = (0.0, 0.0, 0.0)
@@ -762,11 +793,17 @@ NOETHER_Z_OFFSET = 0.0
 # millimetre equivalent instead, so the number can still be read back the way
 # the fixture is measured.
 #
-# 0 at startup: the right value is a property of this fixture and this part, and
-# nothing here has measured it. At 0 the tip is commanded exactly onto the
-# measured surface and every error in the mesh becomes lift-off (mesh high) or
-# compression (mesh low), one for one.
-EC_PRELOAD_M = 0.0
+# NOW MEASURED: 2.00 mm, which is what 10-16 and 10-19 both set by hand before
+# every scan and what both scans ran at. It was 0 at startup while nothing had
+# measured it -- and at 0 the tip is commanded exactly onto the measured surface,
+# so every error in the mesh becomes lift-off (mesh high) or compression (mesh
+# low), one for one, which is why it was never the value to scan at.
+#
+# This is EXACTLY EC_PRELOAD_CEILING_M below, so there is no headroom left: if
+# the tooling description changes and the ceiling drops, plan_ec_path() will
+# refuse this default by name rather than quietly clipping it. That is the
+# intended behaviour and the reason the ceiling is derived from the geometry.
+EC_PRELOAD_M = 0.002
 
 # The hard ceiling on the preload, in metres. Refused above this, by
 # set_ec_preload() and by plan_ec_path(preload=) alike.

@@ -121,7 +121,8 @@ locked_quats = ns["locked_quats_from_axes"]
 quat_to_matrix = ns["quat_to_matrix"]
 twist = ns["tool_twist_deg"]
 
-#: SCAN_LINE_SPACING in ECAutomatedScan.dgp: the distance BETWEEN passes.
+#: The distance BETWEEN passes that the 81-pass plan below was observed at.
+#: Not SCAN_LINE_SPACING's current default (0.25 mm): these are measurements.
 LINE_SPACING = 0.0003
 #: NOETHER_ROLL_REFERENCE: the tool x axis the eddy-current roll is locked to.
 REFERENCE = (1.0, 0.0, 0.0)

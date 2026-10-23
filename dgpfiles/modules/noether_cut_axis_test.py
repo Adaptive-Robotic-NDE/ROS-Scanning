@@ -149,8 +149,8 @@ pass_axis = ns["noether_pass_axis"]
 principal = ns["noether_principal_axes"]
 report = ns["mesh_plan_report"]
 
-#: SCAN_LINE_SPACING in ECAutomatedScan.dgp -- the spacing the numbers above
-#: were measured at.
+#: The spacing the numbers above were measured at. Not SCAN_LINE_SPACING's
+#: current default (0.25 mm) -- these are observations, not configuration.
 LINE_SPACING = 0.0003
 
 FAILS = []

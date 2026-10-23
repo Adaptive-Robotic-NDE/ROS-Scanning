@@ -148,8 +148,10 @@ TMP = tempfile.mkdtemp(prefix="mesh_gate_")
 WORK_VOLUME = ([0.5869960242599606, -0.4648912774417954, 0.9228375632711517],
                [1.1211007192022888, 0.4011034430451927, 1.2428375632711517])
 
-#: SCAN_LINE_SPACING in ECAutomatedScan.dgp. Everything the gate predicts scales
-#: on it, and 0.3 mm is the value the eddy-current scan uses.
+#: The line spacing the gate's predictions below were MEASURED at. Everything
+#: the gate predicts scales on it, so this stays at 0.3 mm even though
+#: SCAN_LINE_SPACING is 0.25 mm now -- changing it here would invalidate the
+#: recorded numbers rather than re-measure them.
 LINE_SPACING = 0.0003
 
 FAILS = []

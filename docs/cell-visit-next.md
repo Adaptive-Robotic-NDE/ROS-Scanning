@@ -274,11 +274,8 @@ the filter corners to be unchanged (they are the instrument's, not the card's).
 
 ### 2.5 Then the scan, at the resolution the card can now afford
 
-```
-set_scan_step_size(0.00025)
-set_scan_velocity(0.0025)
-set_projection_mode("live")
-```
+Nothing to type: the step size, the line spacing, the preload and the
+conditioning rotation are config defaults since 2026-10-22 (§3.4). Just run it.
 
 That is the results26 scan with a tenth of the smear and nothing else changed —
 the comparison that isolates the block length. If `read_errors` stayed 0 at 100
@@ -351,19 +348,49 @@ It leaves you at a `dgpy>` prompt. Everything below is typed there.
 
 ### 3.4 Confirm what the run will use, before it moves
 
+**The four settings that used to be typed before every scan are defaults now**
+(2026-10-22). Nothing to set — check that they are what you expect:
+
+| | default | was |
+|---|---|---|
+| `SCAN_STEP_SIZE` | 0.25 mm | 1 mm |
+| `SCAN_LINE_SPACING` | 0.25 mm | 0.3 mm |
+| `EC_PRELOAD_M` | 2.00 mm | 0 |
+| `EC_ROTATION_DEG` | 86.5 deg | 0 |
+
 ```
 describe_calibration()
-probe_rotation()
 scan_plan()
+ec_preload()
+ec_rotation()
+probe_rotation()
 daq.AcquisitionStatus()
 ```
 
 `describe_calibration()` must show the 0.822 mm Azure solve and a **non-zero
 Keyence lateral correction** — deploying a calibration has silently zeroed that
-one before. `probe_rotation()` is the rotation the locked path will hold.
+one before.
+
 `scan_plan()` prints the step size, the velocity it will actually command, the
-trace rate, and the time and memory estimate; read the commanded velocity, not
-the requested one.
+trace rate, and the time and memory estimate. **Read the commanded velocity, not
+the requested one**: at a 0.25 mm step the 10 mm/s request is clamped to
+2.5 mm/s by the live trace-rate ceiling, and the plan says so. That clamp is
+deliberate — see the note on `SCAN_VELOCITY` in the config for why the velocity
+was not simply lowered to match.
+
+`ec_preload()` is 2.00 mm, which is exactly `EC_PRELOAD_CEILING_M`. If the
+tooling has changed and the ceiling has dropped, `plan_ec_path()` refuses this
+default by name rather than clipping it.
+
+`ec_rotation()` is the rotation the scan STARTS with, and it is still a property
+of this probe and this instrument today: `EC_AUTO_ROTATION` re-measures it from
+the scan's own traces at the end and re-paints, and `set_rotation()` overrides
+it at the prompt. If the measured value comes back far from 86.5, that is the
+number to bring home.
+
+`probe_rotation()` is 0: the PHYSICAL rotation of the probe about its own axis,
+which is the one the locked path in §3.6 holds. Not the same quantity as
+`ec_rotation()`, which is a rotation of the impedance plane in software.
 
 ### 3.5 The reference run: surface-following
 

@@ -432,7 +432,11 @@ print("THE SETTER: one way in, metres, and it reports in millimetres")
 @_checked
 def test_setter_sets_and_reports():
     ns, said = load_preload()
-    check("the config starts at 0", ns["EC_PRELOAD_M"] == 0.0)
+    # 2.00 mm since 2026-10-22: measured on 10-16 and 10-19 and made the
+    # default. The check is that the constant starts at a definite value the
+    # setter then replaces, not that the value is any particular one.
+    check("the config starts at the measured preload",
+          ns["EC_PRELOAD_M"] == 0.002, ns["EC_PRELOAD_M"])
     out = ns["set_ec_preload"](0.0003)
     check("set_ec_preload returns the metres it set", out == 0.0003, out)
     check("and the shared value is updated", ns["EC_PRELOAD_M"] == 0.0003)
