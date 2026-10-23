@@ -15,8 +15,8 @@ Undated. Nothing here goes stale with time, only with the next run.
 
 | | |
 |---|---|
-| **The NVMe is not the problem** | and neither is the antivirus. The 10-19 stall capture has **no threads in D state**, PSI io all zeros, and `delayacct blkio ticks = 0`. The 10-14 diagnosis was wrong and this replaces it. |
-| **The stall is a deadlock in spatialnde2** | not a slowdown, not a livelock, not contention. `snde2 recdb gmn` burned **549 ticks at 17:08 and 549 ticks at 17:13** — zero CPU in five minutes — and that thread is the only thing that can release a blocked mutable computation. §1. |
+| **The NVMe is not the problem** | and neither is the antivirus. The stall capture has **no storage wait channel on any thread** (no `io_schedule`/`wait_on_page_bit`/`folio_wait_bit`), `/proc/pressure/io` all zeros in both samples, and the process's `delayacct blkio ticks = 0`. Three independent grounds. The 10-14 diagnosis was wrong and this replaces it. |
+| **The stall is in spatialnde2, in the mutable-math path** | not storage. All 59 `snde2 *` threads — 48 compute workers, the dispatcher, the transaction-end threads, the requeue thread and the compositor's worker — were in a futex wait at both samples, 5 min 38 s apart. §1. **The per-thread CPU numbers the first version of this section quoted were wrong; see §1.1.** |
 | **The card was the speed limit, by coincidence** | 1 kHz / 100 samples = 10 blocks/s, and `max_trace_rate_hz["live"]` is 10.0 Hz. Two independent ceilings at the same number, so neither showed up as the binding one. §2. |
 | **-200279 immediately on a rate change** | 2657 of them. Expected: `SampleRate` and `SampsPerChan` could only be set one at a time, so 250 kHz with the block still 100 samples asked for 2500 blocks/s. Fixed in the module. §2. |
 | **bench_ec's measurements were good and its verdict was wrong** | the numbers below stand; the conclusion drawn from them did not. §2.3. |
@@ -38,20 +38,32 @@ stage_ec_reading   (ec_acquisition.dpi:946)
 
 So the thing not completing is the **projection's** globalrev, not the trace's.
 
-`threads.txt`: 0 threads in D state, 237 in `futex_wait`. CPU deltas over the
-five minutes between the two captures:
+**Wait channels**, which is what this capture actually supports. All 59
+`snde2 *` threads were in `futex_wait_queue_me` at 17:08:05 and again at
+17:13:43: 48 `snde2 acrd NN` compute workers, `snde2 acrd disp`, 8
+`snde2 ttm tbec`, `snde2 recdb gmn` and `snde2 qt_osg wo` (the compositor's own
+worker). No thread anywhere in the process had an `io_schedule`,
+`wait_on_page_bit` or `folio_wait_bit` channel; `/proc/pressure/io` read
+`some avg10=0.00 avg60=0.00 avg300=0.00` in both captures; the process's
+`delayacct blkio ticks` was 0. **Storage and the antivirus are excluded on
+three independent grounds.**
 
-| thread | 17:08 | 17:13 | delta |
-|---|---|---|---|
-| `ros_spinner` | | | +67 s |
-| `dgpy_initializa` | | | +64 s |
-| Qt main | | | +8 s |
-| **`snde2 recdb gmn`** | **549** | **549** | **0** |
-| `snde2 acrd 00/01/02` | 1316 / 43179 / 9018 | same | 0 |
-| `snde2 ttm tbec` x8 | 547 | 547 | 0 |
+Threads that are not the library's did advance: `ros_spinner` +67 s of CPU,
+`dgpy_initializa` +64 s, the digitizer read thread +8.8 s, `dgpy_main_threa`
++7.9 s. The process was alive and scheduled; the recording database was not
+running.
 
-The process is busy. The math pipeline is not merely slow — it did not execute
-a single instruction for five minutes.
+> **CORRECTION, 2026-10-23.** The first version of this section said every
+> `snde2` thread consumed *zero CPU* over those five minutes and printed a table
+> of tick counts (549, 547, 43179, ...). **That was wrong.** `capture_stall.sh`
+> read `/proc/<tid>/stat` by splitting the line on whitespace, but field 2 is the
+> thread name in parentheses and every spatialnde2 thread's name contains spaces
+> (`snde2 acrd 01`). Every later field shifted by two, so the "CPU ticks" column
+> was really `majflt+cmajflt` and the "state" column was a fragment of the name.
+> No major page faults is not no CPU. The script is fixed and now records the raw
+> `stat` line as well, but **per-thread CPU for this stall is unrecoverable** --
+> it was never stored correctly. The wait-channel evidence above is read from
+> `/proc/<tid>/wchan` directly and is unaffected.
 
 ### 1.2 Why that is a deadlock and not a slow queue
 
@@ -75,13 +87,17 @@ it accumulates on top of its own previous revision.
 
 `blocked_list` has exactly **one** drain: `recdatabase::globalrev_mutablenotneeded_code()`,
 which runs on the `snde2 recdb gmn` thread and is woken only by
-`~globalrev_mutable_lock()`. Zero ticks on that thread over five minutes means
-no `globalrev_mutable_lock` destructor ever ran, which means a holder is pinned,
-which means every later mutable computation stays blocked forever. The
-projection globalrev can then never complete, and `project(wait=True)` never
-returns. That is a cycle with no timer in it anywhere — a deadlock.
+`~globalrev_mutable_lock()`. If a holder is pinned, every later mutable
+computation stays blocked forever: the projection globalrev can never complete,
+and `project(wait=True)` never returns. There is no timer anywhere in that path.
 
-### 1.3 Who is holding it
+Be careful about how much the capture proves here. `snde2 recdb gmn` waits on a
+condition variable, so "parked in a futex wait" is also what it looks like when
+there is simply nothing to release. The capture establishes the symptom; it does
+not by itself prove a pinned holder rather than some other reason nothing was
+runnable.
+
+### 1.3 The leading candidate for who is holding it
 
 `osg_compositor::perform_ondemand_calcs`, `openscenegraph_compositor.cpp:495-556`:
 
@@ -108,9 +124,18 @@ globalrev's holder only if it is **not** the latest defined, and
 globalrev is defined. The compositor's copy keeps the lock object alive past
 both.
 
-**Not yet proven:** which globalrev's holder is pinned, and whether the
-compositor is the only holder. The compositor's native stack is among the 310
-threads gdb missed on 10-19. §1.4 is the capture that settles it.
+**Why this is the leading candidate.** `snde2 qt_osg wo` -- the compositor's own
+worker, which is what runs the on-demand stage in this configuration -- was in a
+futex wait at both samples. That is what parking in `wait_complete()` while
+holding `incomplete_mutable_recording_locker` looks like. Note that `py-spy`
+showing the Qt main thread in its normal event loop does NOT exonerate the
+compositor, which is how this was first read: the on-demand stage runs on a pure
+C++ thread with no Python frames, so `py-spy` cannot see it at all.
+
+**Not proven:** which globalrev's holder is pinned, whether the compositor is
+the holder, or whether a pinned holder is the cause rather than a consequence.
+There is no stack for that thread -- it is one of the 310 gdb missed. §1.4 is
+the capture that settles it.
 
 ### 1.4 What to capture next time, and how
 

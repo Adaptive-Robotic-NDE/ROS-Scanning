@@ -159,20 +159,39 @@ say "pid $PID: $(tr '\0' ' ' < /proc/$PID/cmdline 2>/dev/null)"
 # THE DISCRIMINATOR. One line per thread: what the kernel says it is waiting
 # on. See the header for how to read it.
 {
-    echo "# tid  state  %cpu  wchan  name"
+    echo "# tid  state  cputicks  wchan  name"
     echo "#"
     echo "# state: R running  S interruptible sleep  D UNINTERRUPTIBLE (storage)"
+    echo "# cputicks: utime+stime in clock ticks (100/s), CUMULATIVE since the"
+    echo "#           thread started. Compare two captures to get CPU consumed"
+    echo "#           between them: no change = the thread did nothing at all."
     echo "# wchan: io_schedule/wait_on_page_bit/folio_wait_bit = STORAGE"
     echo "#        futex_wait/rwsem/mutex_lock = waiting on another thread"
     echo "#        do_sys_poll/ep_poll/futex_wait_queue = idle"
     echo
+    # PARSE /proc/<tid>/stat BY STRIPPING THROUGH THE LAST ')'. Field 2 is the
+    # thread name in parentheses and it may contain spaces -- every spatialnde2
+    # thread's does ("snde2 acrd 01", "snde2 recdb gmnnc"). Splitting the whole
+    # line on whitespace shifts every later field by the number of spaces in the
+    # name, so `$3` returns a fragment of the name instead of the state and
+    # `$14+$15` returns major-fault counters instead of CPU time -- for exactly
+    # the threads a recording-database stall is about. This cost a reading of
+    # the 2026-10-22 capture: 59 library threads appeared to have consumed no
+    # CPU for five and a half minutes, which was really "no major page faults".
+    # The raw line is kept below so a future mistake here is recoverable.
     for t in /proc/$PID/task/*; do
         tid="$(basename "$t")"
-        st="$(awk '{print $3}' "$t/stat" 2>/dev/null)"
-        ut="$(awk '{print $14+$15}' "$t/stat" 2>/dev/null)"
-        wc="$(cat "$t/wchan" 2>/dev/null)"
         nm="$(cat "$t/comm" 2>/dev/null)"
+        rest="$(sed 's/^.*) //' "$t/stat" 2>/dev/null)"   # fields from state onward
+        st="$(echo "$rest" | awk '{print $1}')"
+        ut="$(echo "$rest" | awk '{print $12+$13}')"      # utime, stime
+        wc="$(cat "$t/wchan" 2>/dev/null)"
         printf "%-8s %-3s %-10s %-28s %s\n" "$tid" "${st:-?}" "${ut:-?}" "${wc:-0}" "${nm:-?}"
+    done
+    echo
+    echo "### raw /proc/<tid>/stat, in case the parse above is ever wrong again"
+    for t in /proc/$PID/task/*; do
+        cat "$t/stat" 2>/dev/null
     done
     echo
     echo "### kernel stacks (needs root; blank without it)"
