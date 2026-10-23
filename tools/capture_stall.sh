@@ -50,6 +50,12 @@
 # USAGE
 #     ROS-Scanning/tools/capture_stall.sh [pid] [-o outdir] [--no-gdb] [--gdb]
 #
+# RUN IT WITH sudo IF YOU WANT NATIVE STACKS. gdb cannot attach to a process it
+# did not start unless it is root (kernel.yama.ptrace_scope), and native.txt is
+# where the C++ side of a stall lives. Everything else works unprivileged, so
+# an unprivileged run is still worth having -- it just says so instead of
+# pretending. GDB_TIMEOUT=<seconds> overrides the 600 s cap.
+#
 # With no pid it finds the dataguzzler-python process itself and refuses if
 # there is more than one. Nothing here writes to the stalled process, kills
 # anything, or touches the robot.
@@ -326,6 +332,25 @@ elif ! have gdb; then
       echo "a spatialnde2 globalrev wait and an uninterruptible page fault look"
       echo "identical from Python."; } > "$OUTDIR/native.txt"
 else
+    # CAN IT ATTACH AT ALL? Checked FIRST, because on 2026-10-22 it could not
+    # -- ptrace_scope was 1 and gdb needs root for a process it did not start
+    # -- and this script announced "the process is SUSPENDED" and then "pid
+    # resumed" while gdb had in fact never attached. An operator who reads
+    # that believes they have native stacks and they have none.
+    scope="$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)"
+    if [ "$(id -u)" -ne 0 ] && [ "${scope:-0}" != "0" ]; then
+        {
+            echo "gdb was NOT run: kernel.yama.ptrace_scope is $scope and this"
+            echo "is not root, so gdb cannot attach to a process it did not"
+            echo "start. Re-run the whole script with sudo to get native"
+            echo "stacks:"
+            echo
+            echo "    sudo $0 $PID"
+            echo
+            echo "Everything else in this directory was collected without it."
+        } > "$OUTDIR/native.txt"
+        say "SKIPPED gdb: needs sudo (ptrace_scope=$scope). Re-run: sudo $0 $PID"
+    else
     say "attaching gdb -- the process is SUSPENDED until this finishes"
     trap 'kill -CONT '"$PID"' 2>/dev/null; echo; echo "resumed pid '"$PID"'"' \
         EXIT INT TERM
@@ -335,19 +360,48 @@ else
     #   pagination/height/width the "---Type <return>---" prompt is a hang
     #   timeout                 a gdb that cannot attach must not be forever
     #   2>&1 into the file      the reason it failed is on stderr
-    timeout 180 gdb -p "$PID" -batch -nx \
+    #
+    #   frame-arguments none    THE ONE THAT DECIDES WHETHER THIS FINISHES. A
+    #                           dgpy process has ~300 threads, and with
+    #                           arguments on gdb renders every frame's locals
+    #                           through the python-gdb pretty printer -- full
+    #                           Python object reprs, per frame, per thread. On
+    #                           2026-10-22 that produced 4 backtraces of 314
+    #                           before the timeout, and the compositor's stack
+    #                           -- the one the stall needed -- was not among
+    #                           them. Off, the same dump takes seconds.
+    #   bt 40                   a stall is near the top of the stack; 40 frames
+    #                           reaches through SWIG and the interpreter loop
+    #                           with room to spare.
+    timeout "${GDB_TIMEOUT:-600}" gdb -p "$PID" -batch -nx \
         -iex 'set debuginfod enabled off' \
         -iex 'set pagination off' \
         -iex 'set height 0' \
         -iex 'set width 0' \
         -iex 'set confirm off' \
+        -iex 'set print frame-arguments none' \
+        -iex 'set print address on' \
         -ex 'info threads' \
-        -ex 'thread apply all bt' \
+        -ex 'thread apply all bt 40' \
         > "$OUTDIR/native.txt" 2>&1
-    echo "### exit $?" >> "$OUTDIR/native.txt"
+    rc=$?
+    echo "### exit $rc" >> "$OUTDIR/native.txt"
     kill -CONT "$PID" 2>/dev/null
     trap - EXIT INT TERM
-    say "gdb done, pid $PID resumed"
+    # DID IT ACTUALLY PRODUCE STACKS? "exit 0" is not the same as "it worked":
+    # gdb exits 0 having printed "ptrace: Operation not permitted. No threads."
+    got=$(grep -c "^Thread [0-9]* (Thread" "$OUTDIR/native.txt" || true)
+    # The current thread's row is "* 1  Thread 0x...", the rest "  2  Thread".
+    listed=$(grep -cE "^[ *]+[0-9]+ +Thread 0x" "$OUTDIR/native.txt" || true)
+    if [ "$rc" -eq 124 ]; then
+        say "gdb TIMED OUT after ${GDB_TIMEOUT:-600}s with $got of $listed"\
+            "thread(s) dumped -- raise GDB_TIMEOUT"
+    elif [ "$got" -eq 0 ]; then
+        say "gdb produced NO stacks -- read the top of native.txt for why"
+    else
+        say "gdb done ($got of $listed threads dumped), pid $PID resumed"
+    fi
+    fi
 fi
 
 # ===================================================================== wrap up
