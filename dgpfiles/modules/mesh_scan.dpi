@@ -111,7 +111,8 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
                    specimen_kwargs=None, roll_reference=None,
                    rotation_offset=None, max_tilt_deg=None, clearance=None,
                    check_clearance=True, allow_contact_links=None,
-                   gate=None, gate_repair=None, roi=None, region=None):
+                   gate=None, gate_repair=None, roi=None, region=None,
+                   fixed_quat=None):
     """Plan a toolpath over a mesh and prepare its projection surface.
 
     Returns (ScanPath, x3d path). Both are also left in the globals
@@ -238,16 +239,22 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
                            "(a mesh with no vertex normals needs estimate_normals=True)"
                            % (mesh,))
 
-    fixed_quat = None
-    if orient == "fixed":
+    if orient == "fixed" and fixed_quat is None:
         # The orientation the arm is actually holding. Taken from live TF rather
         # than written down, because it is a property of how the probe is mounted
         # in this cell and it changes when the tooling does.
+        #
+        # A caller that knows the orientation it wants passes fixed_quat instead
+        # -- plan_ec_path() does, from ec_probe_rotation_reference(), so an
+        # axis-locked eddy-current path is the same path whatever the arm
+        # happened to be holding when it was planned.
         t = ros.t
         if t is None:
             raise RuntimeError("no TF for probe_end; cannot take the fixed orientation")
         r = t.transform.rotation
         fixed_quat = (float(r.x), float(r.y), float(r.z), float(r.w))
+    elif orient != "fixed":
+        fixed_quat = None
 
     if orient == "capped" and max_tilt_deg is None:
         max_tilt_deg = globals().get("NOETHER_MAX_TILT_DEG", 35.0)

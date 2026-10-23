@@ -2841,6 +2841,18 @@ def plan_ec_path(mesh=None, line_spacing=None, region=None, preload=None,
     # path by construction, in both serpentine directions, and the direction of
     # travel never enters it.
     kwargs.setdefault("roll_reference", ec_probe_rotation_reference(rotation))
+    # AXIS-LOCKED: ONE ORIENTATION FOR THE WHOLE PATH, and it is the probe's own
+    # vertical reference with the set rotation already in it -- not whatever the
+    # arm happened to be holding when the plan was made, which is what
+    # plan_mesh_path() takes when nobody says. So an axis-locked plan is
+    # reproducible, and the rotation went through check_ec_probe_rotation()
+    # above exactly as it does for a surface-following plan.
+    #
+    # The tilt crop below then keeps every waypoint (tilt is 0 at all of them)
+    # and the axis smoothing declines (the roll mode is no longer "locked"),
+    # both correctly: there is no axis motion left to bound or to average.
+    if kwargs.get("orient") == "fixed":
+        kwargs.setdefault("fixed_quat", ec_probe_rotation_reference(rotation))
     max_tilt = EC_MAX_TILT_DEG if max_tilt_deg is None else max_tilt_deg
     smooth = EC_AXIS_SMOOTHING_M if axis_smoothing_m is None else axis_smoothing_m
     require_work_volume("the eddy-current toolpath")
@@ -3805,7 +3817,7 @@ def _ec_azure_gauge(mesh, allow=False):
 global run_automated_scan
 def run_automated_scan(index=0, scan=True, cutoff=None, line_spacing=None,
                        region=None, park=True, release_yolo_after_detection=True,
-                       roi_select=None, allow_azure_bias=False):
+                       roi_select=None, allow_azure_bias=False, orient=None):
     """Detect, measure, plan -- and scan, if asked.
 
     The whole point of the exercise: one call, no questions. It prints what it
@@ -3831,6 +3843,13 @@ def run_automated_scan(index=0, scan=True, cutoff=None, line_spacing=None,
     even when the gauge says the two disagree by more than AZURE_GAUGE_MAX_MM.
     EC_ALLOW_AZURE_BIAS in a config is the same override for an unattended run.
     Default False, and it is False for a reason -- see stage 2a.
+
+    orient="fixed" locks the tool axis: one orientation for every waypoint of
+    the eddy-current path -- the probe's vertical reference with
+    EC_PROBE_ROTATION_DEG in it -- instead of following the mesh's normals.
+    Everything before the toolpath is unchanged, so the same run still measures
+    the part. That is the A/B against a surface-following scan on one specimen:
+    run_automated_scan() and run_automated_scan(orient="fixed").
 
     The work volume is checked FIRST, before anything moves. The warning light
     is held for the whole run, and park=True rises out of the work volume and
@@ -4014,10 +4033,13 @@ def run_automated_scan(index=0, scan=True, cutoff=None, line_spacing=None,
             # almost all of its discrimination: over a whole mesh a bad scan and
             # a good one have read 55.5 and 52.6 deg normal-turn p99, 6% apart,
             # while over the plate alone the same two read 10.5 and 4.5 -- 2.3x.
+            _plan_kwargs = {}
+            if orient is not None:
+                _plan_kwargs["orient"] = orient
             out["path"], out["x3d"] = plan_ec_path(
                 mesh=out["mesh"], line_spacing=line_spacing,
                 region=EC_SCAN_REGION if EC_SCAN_REGION else region,
-                roi=out["roi"])
+                roi=out["roi"], **_plan_kwargs)
             out["plan"] = preview_ec_scan(out["path"])
 
             if not scan:

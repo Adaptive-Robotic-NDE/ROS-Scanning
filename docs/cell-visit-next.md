@@ -1,309 +1,429 @@
 # Cell visit, next session
 
-Written 2026-10-17 from `results25`. **Supersedes the 2026-10-15 version.**
-That one was built around the stall and the Azure calibration; both of those
-are now either fixed or instrumented, and what is left is a scan that works
-and takes 43 minutes to cover 18 x 29 mm.
+Written 2026-10-22 from `results26`. **Supersedes the 2026-10-17 version.**
+
+That one was about speed and the disk. Speed is now understood and the limit
+has moved; the stall is now diagnosed rather than instrumented; and the two
+things to carry to the cell are a digitizer that can go faster than 10 blocks
+per second and a scan that holds its tool axis still.
 
 Undated. Nothing here goes stale with time, only with the next run.
 
 ---
 
-## 0. What 10-16 settled
+## 0. What results26 settled
 
 | | |
 |---|---|
-| **No stall** | 72 of 72 passes, 8469 of 8496 traces, `Fault none`, `Acquisition Errors 0`, `Staging Timeouts 0`, worst correlation wait **71 ms**. The scan ran to the end with the antivirus running and the disk still erroring. |
-| **The clearance gate reports** | `gate: 2171/2171 poses, 0:00:01 elapsed`. It also took the SAMPLED path this time (2171 poses, over the 2000 threshold) and measured only 144 of them, in one second. §4 is the case that does not. |
-| **The NORMS plug-in works at the cell** | `JSON Valid`, 41 properties, both figures hashed and backed up, `Horizontal Channel` / `Vertical Channel`. |
-| **Scan quality** | the notch is a clean dipole at (5.5, 7.75) mm, peak 0.944 V, SNR 18.4. |
-| **The disk is worse** | `RxErr` has reached **16 630** and was climbing by 7 between two consecutive commands. §1. |
-| **Speed** | measured, explained, and NOT what the end-of-scan message said. §2 is the whole of it. |
+| **The NVMe is not the problem** | and neither is the antivirus. The 10-19 stall capture has **no threads in D state**, PSI io all zeros, and `delayacct blkio ticks = 0`. The 10-14 diagnosis was wrong and this replaces it. |
+| **The stall is a deadlock in spatialnde2** | not a slowdown, not a livelock, not contention. `snde2 recdb gmn` burned **549 ticks at 17:08 and 549 ticks at 17:13** — zero CPU in five minutes — and that thread is the only thing that can release a blocked mutable computation. §1. |
+| **The card was the speed limit, by coincidence** | 1 kHz / 100 samples = 10 blocks/s, and `max_trace_rate_hz["live"]` is 10.0 Hz. Two independent ceilings at the same number, so neither showed up as the binding one. §2. |
+| **-200279 immediately on a rate change** | 2657 of them. Expected: `SampleRate` and `SampsPerChan` could only be set one at a time, so 250 kHz with the block still 100 samples asked for 2500 blocks/s. Fixed in the module. §2. |
+| **bench_ec's measurements were good and its verdict was wrong** | the numbers below stand; the conclusion drawn from them did not. §2.3. |
+| **The capture script did not capture** | gdb never attached (no sudo), and when it did it timed out after 4 of 314 threads. Both fixed; §1.4 is how to run it. |
 
 ---
 
-## 1. The NVMe, again
+## 1. The stall is a deadlock, and here is the chain
 
-`tmp.log` from 10-16:
+### 1.1 What the capture says
+
+`py-spy` puts the stalled thread here:
 
 ```
-== /sys/bus/pci/devices/0000:89:00.0
-RxErr 16623   ...   TOTAL_ERR_COR 16623
-(seconds later)
-RxErr 16630
+stage_ec_reading   (ec_acquisition.dpi:946)
+  project          (surface_projection.dpi:1072, wait=True)
+    globalrev_wait                                  k = 1967
 ```
 
-Seven corrected receiver errors between two consecutive shell commands. It has
-not caused a failure yet and it is not why the scan is slow — but it is a
-hardware fault that has been running for at least three sessions and it is the
-thing that will eventually corrupt a run. `lspci -s 89:00.0 -vv` printed
-nothing in that log, which means it needs `sudo`:
+So the thing not completing is the **projection's** globalrev, not the trace's.
+
+`threads.txt`: 0 threads in D state, 237 in `futex_wait`. CPU deltas over the
+five minutes between the two captures:
+
+| thread | 17:08 | 17:13 | delta |
+|---|---|---|---|
+| `ros_spinner` | | | +67 s |
+| `dgpy_initializa` | | | +64 s |
+| Qt main | | | +8 s |
+| **`snde2 recdb gmn`** | **549** | **549** | **0** |
+| `snde2 acrd 00/01/02` | 1316 / 43179 / 9018 | same | 0 |
+| `snde2 ttm tbec` x8 | 547 | 547 | 0 |
+
+The process is busy. The math pipeline is not merely slow — it did not execute
+a single instruction for five minutes.
+
+### 1.2 Why that is a deadlock and not a slow queue
+
+`recmath_compute_resource.cpp:586` is the gate:
+
+```cpp
+if (!computation->function_to_execute->is_mutable || !computation_rss_is_globalrev
+    || !prior_globalrev
+    || (prior_globalrev->ready && (!prior_globalrev_globalrev
+        || !prior_globalrev_globalrev->mutable_recordings_still_needed))) {
+  _queue_computation_into_database_acrdb_locked(...)
+} else {
+  blocked_list.emplace(...)           // <-- the projector lands here
+}
+```
+
+A **mutable** computation in globalrev N is refused the queue unless N-1 is
+ready *and* nobody still needs its mutable recordings. The surface projector is
+`mutable=True` and documented as requiring it (`surface_projection.dpi:827`):
+it accumulates on top of its own previous revision.
+
+`blocked_list` has exactly **one** drain: `recdatabase::globalrev_mutablenotneeded_code()`,
+which runs on the `snde2 recdb gmn` thread and is woken only by
+`~globalrev_mutable_lock()`. Zero ticks on that thread over five minutes means
+no `globalrev_mutable_lock` destructor ever ran, which means a holder is pinned,
+which means every later mutable computation stays blocked forever. The
+projection globalrev can then never complete, and `project(wait=True)` never
+returns. That is a cycle with no timer in it anywhere — a deadlock.
+
+### 1.3 Who is holding it
+
+`osg_compositor::perform_ondemand_calcs`, `openscenegraph_compositor.cpp:495-556`:
+
+```cpp
+if (mutable_channels.size() > 0) {
+  { std::lock_guard<std::mutex> recdb_admin(recdb_strong->admin);
+    globalrev = recdb_strong->latest_defined_globalrev();
+    std::lock_guard<std::mutex> globalrev_admin(globalrev->admin);
+    incomplete_mutable_recording_locker = globalrev->mutable_recordings_need_holder;
+    ... }
+  globalrev->wait_complete();   // still holding the holder
+}
+```
+
+It takes a **copy of the holder** for the *latest defined* globalrev, then waits
+for that globalrev to complete while holding it. A globalrev whose own mutable
+math is on `blocked_list` cannot complete. The compositor waits for the
+globalrev; the globalrev waits for the holder; the holder is in the
+compositor's own stack frame.
+
+The two release paths cannot help: `notify.cpp:757-760` nulls a completed
+globalrev's holder only if it is **not** the latest defined, and
+`recstore.cpp:4048-4054` nulls the *previous* latest's holder when a new
+globalrev is defined. The compositor's copy keeps the lock object alive past
+both.
+
+**Not yet proven:** which globalrev's holder is pinned, and whether the
+compositor is the only holder. The compositor's native stack is among the 310
+threads gdb missed on 10-19. §1.4 is the capture that settles it.
+
+### 1.4 What to capture next time, and how
 
 ```bash
-sudo lspci -s 89:00.0 -vv | grep -iE 'LnkSta|LnkCap'
+sudo ~/Desktop/tyler_test9_ws/ROS-Scanning/tools/capture_stall.sh $(pgrep -f ECAutomatedScan)
 ```
 
-If `LnkSta` is below `LnkCap` in width or speed, the link has already
-degraded. Reseat it, try another socket, or move `/data/scandata` to a
-different disk — it is one path and nothing depends on where it points.
+**`sudo` is required.** `kernel.yama.ptrace_scope` is 1 on this machine, so gdb
+cannot attach to a process it did not start; without it the script now refuses
+in one line and writes the exact command to run into `native.txt` instead of
+pretending. With it: 41 of 41 threads in about two seconds, where before it was
+4 of 314 in 180 s (python-gdb was pretty-printing every frame argument).
+
+In the output, `native.txt` is the file that matters. Look for:
+
+* a thread in `osg_compositor::perform_ondemand_calcs` inside `wait_complete` —
+  that confirms §1.3;
+* any other frame holding a `globalrev_mutable_lock`;
+* `recmath_compute_resource` frames, and whether `blocked_list` is non-empty.
+
+### 1.5 What to do about it
+
+Two real fixes, both in spatialnde2, and neither is "do not plot it":
+
+1. **Drop the holder once the arrays have been read.** The compositor needs the
+   mutable data to be stable while it copies it into the render pass, not for
+   the whole ondemand → render → composite pass and certainly not across a
+   `wait_complete()`. Releasing it before the wait breaks the cycle outright.
+2. **Make the inhibit per-channel instead of per-globalrev.** An off-screen
+   mutable channel is blocked today by a holder taken for a globalrev. This is
+   also the fix for the GUI stall in §1.6.
+
+The workaround that does not defeat the purpose, if a scan has to run before
+either lands: make the projector non-mutable, the way `compute_cscan` in
+`virtual_scanner.dpi` already is. It costs one 512x512 copy per trace and keeps
+the live image. `EC_PROJECTION_MODE = "deferred"` also avoids it, at the price of
+no live image, which is the thing worth having.
+
+### 1.6 The related, separate thing: mutable math on screen costs 0.7-2 s per globalrev
+
+Measured 2026-08-09 on `virtual_scanner.dgp`: instantiating a math function with
+`mutable=True` on a channel the live viewer displays costs 0.7-2 s of Qt
+GUI-thread stall per new globalrev (blocked time far exceeds total process CPU,
+so the thread is waiting, not working). Same mechanism as §1.3 — the compositor
+holds `mutable_recordings_need_holder` for the whole pass, so compositor and
+math pipeline alternate instead of overlapping — but the outcome there is slow,
+not stuck. `compute_cscan` was left non-mutable for exactly this reason; the
+incremental copy-forward path already gives ~100x and only the nx*ny copy is
+given up.
+
+Do not conflate either of these with the **globalrev completion wedge**, which
+was a different defect (a producing mutable channel permanently stopping
+globalrev completion, so the database retained every recording and the process
+died of "Too many open files"). That is **fixed**, spatialnde2 `976aa6b`. With
+it fixed, `mutable=True` is fine on channels nothing displays live: a full 60x60
+scan with the mutable surface projector ran 658.6 s with flat fds and
+`latest_defined == latest_ready` throughout.
 
 ---
 
-## 2. SPEED: what is actually limiting the scan
+## 2. The digitizer: 10 blocks per second was the card, not the pipeline
 
-The 43.6-minute scan breaks down exactly:
+### 2.1 The arithmetic
+
+The correlator takes **one block per pitch crossing**, so the block rate is the
+hard ceiling on trace rate:
 
 ```
-72 passes x 27.0 s of sweep   = 32.4 min     TOTG's trajectory
-72 passes x  8.5 s of overhead = 10.2 min    lift, transit, descend, plan
-                                 -------
-                                  42.6 min   (43.6 observed)
+block rate = SampleRate / SampsPerChan = 1000 / 100 = 10 blocks/s
 ```
 
-### 2.1 The arm is doing exactly what it was told
+and `max_trace_rate_hz["live"] = 10.0`. Those are two independent ceilings that
+happen to be the same number, which is why raising one alone would have changed
+nothing and why the scan speed looked like a software clamp.
 
-The end-of-scan report said:
+At `SCAN_STEP_SIZE = 0.00025` that is 10 x 0.25 mm = **2.5 mm/s**, which is
+exactly what was commanded.
 
-> observed probe speed 1.1 mm/s over 72 passes (asked for 2.5)
-> that is 0.43x what was asked for: ROBOT_VELOCITY_CALIBRATION is wrong here.
+### 2.2 Smear does not improve with sample rate alone
 
-**It is not.** mtc prints a trajectory check for every pass, and over all 72:
+Each trace is the mean of one block, so
+
+```
+smear / pitch = block_duration / block_period = 1
+```
+
+at any sample rate, as long as the blocks are contiguous. Running the card at
+250 kHz with `SampsPerChan` scaled to keep 10 blocks/s gives a 100 ms block —
+2500 samples averaged instead of 100 — and the **same 0.25 mm of smear**. More
+samples in the average, not finer resolution.
+
+**Shorter blocks are what buys resolution.** 250 kHz with `SampsPerChan = 2500`
+is a 10 ms block at 100 blocks/s; the correlator still takes one per crossing at
+10 crossings/s, and each trace is now a 10 ms average — 0.025 mm of smear, a
+tenth of the pitch. The blocks between crossings are discarded, which is the
+right thing to discard.
+
+### 2.3 What bench_ec measured, and what it got wrong
+
+The measurements stand:
 
 | | |
 |---|---|
-| peak tool speed | **2.80 mm/s** median (asked for 2.5) |
-| mean tool speed | **1.09 mm/s** median |
-| mean / peak | **0.39** |
-| worst joint at peak | 91% of its scaled limit |
-| duration | 26.95 s median, 24.96 min, 37.32 max |
+| block rate | 10.21 Hz, jitter 15.37 ms |
+| output filter corner | 15.6 Hz horizontal, 24.4 Hz vertical |
+| averaging efficiency | 13% horizontal, 5% vertical |
+| vertical noise when averaged | **0.5x** — it got *worse* |
 
-The calibration maps a scaling to a **peak** and the peak is right. The arm
-then executes that trajectory faithfully — pass duration tracks the planned
-duration to within the 8.5 s of per-pass overhead, including the one 45.8 s
-outlier, which was a planned 37.3 s trajectory and not a stall. That message
-has been rewritten to name both causes and say which line of mtc's output
-tells them apart.
+The last line is the finding: averaging made the vertical channel noisier, so
+the dominant noise is **below** the block rate — drift, not white noise — and no
+amount of averaging can help it. That is a reason to go faster, not slower.
 
-### 2.2 What costs the other 61%
+Two things it said that were wrong, and are fixed in `ec_bench.dpi`'s verdict:
+it compared the achieved speed against `SCAN_VELOCITY` (the *requested* 10 mm/s)
+instead of the 2.5 mm/s commanded and 1.1 mm/s achieved; and it called the
+instrument's front-panel filter setting an instrument limit. The filter is
+adjustable, and at 15.6 Hz it is aggressive for a 10 Hz block rate — worth
+checking against the gantry instrument's setting, which is the comparison that
+matters.
 
-Compare the same arm on different paths in the same session:
+### 2.4 At the cell: set the card, then measure it
 
-| path | waypoints | tool axis | mean / peak |
-|---|---|---|---|
-| transit | 2 | fixed | **0.94** |
-| Azure sweep row | 5 | locked to world z | 0.98 |
-| Keyence raster row | 21 | locked to world z | 0.86 |
-| **EC scan pass** | **30** | **follows the surface normal** | **0.39** |
-
-The EC pass is the only one that tracks the surface normal, and it is the only
-one that loses most of its speed. This is the mechanism from the 10-09 stall
-([[ec-stall-is-totg-pricing-turn-rate]]) still alive at a much smaller
-magnitude: TOTG decelerates through orientation changes.
-
-**And on this part the orientation change buys nothing.** The whole toolpath
-tilts **up to 1.0 degree from vertical, mean 0.4** (18 x 29 mm, 10.7 mm of
-relief). The smoother is already at its cap and says so:
-
-> tool axis smoothed (linear, 20.0 mm -- widened from 6.0): turn rate
-> 0.763 -> 0.818 deg/mm worst, 0.540 -> 0.182 at p99
-> ** still over the 0.40 deg/mm bound at the 20.0 mm window cap, and widening
-> was still helping -- the mesh is noisier than this can fix.
-
-So the axis is being made to chase mesh noise across a surface that is flat to
-one degree, and paying 2.5x the scan time for it.
-
-### 2.3 The experiment, and it is cheap
-
-**Fly one pass with the tool axis locked to vertical, and compare.** Nothing
-else changes — same mesh, same region, same pitch, same instrument.
+`dgpython-nidaqmx` now sets rate and block length together, sizes the input
+buffer for a second of data, and reads into a preallocated array. **Nothing
+moves for any of this.** Put the probe on the part and leave the arm still.
 
 ```
-dry_run_ec_scan()          # note the per-pass trajectory duration mtc prints
+daq.AcquisitionStatus()
 ```
 
-Then lock the axis and do it again. If mean/peak goes from 0.39 to ~0.86, the
-orientation tracking is proven to be the cost and the remedy is a rule — lock
-the axis where the surface is flatter than some threshold, follow it where it
-is not. If it does not move, the cost is the waypoint spacing instead and the
-next knob is `EC_WAYPOINT_SPACING_M` (1.0 mm now, 30 waypoints per pass).
-
-Bring back mtc's `Trajectory check:` line for both, verbatim. The numbers to
-compare are `N points, T s` and `at up to X mm/s`.
-
-### 2.4 The ceiling above it
-
-Even at 0.39, the commanded 2.5 mm/s is not the robot's choice. It comes from
+Expect `{'alive': True, 'blocks': <rising>, 'read_errors': 0,
+'sample_rate_hz': 1000.0, 'block_samples': 100, 'block_rate_hz': 10.0,
+'input_buf_size': 1000, ...}`. `read_errors` is the -200279 count; it should be
+0 before you change anything.
 
 ```
-velocity 10.0 mm/s REQUESTED -> 2.5 mm/s USED
-         scaled down to hold 10.0 traces/s; the ceiling is 10.0 traces/s
+daq.Configure(SampleRate=250*ur.kHz, SampsPerChan=2500)
 ```
 
-`MAX_TRACE_RATE_HZ["live"] = 10.0`, and that number was measured on an
-**ultrasound** scan whose trace is a 16000-point waveform. An eddy-current
-trace is one complex number. It has never been measured for this instrument,
-and the evidence says it is far too low: the staging queue **peaked at 2** all
-run, and the hard floor from the transaction window is 25 Hz, not 10.
-
-Raising it to 25 would command 6.25 mm/s, which is also back inside the range
-the arm was actually calibrated over (5.1–32.7 mm/s) instead of extrapolated
-below it. **Two problems, one change.**
-
-Measure it rather than assume it — §3 and §5.2.
-
----
-
-## 3. FIRST, AND IT NEEDS NOTHING TO MOVE: `bench_ec()`
-
-Put the probe on the part, leave the arm still, and run:
+Returns every parameter. One reconfiguration, so there is no instant at which
+the card is asked for 2500 blocks/s. Then:
 
 ```
-bench_ec()
+daq.AcquisitionStatus()
 ```
 
-Twenty seconds. It answers the question nobody has ever asked of this cell:
-**what does the instrument itself allow?** The US-454A's frequency, drive,
-gain, filter and phase are all set on its front panel and this config reads
-none of them back, so its output bandwidth — which decides how fast the probe
-may cross a flaw before the flaw is smeared — has never been measured.
-
-It reports four things and the last is the point:
-
-| | |
-|---|---|
-| block rate and gaps | is the card delivering what it was asked for |
-| averaging efficiency | is the 100-sample block average buying its sqrt(100), or is the instrument's filter slower than the block and 98 of those samples redundant |
-| mains fraction | is the noise floor hum (fixable) or broadband (not) |
-| **v_max** | **the scan speed the instrument's own bandwidth allows** |
-
-Read `v_max` against the 2.5 mm/s the scan commands:
-
-* **near or below it** — the scan is already at the instrument's limit, §2 is
-  not worth doing, and the 43 minutes is the right answer. (A 10 Hz output
-  filter gives 2.0 mm/s against a 1 mm flaw, which is almost exactly what the
-  scan runs at. This outcome is entirely possible and it would settle the
-  question.)
-* **far above it** — the instrument is not what the scan is waiting for, and
-  §2.3 and §2.4 are where the 43 minutes actually goes.
-
-It prints a verdict line saying which. Bring the whole report back.
-
-The estimators are checked against filters of known corner in
-`ec_bench_test.py` — within about 15% from 25 Hz to 400 Hz, biased high at
-5–10 Hz. Good enough for a decision with a factor-of-1.5 threshold on it, not
-good enough to quote as an instrument specification.
-
----
-
-## 4. The clearance gate, if the region is smaller
-
-10-16 planned 2171 poses, which is over `TOOLING_GATE_SAMPLE_ABOVE` (2000), so
-the gate sampled and took **1 second**. 10-15 planned 1749, which is under it,
-so the gate measured every pose and took **231 seconds in silence**.
-
-Both are fixed as far as reporting goes — the gate now prints progress at any
-length over 120 poses — but the 80x cost difference across that threshold is
-real and still there. A smaller region can plan for far longer than a big one.
-If the plan says
-
-> planning time 0:04:49 (the clearance gate, every pose measured -- under the
-> 2000-pose sampling threshold, so it costs ~132 ms each; it reports its own
-> progress while it runs)
-
-that is now expected, announced, and not a hang.
-
----
-
-## 5. The run
-
-### 5.1 Settings
-
-Unchanged. Rotation 86.5 again — but see 5.3.
+Expect `block_rate_hz: 100.0`, `input_buf_size: 250000`, `read_errors` still 0
+and `blocks` climbing by about 100/s. **If `read_errors` climbs, that is the
+pipeline not keeping up with 100 blocks/s, not the card** — `CalcSync` makes
+every block wait for its math, so 100 blocks/s is 100 blocking globalrevs/s.
+Step down (`SampsPerChan=12500` for 20 blocks/s, `25000` for 10) until it is
+clean, and report which number held. That measurement is the input to the next
+change, §2.6.
 
 ```
-set_probe_rotation(0)
-set_ec_preload(0.002)
+bench_ec(seconds=20)
+```
+
+Expect the block rate to read back what you set, the jitter to fall with it, and
+the filter corners to be unchanged (they are the instrument's, not the card's).
+
+### 2.5 Then the scan, at the resolution the card can now afford
+
+```
 set_scan_step_size(0.00025)
-set_rotation(86.5)
+set_scan_velocity(0.0025)
+set_projection_mode("live")
 ```
 
-```
-ec_serpentine()   probe_rotation()   ec_preload()
-scan_velocity()   scan_step_size()   projection_mode()   ec_rotation()
-```
+That is the results26 scan with a tenth of the smear and nothing else changed —
+the comparison that isolates the block length. If `read_errors` stayed 0 at 100
+blocks/s, this is the run to do first.
 
-### 5.2 One short scan with projection off
+### 2.6 What is still owed here
 
-Before the real one, and only if §3 says the instrument has headroom:
-
-```
-set_projection_mode("deferred")
-```
-
-`MAX_TRACE_RATE_HZ["deferred"]` is 22 Hz, so the same scan commands 5.5 mm/s
-instead of 2.5. Run **four passes** of it and read three things:
-
-* the staging queue depth in the end-of-scan report (anything under 16 is fine)
-* `Max Correlation Wait` in the pass metadata (71 ms on 10-16; it is the margin)
-* mtc's per-pass peak and duration
-
-If that holds, the live ceiling is the thing to raise and the image can be
-rebuilt afterwards with `replay_ec_scan()` — deferred records the same traces
-and projects them at the end for an identical picture.
-
-### 5.3 Watch for the lift-off angle being refused
-
-10-16 ended with:
-
-> could not measure the lift-off rotation (anisotropy 2.86, under 3.00, so
-> there is no lift-off direction to find and any angle would be arbitrary.
-> That is what a scan over a part with no lift-off variation looks like —
-> and also what a dead instrument looks like.)
-
-The scan was fine, so it is the first of those two. But the ratio has been
-falling — 6.45 on 10-15, 4.14 on 10-09, **2.30** on 10-16 — while the flaw
-channel noise has been rising, 0.032 → 0.051 V. Both point the same way: the
-signal is getting smaller relative to the noise floor. **`bench_ec()` is the
-measurement that says whether that is the instrument's gain.**
-
-The NORMS plug-in now applies the same threshold, so the record says
-`Lift-off Angle Determinate: no` and withholds the angle rather than writing
-down a number the pipeline calls arbitrary.
-
-### 5.4 Lines to read in the plan
-
-| line | expect |
-|---|---|
-| `planning time` | honest now; minutes for a small region, seconds for a big one (§4) |
-| `Sample Rate` / `Block Span` in the record | **NEW and the point of §3.** The card's rate is recorded now, so `Block Smear` says how far the probe moved during one trace's average. If the smear approaches the 0.25 mm pitch, the resolution is set by the block and not by the step size |
-| `tool axis smoothed ... still over the ... bound` | expected on this mesh; §2.2 |
-| `region_coverage` | 77% on 10-16 — the ROI was drawn wider than the fine sweep measured. Draw inside the swept area |
-| `IMPOSSIBLE PENETRATION` | absent |
+* **Option 5, the reader thread.** One thread reading the card into a bounded
+  queue, another publishing. Not needed if §2.4 holds at 100 blocks/s; needed if
+  it does not.
+* **A replacement for CalcSync.** `max_pending_globalrevs=` is in the module
+  now and is **off**: it waits only once the number of defined-but-not-ready
+  globalrevs exceeds the bound, so the card runs free until the pipeline falls
+  behind, and then the card slows instead of memory growing. It does not give up
+  — an advisory bound is not a bound. It is not enabled because the right number
+  for it is a measurement, not a guess, and §2.4 is that measurement. Note
+  `globalrev_backlog_warning_threshold` (default 100) is a *warning* and not a
+  throttle; there is no native backpressure.
 
 ---
 
-## 6. Still open, unchanged
+## 3. The axis-locked scan, start to finish
 
-**The acquisition lag.** 0.140 s at 3.93 mm/s, one scan, one speed. Still the
-oldest open question and still worth 25 minutes once §2 and §3 are settled —
-and §5.2's faster scan would give the second speed for free.
+**What it is.** One tool orientation for every waypoint of the eddy-current
+path, instead of the commanded axis following the mesh's normals. On a plate
+flat to about a degree, normal-following costs 61% of the commanded speed and
+makes the arm rock along a pass; the axis turn rate is what TOTG prices the
+trajectory on. Locking it should cost nothing on a plate, and this is the run
+that says whether it does.
 
-**The per-pass overhead.** 8.5 s x 72 passes = 10.2 min of the 43.6. Two
-2-pose moves at 2.54 mm/s plus a planning round trip. Not yet looked at.
+The locked orientation is the probe's own vertical reference with
+`EC_PROBE_ROTATION_DEG` in it — chosen, not taken from wherever the arm happened
+to be standing — so a locked plan is the same plan every time.
 
-**The rare spatialnde2 background-thread crash.** Two sightings, never
-reproduced. Did not happen on 10-16.
+### 3.1 Deploy
+
+From the workspace root on the cell PC:
+
+```bash
+./tari.bash --layer site
+```
+
+That is the whole deployment. Do not install a package by hand -- the layer
+chain fetches the manifests, builds and verifies, and it is idempotent, so
+running it again is the way to fix a partial state.
+
+### 3.2 Bring the cell up
+
+```bash
+ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=hw
+```
+
+(From the cell PC's own desktop session, so `DISPLAY` is already set. The
+explicit `DISPLAY=:10` is a container thing and does not belong here.)
+
+Wait for it to settle, then check that the pieces are there rather than assuming:
+
+```bash
+ros2 run tari_bringup tari_cell_info --cell ex-ur10e-1 --mode hw
+```
+
+### 3.3 Start the scan config
+
+```bash
+cd ~/Desktop/tyler_test9_ws/ROS-Scanning/dgpfiles
+dataguzzler-python ECAutomatedScan.dgp
+```
+
+It leaves you at a `dgpy>` prompt. Everything below is typed there.
+
+### 3.4 Confirm what the run will use, before it moves
+
+```
+describe_calibration()
+probe_rotation()
+scan_plan()
+daq.AcquisitionStatus()
+```
+
+`describe_calibration()` must show the 0.822 mm Azure solve and a **non-zero
+Keyence lateral correction** — deploying a calibration has silently zeroed that
+one before. `probe_rotation()` is the rotation the locked path will hold.
+`scan_plan()` prints the step size, the velocity it will actually command, the
+trace rate, and the time and memory estimate; read the commanded velocity, not
+the requested one.
+
+### 3.5 The reference run: surface-following
+
+```
+run_automated_scan()
+```
+
+Five stages, each printed: detect, Azure sweep, ROI, Keyence raster, mesh
+filter, toolpath. It then scans. At the end it prints the outcome check — passes
+completed, traces staged, `Fault`, `Acquisition Errors`, `Staging Timeouts`,
+worst correlation wait, observed probe speed. Note the elapsed time and the
+observed speed; they are the baseline.
+
+### 3.6 The locked run: one command, one argument
+
+```
+run_automated_scan(orient="fixed")
+```
+
+Everything before the toolpath is identical, so it measures the same part. At
+the planning stage it will print the probe rotation and the reachability report
+as usual; the difference to look for is that the 45-degree tilt crop drops
+**nothing** (`0 waypoints cropped`), because a vertical axis tilts zero degrees
+everywhere.
+
+Compare: elapsed time, observed probe speed, and the notch's peak and SNR from
+the NORMS figures. If the locked run is faster at the same quality on this
+plate, locking is the default for flat work.
+
+### 3.7 If you want to see the locked path before flying it
+
+```
+run_automated_scan(scan=False, orient="fixed")
+dry_run_ec_scan(passes=[0, 1, 2], sample=5)
+```
+
+`scan=False` stops after the plan and leaves it in `ec_scan_path`;
+`dry_run_ec_scan` flies the named passes with no instrument and no contact, at
+one waypoint in `sample`. Use it the first time; the full run does not need it.
+
+### 3.8 Safety, unchanged
+
+* The contact probe never goes beyond the taught points. Shrink
+  `EC_SCAN_REGION` for margin; never grow the motion.
+* Absolute wrist-3 angle governs the cable envelope. A refusal is never resolved
+  by turning the wrist a whole revolution to the same probe orientation.
+* The Azure's power cable is a collision hazard and the planner has no model of
+  it. It caused the 2026-10-06 e-stop. Watch it.
+* Stopping External Control on the pendant is a **pause** inside
+  `run_automated_scan` (it runs supervised). Resume it, or the run ends with
+  `ScanAborted` rather than a mesh with holes in it.
 
 ---
 
-## 7. What to bring back
+## 4. Checklist
 
-1. **The whole `bench_ec()` report.** It is the one measurement that has never
-   been made and it decides whether anything else in §2 is worth doing.
-2. mtc's `Trajectory check:` line for a normal pass, and for a pass flown with
-   the tool axis locked to vertical (§2.3).
-3. The end-of-scan report, verbatim — it now names both causes of a slow scan
-   instead of asserting one.
-4. The `ec_scan_*` directory, `dataguzzler.log`, `ros.log`, `dmesg.log`.
-5. `sudo lspci -s 89:00.0 -vv | grep -iE 'LnkSta|LnkCap'` and the AER counters.
-6. Whether the lift-off ratio is still falling (§5.3).
+1. `sudo lspci -s 89:00.0 -vv | grep -iE 'LnkSta|LnkCap'` — the NVMe link is
+   still erroring and still not the cause of anything. One line, for the record.
+2. §2.4 — the block rate the pipeline sustains with `CalcSync` on. **This is the
+   number the next change depends on.**
+3. §2.5 — the results26 scan at a tenth of the smear.
+4. §3.5 and §3.6 — the surface-following and axis-locked pair.
+5. If anything stalls: `sudo .../capture_stall.sh <pid>`, and keep `native.txt`.
