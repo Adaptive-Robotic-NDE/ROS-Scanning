@@ -1,0 +1,1449 @@
+# Eddy-current acquisition: one complex impedance per trigger, correlated by
+# timestamp, plus the impedance-plane conditioning every EC inspection needs.
+#
+# WHY THE CORRELATION IS BY TIMESTAMP. The straightforward alternative -- stop
+# the arm, wait for the next globalrev, average whatever the DAQ has produced,
+# call that the reading at this point -- fails in two ways, and only the first
+# is obvious.
+#
+#   * It requires stopping. A scan that stops at every point is slower than the
+#     part deserves and the stops are most of the time.
+#   * Nothing ties the samples to WHERE the probe was. "The latest block at the
+#     moment of the request" is systematically old by the acquisition-to-globalrev
+#     latency, and on a serpentine that bias reverses every pass -- so it shows
+#     up as a zipper between adjacent rows, not as a harmless offset.
+#
+# So this uses the same mechanism the ultrasound scan uses: under
+# timed_transaction_manager, transactions commit in measurement-timestamp order,
+# so a pose transaction stamped at the crossing produces a globalrev carrying
+# exactly the DAQ block that was current then. See timestamped_trigger.dpi for
+# why that works and what it was measured at.
+#
+# WHAT AN EC TRACE IS. One complex number, not a waveform. The instrument's X
+# and Y outputs arrive on two separate real channels of the DAQ, and a "trace"
+# here is one sample of each combined into one complex impedance. The trace list
+# is therefore (K, 1) complex with a pose per entry -- the same shape the
+# ultrasound trace list has with nsamples=1, which is what lets the accumulation
+# and projection code be shared rather than duplicated.
+#
+# CONDITIONING IS NOT HERE. Null, rotation and gain are a compiled spatialnde2
+# math function (spatialnde2-ec-functions), because every parameter is a
+# recording so that an operator can turn the rotation and watch thousands of
+# traces re-render. This module wires that function up; it does not do the
+# arithmetic.
+#
+# TWO DIFFERENT THINGS ARE CALLED A NULL, and this module touches both.
+#
+#   the INSTRUMENT null    a hardware balance of the instrument's own bridge,
+#                          issued once with the probe ON unflawed material. It
+#                          decides where the operating point sits, and the gain
+#                          is applied about that point. ec_first_contact_null()
+#                          below is when it happens.
+#   the CONDITIONING null  /ec/cond/null: a complex number subtracted from the
+#                          recorded traces in software, set live by the operator
+#                          (null_here()) and re-runnable over traces already
+#                          acquired.
+#
+# The software one sits on top of the hardware one and does not replace it: an
+# instrument balanced in air has its operating point in the wrong place before
+# any trace is recorded, and subtracting a constant afterwards does not move it.
+
+import os
+import re
+import time
+
+import numpy as np
+import spatialnde2 as snde
+
+# The conditioning arithmetic is compiled (see the header): importing it here
+# rather than expecting the config to have done so keeps the dependency with the
+# code that uses it, and gives a clear ImportError naming the package instead of
+# a NameError on `ec_condition_function` several hundred lines later.
+#
+# A bare ModuleNotFoundError reads as "a dependency is missing from the outside
+# world", which invites the wrong fix. The package lives at
+# spatialnde2-ec-functions/ in the same source tree, builds in about a minute,
+# and is not installed on every machine by default. Say that here, where the
+# failure happens.
+try:
+    from spatialnde2_ec_functions import ec_condition_function
+except ImportError as _ec_import_error:
+    raise ImportError(
+        "%s\n\n"
+        "spatialnde2_ec_functions is the COMPILED impedance-plane conditioning\n"
+        "(Cython over C++, linked against spatialnde2). It is not optional for\n"
+        "an eddy-current scan and it cannot be imported from its source\n"
+        "directory -- it needs the built extension beside its __init__.\n\n"
+        "It is part of this workspace, at spatialnde2-ec-functions/. With\n"
+        "spatialnde2 already installed (its setup.py reads the compile flags\n"
+        "out of the installed package):\n\n"
+        "    ./dgpy_install.sh --with-extras\n"
+        "  or, for a local build in that directory:\n"
+        "    python3 setup.py build_ext --inplace\n"
+        % (_ec_import_error,))
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global ECTimestampedSource
+global setup_ec_conditioning
+global teardown_ec_conditioning
+global set_ec_parameter
+global EC_CONDITIONING_READY_TIMEOUT_S
+global ec_null_from_traces
+global ec_liftoff_rotation_from_traces
+global MIN_LIFTOFF_ANISOTROPY
+global ec_channel_exists
+global ec_conditioning_parameters
+global ec_conditioning_in_force
+global ensure_ec_conditioning
+global ec_cond_pending
+global check_ec_conditioning
+global ec_conditioning_selftest_source
+global ec_first_contact_null
+global ec_instrument_null
+
+#: What the last scan's instrument null did, as
+#: {"nulled": bool, "why": str, "required": bool} -- None before any scan has
+#: reached the part. Also returned in the scan report as report["instrument_null"].
+ec_instrument_null = None
+
+
+class ECTimestampedSource(TimestampedTriggerSource):
+    """One complex impedance per trigger, from two free-running DAQ channels.
+
+    Everything about the trigger, the correlation and the threading is inherited
+    -- the ONLY thing eddy current changes is what a trace is built from, which
+    is why timestamped_trigger.dpi has a _sample() hook and why this class is
+    twenty lines rather than a second copy of that machinery.
+
+    `reduce` decides what to do with the DAQ block the crossing correlated to.
+    The block spans time, and during that time the probe moved, so this is a
+    spatial averaging choice and not a numerical detail:
+
+      "mean"  average the block. Lower noise. Smears over however far the probe
+              travelled during the block -- report_smear() says how far, and it
+              is the caller's job to decide whether that is acceptable against
+              the trace pitch.
+      "last"  the final sample of the block: closest in time to the crossing,
+              noisiest.
+      "first" the first sample: the block's own timestamp is the timestamp the
+              correlation matched, so this is the sample that timestamp
+              actually describes.
+
+    Default is "mean" because EC signals are small; change it if the smear is a
+    problem.
+    """
+
+    trigger_mode = "timestamped-ec"
+
+    def __init__(self, recdb, clock, real_path, imag_path, position_fn,
+                 trigger_pitch_m, reduce="mean", pose_path="/ec/trigger_pose",
+                 **kwargs):
+        if reduce not in ("mean", "last", "first"):
+            raise ValueError("reduce must be 'mean', 'last' or 'first', not %r"
+                             % (reduce,))
+        self.real_path = real_path
+        self.imag_path = imag_path
+        self.reduce = reduce
+        self.block_samples = 0
+        self.sample_rate_hz = None
+        self._rate_for = None
+        self.mismatched_blocks = 0
+        # ascan_path is inherited and is what the base class would read for a
+        # single-channel instrument. Point it at the real channel so anything
+        # that inspects it names a channel that exists.
+        TimestampedTriggerSource.__init__(
+            self, recdb, clock, real_path, position_fn, trigger_pitch_m,
+            pose_path=pose_path, **kwargs)
+
+    def _sample(self, getref):
+        rref = getref(self.real_path)
+        iref = getref(self.imag_path)
+        rdata = np.asarray(rref.data)
+        idata = np.asarray(iref.data)
+
+        # The two channels are separate recordings on one card. If they ever
+        # differ in length the pairing is not what it looks like, so say so
+        # rather than silently truncating -- np.mean over mismatched blocks
+        # produces a plausible number from the wrong samples.
+        if rdata.shape != idata.shape:
+            self.mismatched_blocks += 1
+            n = min(rdata.size, idata.size)
+            rdata = rdata.reshape(-1)[:n]
+            idata = idata.reshape(-1)[:n]
+
+        self.block_samples = int(rdata.size)
+        # AND THE RATE THOSE SAMPLES WERE TAKEN AT, read off the card's own
+        # channel. Without it `block_samples` cannot be turned into a time or a
+        # distance, so the saved record could not say whether a trace averages
+        # over 4% of the trace pitch or 40% of it -- and report_smear(), which
+        # exists to answer exactly that, had to be handed a rate nobody held.
+        # Read every block rather than once: a card reconfigured mid-session
+        # would otherwise be described by the rate it had at the first trace.
+        if self.sample_rate_hz is None or self.block_samples != self._rate_for:
+            try:
+                dt = float(rref.rec.metadata.GetMetaDatumDbl(
+                    "ande_array-axis0_scale", 0.0))
+                self.sample_rate_hz = (1.0/dt) if dt > 0 else None
+            except Exception:                                  # noqa: BLE001
+                self.sample_rate_hz = None
+            self._rate_for = self.block_samples
+        if self.reduce == "mean":
+            re = float(np.mean(rdata)) if rdata.size else 0.0
+            im = float(np.mean(idata)) if idata.size else 0.0
+        elif self.reduce == "last":
+            re = float(rdata.reshape(-1)[-1]) if rdata.size else 0.0
+            im = float(idata.reshape(-1)[-1]) if idata.size else 0.0
+        else:
+            re = float(rdata.reshape(-1)[0]) if rdata.size else 0.0
+            im = float(idata.reshape(-1)[0]) if idata.size else 0.0
+
+        # Shape (1,): one complex sample IS the trace. Keeping it an array
+        # rather than a scalar is what lets the shared accumulation code treat
+        # an EC trace list as an ultrasound trace list with nsamples=1.
+        return np.array([re + 1j*im], dtype=np.complex128), rref.rec.metadata
+
+    def report_smear(self, velocity_mps, sample_rate_hz=None):
+        """How far the probe moved during one averaged block, in metres.
+
+        Not decorative. If this approaches the trace pitch, adjacent traces
+        overlap in space and the scan's resolution is set by the block length
+        rather than by the pitch that was asked for.
+        """
+        sample_rate_hz = (self.sample_rate_hz if sample_rate_hz is None
+                          else sample_rate_hz)
+        if not sample_rate_hz or not self.block_samples:
+            return None
+        span_s = self.block_samples/float(sample_rate_hz)
+        smear_m = span_s*float(velocity_mps)
+        return {"block_samples": self.block_samples,
+                "block_span_s": span_s,
+                "smear_m": smear_m,
+                "trace_pitch_m": self.trigger_pitch_m,
+                "fraction_of_pitch": (smear_m/self.trigger_pitch_m
+                                      if self.trigger_pitch_m else None),
+                "reduce": self.reduce}
+
+    def trigger_report(self):
+        report = TimestampedTriggerSource.trigger_report(self)
+        report.update({"mode": "timestamped-ec",
+                       "real_path": self.real_path,
+                       "imag_path": self.imag_path,
+                       "reduce": self.reduce,
+                       "block_samples": self.block_samples,
+                       "sample_rate_hz": self.sample_rate_hz,
+                       "block_span_s": (
+                           self.block_samples/self.sample_rate_hz
+                           if self.sample_rate_hz else None),
+                       "mismatched_blocks": self.mismatched_blocks})
+        return report
+
+
+# ==============================================================================
+# IMPEDANCE-PLANE CONDITIONING
+# ==============================================================================
+# Null, rotation and per-axis gain, wired onto a trace list. Every parameter is
+# its own channel so any of them can be retuned live -- which is the whole point,
+# because setting the rotation IS the setup procedure for an EC inspection and it
+# is done by turning it until lift-off flattens onto the horizontal axis.
+#
+# Modelled on setup_gated_cscan() in trace_acquisition.dpi, and it shares that
+# function's trap: define_channel() does not raise when a channel already
+# exists, it hands back a reserved_channel that is no longer the current owner,
+# and the transaction then fails at end_transaction() with "provided
+# reserved_channel is not current" -- nowhere near the line that caused it. So
+# every channel taken here must go back through teardown_ec_conditioning()
+# before a second scan in the same session defines them again.
+#
+# WHEN IT MAY BE WIRED: ONLY ONCE THE TRACE LIST EXISTS. This is not a style
+# preference. `traces_path` is an OUTPUT of nd_accumulate_once
+# (TraceAccumulator.setup()), so it does not exist until the first reading has
+# been staged; wiring it during setup names a channel that cannot be there yet.
+# See ensure_ec_conditioning() below, which is the ordering made explicit.
+#
+# WHY THAT IS FATAL RATHER THAN AN ERROR: spatialnde2 resolves a math function's
+# inputs when the transaction is realized, and a missing one is an snde_error
+# thrown THERE. Which thread that is depends on the transaction manager:
+#
+#   ordered_transaction_manager  realizes on the caller's thread, so
+#                                end_transaction() raises a catchable
+#                                snde_error.
+#   timed_transaction_manager    realizes on transaction_end_thread_code(), its
+#                                OWN thread. Nothing is there to catch it, so
+#                                it is terminate() and SIGABRT -- the whole
+#                                dgpy process, mid-scan, with no traceback
+#                                anybody can act on.
+#
+# ECAutomatedScan.dgp REQUIRES the timed manager (the eddy-current correlation
+# IS the timestamp ordering), so this config always gets the second column. That
+# is why ec_channel_exists() below is a hard gate and not a warning: it is the
+# only place a wrong channel name can still be reported instead of dumping core.
+#
+# Channel nesting is NOT involved: a three-deep /ec/cond/conditioned resolves and
+# computes with no group channel declared for /ec or /ec/cond. Only graphics
+# groups need the trailing-slash form (surface_projection.dpi).
+
+def ec_channel_exists(recdb, path):
+    """Whether `path` is a channel of the newest complete globalrev.
+
+    The question a math function's prerequisite check asks. list_recordings()
+    is the authoritative answer and also names what IS there, which is what
+    makes a typo in a channel name diagnosable.
+    """
+    try:
+        return str(path) in set(recdb.latest.list_recordings())
+    except Exception:                                     # noqa: BLE001
+        # No complete globalrev yet, or an older binding. check_for_recording_ref
+        # returns None for an absent channel rather than raising.
+        try:
+            return recdb.latest.check_for_recording_ref(str(path)) is not None
+        except Exception:                                 # noqa: BLE001
+            return False
+
+
+#: How long setup_ec_conditioning() waits for the math it just wired to produce
+#: its first output. Generous: it is paid once per scan, and the alternative to
+#: waiting is an intermittent "channel not found" in whatever reads the
+#: conditioned channels next.
+EC_CONDITIONING_READY_TIMEOUT_S = 30.0
+
+
+def setup_ec_conditioning(recdb, traces_path, prefix="/ec/cond",
+                          null=(0.0, 0.0), rotation_deg=0.0, gain=(1.0, 1.0)):
+    """Wire the conditioning math onto an EC trace list.
+
+    Produces, under `prefix`:
+
+        conditioned   complex, stamped for the phase plane. Use it to SET the
+                      rotation -- the phase plane shows the shape of the signal
+                      but carries no position, so it cannot show where on the
+                      part anything came from.
+        horizontal    float32, the lift-off axis after rotation
+        vertical      float32, the defect axis after rotation
+        magnitude     float32
+
+    THE SCALARS ARE THE SCAN DISPLAY. They are what gets projected onto the
+    surface to make a spatial plot; the complex channel is a setup aid.
+
+    `traces_path` MUST ALREADY EXIST -- see the note above. Raises RuntimeError
+    if it does not, which is the whole point: the alternative is SIGABRT on the
+    transaction manager's thread.
+    """
+    prefix = prefix.rstrip("/")
+
+    # THE ONLY PLACE THIS CAN STILL BE REPORTED. Do not soften it to a warning:
+    # proceeding is a core dump, not a degraded run.
+    if not ec_channel_exists(recdb, traces_path):
+        try:
+            have = sorted(recdb.latest.list_recordings())
+        except Exception:                                 # noqa: BLE001
+            have = []
+        raise RuntimeError(
+            "cannot wire the eddy-current conditioning onto %r: that channel "
+            "does not exist yet.\n"
+            "  The trace list is an OUTPUT of nd_accumulate_once and is created "
+            "by TraceAccumulator.setup(), which run_ec_path_scan() calls only "
+            "after the first reading has been staged. So the conditioning "
+            "cannot be wired during setup -- use ensure_ec_conditioning(), "
+            "which is called from the scan's setup_after_first hook.\n"
+            "  This is checked here because spatialnde2 would otherwise throw "
+            "on the timed transaction manager's own thread, where nothing can "
+            "catch it: that is terminate() and SIGABRT for the whole process, "
+            "mid-scan, with no traceback.\n"
+            "  Channels that DO exist: %s"
+            % (traces_path,
+               ", ".join(have) if have else "(none -- no complete globalrev)"))
+
+    trans = recdb.start_transaction()
+
+    chans = {}
+    paths = {}
+    for key, values in (("null", tuple(null)),
+                        ("rotation", (float(rotation_deg),)),
+                        ("gain", tuple(gain))):
+        path = "%s/%s" % (prefix, key)
+        chan = trans.define_channel(path, "main")
+        ref = snde.create_ndarray_ref(trans, chan, snde.SNDE_RTN_FLOAT64)
+        ref.allocate_storage([len(values)], False)
+        for i, v in enumerate(values):
+            ref.data[i] = float(v)
+        ref.rec.mark_data_and_metadata_ready()
+        chans[key] = chan
+        paths[key] = path
+
+    outputs = {name: "%s/%s" % (prefix, name)
+               for name in ("conditioned", "horizontal", "vertical", "magnitude")}
+
+    fcn = ec_condition_function.instantiate(
+        [snde.math_parameter_recording(traces_path),
+         snde.math_parameter_recording(paths["null"]),
+         snde.math_parameter_recording(paths["rotation"]),
+         snde.math_parameter_recording(paths["gain"])],
+        [snde.shared_string(outputs["conditioned"]),
+         snde.shared_string(outputs["horizontal"]),
+         snde.shared_string(outputs["vertical"]),
+         snde.shared_string(outputs["magnitude"])],
+        "/", False, False, False,
+        snde.math_definition("ec impedance-plane conditioning"), [], None)
+    trans.add_math_function(fcn, False)
+
+    trans.end_transaction().globalrev_wait().wait_complete()
+
+    # AND WAIT FOR THE OUTPUTS, which is a different thing from waiting for the
+    # transaction. The globalrev above carries the math function's DEFINITION;
+    # whether its outputs have been computed into a COMPLETE globalrev yet is a
+    # scheduling question, and recdb.latest only advances to complete ones. So a
+    # caller that wires the conditioning and immediately reads
+    # /ec/cond/vertical can find it missing -- intermittently, because it
+    # depends on how busy the math threads are.
+    #
+    # It is not a hypothetical: it made ec_scan_wiring_test.py fail about one
+    # run in four with "get_recording(): channel /ec/cond/horizontal not found",
+    # and the same read happens in the scan's own setup_after_first hook.
+    # Waiting here, once, is cheaper than every caller learning to.
+    deadline = time.monotonic() + EC_CONDITIONING_READY_TIMEOUT_S
+    wanted = set(outputs.values())
+    have = set()
+    while time.monotonic() < deadline:
+        try:
+            have = set(recdb.latest.list_recordings())
+        except Exception:                                  # noqa: BLE001
+            have = set()
+        if wanted <= have:
+            break
+        time.sleep(0.02)
+    else:
+        raise RuntimeError(
+            "the conditioning math was defined but produced no output within "
+            "%.1f s: %s missing. The function is wired and the parameters are "
+            "set, so this is the math not running rather than a wiring fault -- "
+            "check that ec_condition_function instantiated against a matching "
+            "spatialnde2 build (check_ec_conditioning())."
+            % (EC_CONDITIONING_READY_TIMEOUT_S,
+               ", ".join(sorted(wanted - have)) or "(none)"))
+
+    return {"function": fcn, "chans": chans, "paths": paths,
+            "outputs": outputs, "recdb": recdb, "prefix": prefix}
+
+
+def teardown_ec_conditioning(recdb, cond):
+    """Remove the conditioning and hand back every channel it took.
+
+    Deleting the math function is only half of it; see the note above about
+    reserved_channel ownership and the error it produces two scans later.
+    """
+    if not cond:
+        return
+    trans = recdb.start_transaction()
+    trans.delete_math_function(list(cond["outputs"].values()), cond["function"])
+    for chan in cond["chans"].values():
+        trans.release_channel(chan)
+    trans.end_transaction().globalrev_wait().wait_complete()
+
+
+#: Conditioning parameters held until there is a trace list to wire them onto.
+#:
+#: The operator sets the rotation and the null during setup, which is BEFORE the
+#: first trace exists -- so the values have to live somewhere that is not a
+#: recording channel until they can become one. This is that somewhere.
+#: ensure_ec_conditioning() hands them to setup_ec_conditioning() when the trace
+#: list appears; after that the channels are authoritative and this is only the
+#: record of what they started as.
+ec_cond_pending = {"null": (0.0, 0.0), "rotation": 0.0, "gain": (1.0, 1.0)}
+
+
+def ec_conditioning_selftest_source():
+    """The self-test, as a script to run in a CHILD process. See below."""
+    return (
+        "import numpy as np, spatialnde2 as snde\n"
+        "from spatialnde2_ec_functions import ec_condition_function\n"
+        "recdb = snde.recdatabase()\n"
+        "snde.setup_cpu(recdb, [], 2)\n"
+        "snde.setup_storage_manager(recdb)\n"
+        "snde.setup_math_functions(recdb, [])\n"
+        "recdb.startup()\n"
+        "K = 8\n"
+        "tr = ((1.0 - 0.5j) + np.linspace(0.0, 1.0, K)*(0.5 + 0.8j))"
+        ".reshape(K, 1).astype(np.complex128)\n"
+        "t = recdb.start_transaction()\n"
+        "c = t.define_channel('/selftest/traces', 'main')\n"
+        "r = snde.create_ndarray_ref(t, c, snde.SNDE_RTN_COMPLEXFLOAT64)\n"
+        "r.allocate_storage([K, 1], False)\n"
+        "r.data[:] = tr\n"
+        "r.rec.mark_data_and_metadata_ready()\n"
+        "t.end_transaction().globalrev_wait().wait_complete()\n"
+        "t = recdb.start_transaction()\n"
+        "for p, v in (('/selftest/null', (1.0, -0.5)),\n"
+        "             ('/selftest/rotation', (35.0,)),\n"
+        "             ('/selftest/gain', (1.0, 1.0))):\n"
+        "    ch = t.define_channel(p, 'main')\n"
+        "    rr = snde.create_ndarray_ref(t, ch, snde.SNDE_RTN_FLOAT64)\n"
+        "    rr.allocate_storage([len(v)], False)\n"
+        "    for i, x in enumerate(v):\n"
+        "        rr.data[i] = float(x)\n"
+        "    rr.rec.mark_data_and_metadata_ready()\n"
+        "outs = ['/selftest/conditioned', '/selftest/horizontal',\n"
+        "        '/selftest/vertical', '/selftest/magnitude']\n"
+        "f = ec_condition_function.instantiate(\n"
+        "    [snde.math_parameter_recording('/selftest/traces')] +\n"
+        "    [snde.math_parameter_recording(p) for p in\n"
+        "     ('/selftest/null', '/selftest/rotation', '/selftest/gain')],\n"
+        "    [snde.shared_string(p) for p in outs],\n"
+        "    '/', False, False, False, snde.math_definition('selftest'), [], None)\n"
+        "t.add_math_function(f, False)\n"
+        "t.end_transaction().globalrev_wait().wait_complete()\n"
+        # THE SAME WAIT setup_ec_conditioning() does, and for the same reason:
+        # the globalrev above carries the math function's DEFINITION, and
+        # whether its OUTPUTS have reached a complete globalrev yet is a
+        # scheduling question. Reading straight through failed about one child
+        # in eight with "channel /selftest/vertical not found" -- which this
+        # self-test then reported as a conditioning fault, i.e. it blamed the
+        # compiled extension for a race in its own harness.
+        "import time as _t\n"
+        "_deadline = _t.monotonic() + 30.0\n"
+        "while _t.monotonic() < _deadline:\n"
+        "    try:\n"
+        "        if outs[2] in set(recdb.latest.list_recordings()): break\n"
+        "    except Exception: pass\n"
+        "    _t.sleep(0.02)\n"
+        "else:\n"
+        "    raise SystemExit('the conditioning math produced no output in 30 s')\n"
+        "v = np.asarray(recdb.latest.ref(outs[2]).data "
+        "if callable(getattr(recdb.latest, 'ref', None)) "
+        "else recdb.latest.ref[outs[2]].data).reshape(-1)\n"
+        "assert abs(float(v[0])) < 1e-9, 'nulled trace did not condition to 0'\n"
+        "assert abs(float(v[-1])) > 1e-6, 'a departing trace conditioned to 0'\n"
+        "print('EC_CONDITIONING_OK')\n")
+
+
+def _selftest_excerpt(out, lines=25):
+    """The part of a failed self-test's output that says what went wrong.
+
+    THE TAIL IS THE WRONG END. snde_error.what() appends a C++ backtrace --
+    twenty-odd frames of hex addresses -- so quoting the last N characters
+    reliably shows the backtrace and hides the message, which is what it did
+    while this was being debugged: "exit 1" followed by nothing but addresses.
+
+    So the backtrace frames are dropped and the first `lines` of what is left
+    are quoted, with a count of what was removed so nobody wonders where it
+    went.
+    """
+    kept = []
+    dropped = 0
+    for line in (out or "").splitlines():
+        if re.match(r"^\s*\[\s*\d+\s*\]:", line) or re.match(r"^\s*Binary file ", line):
+            dropped += 1
+            continue
+        kept.append(line)
+    text = "\n".join(kept[:lines]).strip()
+    if len(kept) > lines:
+        text += "\n  ... and %d more line(s)" % (len(kept) - lines,)
+    if dropped:
+        text += "\n  (%d C++ backtrace frame(s) omitted)" % (dropped,)
+    return text or "(the child produced no output)"
+
+
+def check_ec_conditioning(timeout=180.0):
+    """Does the compiled conditioning actually RUN? Checked in a child process.
+
+    WHY A CHILD PROCESS. ec_condition is a Cython extension linked against
+    spatialnde2's C++ ABI -- headers, templates, inlined code. Rebuild
+    spatialnde2 and leave the extension alone and the two disagree about object
+    layout, and the failure is a SEGFAULT inside the extension's call into the
+    library. Not an exception: a signal. In-process there is nothing to catch and
+    nothing to report, which is why this cannot be a try/except.
+
+    WHAT IT LOOKS LIKE WHEN IT HAPPENS: the scan dies silently -- no traceback,
+    no "terminate called", the log simply stops mid-scan with the arm on the
+    part. The core says SIGSEGV on thread "snde2 acrd 00", with frames running
+    spatialnde2 -> ec_condition -> libspatialnde2 -> libspatialnde2_ocl_math.
+    Compare the build dates of ec_condition*.so and libspatialnde2.so; a library
+    newer than the extension is the fault, and rebuilding the extension against
+    the installed library fixes it outright. IMPORTING IT DOES NOT CATCH THIS --
+    the import succeeds either way; only executing the math touches the ABI.
+
+    So: run it once, for real, in a child, on eight synthetic traces. A child
+    that dies on a signal is the answer. Costs a couple of seconds and it happens
+    before the arm moves rather than twenty minutes into a scan with the probe
+    down.
+
+    Returns (ok, why).
+    """
+    import subprocess
+    import sys as _sys
+    # The child must import the SAME spatialnde2 and the SAME extension this
+    # process has, or the test answers a question nobody asked. A plain
+    # `python3 -c` starts with none of the parent's sys.path additions -- which
+    # on a host where the extension is built in place rather than installed is
+    # the difference between "it crashes" and "it is not installed".
+    env = dict(os.environ)
+    extra = [p for p in _sys.path if p]
+    env["PYTHONPATH"] = os.pathsep.join(
+        extra + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    try:
+        p = subprocess.run([_sys.executable, "-c",
+                            ec_conditioning_selftest_source()],
+                           capture_output=True, text=True, timeout=timeout,
+                           env=env)
+    except Exception as e:                                # noqa: BLE001
+        return (False, "could not run the self-test: %r" % (e,))
+    out = (p.stdout or "") + (p.stderr or "")
+    if p.returncode == 0 and "EC_CONDITIONING_OK" in out:
+        return (True, "the compiled conditioning runs and its arithmetic is right")
+    if p.returncode < 0 or p.returncode in (134, 139):
+        return (False,
+                "THE COMPILED CONDITIONING CRASHED THE PROCESS (signal, exit "
+                "%s). spatialnde2_ec_functions is a Cython extension linked "
+                "against spatialnde2's C++ ABI, and this is what a REBUILT "
+                "spatialnde2 with a stale extension looks like -- importing it "
+                "works, executing it segfaults. Rebuild it against the "
+                "spatialnde2 that is installed:\n"
+                "    cd spatialnde2-ec-functions\n"
+                "    SETUPTOOLS_USE_DISTUTILS=stdlib python3 setup.py "
+                "build_ext --inplace\n"
+                "    cp spatialnde2_ec_functions/ec_condition*.so "
+                "$(python3 -c 'import spatialnde2_ec_functions as m, os; "
+                "print(os.path.dirname(m.__file__))')\n"
+                "Compare the build dates of ec_condition*.so and "
+                "libspatialnde2.so; if the library is newer, that is the "
+                "fault.\n%s" % (p.returncode, out[-800:]))
+    return (False, "the conditioning self-test failed (exit %s):\n%s"
+                   % (p.returncode, _selftest_excerpt(out)))
+
+
+def ec_conditioning_parameters(null=None, rotation_deg=None, gain=None,
+                               cond=None):
+    """Set null / rotation / gain whether or not the math is wired yet.
+
+    Wired  -> writes the parameter channels, so it takes effect over every trace
+              already acquired (which is what makes set_rotation() a setup
+              procedure rather than a reason to re-scan).
+    Not yet -> remembers the value for ensure_ec_conditioning() to apply.
+
+    Returns a dict of what is now in force, and whether it is live.
+    """
+    global ec_cond_pending
+    if null is not None:
+        ec_cond_pending["null"] = tuple(float(v) for v in null)
+    if rotation_deg is not None:
+        ec_cond_pending["rotation"] = float(rotation_deg)
+    if gain is not None:
+        ec_cond_pending["gain"] = tuple(float(v) for v in gain)
+
+    live = False
+    if cond is not None:
+        if null is not None:
+            set_ec_parameter(cond, "null", ec_cond_pending["null"])
+        if rotation_deg is not None:
+            set_ec_parameter(cond, "rotation", ec_cond_pending["rotation"])
+        if gain is not None:
+            set_ec_parameter(cond, "gain", ec_cond_pending["gain"])
+        live = True
+    out = dict(ec_cond_pending)
+    out["live"] = live
+    return out
+
+
+def ec_conditioning_in_force(cond=None):
+    """The null, rotation and gain the math is ACTUALLY using. -> dict
+
+    Off the parameter CHANNELS when the conditioning is wired, because those are
+    what the math function reads: ec_cond_pending is kept in step by
+    ec_conditioning_parameters(), but set_ec_parameter() writes a channel
+    directly and anything that reports the pending dict would then be reporting
+    a stale number.
+
+    This is what the per-pass save records, so that a replay months later
+    conditions the saved traces the way the scan did rather than the way the
+    config was configured. Never raises: an unreadable channel falls back to the
+    pending value and says which it used.
+    """
+    out = {"null": tuple(float(v) for v in ec_cond_pending["null"]),
+           "rotation_deg": float(ec_cond_pending["rotation"]),
+           "gain": tuple(float(v) for v in ec_cond_pending["gain"]),
+           "from": "pending"}
+    paths = (cond or {}).get("paths")
+    if not paths:
+        return out
+    try:
+        null = np.asarray(recdb.latest.ref[paths["null"]].data).reshape(-1)
+        rot = np.asarray(recdb.latest.ref[paths["rotation"]].data).reshape(-1)
+        gain = np.asarray(recdb.latest.ref[paths["gain"]].data).reshape(-1)
+        out["null"] = (float(null[0]), float(null[1]))
+        out["rotation_deg"] = float(rot[0])
+        out["gain"] = (float(gain[0]), float(gain[1]))
+        out["from"] = "channels"
+    except Exception as e:                                    # noqa: BLE001
+        out["from"] = "pending (the parameter channels did not answer: %s)" % (e,)
+    return out
+
+
+def ensure_ec_conditioning(recdb, traces_path, prefix="/ec/cond", cond=None):
+    """Wire the conditioning if it is not wired, using the pending parameters.
+
+    CALL THIS FROM THE SCAN'S setup_after_first HOOK, never from setup. The
+    trace list is created by TraceAccumulator.setup() and does not exist before
+    the first reading is staged; wiring earlier names a channel that cannot be
+    there, and under the timed transaction manager that is SIGABRT rather than
+    an error. See the section note above.
+
+    Idempotent: returns `cond` unchanged when it is already wired, so a second
+    pass or a second scan in one session does not redefine the channels (which
+    is its own failure -- see teardown_ec_conditioning).
+    """
+    if cond is not None:
+        return cond
+    p = ec_cond_pending
+    return setup_ec_conditioning(recdb, traces_path, prefix=prefix,
+                                 null=p["null"], rotation_deg=p["rotation"],
+                                 gain=p["gain"])
+
+
+def set_ec_parameter(cond, key, value):
+    """Retune null, rotation or gain live, without redefining the math.
+
+    key is "null" (a 2-tuple), "rotation" (degrees) or "gain" (a 2-tuple).
+    """
+    if key not in cond["chans"]:
+        raise KeyError("no EC parameter %r; have %s"
+                       % (key, ", ".join(sorted(cond["chans"]))))
+    values = (value,) if np.isscalar(value) else tuple(value)
+    recdb = cond["recdb"]
+    trans = recdb.start_transaction()
+    ref = snde.create_ndarray_ref(trans, cond["chans"][key], snde.SNDE_RTN_FLOAT64)
+    ref.allocate_storage([len(values)], False)
+    for i, v in enumerate(values):
+        ref.data[i] = float(v)
+    ref.rec.mark_data_and_metadata_ready()
+    trans.end_transaction().globalrev_wait().wait_complete()
+    return tuple(float(v) for v in values)
+
+
+#: How much longer the first principal axis of the trace scatter has to be than
+#: the second before ec_liftoff_rotation_from_traces() will call it a direction.
+#: Measured scans run 9 to 21; a round scatter is 1. Three is well clear of
+#: round and well under anything real.
+MIN_LIFTOFF_ANISOTROPY = 3.0
+
+
+def ec_null_from_traces(recdb, traces_path, first=0, count=None):
+    """The mean impedance over a span of traces, to use as the null point.
+
+    Nulling is done on good material, so the honest way to get the value is to
+    take it from traces the operator knows were over good material -- rather
+    than from a number typed in from a previous session on a different probe at
+    a different temperature.
+    """
+    ref = recdb.latest.ref[traces_path]
+    data = np.asarray(ref.data).reshape(-1)
+    if count is not None:
+        data = data[first:first+count]
+    else:
+        data = data[first:]
+    if not data.size:
+        raise ValueError("no traces at %s to null against" % (traces_path,))
+    mean = np.mean(data)
+    return (float(np.real(mean)), float(np.imag(mean)))
+
+
+def ec_liftoff_rotation_from_traces(recdb, traces_path, null=None,
+                                    first=0, count=None, min_traces=200):
+    """The rotation that lays lift-off along the horizontal axis. -> (deg, detail)
+
+    THE ANGLE IS MEASURED FROM THE SCAN'S OWN TRACES, not dialled in. An
+    instrument's lift-off direction belongs to the probe, the frequency and the
+    instrument's own phase; it is not a number that survives a session, a probe
+    change or a warm-up, and the one reliable place to get it is the data just
+    acquired.
+
+    HOW: over good material the reading moves almost entirely along one
+    direction in the impedance plane, because lift-off and tilt dominate and
+    they share an axis. So the first principal direction of the nulled traces
+    IS that axis, and the angle returned is the one to hand to set_rotation()
+    -- which quotes the angle a feature SITS AT, the way an instrument does.
+
+    FLAWS DO NOT HAVE TO BE EXCLUDED, and that matters because a scan does not
+    know where they are. They are sparse and they lie off this axis, so they
+    perturb it rather than defining it: measured on a 2212-trace scan over
+    twelve notches, using every trace gave -65.41 deg against -66.00 deg from
+    good material alone, and the detection that followed was within a few per
+    cent either way.
+
+    `detail["anisotropy"]` is how much longer the first principal axis is than
+    the second -- how clearly there IS a lift-off direction. Near 1 means the
+    scatter is round and the angle is arbitrary; this refuses below
+    MIN_LIFTOFF_ANISOTROPY rather than returning a number that means nothing.
+
+    The median is used for centring rather than the mean, so a handful of large
+    flaw excursions cannot drag the centre.
+    """
+    ref = recdb.latest.ref[traces_path]
+    data = np.asarray(ref.data).reshape(-1)
+    data = data[first:first+count] if count is not None else data[first:]
+
+    # DROP THE SLOTS THE SCAN NEVER FILLED.
+    #
+    # The trace list is allocated for the PLANNED number of traces and a scan
+    # that drops a pass, or ends a pass early, leaves the tail at 0+0j. Those
+    # are not readings: a real one carries the instrument's standing offset, so
+    # it is about 1.25 V from the origin, while the whole cloud of real readings
+    # spans about 0.01 V. Sixteen unwritten slots among 2370 therefore carry
+    # over a hundred times the leverage of a real point each, and the principal
+    # direction stops describing the data and starts describing the line from
+    # the cluster to the origin. Measured: a scan whose axis is -65.1 deg
+    # computed from its own saved traces reported -17.8 deg from this channel,
+    # and the rotation applied to the image was wrong by 47 degrees.
+    #
+    # An exact zero on BOTH components is the signature of an untouched slot and
+    # not of a measurement, so testing for it is safe; a reading that genuinely
+    # landed on 0+0j would be one point among thousands and is no loss.
+    keep = np.isfinite(data) & (data != 0)
+    dropped_unwritten = int((~keep).sum())
+    data = data[keep]
+
+    if data.size < min_traces:
+        raise ValueError(
+            "only %d trace(s) at %s; %d are wanted before the lift-off "
+            "direction means anything. Scan further, or lower min_traces "
+            "deliberately." % (data.size, traces_path, min_traces))
+    if null is None:
+        centre = np.median(data.real) + 1j*np.median(data.imag)
+    else:
+        centre = complex(null[0], null[1])
+    z = data - centre
+    X = np.column_stack([z.real, z.imag])
+    X = X - np.median(X, axis=0)
+    _u, sv, vt = np.linalg.svd(X, full_matrices=False)
+    anisotropy = float(sv[0]/sv[1]) if sv[1] > 0 else float("inf")
+    angle = float(np.degrees(np.arctan2(vt[0, 1], vt[0, 0])))
+    # The axis is a LINE, not a direction: +theta and theta-180 describe the
+    # same rotation. Reported in (-90, 90] so two scans of the same setup give
+    # the same number instead of ones that differ by a half turn.
+    while angle <= -90.0:
+        angle += 180.0
+    while angle > 90.0:
+        angle -= 180.0
+    detail = {"traces": int(data.size), "unwritten_dropped": dropped_unwritten,
+              "anisotropy": anisotropy,
+              "centre": (float(centre.real), float(centre.imag)),
+              "sigma_along": float(sv[0]/max(np.sqrt(len(X)), 1.0)),
+              "sigma_across": float(sv[1]/max(np.sqrt(len(X)), 1.0))}
+    if anisotropy < MIN_LIFTOFF_ANISOTROPY:
+        raise ValueError(
+            "the traces at %s scatter almost equally in every direction "
+            "(anisotropy %.2f, under %.2f), so there is no lift-off direction "
+            "to find and any angle would be arbitrary. That is what a scan over "
+            "a part with no lift-off variation looks like -- and also what a "
+            "dead instrument looks like."
+            % (traces_path, anisotropy, MIN_LIFTOFF_ANISOTROPY))
+    return angle, detail
+
+
+# ==============================================================================
+# THE SCAN
+# ==============================================================================
+
+global ec_trace_accum
+global ec_projector
+global ec_scan_component
+global ec_staging_chan
+global ec_projection_errors
+global ec_projection_last_error
+global ec_projection_status
+global scan_projection_status
+global ec_pass_saver
+global project_ec_traces
+global scan_replay_projection
+ec_trace_accum = None
+ec_projector = None
+
+#: The per-pass recorder the running (or last) scan is writing through.
+#:
+#: Module level so ec_save_status() can be asked from the prompt mid-scan, and
+#: so the report of a scan that did not finish can still say what reached the
+#: disk. None means nothing is being written -- which, for an eddy-current scan,
+#: means the measurement exists only in this process.
+ec_pass_saver = None
+
+#: Projection failures counted rather than only printed.
+#:
+#: stage_ec_reading() runs on the DIGITIZER'S ACQUISITION THREAD, where a print()
+#: goes to process stdout through a block-buffered pipe and, if the scan is
+#: interrupted, is never flushed at all. Every projection error in a 6000-trace
+#: scan can therefore vanish, leaving an empty image and a clean-looking log --
+#: which is exactly the state that is impossible to troubleshoot afterwards. The
+#: count and the last message are cheap, survive the thread, and are readable
+#: from the prompt at any time with ec_projection_status().
+ec_projection_errors = 0
+ec_projection_last_error = None
+
+#: The reservation on the staging channel a reading is written to.
+#:
+#: Module level, not local to the scan, because it must outlive one scan in order
+#: to be handed back at the start of the next -- see _prepare() in
+#: run_ec_path_scan(). None means nobody holds it.
+ec_staging_chan = None
+
+# Which conditioned scalar gets projected onto the surface. "vertical" is the
+# usual answer: after the rotation is set, lift-off lies horizontal and what is
+# left vertically is the part. "magnitude" ignores the rotation entirely and is
+# the safe choice before one has been set.
+ec_scan_component = "vertical"
+
+
+def stage_ec_reading(data, metadata, pose7=None):
+    """Stage one impedance reading and the pose it was taken at, in ONE
+    transaction.
+
+    Both together, because that is what makes trace_poses[k] BELONG to
+    traces[k] rather than merely correlate with it. Runs on the source's
+    acquisition thread, so it must not touch a dgpy module -- no ros, no daq.
+    """
+    # A TRANSACTION MUST BE ENDED ON EVERY PATH OUT OF HERE. An
+    # active_transaction ends itself when it is destroyed, which covers the
+    # ordinary exception case -- but only if nothing retains the traceback, and
+    # the caller's error bookkeeping used to do exactly that. An unended
+    # transaction is not a lost trace: under the timed transaction manager the
+    # map commits strictly from the head, so it stops every globalrev wait in
+    # the process permanently and silently. Do not rely on refcounting for
+    # something with that blast radius.
+    transact = recdb.start_transaction()
+    ended = None
+    try:
+        staging_rec = snde.create_ndarray_ref(transact, ec_staging_chan,
+                                              snde.SNDE_RTN_COMPLEXFLOAT64)
+        if metadata:
+            staging_rec.rec.metadata = metadata
+        staging_rec.rec.mark_metadata_done()
+        staging_rec.allocate_storage(data.shape, True)
+        staging_rec.data[:] = data
+        staging_rec.rec.mark_data_ready()
+
+        if ec_trace_accum is not None and pose7 is not None:
+            ec_trace_accum.stage_pose_only_in_transaction(transact, pose7)
+    finally:
+        # end_transaction() is what releases the head of the map. It is safe to
+        # call on a transaction whose recordings were never completed -- the
+        # globalrev simply carries whatever was defined -- and far safer than
+        # leaving it open.
+        ended = transact.end_transaction()
+    ended.globalrev_wait().wait_complete()
+
+    # Project the CONDITIONED value at the pose it was taken at, after the
+    # transaction -- the conditioning is a math function and its answer for this
+    # reading does not exist until the globalrev completes.
+    #
+    # Live only. This is a second serialised globalrev wait and it is what limits
+    # the sustainable rate; "deferred" records the traces and replays the whole
+    # list through the projector afterwards for an identical image.
+    if projection_is_live() and ec_projector is not None and pose7 is not None \
+            and ec_cond_paths is not None:
+        try:
+            k = ec_trace_accum.staged - 1 if ec_trace_accum is not None else 0
+            vals = recdb.latest.ref[ec_cond_paths[ec_scan_component]].data
+            flat = np.asarray(vals).reshape(-1)
+            if 0 <= k < len(flat):
+                ec_projector.project(pose7, float(flat[k]))
+        except Exception as e:
+            # Counted as well as printed: see ec_projection_errors above. Only
+            # the first few are printed, because one recurring fault at the trace
+            # rate buries everything else in the log.
+            global ec_projection_errors, ec_projection_last_error
+            ec_projection_errors += 1
+            ec_projection_last_error = "%s: %s" % (type(e).__name__, e)
+            if ec_projection_errors <= 5:
+                print("projection: %s" % (e,))
+                if ec_projection_errors == 5:
+                    print("projection: further errors counted, not printed "
+                          "-- ec_projection_status()")
+
+
+def ec_projection_status(quiet=False):
+    """Is the eddy-current data actually reaching the projected image? -> dict
+
+    The one call to make when the projection looks empty. It separates the three
+    states that look identical from the viewer:
+
+      * nothing was offered            -- not projecting (live mode off, or no pose)
+      * offered but nothing landed     -- the poses are missing the surface
+      * landed                         -- the image has data and the VIEWER is
+                                          the thing that is broken
+
+    None of that is visible otherwise: a ray that misses the surface is dropped
+    inside the math function without raising, and the errors that DO raise are
+    printed on the acquisition thread where the buffer may never be flushed.
+    """
+    status = {"errors": ec_projection_errors,
+              "last_error": ec_projection_last_error,
+              "projector": None}
+    if ec_projector is None:
+        status["projector"] = "no projector -- ec_projector is None"
+        if not quiet:
+            print("  projection: NO PROJECTOR. Either the scan has not built one "
+                  "yet or this config does not project.")
+    else:
+        status["projector"] = ec_projector.projection_status(quiet=quiet)
+    if not quiet and ec_projection_errors:
+        print("    %d projection error(s) during the scan; last was %s"
+              % (ec_projection_errors, ec_projection_last_error))
+    return status
+
+
+#: The instrument-independent name surface_path_scan.dpi looks for.
+#:
+#: That module runs the pass loop and cannot know this config holds an
+#: eddy-current projector, so it asks globals() for this name -- the same idiom
+#: as cartesian_move and joint_move_kwargs. Defined here because this is the
+#: module that owns the projector.
+scan_projection_status = ec_projection_status
+
+
+def project_ec_traces(first=0, count=None, component=None, quiet=False):
+    """Replay THIS PROCESS's eddy-current trace list through the projector.
+
+    The eddy-current counterpart of project_traces() (scan_plan.dpi), and the
+    deferred half of PROJECTION_MODE for this instrument. It exists because the
+    ultrasound one cannot serve an EC scan even in principle: it reads
+    `projector`, `trace_accum` and `cscan_gates`, which scan_accumulation.dpi
+    owns and an EC scan never sets -- an EC scan uses ec_projector,
+    ec_trace_accum and ec_cond_paths. So PROJECTION_MODE="deferred" used to
+    record the traces and silently never replay them, and
+    scan_settings_panel.dpi's re-project button raised "no projector" on a scan
+    whose projector was right there under another name.
+
+    Live or deferred, the image is the same: every trace carries the pose it was
+    taken at and the conditioning is a math function over the whole list, so the
+    only difference is when the splats happen. Deferred is also much faster --
+    wait=False per point with one wait at the end, measured at 11x on the
+    ultrasound path -- which is safe here precisely because nothing is
+    producing.
+
+    This needs the trace list that is in THIS process. For a scan whose process
+    is gone, replay_ec_scan() (ec_trace_store.dpi) does the same job from the
+    per-pass files on disk.
+    """
+    if ec_projector is None:
+        raise RuntimeError(
+            "no eddy-current projector -- PROJECTION_MODE is 'off', or no scan "
+            "has set up a surface yet. A scan from an earlier process is "
+            "replayed with replay_ec_scan() instead, off the per-pass files.")
+    if ec_trace_accum is None or not ec_trace_accum.staged:
+        raise RuntimeError(
+            "no eddy-current trace list to project from -- no scan has staged "
+            "a reading in this process. replay_ec_scan() replays a saved run.")
+    component = ec_scan_component if component is None else component
+    if not ec_cond_paths or component not in ec_cond_paths:
+        raise RuntimeError(
+            "the conditioning is not wired, so there is no %s channel to "
+            "project. It is wired by the scan itself once the first reading has "
+            "given it a trace list; a scan that never staged one has nothing to "
+            "replay." % (component,))
+
+    poses = np.array(recdb.latest.ref[ec_trace_accum.poses_path].data, copy=True)
+    vals = np.asarray(recdb.latest.ref[ec_cond_paths[component]].data).reshape(-1)
+
+    end = min(len(poses), len(vals))
+    # The accumulators are allocated for the whole planned scan; only the traces
+    # actually staged are real. Projecting the unwritten tail would splat zeros
+    # at an invalid orientation.
+    end = min(end, int(ec_trace_accum.staged))
+    if count is not None:
+        end = min(end, first + int(count))
+
+    started = time.monotonic()
+    done = 0
+    skipped = 0
+    gr = None
+    for k in range(first, end):
+        pose7 = poses[k]
+        if not float(np.linalg.norm(pose7[:4])) > 1e-6:
+            skipped += 1          # never staged: a zero quaternion is no pose
+            continue
+        gr = ec_projector.project(pose7, float(vals[k]), wait=False)
+        done += 1
+    if gr is not None:
+        # One wait, at the end. Each projection is a transaction and the
+        # projector accumulates in mutable storage, so they must all land -- but
+        # they need not land one at a time.
+        gr.globalrev_wait().wait_complete()
+    elapsed = time.monotonic() - started
+    if not quiet:
+        print("  projected %d %s trace(s) in %.1f s (%.1f traces/s)%s"
+              % (done, component, elapsed, done/elapsed if elapsed > 0 else 0.0,
+                 ", %d unstaged skipped" % skipped if skipped else ""))
+    return {"projected": done, "skipped": skipped, "elapsed": elapsed,
+            "component": component}
+
+
+#: The instrument-independent name scan_plan.dpi looks for when it is asked to
+#: replay a trace list.
+#:
+#: Same idiom as scan_projection_status above, and it is what makes
+#: project_traces(), finish_projection() and the settings panel's re-project
+#: button work in an eddy-current config rather than raising or, worse,
+#: returning quietly having done nothing.
+scan_replay_projection = project_ec_traces
+
+
+def ec_first_contact_null(null_fn, required=True):
+    """The first-touchdown callable that balances the INSTRUMENT. -> callable
+
+    `null_fn` is the hardware null, with no arguments -- for the Uniwest that is
+    UniWest.null(), which sends the instrument's NULL command. It is called once
+    per scan, with the probe on the part and before any reading is staged; see
+    first_touchdown_hook() in surface_path_scan.dpi for why that is the only
+    place it can go.
+
+    NOT THE CONDITIONING NULL (/ec/cond/null, null_here()). That one is a complex
+    offset subtracted from the recorded traces in software; this one sets where
+    the instrument's own operating point sits, and no software offset repairs an
+    instrument balanced in air. Both are wanted; neither replaces the other.
+
+    required=True stops the scan when the null fails. That happens at the first
+    pass, before any trace is staged, so nothing measured is lost and the scan's
+    own teardown lifts the probe off the part on the way out -- against the
+    alternative of a finished scan whose every trace rides on an unknown offset.
+    required=False prints the same finding and carries on, which is the bench
+    case: no instrument to balance, and nothing being measured either way.
+
+    The outcome is left in ec_instrument_null and returned in the scan report.
+    """
+    def _null():
+        global ec_instrument_null
+        print("  nulling the INSTRUMENT: the probe is on the part and nothing "
+              "has been read yet. Hardware balance -- the conditioning null "
+              "(/ec/cond/null, null_here()) is a separate software offset on top "
+              "of it.")
+        try:
+            null_fn()
+        except Exception as e:                                    # noqa: BLE001
+            why = "%s: %s" % (type(e).__name__, e)
+            ec_instrument_null = {"nulled": False, "why": why,
+                                  "required": bool(required)}
+            if required:
+                raise RuntimeError(
+                    "the eddy-current instrument would not null with the probe "
+                    "on the part (%s). STOPPING at the first pass rather than "
+                    "acquiring un-nulled: an instrument balanced in air puts the "
+                    "operating point in the wrong place and every trace of the "
+                    "scan rides at an offset that no software null repairs. Fix "
+                    "the instrument, or set_ec_nulling(required=False) to accept "
+                    "an un-nulled scan deliberately." % (why,))
+            print("  WARNING: the instrument did NOT null (%s). The scan is "
+                  "going ahead UN-NULLED: every trace carries the instrument's "
+                  "own offset, the impedance plane is not centred on unflawed "
+                  "material, and that cannot be corrected afterwards." % (why,))
+            return
+        ec_instrument_null = {"nulled": True, "why": "", "required": bool(required)}
+        print("  instrument nulled on the part")
+
+    return _null
+
+
+global run_ec_path_scan
+def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
+                     staging_path="/ec/current", component=None,
+                     max_passes=None, force=False, pitch_m=None, contact=None,
+                     cond_prefix="/ec/cond", null_instrument=None,
+                     null_required=True, save=True, run_dir=None):
+    """Scan a surface-following toolpath with an eddy-current instrument.
+
+    The acquisition is shared with the ultrasound scan -- see
+    surface_path_scan.dpi -- and everything eddy-current about it is here: what
+    a reading is, which channel it accumulates into, and which conditioned
+    scalar gets projected.
+
+    `cond` may be None, and None is the normal case: the conditioning is
+    wired HERE, in the setup_after_first hook, because its input is the trace
+    list and the trace list does not exist until the first reading has been
+    staged. The wired handle is returned in the report as report["cond"] and
+    left in the module global `ec_cond`. Passing an already-wired `cond`
+    (a second scan in one session) reuses it.
+
+    NOTE position_relative_to_origin=False. The eddy-current config's
+    probe_position() reports WORLD coordinates, unlike UTPlaneScan's, which
+    reports coordinates relative to the scan origin. Getting this wrong does not
+    raise: it places every trace one footprint away from the part.
+
+    `contact` (surface_path_scan.dpi's contact_motion()) is how a probe that
+    touches the part moves between passes: straight off along its own axis,
+    across in the air, straight back down -- never a joint move with the tip on
+    the surface. None is the standoff behaviour, for a probe that never touches.
+
+    `null_instrument` is the instrument's own hardware balance, with no arguments
+    (UniWest.null()). It is issued ONCE, at the first touchdown, before any trace
+    is staged; None skips it. `null_required` decides what a failed null means --
+    see ec_first_contact_null(). Not the conditioning null; that is
+    /ec/cond/null, wired below and set by null_here().
+
+    `save` writes every COMPLETED PASS to disk, into its own directory beside
+    the meshes, and is on by default for the reason the whole mechanism exists:
+    the recording database is in memory, so until a pass is on disk the process
+    IS the dataset. On 2026-10-02 a scan reached pass 59 of 64 with live
+    projection working and real indications visible, wedged, and was killed; all
+    59 passes went with it and there was nothing to reproject. `run_dir` puts
+    those files somewhere specific; None names one from the time the scan
+    started. The directory is returned in report["run_dir"], and
+    replay_ec_scan() rebuilds the image from it in any later session.
+
+    save=False is for a bench run that is deliberately throwing its data away.
+    It is not an optimisation: the write is a few hundred microseconds per pass
+    against passes that take tens of seconds.
+    """
+    global ec_trace_accum, ec_projector, ec_staging_chan, ec_cond_paths
+    global ec_scan_component, ec_cond, ec_pass_saver
+    if component is not None:
+        ec_scan_component = component
+    if ec_scan_component not in ("horizontal", "vertical", "magnitude"):
+        raise ValueError("component must be horizontal, vertical or magnitude, "
+                         "not %r" % (ec_scan_component,))
+    # Not from `cond`: there may not be one yet. The projector reads
+    # ec_cond_paths, and nothing is projected until the first reading has been
+    # staged and _setup() has run, so filling it there is in time.
+    ec_cond_paths = dict(cond["outputs"]) if cond else None
+
+    def _prepare(n_traces):
+        """Create the staging channel and the accumulator before the first
+        reading is staged.
+
+        Ordering matters: nd_accumulate_once consumes whatever is on its input
+        channel at instantiation as entry zero, so the staging channel has to
+        exist and the accumulator has to be built BEFORE any reading is staged,
+        and setup() has to run after exactly one has been.
+        """
+        global ec_trace_accum, ec_staging_chan
+        if ec_trace_accum is not None:
+            # A second scan in one process, or the accumulator is sized for the
+            # previous toolpath's trace count. Teardown first: its accumulator
+            # reads the staging channel, and a math function must go before its
+            # input can be handed back.
+            ec_trace_accum.teardown()
+            ec_trace_accum = None
+        trans = recdb.start_transaction()
+        # HAND THE STAGING CHANNEL BACK BEFORE TAKING IT AGAIN. The accumulator
+        # is told to use this channel rather than making its own, so
+        # TraceAccumulator.teardown() leaves it alone -- it only releases what it
+        # owns. Nothing else released it either, so the second scan in a session
+        # used to redefine a channel it still held. define_channel() does not
+        # object; it returns a reserved_channel that is no longer the current
+        # owner, and the transaction fails later with
+        #
+        #     realize_transaction: provided reserved_channel for /ec/current by
+        #     main is not current (current owner is main)
+        #
+        # thrown on the transaction manager's own thread under the timed manager,
+        # where nothing catches it: SIGABRT, mid-scan, probe on the part.
+        if ec_staging_chan is not None:
+            trans.release_channel(ec_staging_chan)
+            ec_staging_chan = None
+        ec_staging_chan = trans.define_channel(staging_path, "main")
+        ref = snde.create_ndarray_ref(trans, ec_staging_chan,
+                                      snde.SNDE_RTN_COMPLEXFLOAT64)
+        ref.allocate_storage([1], False)
+        ref.data[:] = 0
+        ref.rec.mark_data_and_metadata_ready()
+        trans.end_transaction().globalrev_wait().wait_complete()
+        # num_samples=1: an eddy-current reading IS one complex number. That is
+        # what makes the trace list (K, 1) and lets the same accumulation and
+        # projection code serve both instruments.
+        #
+        # sample_period=None because there is no time axis at all here, which
+        # TraceAccumulator stamps as 1.0 s/sample so the units stay honest
+        # rather than implying a rate that does not exist.
+        ec_trace_accum = TraceAccumulator(
+            recdb, int(n_traces), 1,
+            prefix=prefix,
+            sample_period=None, time_offset=0.0,
+            ascan_typenum=snde.SNDE_RTN_COMPLEXFLOAT64,
+            ascan_path=staging_path,
+            ascan_chan=ec_staging_chan)
+
+    def _setup(plan, x3d_path, proj_prefix):
+        # proj_prefix, not prefix: the outer `prefix` is the accumulator's
+        # ("/ec") and this is the projector's ("/ec/proj"). They are different
+        # trees and shadowing one with the other reads as a bug even when it
+        # is not.
+        global ec_projector, ec_cond, ec_cond_paths
+        if ec_trace_accum is not None:
+            ec_trace_accum.setup()
+
+            # THE CONDITIONING GOES HERE, and nowhere earlier. setup() above is
+            # what creates the trace list -- it is the output of
+            # nd_accumulate_once -- so this is the first instant at which the
+            # conditioning's input exists. Wiring it during setup_ec() instead
+            # dumps core; see the section note above.
+            #
+            # This is also exactly where the ultrasound scan wires ITS derived
+            # math (setup_gated_cscan, scan_accumulation.dpi:242): straight
+            # after trace_accum.setup(), for the same reason.
+            ec_cond = ensure_ec_conditioning(recdb, ec_trace_accum.traces_path,
+                                             prefix=cond_prefix, cond=ec_cond)
+            ec_cond_paths = dict(ec_cond["outputs"])
+            print("  conditioning on %s -> %s/{conditioned,horizontal,"
+                  "vertical,magnitude}; null (%.5f, %.5f), rotation %.1f deg, "
+                  "gain h=%.2f v=%.2f"
+                  % ((ec_trace_accum.traces_path, cond_prefix.rstrip("/"))
+                     + tuple(ec_cond_pending["null"])
+                     + (ec_cond_pending["rotation"],)
+                     + tuple(ec_cond_pending["gain"])))
+
+        if projection_enabled() and x3d_path is not None:
+            radius, pixels = projection_settings(plan)
+            # PATH AND CONTENTS. Comparing the path alone is what produced
+            # results16: the second measurement's parameterization was written
+            # over the first's, this test said "same surface", and the whole
+            # scan projected onto geometry 31 mm away from the part. Not one of
+            # its 3531 traces landed and every pass reported 100%. See
+            # projection_surface_reusable() in surface_projection.dpi.
+            reuse, why = projection_surface_reusable(ec_projector, x3d_path)
+            if reuse:
+                # Same surface: empty the picture and reuse it. Rebuilding would
+                # work but would reload the mesh and recompute its projection
+                # geometry, which on a CPU-only build is the slow part, and would
+                # strand another model tree that cannot be reclaimed.
+                ec_projector.radius = radius
+                ec_projector.horizontal_pixels = pixels
+                ec_projector.vertical_pixels = pixels
+                ec_projector.restart()
+                print("  projection surface reused (image cleared): %s" % x3d_path)
+            else:
+                if ec_projector is not None:
+                    ec_projector.teardown()
+                    ec_projector = None
+                    print("  rebuilding the projection surface -- %s" % (why,))
+                ec_projector = SurfaceProjector(recdb, x3d_path, prefix=proj_prefix,
+                                                radius=radius,
+                                                horizontal_pixels=pixels,
+                                                vertical_pixels=pixels)
+                print("  projection surface: %s  (projecting %s)"
+                      % (x3d_path, ec_scan_component))
+            # IS THAT SURFACE UNDER THIS TOOLPATH? Refuses on disjoint, naming
+            # both boxes and the gap. The pre-flight below asks the same
+            # question of the FILE before any motion; this one asks it of the
+            # surface that is actually LOADED, which is the half that catches a
+            # stale reuse -- the file on disk may by then be the right one while
+            # the projector is still holding the previous run's geometry.
+            check_projection_covers_path(ec_projector, path, what="toolpath")
+
+    # BEFORE THE ARM MOVES. The projector itself is not built until the first
+    # reading has been staged -- by which time the probe is on the part -- so
+    # the surface is checked against the toolpath here, off the file, where a
+    # refusal costs nothing. results16 would have stopped on this line.
+    if projection_enabled() and x3d is not None:
+        check_projection_covers_path(x3d, path, what="toolpath")
+
+    global ec_instrument_null
+    ec_instrument_null = None
+    on_contact = (None if null_instrument is None
+                  else ec_first_contact_null(null_instrument,
+                                             required=null_required))
+
+    # ONE DIRECTORY FOR THIS RUN'S TRACES, created BEFORE the arm moves so an
+    # unwritable path is a refusal here rather than 64 warnings with the probe
+    # on the part.
+    #
+    # The state closure is read ONCE PER PASS rather than captured now, and that
+    # is load-bearing: the conditioning does not exist yet. It is wired in
+    # _setup() -- after the first reading has been staged, because its input is
+    # the trace list -- so a recorder holding a snapshot taken here would record
+    # "no conditioning, no parameters" for every pass of the scan.
+    ec_pass_saver = None
+    if save:
+        def _saver_state():
+            params = ec_conditioning_in_force(ec_cond)
+            return {"accum": ec_trace_accum,
+                    "cond_paths": ec_cond_paths,
+                    "component": ec_scan_component,
+                    "null": params["null"],
+                    "rotation_deg": params["rotation_deg"],
+                    "gain": params["gain"],
+                    "parameters_from": params["from"],
+                    "x3d": (None if ec_projector is None
+                            else ec_projector.x3d_path) or x3d,
+                    # The mesh the surface was parameterized from, so a run
+                    # whose .x3d has since been overwritten says what to
+                    # re-parameterize. A ScanPath carries no mesh -- only a
+                    # `source` string -- so it comes from the pipeline's own
+                    # globals, newest stage first.
+                    "mesh": (globals().get("specimen_mesh")
+                             or globals().get("fine_mesh")
+                             or globals().get("rough_mesh")),
+                    "path_source": getattr(path, "source", None),
+                    "pitch_m": getattr(source, "trigger_pitch_m", pitch_m),
+                    "projection_radius_m": (None if ec_projector is None
+                                            else ec_projector.radius),
+                    "projection_pixels": (None if ec_projector is None
+                                          else ec_projector.horizontal_pixels),
+                    "trigger_report": getattr(source, "trigger_report", None),
+                    "label": "eddy-current path scan"}
+
+        ec_pass_saver = ec_pass_recorder(run_dir=run_dir, state=_saver_state)
+        print("  traces will be written one file per completed pass to %s"
+              % (ec_pass_saver.run_dir,))
+    else:
+        print("  ** NOT SAVING TRACES (save=False). The recording database is "
+              "in memory, so if this process dies the whole scan is gone -- "
+              "which is what happened on 2026-10-02 at pass 59 of 64.")
+
+    # try/finally, because the scans that most need the projection report are
+    # the ones that do not reach the end of this function. On 2026-10-01 one
+    # scan stopped when the pendant dropped External Control at pass 84 of 163
+    # and the other was aborted at pass 23 of 174; neither printed a projection
+    # line, so whether anything had landed was unrecorded. A KeyboardInterrupt
+    # or a supervisor abort now still says.
+    try:
+        report = run_surface_path_scan(
+            path, x3d, source, stage_ec_reading, _prepare, _setup,
+            max_passes=max_passes, force=force,
+            projector_prefix="/ec/proj", label="Eddy-current path scan",
+            pitch_m=pitch_m, position_relative_to_origin=False, contact=contact,
+            on_first_contact=on_contact, on_pass=ec_pass_saver)
+    except BaseException:
+        # BaseException, not Exception: Ctrl-C is the common case here.
+        try:
+            st = ec_projection_status(quiet=True)
+            if ec_projector is not None and st["projector"]:
+                print("  the scan did not finish; the projection stood at:")
+                print(describe_projection_status(st["projector"]))
+            if ec_projection_errors:
+                print("    %d projection error(s); last was %s"
+                      % (ec_projection_errors, ec_projection_last_error))
+            # AND WHAT SURVIVES IT. This is the branch the whole per-pass
+            # mechanism was built for -- a scan that did not reach its own last
+            # line -- so it is the branch that most has to say where the data
+            # is and how to get the picture back.
+            if ec_pass_saver is not None:
+                # AND THE PASS THAT WAS IN FLIGHT. The per-pass hook only fires
+                # on a pass that finished, so without this the sweep the scan
+                # was abandoned in the middle of is the one pass that is lost.
+                # Its traces are real measurements at real poses; they are
+                # marked partial rather than offered as a complete line.
+                saved, why = ec_pass_saver.flush()
+                if saved:
+                    print("  the interrupted pass was saved too (partial): %s"
+                          % (os.path.basename(why),))
+                print(ec_pass_saver.describe())
+                if ec_pass_saver.saved:
+                    print("    replay_ec_scan() rebuilds the image from those "
+                          "files, in this session or any later one")
+        except Exception as e:                                # noqa: BLE001
+            print("  (projection status unavailable: %s)" % (e,))
+        raise
+    report["instrument_null"] = ec_instrument_null
+    report["run_dir"] = None if ec_pass_saver is None else ec_pass_saver.run_dir
+    report["saved"] = None if ec_pass_saver is None else ec_pass_saver.status()
+    if ec_pass_saver is not None:
+        print(ec_pass_saver.describe())
+
+    # WHETHER THE TRACES REACHED THE IMAGE, printed with the rest of the report
+    # rather than left to be asked for. An empty projection is silent -- missed
+    # rays are dropped inside the math function and the errors that do raise are
+    # printed on a thread whose buffer may never flush -- so the one run where
+    # nobody thought to check is the run that cannot be diagnosed afterwards.
+    report["projection"] = ec_projection_status(quiet=True)
+    if ec_projector is not None and report["projection"]["projector"]:
+        print(describe_projection_status(report["projection"]["projector"]))
+    if ec_projection_errors:
+        print("    %d projection error(s) during the scan; last was %s"
+              % (ec_projection_errors, ec_projection_last_error))
+    return report

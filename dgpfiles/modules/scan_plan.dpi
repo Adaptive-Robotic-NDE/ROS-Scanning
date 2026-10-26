@@ -1,0 +1,664 @@
+# ==============================================================================
+# THE TECHNICIAN-CONTROL DERIVATION LAYER
+# ==============================================================================
+# scan_parameters.dpi holds the pure arithmetic -- ROS-free, host-testable, no
+# recording database. This is its wiring: it reads the config's globals and the
+# live digitizer, hands them to plan_scan(), and keeps the resulting plan.
+
+# The plan the scan currently running was started from. Everything that has to
+# know how fast to move or how big to make the projection reads it, so there is
+# one derivation rather than one per call site.
+#
+# THIS FILE OWNS scan_plan: plan_current_scan() is the only thing that builds
+# one. plane_scan.dpi's Scan2DPlane() also writes it, and only ever to None --
+# a point-to-point scan has no sweep velocity, so an inherited plan from an
+# earlier continuous scan would describe something it is not doing. That is a
+# second writer of one shared variable, not a second definition, and it is
+# allowlisted in dpi_exports_test.py.
+global scan_plan
+scan_plan = None
+
+global projection_enabled
+def projection_enabled():
+    return PROJECTION_MODE != "off"
+
+global projection_is_live
+def projection_is_live():
+    """Project each trace as it is staged, rather than replaying afterwards.
+
+    Read from PROJECTION_MODE rather than from the plan, deliberately: the
+    settings panel writes that global, so switching to "deferred" partway
+    through a scan that is falling behind takes effect on the next trace. The
+    plan then no longer describes what happened, which check_scan_outcome()
+    reports as an achieved rate that beat the planned one.
+    """
+    return PROJECTION_MODE == "live"
+
+# ==============================================================================
+# COMMANDING A TOOL SPEED INSTEAD OF A JOINT-LIMIT FRACTION
+# ==============================================================================
+# OFF BY DEFAULT. Everything below changes nothing until set_tool_speed_solver()
+# turns it on, and turning it off puts the pipeline back bit for bit.
+#
+# WHAT IT IS. CartesianMove's `vel` is MoveIt's max_velocity_scaling_factor -- a
+# fraction of every joint's own limit -- and what the TOOL does with that is the
+# Jacobian's business, so it varies along a path and with configuration. This
+# pipeline converts a wanted m/s into one of those fractions through a scalar
+# curve (ROBOT_VELOCITY_CALIBRATION) fitted by driving ONE straight line at five
+# speeds. The curve does not transfer: re-measuring moved the eddy-current
+# figure from 0.0064 to 0.0047 for the same commanded 10 mm/s.
+#
+# mtc_hub_node can now solve for the scaling instead -- parameterise, measure
+# peak tool speed by forward kinematics, correct, repeat -- so the scaling
+# becomes an OUTPUT of the real kinematics of the actual path. Sending
+# tool_speed_mps is what asks for that.
+#
+# WHAT IT WILL AND WILL NOT BUY, HONESTLY. The caller's scaling is the solver's
+# ceiling as well as its guess, so a solved move can only ever come out SLOWER.
+# Measured in results17, every shortfall ran the OTHER way:
+#
+#     scaling   commanded   measured peak   ratio
+#     0.00254     6.0 mm/s       5.8 mm/s    97%
+#     0.00473    10.0            8.5         85%
+#     0.00630    13.0            8.0         62%
+#     0.01649    32.7           20.4         62%
+#
+# Reaching the commanded speed in those cases needs a scaling ABOVE the curve's,
+# which the ceiling forbids. So switching this on, by itself, buys a GUARANTEE
+# (the tool never overruns the speed it was commanded at, measured rather than
+# predicted) and not throughput. The throughput half needs the ceiling raised,
+# which is mtc_hub_node's raster_tool_speed_ceiling_factor -- a live ROS
+# parameter, default 1.0, and the planner prints "THE CEILING BOUND IT" on any
+# pass where that is what stopped it reaching the commanded speed. Read that
+# line before raising anything.
+global TOOL_SPEED_SOLVER
+TOOL_SPEED_SOLVER = False
+
+
+global set_tool_speed_solver
+def set_tool_speed_solver(on=True):
+    """Command tool speed in m/s rather than converting through the curve.
+
+        set_tool_speed_solver(True)    solve the scaling from the kinematics
+        set_tool_speed_solver(False)   back to ROBOT_VELOCITY_CALIBRATION
+
+    Takes effect on the NEXT move; a plan already in hand is unaffected. The
+    scaling the curve produced is still sent, as the solver's starting guess and
+    its ceiling, so this cannot make any move faster than it is today.
+
+    See the block comment above for what it does and does not buy.
+    """
+    global TOOL_SPEED_SOLVER
+    TOOL_SPEED_SOLVER = bool(on)
+    print(describe_tool_speed_solver())
+    return TOOL_SPEED_SOLVER
+
+
+global tool_speed_solver
+def tool_speed_solver():
+    """Whether tool speed is being commanded in m/s. Prints it."""
+    print(describe_tool_speed_solver())
+    return TOOL_SPEED_SOLVER
+
+
+global describe_tool_speed_solver
+def describe_tool_speed_solver():
+    """One line for the startup banner and the setter. Never blank."""
+    if TOOL_SPEED_SOLVER:
+        return ("  tool speed: COMMANDED IN M/S -- mtc_hub_node solves the "
+                "velocity scaling from the path's own kinematics, with the "
+                "curve's scaling as the guess and the ceiling. Watch for "
+                "'Tool speed solved' in the mtc_hub_node log, and for 'THE "
+                "CEILING BOUND IT'. set_tool_speed_solver(False) reverts.")
+    return ("  tool speed: CONVERTED THROUGH THE CURVE "
+            "(ROBOT_VELOCITY_CALIBRATION) -- the long-standing behaviour. The "
+            "curve over-predicted by up to 38%% on the last cell run. "
+            "set_tool_speed_solver(True) asks the planner to solve it instead.")
+
+
+global raster_tool_speed
+def raster_tool_speed():
+    """The sweep speed in m/s from the plan, or None when there is no plan.
+
+    The plan's `effective_velocity_mps` and not `requested_velocity_mps`: the
+    effective one is what the staging pipeline can keep up with at the chosen
+    step, and it is the speed the scaling was derived from, so it is the one the
+    solver should be asked to deliver.
+    """
+    if scan_plan is None:
+        return None
+    speed = scan_plan.get("effective_velocity_mps")
+    return float(speed) if speed else None
+
+
+global tool_speed_kwargs
+def tool_speed_kwargs(speed_mps=None):
+    """{tool_speed_mps: ...} when the solver is on, {} otherwise.
+
+        ros.CartesianMove(poses, vel=s, acc=a, **tool_speed_kwargs(0.010))
+
+    Follows joint_move_kwargs(): an empty dict leaves the call exactly as it
+    was, so a call site can be converted once and then be inert until the
+    toggle is flipped. `speed_mps` None falls back to the plan's sweep speed,
+    and if there is no plan either the result is empty -- a stage that does not
+    know its own speed in m/s must not pretend to.
+    """
+    if not TOOL_SPEED_SOLVER:
+        return {}
+    speed = speed_mps if speed_mps is not None else raster_tool_speed()
+    if not speed or not speed > 0.0:
+        return {}
+    return {"tool_speed_mps": float(speed)}
+
+
+global raster_velocity
+def raster_velocity():
+    """MoveIt velocity scaling for the sweeps, from the plan when there is one.
+
+    RASTER_VELOCITY is the fallback and nothing more. A scan started through
+    run_*_scan() always has a plan, and the plan's scaling is SCAN_VELOCITY
+    clamped to whatever the staging pipeline can keep up with at the chosen step
+    size, then converted through ROBOT_VELOCITY_CALIBRATION.
+    """
+    if scan_plan is None:
+        return RASTER_VELOCITY
+    return scan_plan["velocity_scaling"]
+
+global motion_scaling
+def motion_scaling(speed_mps):
+    """The MoveIt velocity SCALING that moves the probe at `speed_mps`.
+
+    CartesianMove's vel is a fraction of the robot's joint limits, not a speed,
+    and in this cell the mapping is a curve (ROBOT_VELOCITY_CALIBRATION; see
+    velocity_scaling_for()). Every automated stage that states a speed in m/s
+    -- the Keyence sweep, the Azure sweep, the eddy-current contact moves --
+    converts it here, so "10 mm/s near the part" is 10 mm/s rather than the
+    15.6 mm/s a scaling of 0.01 actually produces.
+
+    A config with no calibration gets the number back unchanged, which is the
+    uncalibrated behaviour.
+    """
+    cal = globals().get("ROBOT_VELOCITY_CALIBRATION")
+    if not cal:
+        return float(speed_mps)
+    return velocity_scaling_for(speed_mps, cal)
+
+global joint_move_kwargs
+def joint_move_kwargs():
+    """{vel, acc} for a MoveIt joint move, from JOINT_MOVE_SCALING, or {}.
+
+    Every automated joint move -- ApproachInConfiguration() into a pass or a
+    row, the home retry, a named pose -- goes at MoveJoints' default scaling of
+    0.1 unless this says otherwise, and a joint move's tip speed is not bounded
+    in Cartesian terms by that scaling. Measured on the tip in simulation at 0.1:
+    132 mm/s going to over_table, 194 in the Azure sweep's row approaches, 245 in
+    the Keyence raster's -- 46 mm above the part -- and 75-80 between
+    eddy-current passes, against an approved limit of 50 mm/s. A config that sets
+    JOINT_MOVE_SCALING slows all of them together; one that does not (UTPlaneScan)
+    keeps 0.1.
+    """
+    s = globals().get("JOINT_MOVE_SCALING")
+    return {"vel": float(s), "acc": float(s)} if s else {}
+
+global trace_pitch
+def trace_pitch():
+    """Distance between traces along a pass.
+
+    The trigger's pitch when there is a trigger, because that is the number that
+    physically produced the traces; SCAN_STEP_SIZE otherwise.
+    """
+    if ascan_source is not None and getattr(ascan_source, "trigger_pitch_m", None):
+        return float(ascan_source.trigger_pitch_m)
+    return float(SCAN_STEP_SIZE)
+
+global plane_grid_size
+def plane_grid_size(size=0.30):
+    """(m, n) for a square plane scan of the given side.
+
+    Derived from the step size and the line spacing, which is what makes them
+    the primary controls: SCAN_M/SCAN_N are the override, not the input. A
+    rectangular scan's column pitch and trigger pitch are necessarily equal
+    (trigger k must be column k), so pinning the grid pins the step.
+    """
+    m = SCAN_M if SCAN_M else int(round(size/SCAN_STEP_SIZE)) + 1
+    n = SCAN_N if SCAN_N else int(round(size/SCAN_LINE_SPACING)) + 1
+    return max(int(m), 2), max(int(n), 1)
+
+global set_trigger_pitch
+def set_trigger_pitch(pitch_m, source=None):
+    """Retune the trigger pitch on the live source, and return the pitch.
+
+    A plane scan's pitch is its grid pitch, so it is not knowable until the scan
+    corners are, and the source was constructed long before that. Both trigger
+    sources hold the pitch in one attribute and read it every poll, so this takes
+    effect immediately -- but only between passes, never during one, because the
+    arc-length phase of a pass is measured against it.
+
+    `source` is WHICH source to retune, and it matters: `ascan_source` is the
+    ULTRASOUND config's global, which ECAutomatedScan.dgp declares and leaves
+    None forever because its source is `ec_source`. Defaulting to it retunes
+    nothing in an eddy-current scan and says nothing about it.
+
+    THE PITCH IS ALWAYS RETURNED, even when there is no source to retune. A
+    missing source is a reason not to retune anything; it is not a reason to
+    answer None to "what is the pitch". Returning None here puts a None into
+    run_surface_path_scan's `pitch`, and the next line divides a segment length
+    by it: "TypeError: unsupported operand type(s) for /: 'float' and 'NoneType'"
+    out of trace_count().
+    """
+    src = ascan_source if source is None else source
+    pitch_m = float(pitch_m)
+    if src is None:
+        return pitch_m
+    if getattr(src, "trigger_pitch_m", None) != pitch_m:
+        src.trigger_pitch_m = pitch_m
+    return pitch_m
+
+global build_scan_plan
+def build_scan_plan(path_length_m, passes, step_m=None, velocity_mps=None,
+                    projection_extent_m=None, force=False, geom_timeout=5.0,
+                    num_samples=None, sample_bytes=None):
+    """The arithmetic for a scan of this shape, without committing to it.
+
+    Separate from plan_current_scan so the settings panel can show what the
+    current numbers would produce without disturbing a scan that is running.
+
+    geom_timeout is how long to wait for the digitizer to say what it produces.
+    A scan can afford to wait for an externally triggered card; the panel, which
+    replans on every keystroke, cannot -- so it passes 0 and takes the
+    configured record length instead.
+    """
+    step_m = trace_pitch() if step_m is None else float(step_m)
+    velocity_mps = SCAN_VELOCITY if velocity_mps is None else float(velocity_mps)
+
+    # Record length and sample type belong to the card, so ask it rather than
+    # this file. Before the first trigger on an externally triggered card there
+    # may be nothing yet; fall back to the configured length so the plan can
+    # still be printed, and say which it used.
+    # An instrument that knows its own trace size supplies it and nothing else
+    # is asked. Eddy current does: one complex number per point, always.
+    if num_samples is None or sample_bytes is None:
+        # Otherwise ask the digitizer, because record length and sample type
+        # belong to the card rather than to this file. ascan_geometry lives in
+        # digitizer.dpi, which an instrument with no waveform to digitize does
+        # not include at all -- so the NAME may not exist, not merely return
+        # None. Looking it up rather than calling it directly is what lets this
+        # module serve both.
+        _geom_fn = globals().get("ascan_geometry")
+        geom = _geom_fn(timeout=geom_timeout, require=False) if _geom_fn else None
+        if geom is not None:
+            num_samples = geom["num_points"]
+            sample_bytes = np.dtype(geom["dtype"]).itemsize
+        else:
+            num_samples = globals().get("ASCAN_NUM_POINTS", 1)
+            _dt = globals().get("ASCAN_SIM_DTYPE", np.complex128)
+            sample_bytes = np.dtype(_dt).itemsize
+            if geom_timeout > 0.0 and _geom_fn is not None:
+                print("  (no A-scan yet, so the memory estimate assumes %d samples of %s)"
+                      % (num_samples, np.dtype(_dt)))
+
+    return plan_scan(
+        step_m=step_m,
+        velocity_mps=velocity_mps,
+        path_length_m=path_length_m,
+        passes=passes,
+        num_samples=num_samples,
+        sample_bytes=sample_bytes,
+        trigger_mode=globals().get("ASCAN_TRIGGER_MODE", "timestamped"),
+        projection_mode=PROJECTION_MODE,
+        transaction_latency_s=(TRANSACTION_LATENCY if transmgr is not None else 0.0),
+        digitizer_rate_hz=globals().get("ASCAN_RATE_HZ", None),
+        velocity_calibration=ROBOT_VELOCITY_CALIBRATION,
+        spot_radius_m=PROJECTION_SPOT_RADIUS,
+        projection_pixels=PROJECTION_PIXELS,
+        line_spacing_m=globals().get("SCAN_LINE_SPACING"),
+        projection_extent_m=projection_extent_m,
+        # WHETHER THE TRACES ARE ON DISK, not whether a storage manager was
+        # constructed. setup_file_storage_manager() returns one; a channel is
+        # file-backed only if it was handed it, and the eddy-current
+        # accumulator is not. A config that knows better says so by declaring
+        # TRACE_STORAGE_IS_FILE_BACKED, because only the config knows which of
+        # its accumulators got the manager.
+        file_backed=bool(globals().get("TRACE_STORAGE_IS_FILE_BACKED",
+                                       scan_storage_manager is not None)),
+        limits=SCAN_LIMITS,
+        force=force)
+
+global plan_current_scan
+def plan_current_scan(path_length_m, passes, step_m=None, velocity_mps=None,
+                      projection_extent_m=None, force=False,
+                      num_samples=None, sample_bytes=None):
+    """Work out what the scan about to run costs, print it, and hold onto it.
+
+    Called by every continuous scan before it moves. It is the one place the two
+    technician numbers turn into a velocity scaling, a trace count, a memory
+    figure and a projection resolution -- and the one place a scan is refused.
+
+    force=True runs a scan the limits would otherwise reject, still printing
+    exactly what is wrong with it. That is the escape hatch for a deliberate
+    four-hour scan; it is not the default, because the point of the limits is
+    that such a scan should be a decision.
+    """
+    global scan_plan
+    scan_plan = build_scan_plan(path_length_m, passes, step_m=step_m,
+                                velocity_mps=velocity_mps,
+                                projection_extent_m=projection_extent_m,
+                                force=force, num_samples=num_samples,
+                                sample_bytes=sample_bytes)
+    print(format_scan_plan(scan_plan))
+    return scan_plan
+
+global preview_scan_plan
+def preview_scan_plan(size=0.30, force=True):
+    """What the CURRENT settings would produce, for the settings panel.
+
+    Uses the planned mesh toolpath when there is one, and the default square
+    plane scan otherwise, because those are the two things run_*_scan() would
+    actually do. force=True: a preview reports limit violations rather than
+    raising on them -- refusing is the job of the scan, not of the display.
+    """
+    if mesh_scan_path is not None:
+        segs = mesh_scan_path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+        travel = sum(mesh_scan_path.segment_length_m(s) for s in segs)
+        pos = mesh_scan_path.positions
+        return build_scan_plan(path_length_m=travel, passes=len(segs),
+                               step_m=SCAN_STEP_SIZE,
+                               projection_extent_m=float(max(pos[:, 0].ptp(),
+                                                             pos[:, 1].ptp())),
+                               force=force, geom_timeout=0.0)
+    m, n = plane_grid_size(size)
+    step = size/(m-1) if m > 1 else SCAN_STEP_SIZE
+    return build_scan_plan(path_length_m=size*n, passes=n, step_m=step,
+                           projection_extent_m=size, force=force, geom_timeout=0.0)
+
+global report_scan_outcome
+def report_scan_outcome(report):
+    """What the scan actually achieved, against what was planned.
+
+    Printed after every scan, and it is the half that keeps the measured
+    constants in scan_parameters.dpi honest -- a queue that grew, a rate that
+    was not reached or a probe that moved at a different speed than asked all
+    say the plan was built on a number that no longer holds here.
+    """
+    if scan_plan is None:
+        return
+    if transmgr is not None:
+        try:
+            report.setdefault("late_transactions", int(transmgr.late_transactions))
+            report.setdefault("max_lateness_secs", float(transmgr.max_lateness_secs))
+        except Exception:
+            pass
+    for line in check_scan_outcome(scan_plan, report, SCAN_LIMITS):
+        print(line)
+    src = ascan_source
+    if getattr(src, "trigger_mode", None) == "timestamped":
+        tr = src.trigger_report()
+        if tr.get("uninterpolated_timestamps"):
+            print("  %d crossing(s) could not have their timestamp interpolated; "
+                  "any that shared a poll shared an A-scan."
+                  % tr["uninterpolated_timestamps"])
+        if tr.get("max_crossings_per_poll", 0) > 1:
+            print("  up to %d crossings fell inside one %.1f ms poll, all "
+                  "interpolated to their own instant"
+                  % (tr["max_crossings_per_poll"], src.poll_period*1e3))
+
+global project_traces
+def project_traces(first=0, count=None, gate="cscan", quiet=False):
+    """Replay the recorded trace list through the projector.
+
+    This is the deferred half of PROJECTION_MODE, and it is the reason the trace
+    list exists. Every trace carries the pose it was taken at, and the gate runs
+    over the whole list as a math function, so the projected image can be rebuilt
+    from what is already in the database -- no robot, no re-scan.
+
+    Measured on 3600 traces: 58.1 s, 62 traces/s, against 658.6 s of live
+    projection during the scan, and an identical image. The 11x is almost
+    entirely the globalrev wait: wait=False per point with a single wait at the
+    end, which is safe here precisely because nothing else is producing.
+
+    Run it again after changing the spot radius, the gate or the surface.
+
+    AN INSTRUMENT MAY OWN THIS. The three names read below -- `projector`,
+    `trace_accum`, `cscan_gates` -- belong to scan_accumulation.dpi and are the
+    ULTRASOUND ones. An eddy-current scan sets none of them: it has
+    ec_projector, ec_trace_accum and ec_cond_paths, and no gate at all, because
+    an impedance reading has no time axis to gate. So this function could not
+    serve an EC scan even in principle, and PROJECTION_MODE="deferred" used to
+    record an EC scan's traces and never replay them -- silently, because
+    finish_projection() returned None on `projector is None`.
+    scan_replay_projection is how an instrument says it has its own replay; the
+    eddy-current one is project_ec_traces() in ec_acquisition.dpi.
+    """
+    replay = globals().get("scan_replay_projection")
+    if callable(replay):
+        return replay(first=first, count=count, quiet=quiet)
+    if projector is None:
+        raise RuntimeError("no projector -- PROJECTION_MODE is 'off', or no scan "
+                           "has set up a surface yet")
+    if trace_accum is None:
+        raise RuntimeError("no trace list to project from -- RECORD_TRACE_LIST "
+                           "is off, or no scan has run yet")
+    if not cscan_gates or gate not in cscan_gates:
+        raise RuntimeError("no gate chain to project; run a scan first")
+
+    poses = np.array(recdb.latest.ref[trace_accum.poses_path].data, copy=True)
+    ampl = np.array(recdb.latest.ref[cscan_gates[gate]["ampl"]].data, copy=True)
+
+    end = min(len(poses), len(ampl))
+    if trace_accum is not None and trace_accum.staged:
+        # The accumulators are allocated for the whole planned scan; only the
+        # traces actually staged are real. Projecting the unwritten tail would
+        # splat zeros at an invalid orientation.
+        end = min(end, trace_accum.staged)
+    if count is not None:
+        end = min(end, first + int(count))
+
+    started = time.monotonic()
+    done = 0
+    skipped = 0
+    gr = None
+    for k in range(first, end):
+        pose7 = poses[k]
+        if not float(np.linalg.norm(pose7[:4])) > 1e-6:
+            skipped += 1          # never staged: a zero quaternion is no pose
+            continue
+        gr = projector.project(pose7, float(ampl[k]), wait=False)
+        done += 1
+    if gr is not None:
+        # One wait, at the end. Each projection is a transaction and the
+        # projector accumulates in mutable storage, so they must all land -- but
+        # they need not land one at a time.
+        gr.globalrev_wait().wait_complete()
+    elapsed = time.monotonic() - started
+    if not quiet:
+        print("  projected %d trace(s) in %.1f s (%.1f traces/s)%s"
+              % (done, elapsed, done/elapsed if elapsed > 0 else 0.0,
+                 ", %d unstaged skipped" % skipped if skipped else ""))
+    return {"projected": done, "skipped": skipped, "elapsed": elapsed}
+
+global motion_profile
+def motion_profile(name="scan"):
+    """Hold every IK-solving node in the named motion profile for a block.
+
+        with motion_profile("scan"):
+            ...
+
+    The profiles are defined once, in tari_ur_description's
+    config/motion_profiles.yaml, and ros.SetMotionProfile() applies one to
+    every node that solves IK -- move_group, mtc_hub_node,
+    dgpython_action_server -- because each holds its own copy of the solver's
+    settings. A cell starts in `transit`: large moves, free to change arm
+    configuration, 0.1 mm is ample.
+
+    A scan wants the opposite, for two reasons. ApproachInConfiguration()
+    solves the far end of a row and seeds the near end from it so the whole row
+    is reachable in one configuration, and a global solver may hand back the
+    other branch and truncate the row. And a point-to-point step of a few
+    hundred microns needs IK to stop within 0.01 mm rather than 0.1, or every
+    step lands short: 0.2 mm steps move 0.106-0.113 mm at the transit setting
+    and 0.188-0.199 mm at the scan one. So a scan takes
+    `scan` for as long as it runs and gives back exactly what was there before,
+    including when it fails.
+
+    Never fatal. Where a node is not up, or runs a solver without these
+    parameters, this says so and lets the scan proceed; the scan may be worse
+    without it, but refusing to scan because a solver knob is missing would be
+    worse still.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _hold():
+        previous = None
+        try:
+            previous = ros.SetMotionProfile(name)
+        except Exception as e:
+            print("  WARNING: could not put the IK solvers in the %r motion "
+                  "profile (%s); continuing with what they have. Rows may "
+                  "truncate, and small steps may land up to 0.1 mm short."
+                  % (name, e))
+        try:
+            yield previous
+        finally:
+            if previous:
+                try:
+                    ros.SetMotionParameters(previous)
+                except Exception as e:
+                    print("  WARNING: could not put the IK solver settings back "
+                          "(%s). Large moves may be refused until they are: "
+                          "ros.SetMotionProfile('transit')." % (e,))
+    return _hold()
+
+global motion_kind
+def motion_kind(kind):
+    """Overlay the IK settings ONE kind of move needs, for a block.
+
+        with motion_kind("cartesian_path"):
+            ros.CartesianMove(poses, ...)
+
+    A profile is the settings for a kind of MOTION -- a scan, a transit. This is
+    the settings for one MOVE inside it, and it exists because the two moves a
+    scan makes want opposite values of `position_threshold` from the same node.
+
+    Both are ros.CartesianMove on mtc_hub_node: plane_scan.dpi steps point to
+    point with one pose per call, and every raster row is a polyline of them. A
+    single small step needs IK to stop within 0.01 mm or it lands short (0.2 mm
+    steps move 0.106-0.113 mm at a 0.1 mm threshold). A 69-waypoint row at
+    0.01 mm truncates at 21.3% and at 0.1 mm completes. Neither value is wrong;
+    they belong to different moves.
+
+    The kinds and their values live with the profiles, in tari_ur_description's
+    config/motion_profiles.yaml under `move_kinds`. An unknown kind, or a cell
+    whose description predates them, is a warning and not a failure: the move
+    still flies, with whatever the profile holds.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def _hold():
+        previous = None
+        try:
+            spec = ros.MotionProfiles()
+            kinds = spec.get("move_kinds") or {}
+            if kind not in kinds:
+                raise ValueError(
+                    "no move kind %r in motion_profiles.yaml; defined: %s"
+                    % (kind, ", ".join(sorted(kinds)) or "none"))
+            entry = kinds[kind] or {}
+            common = dict(entry.get("parameters") or {})
+            want = {}
+            for node in spec.get("nodes") or []:
+                values = dict(common)
+                values.update((entry.get("nodes") or {}).get(node) or {})
+                if values:
+                    want[node] = values
+            if want:
+                previous = ros.SetMotionParameters(want)
+        except Exception as e:
+            print("  WARNING: could not apply the %r move-kind settings (%s); "
+                  "the move goes with whatever the profile holds. A "
+                  "multi-waypoint row may truncate, or a small step land short."
+                  % (kind, e))
+        try:
+            yield previous
+        finally:
+            if previous:
+                try:
+                    ros.SetMotionParameters(previous)
+                except Exception as e:
+                    print("  WARNING: could not put the IK settings back after "
+                          "a %r move (%s)" % (kind, e))
+    return _hold()
+
+
+global cartesian_move
+def cartesian_move(poses, kind=None, **kwargs):
+    """ros.CartesianMove with the IK settings this KIND of move needs.
+
+    The kind is taken from the number of waypoints unless a caller names one,
+    because that is the thing that actually decides which settings are right and
+    it is the thing a caller would get wrong: one pose is a step and wants a
+    tight threshold, a polyline is a row and wants a loose one. See
+    motion_kind().
+
+    Everything else is passed straight through, so this is a drop-in for
+    ros.CartesianMove at every call site in a scan.
+    """
+    try:
+        count = len(poses.poses)
+    except AttributeError:
+        count = len(poses)
+    if kind is None:
+        kind = "point_step" if count <= 1 else "cartesian_path"
+    with motion_kind(kind):
+        return ros.CartesianMove(poses, **kwargs)
+
+
+global finish_projection
+def finish_projection():
+    """Run the deferred projection, if that is the mode.
+
+    IT MAY NOT RETURN QUIETLY HAVING DONE NOTHING. "deferred" is the operator
+    asking for the image to be built after the scan rather than during it, so a
+    run that reaches here with nothing to replay has lost the picture of a
+    measurement it took -- and that is worth a paragraph, not a None.
+
+    It used to be a silent no-op for every eddy-current scan: the three names it
+    tested belong to the ultrasound accumulators and an EC scan sets none of
+    them, so `projector is None` was always true and PROJECTION_MODE="deferred"
+    meant "record the traces and never replay them" with nothing said anywhere.
+    An instrument with its own replay publishes scan_replay_projection; see
+    project_traces().
+    """
+    if PROJECTION_MODE != "deferred":
+        return None
+    replay = globals().get("scan_replay_projection")
+    if callable(replay):
+        # The instrument's own. It reports its own state, including why there
+        # was nothing to do.
+        try:
+            return replay()
+        except Exception as e:                                # noqa: BLE001
+            # A presentation failure must not lose a finished scan: the traces
+            # carry their own poses and can be replayed by hand, or from disk in
+            # another session. Loud, because an empty image is otherwise
+            # indistinguishable from a scan that acquired nothing.
+            print("  ** THE DEFERRED PROJECTION DID NOT RUN: %s: %s"
+                  % (type(e).__name__, e))
+            print("     The scan's traces are not affected -- each carries the "
+                  "pose it was taken at. Re-run project_traces() once whatever "
+                  "that says is fixed.")
+            return None
+    if projector is None or trace_accum is None or not trace_accum.staged:
+        print("  ** PROJECTION_MODE IS 'deferred' AND NOTHING WAS REPLAYED: %s."
+              % ("there is no projector, so no surface was ever loaded"
+                 if projector is None else
+                 "there is no trace list" if trace_accum is None else
+                 "the trace list is empty -- no reading was staged"))
+        print("     So the projected image is empty, and that is not a display "
+              "fault. If this config's projector lives under another name, it "
+              "has to publish scan_replay_projection -- see project_traces().")
+        return None
+    print("  deferred projection: replaying %d trace(s) from %s"
+          % (trace_accum.staged, trace_accum.poses_path))
+    return project_traces()

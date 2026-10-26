@@ -1,0 +1,635 @@
+# Correlating a free-running digitizer with a position trigger, by timestamp.
+#
+# This is the shape the real hardware needs, and it is deliberately NOT the
+# shape sim_ascan_source.dpi's "position" mode has.
+#
+# In that mode the simulator IS the trigger: it watches the probe and
+# synthesises an A-scan at the crossing, so the data and the position are the
+# same event by construction. A real card cannot work that way. It free-runs at
+# its own PRF -- 1 kHz or faster -- publishing every shot onto its channel, and
+# something else has to decide which of those shots is the trace at this
+# position. The obvious implementations are both wrong:
+#
+#   * "take the latest recording at the crossing" is biased, not noisy. It is
+#     systematically old by the acquisition-to-globalrev latency, and on a
+#     serpentine that bias reverses direction every pass -- so it shows up as a
+#     zipper between adjacent rows rather than a harmless global offset.
+#
+#   * "buffer the A-scans and search by timestamp" holds a second of 16000-point
+#     records in memory to find one of them, and has to be told when to stop.
+#
+# spatialnde2 already has the right mechanism and it needs neither. Under
+# timed_transaction_manager, transactions commit in measurement-timestamp ORDER
+# rather than in the order their threads finished. So if the position source
+# opens its own transaction stamped at the crossing time, every A-scan stamped
+# before that crossing is already committed when it lands -- and the globalrev
+# that pose transaction produces carries, on the digitizer's channel, exactly
+# the A-scan that was current at the crossing. No buffer, no search, no bias.
+#
+# Verified against a free-running 1 kHz source of 16000-point records and an
+# independent position source: 100.0% of poses saw exactly the A-scan whose
+# timestamp was the latest at or before them, with zero late transactions down
+# to a 2 ms ordering window.
+#
+# What changes when the trigger box arrives: the box's own clock becomes the
+# measurement_clock (measurement_clock is a SWIG director, so it can be
+# subclassed in Python), and the crossing timestamp comes from the box instead
+# of from watching TF. Everything below is unchanged. That is the point of
+# building it this way rather than around "latest recording".
+#
+# Crossing detection itself lives in pitch_crossings.dpi, shared with the
+# simulator, and that file says why progress is measured the way it is.
+# Include it before this one.
+
+import threading
+import time
+import traceback
+
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+
+import numpy as np
+import spatialnde2 as snde
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global TimestampedTriggerSource
+
+
+class TimestampedTriggerSource(object):
+    """Position trigger for a free-running digitizer, correlated by timestamp.
+
+    Presents the same interface run_triggered_path_scan() already uses --
+    arm(sink, emit_on_arm, max_triggers) / disarm() / travelled_m /
+    synthesize() / metadata() -- so the acquisition does not change at all.
+    What changes is where the A-scan comes from: instead of being synthesised
+    at the crossing, it is read out of the globalrev the crossing's own pose
+    transaction produced.
+
+    Three threads, and the split matters:
+
+      watcher     polls the probe, detects pitch crossings, and publishes ONE
+                  timestamped pose transaction per crossing. It never waits for
+                  anything -- under the timed manager end_transaction() returns
+                  immediately, because committing is the manager's job. A
+                  trigger loop that blocks stops watching the probe, which is
+                  the failure that made a 0.30 m pass produce one trace instead
+                  of 59.
+      correlator  waits for each pose's globalrev, reads the A-scan out of it,
+                  and calls the sink. One worker, so order is preserved and
+                  trigger k is still trace k.
+      (the caller's stager)  does the database staging, as before.
+
+    Two rules the watcher lives by:
+
+      It publishes NOTHING while disarmed. The approach and retrace between
+      passes are real travel, and a watcher that stays armed through them emits
+      a pose transaction per pitch of it -- ~100 per row -- with no consumer.
+      Each one is a globalrev the manager has to realize while the digitizer is
+      racing to mark its own records ready, which is the traffic that exposes
+      the placement race in spatialnde2 (see
+      recording_base::_lock_for_state_change).
+
+      It delivers at most the pass's budget. A raster row is m columns and
+      column m does not exist; the caller says how many traces the pass has
+      and anything past that is counted, reported, and not staged. Trace k is
+      column k is a contract here, not a hope.
+    """
+
+    trigger_mode = "timestamped"
+
+    def __init__(self, recdb, clock, ascan_path, position_fn, trigger_pitch_m,
+                 pose_path="/ut/trigger_pose", poll_hz=200.0, queue_depth=4096,
+                 stale_limit=10):
+        self.recdb = recdb
+        self.clock = clock
+        self.ascan_path = ascan_path
+        self.position_fn = position_fn
+        self.pose_path = pose_path
+        self.poll_period = 1.0/poll_hz
+        self._init_trigger_state(trigger_pitch_m, stale_limit=stale_limit)
+
+        trans = recdb.start_transaction(clock.get_current_time())
+        self.pose_chan = trans.define_channel(self.pose_path, "main")
+        ref = snde.create_ndarray_ref(trans, self.pose_chan, snde.SNDE_RTN_FLOAT64)
+        ref.allocate_storage([3], False)
+        ref.data[:] = 0.0
+        ref.rec.mark_data_and_metadata_ready()
+        trans.end_transaction().globalrev_wait().wait_complete()
+
+        self._pending = queue.Queue(queue_depth)
+        self._correlator = threading.Thread(target=self._correlator_loop)
+        self._correlator.daemon = True
+        self._correlator.start()
+        self._watcher = threading.Thread(target=self._watch_loop)
+        self._watcher.daemon = True
+        self._watcher.start()
+
+    def _init_trigger_state(self, trigger_pitch_m, stale_limit=10):
+        """Everything the trigger and the correlation keep, with no database
+        and no threads -- so a test harness can build one without either."""
+        # One lock over arming and crossing detection. arm() used to set a flag
+        # the watcher honoured at the top of its next iteration, so a crossing
+        # already being processed was delivered to the NEW sink with the OLD
+        # phase: a spurious first trace at the start of every pass it happened
+        # to.
+        self._lock = threading.Lock()
+        self._detector = PitchCrossingDetector(trigger_pitch_m)
+        self._last_t = None
+
+        self.triggers = 0            # crossings seen, armed or not
+        self.published = 0           # pose transactions written: armed, within budget
+        self.armed_triggers = 0
+        self.armed_s_m = 0.0
+        self.armed_over_budget = 0
+        self.over_budget = 0
+        self._budget = None
+        self.errors = 0
+        self.last_error = None
+        self.correlation_waits = 0
+        self.max_correlation_wait = 0.0
+        # Correlations abandoned because the globalrev never arrived. See
+        # _correlator_loop: a trace lost here is a hole in the image; a trace
+        # WAITED for here is the whole scan stopped.
+        self.staging_timeouts = 0
+        self.consecutive_staging_timeouts = 0
+        self.max_consecutive_staging_timeouts = 0
+        # Crossings whose timestamp was interpolated within a poll interval
+        # rather than taken at the moment the poll noticed them, and the worst
+        # number of crossings that shared one poll. See _watch_loop.
+        self.interpolated_timestamps = 0
+        self.max_crossings_per_poll = 0
+        self.uninterpolated_timestamps = 0
+        self._interp_warned = False
+
+        # A dead instrument must stop a scan, not decorate it. When the
+        # CompuScope's acquisition thread died mid-scan, every later trigger
+        # correlated to the same last record and 1,450 identical traces were
+        # staged as if they were data. Consecutive triggers that resolve to the
+        # same digitizer revision(s) are counted; stale_limit of them in a row
+        # raises `fault`, after which nothing more is delivered and
+        # run_triggered_path_scan() stops at the end of the pass. A digitizer
+        # slower than the trigger rate legitimately repeats -- raise the limit
+        # for one, and read duplicate_traces in the report either way.
+        self.stale_limit = int(stale_limit)
+        # Crossings whose pose transaction the database refused because its
+        # timestamp could no longer be ordered. Unlike a dropped A-scan -- which
+        # merely repeats the previous one and shows up in duplicate_traces --
+        # a dropped CROSSING costs a trace, so every later trace in that pass is
+        # one place earlier than the grid expects. run_triggered_path_scan()
+        # sees the pass come up short and reports it; nothing silently shifts.
+        self.dropped_crossings = 0
+        self.duplicate_traces = 0
+        self._consecutive_duplicates = 0
+        self._last_revisions = None
+        self.fault = None
+
+        self._sink = None
+        self._armed = False
+        self._emit_on_arm = True
+        self._quit = False
+        self._last_metadata = None
+
+    # trigger_pitch_m is the one attribute the scan retunes between passes
+    # (scan_plan.dpi's set_trigger_pitch), so it lives in one place.
+    @property
+    def trigger_pitch_m(self):
+        return self._detector.pitch_m
+
+    @trigger_pitch_m.setter
+    def trigger_pitch_m(self, value):
+        self._detector.pitch_m = float(value)
+
+    @property
+    def travelled_m(self):
+        """Progress the trigger has seen, in total. See pitch_crossings.dpi."""
+        return self._detector.travelled_m
+
+    @property
+    def raw_travelled_m(self):
+        """The old arc-sum: the difference from travelled_m is the wobble."""
+        return self._detector.raw_travelled_m
+
+    # -- the interface run_triggered_path_scan() expects --------------------
+
+    def arm(self, sink, emit_on_arm=True, max_triggers=None):
+        """Deliver triggers to sink until disarm(), restarting the phase.
+
+        sink(ascan, pos, s_m, index) runs on the correlator thread.
+
+        emit_on_arm=False suppresses the trigger at the start of the pass, for
+        when the caller has already staged that one itself. The phase reference
+        is still taken there, so trigger k still lands at k*pitch along the pass.
+
+        max_triggers caps how many triggers this arming delivers (the arm-time
+        one included, if emitted). A raster pass of m columns has m-1 crossings
+        after its start trace; the m-th would be column m, which does not
+        exist, and staging it shifts every later row. Surplus crossings are
+        counted in armed_over_budget and never reach the sink.
+        """
+        with self._lock:
+            self._sink = sink
+            self.armed_triggers = 0
+            self.armed_s_m = 0.0
+            self.armed_over_budget = 0
+            self._budget = None if max_triggers is None else int(max_triggers)
+            self._emit_on_arm = bool(emit_on_arm)
+            self._detector.reset()
+            self._last_t = None
+            self._armed = True
+
+    def disarm(self):
+        with self._lock:
+            self._armed = False
+            armed = self.armed_triggers
+        # Drain what is already in flight before the caller moves on, or the
+        # last traces of a pass would be delivered during the next one. Not
+        # under the lock: the correlator does not need it, and the watcher must
+        # keep polling.
+        self._pending.join()
+        with self._lock:
+            self._sink = None
+        return armed
+
+    def synthesize(self, pos=None):
+        """The A-scan currently on the digitizer's channel.
+
+        Used for the trace staged at a pass start, where the probe is stationary
+        and 'the latest one' is the right answer -- there is no crossing to
+        correlate with. Named synthesize() only because that is what the
+        simulator called it and what the acquisition asks for.
+        """
+        ascan, metadata = self._read_latest()
+        self._last_metadata = metadata
+        return ascan
+
+    def metadata(self):
+        return self._last_metadata
+
+    def stop(self, timeout=5.0):
+        """Stop both threads AND WAIT FOR THEM.
+
+        Setting the flag is not enough. Both threads are daemons, so the
+        interpreter exits without waiting for them, and spatialnde2's C++
+        objects then destruct underneath two threads still touching the
+        recording database. That surfaces as
+
+            terminate called without an active exception
+            Aborted (core dumped)
+
+        AFTER everything has printed and passed -- so it shows up as a nonzero
+        exit code from a run whose output says it succeeded, which is a
+        genuinely confusing way to fail: a test passes every assertion and then
+        aborts on exit.
+        """
+        self._quit = True
+        self._pending.put(None)
+        for t in (getattr(self, "_watcher", None), getattr(self, "_correlator", None)):
+            if t is not None and t.is_alive():
+                t.join(timeout=timeout)
+
+    def trigger_report(self):
+        pitch = self.trigger_pitch_m
+        expected = self.travelled_m/pitch if pitch else 0.0
+        return {"mode": "timestamped",
+                "pitch_m": pitch,
+                "triggers": self.triggers,
+                "published": self.published,
+                "travelled_m": self.travelled_m,
+                "raw_travelled_m": self.raw_travelled_m,
+                "expected_triggers": expected,
+                "error_triggers": self.triggers - 1 - expected,
+                "over_budget": self.over_budget,
+                "burst_dropped": self._detector.burst_dropped,
+                "correlation_waits": self.correlation_waits,
+                "max_correlation_wait_s": self.max_correlation_wait,
+                "staging_timeouts": self.staging_timeouts,
+                "max_consecutive_staging_timeouts":
+                    self.max_consecutive_staging_timeouts,
+                "interpolated_timestamps": self.interpolated_timestamps,
+                "uninterpolated_timestamps": self.uninterpolated_timestamps,
+                "max_crossings_per_poll": self.max_crossings_per_poll,
+                "duplicate_traces": self.duplicate_traces,
+                "dropped_crossings": self.dropped_crossings,
+                "fault": repr(self.fault) if self.fault else None,
+                "errors": self.errors,
+                "last_error": self.last_error}
+
+    # -- internals ---------------------------------------------------------
+
+    def _sample(self, getref):
+        """One trace, however this instrument makes one.
+
+        `getref(path)` returns an ndarray ref -- from recdb.latest when the
+        probe is stationary, or from a crossing's own globalrev when it is not.
+        Both callers go through here so that WHICH channels a trace is built
+        from is the single thing a different instrument has to override, and
+        the correlation logic above is not duplicated per instrument.
+
+        The default is one channel carrying one trace: an ultrasonic A-scan.
+        See ec_acquisition.dpi for the eddy-current case, where a trace is one
+        complex impedance built from two real channels.
+        """
+        ref = getref(self.ascan_path)
+        return np.array(ref.data, copy=True), ref.rec.metadata
+
+    def _sample_tracked(self, getref):
+        """_sample(), noting which revision(s) the trace was built from.
+
+        Instrument-agnostic on purpose: whatever channels _sample() asks for,
+        their revisions are the identity of this trace, and the same identity
+        twice in a row means the instrument produced nothing in between.
+        """
+        revisions = []
+
+        def tracked(path):
+            ref = getref(path)
+            revisions.append((path, int(ref.rec.info.revision)))
+            return ref
+
+        sample = self._sample(tracked)
+        self._note_revisions(tuple(revisions))
+        return sample
+
+    def _note_revisions(self, key):
+        if key == self._last_revisions:
+            self.duplicate_traces += 1
+            self._consecutive_duplicates += 1
+            if self.fault is None and self._consecutive_duplicates >= self.stale_limit:
+                self.fault = RuntimeError(
+                    "%d consecutive triggers correlated to the same record (%s): "
+                    "the digitizer has stopped producing"
+                    % (self._consecutive_duplicates,
+                       ", ".join("%s rev %d" % (p, r) for p, r in key)))
+                print("  timestamped trigger: %s" % (self.fault,))
+        else:
+            self._consecutive_duplicates = 0
+        self._last_revisions = key
+
+    def _read_latest(self):
+        return self._sample_tracked(lambda path: self.recdb.latest.ref[path])
+
+    def _publish_pose(self, timestamp, pos):
+        """One timestamped transaction carrying where the probe was.
+
+        Returns the ended transaction WITHOUT waiting for its globalrev. Under
+        the timed manager end_transaction() only marks it ended; the manager
+        commits it in timestamp order once the ordering window has passed. So
+        this costs nothing on the watching thread, which is the whole reason the
+        wait happens on the correlator instead.
+        """
+        trans = self.recdb.start_transaction(timestamp)
+        ref = snde.create_ndarray_ref(trans, self.pose_chan, snde.SNDE_RTN_FLOAT64)
+        ref.allocate_storage([3], True)
+        ref.data[0] = float(pos[0])
+        ref.data[1] = float(pos[1])
+        ref.data[2] = float(pos[2]) if len(pos) > 2 else 0.0
+        ref.rec.mark_data_and_metadata_ready()
+        return trans.end_transaction()
+
+    #: How long one correlation may wait for its globalrev before the trace is
+    #: given up. Normal is 50-150 ms: measured over 5648 traces on 2026-10-09
+    #: the worst wait was 0.080 s, and over 2348 traces that afternoon, 0.154 s.
+    #: Twenty seconds is two orders of magnitude past anything ever observed,
+    #: so a timeout here is never a slow machine -- it is a globalrev that is
+    #: not coming.
+    staging_timeout_s = 20.0
+
+    #: Consecutive timeouts before the scan is told. One lost trace is a hole
+    #: in the image and the scan should carry on through it; forty in a row is
+    #: the pipeline, and carrying on would record an empty scan to the end.
+    staging_timeout_fault_after = 40
+
+    @staticmethod
+    def _globalrev_within(ended, timeout_s, poll_s=0.005):
+        """ended.globalrev(), but with a deadline. None if it never arrives.
+
+        WHY THIS IS NOT ended.globalrev(). That call waits forever, on the one
+        thread that must never stop: this is the thread that drains the
+        digitizer. On 2026-10-09 it stopped twice, and both times the whole
+        cell went with it --
+
+          Thread-5 (_correlator_loop), timestamped_trigger.dpi:399
+            snde::transaction::globalrev_wait()
+              snde::promise_channel_notify::wait_interruptable()
+
+        -- and behind it 3517 copies of NI-DAQmx -200279, "the application is
+        not able to keep up with the hardware acquisition", because nothing was
+        reading the card any more. The scan had completed 81 of 123 passes and
+        simply stopped, with no error of its own; disarm() was waiting on
+        _pending.join(), which can only finish when this loop does.
+
+        A transaction ENDED under the timed manager is not committed until the
+        manager commits it in timestamp order, so its globalrev may never come
+        into existence at all. globalrev_nowait() answers "has it yet" without
+        blocking, and `ready` says whether it is complete -- so a deadline can
+        be built out of the two without ever entering an unbounded wait.
+        """
+        deadline = time.monotonic() + float(timeout_s)
+        while True:
+            gr = ended.globalrev_nowait()
+            if gr is not None and gr.ready:
+                return gr
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(poll_s)
+
+    def _staging_timed_out(self, waited, index):
+        """One correlation given up. The scan continues; the trace does not.
+
+        DROPPING IS THE CORRECT BEHAVIOUR and it is worth being plain about
+        why. The alternative on offer is not "keep the trace" -- the globalrev
+        is not coming -- it is "stop the scan, stop reading the digitizer, and
+        leave the arm running over a part recording nothing". A hole in the
+        image is recoverable by rescanning a pass. The freeze costs the run,
+        the DAQ buffer, and an hour of the operator's day.
+        """
+        self.staging_timeouts += 1
+        self.consecutive_staging_timeouts += 1
+        if (self.consecutive_staging_timeouts
+                > self.max_consecutive_staging_timeouts):
+            self.max_consecutive_staging_timeouts = \
+                self.consecutive_staging_timeouts
+        if self.staging_timeouts == 1 or self.consecutive_staging_timeouts == 5:
+            print("  ** staging timed out after %.1f s on trace %s -- the "
+                  "globalrev for that pose never arrived. The trace is given "
+                  "up and the scan continues; %d lost so far. The digitizer is "
+                  "still being read, which is the point."
+                  % (waited, index, self.staging_timeouts))
+        if (self.fault is None
+                and self.consecutive_staging_timeouts
+                >= self.staging_timeout_fault_after):
+            self.fault = RuntimeError(
+                "%d correlations in a row timed out after %.0f s each: the "
+                "recording database is no longer producing globalrevs for "
+                "this source, so every trace from here would be lost. The "
+                "scan is stopping rather than flying the rest of the part "
+                "recording nothing. %d trace(s) lost in total."
+                % (self.consecutive_staging_timeouts, self.staging_timeout_s,
+                   self.staging_timeouts))
+            print("  timestamped trigger: %s" % (self.fault,))
+
+    def _correlator_loop(self):
+        from dataguzzler_python import context
+        context.InitFreeThread()
+        while True:
+            item = self._pending.get()
+            if item is None:
+                self._pending.task_done()
+                break
+            ended, pos, s_m, index, sink = item
+            try:
+                t0 = time.monotonic()
+                # THIS is the correlation. The globalrev this pose produced
+                # contains every A-scan stamped at or before the crossing and
+                # none stamped after it, because the manager committed them in
+                # timestamp order -- so reading the digitizer's channel out of
+                # it gives the shot that was current at the crossing.
+                gr = self._globalrev_within(ended, self.staging_timeout_s)
+                waited = time.monotonic() - t0
+                self.correlation_waits += 1
+                if waited > self.max_correlation_wait:
+                    self.max_correlation_wait = waited
+                if gr is None:
+                    self._staging_timed_out(waited, index)
+                    continue
+                self.consecutive_staging_timeouts = 0
+                ascan, self._last_metadata = self._sample_tracked(gr.get_ndarray_ref)
+                if sink is not None and self.fault is None:
+                    sink(ascan, pos, s_m, index)
+            except Exception:
+                self.errors += 1
+                # A formatted traceback, not the exception: see the long note on
+                # the same line in triggered_acquisition.dpi. _publish_pose and
+                # the correlator both run transactions, so pinning an exception
+                # here wedges the whole recording database.
+                self.last_error = traceback.format_exc()
+            finally:
+                self._pending.task_done()
+
+    def _interpolate_time(self, t0, t1, frac):
+        """The clock time a fraction `frac` of the way from t0 to t1.
+
+        The timestamp is the correlation -- it is the whole reason this class
+        exists -- so taking it at the moment the POLL noticed a crossing rather
+        than at the crossing itself throws away exactly the accuracy the
+        mechanism was built for. The position is already interpolated along the
+        step; this does the same to the time, so the two describe the same event.
+
+        It matters when more than one crossing falls inside one poll interval.
+        Stamped at poll time they share a timestamp, so they correlate to the
+        same A-scan and one shot of the digitizer is recorded twice under two
+        different positions. Crossings per poll is velocity/(pitch*poll_hz):
+        one at 50 mm/s and a 5.08 mm step, but TEN at 50 mm/s and a 0.5 mm step
+        -- which is precisely what a technician does when they turn the step
+        size down and nothing tells them to slow down. The velocity scaling in
+        scan_parameters.dpi keeps it near one; this makes it correct anyway.
+
+        Arithmetic in integer nanoseconds via seconds_nanos(), because that is
+        the only representation measurement_time exposes that can be added to.
+        A clock that does not implement time_from_secs_nanos -- a Python
+        director subclass for the trigger box, say -- falls back to the
+        uninterpolated stamp and is counted, not silently accepted.
+        """
+        if t0 is None or frac >= 1.0:
+            return t1
+        if frac <= 0.0:
+            return t0
+        try:
+            dt = t1.difference_seconds(t0)
+            if not dt > 0.0:
+                return t0
+            sn = t0.seconds_nanos()
+            # SWIG renders std::pair as a proxy with .first/.second; a Python
+            # director subclass may return a plain tuple.
+            try:
+                secs, nanos = int(sn.first), int(sn.second)
+            except AttributeError:
+                secs, nanos = int(sn[0]), int(sn[1])
+            nanos += int(round(frac*dt*1e9))
+            secs += nanos//1000000000
+            nanos %= 1000000000
+            out = self.clock.time_from_secs_nanos(int(secs), int(nanos))
+            self.interpolated_timestamps += 1
+            return out
+        except Exception as e:
+            self.uninterpolated_timestamps += 1
+            if not self._interp_warned:
+                self._interp_warned = True
+                print("  timestamped trigger: cannot interpolate crossing times "
+                      "on this clock (%r); crossings sharing a poll will share a "
+                      "timestamp. Keep velocity/(step*%.0f Hz) at or under 1."
+                      % (e, 1.0/self.poll_period))
+            return t1
+
+    def _watch_loop(self):
+        from dataguzzler_python import context
+        context.InitFreeThread()
+
+        while not self._quit:
+            pos = self.position_fn()
+            # Immediately, and before anything else touches this thread: this is
+            # the time the position below was observed, and it is the far end of
+            # every interpolation done from it.
+            now_t = self.clock.get_current_time()
+            if pos is None:
+                time.sleep(self.poll_period)
+                continue
+
+            with self._lock:
+                primed = self._detector.primed
+                crossings = self._detector.feed(pos)
+                if not primed:
+                    # The origin of this phase: trigger 0, if the caller wants
+                    # it from us. Everything after is measured from here.
+                    if self._armed and self._emit_on_arm:
+                        self._fire(crossings[0][0], 0.0, now_t)
+                else:
+                    n = len(crossings)
+                    if n > self.max_crossings_per_poll:
+                        self.max_crossings_per_poll = n
+                    for p_k, s_k, frac in crossings:
+                        # Position and time interpolated by the SAME fraction of
+                        # the same step, so they describe one event rather than
+                        # two.
+                        self._fire(p_k, s_k, self._interpolate_time(self._last_t, now_t, frac))
+                # Even on a poll that saw no travel: the clock advanced, and
+                # leaving last_t behind would make the next interpolation span
+                # a stationary period the probe did not cross anything in.
+                self._last_t = now_t
+
+            time.sleep(self.poll_period)
+
+    def _fire(self, pos, s_m, timestamp):
+        """One crossing: publish its pose at its own time and hand it to the
+        correlator -- while armed, and within the pass's budget."""
+        self.triggers += 1
+        if not self._armed:
+            return
+        if self._budget is not None and self.armed_triggers >= self._budget:
+            self.armed_over_budget += 1
+            self.over_budget += 1
+            return
+        try:
+            try:
+                ended = self._publish_pose(timestamp, pos)
+            except snde.snde_error as refused:
+                # Too late to be ordered: this crossing is lost. Counted rather
+                # than raised, so one straggler does not take the scan down --
+                # but it IS a hole in the trace list, so it is reported.
+                self.dropped_crossings += 1
+                if self.dropped_crossings <= 5:
+                    print("  timestamped trigger: crossing dropped (%d so far): %s"
+                          % (self.dropped_crossings, str(refused).split("\n")[0]))
+                return
+            self.published += 1
+            index = self.armed_triggers
+            self.armed_triggers += 1
+            self.armed_s_m = s_m
+            self._pending.put((ended, pos, s_m, index, self._sink))
+        except Exception:
+            self.errors += 1
+            # Formatted, not the object: see triggered_acquisition.dpi.
+            self.last_error = traceback.format_exc()

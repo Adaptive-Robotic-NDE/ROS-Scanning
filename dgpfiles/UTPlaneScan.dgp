@@ -1,0 +1,1224 @@
+# UT scanning over a 2D plane with an externally triggered digitizer.
+#
+# Loading this config sets everything up and then stops. It does not scan on its
+# own -- call run_default_scan(), or Scan2DPlane() with your own corners, from
+# the dgpy> prompt.
+
+from dataguzzler_python import dgpy
+import spatialnde2 as snde
+
+include(dgpy,"dgpy_startup.dpi")
+include(dgpy,"matplotlib.dpi")
+include(dgpy,"pint.dpi")
+
+# ==============================================================================
+# TRANSACTION MANAGER
+# ==============================================================================
+# "timed" runs the recording database on timed_transaction_manager, which
+# commits transactions in measurement-TIMESTAMP order rather than in the order
+# their threads happened to finish. Two things follow, and the second is the
+# reason this exists:
+#
+#   * more than one transaction may be open at once. The ordered manager allows
+#     exactly one, which is why an acquisition thread publishing while the
+#     stager staged used to wedge solidly.
+#   * a transaction stamped at time T sees every transaction stamped before T
+#     already committed. So a position trigger that publishes its own timestamped
+#     pose gets, in that pose's globalrev, exactly the A-scan a free-running
+#     digitizer produced at that instant -- with no buffer of A-scans to search
+#     and no bias from "take the most recent one". See
+#     modules/timestamped_trigger.dpi.
+#
+# TRANSACTION_LATENCY is the ordering window: how long the manager holds a
+# transaction so that anything stamped earlier can still arrive and be committed
+# first. It is the floor on how long end_transaction() -> globalrev takes, so
+# anything that waits for its own globalrev is limited to 1/TRANSACTION_LATENCY
+# per second.
+#
+# Measured against a free-running 1 kHz source of 16000-point records plus an
+# independent 200 Hz position source: zero late transactions and 100.0% correct
+# correlation at every window from 0.25 s down to 0.002 s, with in-flight
+# transactions settling at rate*window as theory says. 0.02 s therefore has two
+# orders of magnitude of margin and still allows ~50 waited commits per second,
+# against the ~10 traces/s a scan actually stages.
+#
+# Watch transmgr.late_transactions. Nonzero means the window is too small for
+# some producer: those transactions are still committed (they are not dropped --
+# see the spatialnde2 fix), but their globalrev timestamps stop being monotonic.
+# Raise the window by transmgr.max_lateness_secs.
+RECDB_TRANSACTION_MANAGER = "timed"
+TRANSACTION_LATENCY = 0.02
+
+if RECDB_TRANSACTION_MANAGER == "timed":
+    transaction_clock = snde.measurement_clock_cpp_steady("")
+    transmgr = snde.timed_transaction_manager(transaction_clock, TRANSACTION_LATENCY)
+    include(snde, "recdb.dpi", transmgr=transmgr)
+else:
+    transaction_clock = None
+    transmgr = None
+    include(snde, "recdb.dpi")
+include(snde,"recdb_gui.dpi")
+
+import os
+import time
+import copy
+import itertools
+import threading
+import numpy as np
+import rclpy
+from geometry_msgs.msg import TransformStamped, Pose, PoseArray, PoseStamped
+from dataguzzler_python import Qt, QtWrapper
+
+rclpy.init()
+
+import dgpython_rosmotion as rosm
+
+global ros
+ros = rosm.motion('ros', recdb, 'probe_end', 'world')
+
+# Probe position for anything that has to run while the arm is moving.
+#
+# `ros` is a dgpy module, so every attribute read -- ros.t included -- takes its
+# context lock, and the thread that called ros.Move()/ros.CartesianMove() holds
+# that lock until the move returns. During a raster row that is several seconds
+# with no position available at all, which is exactly long enough to bind a
+# whole row of A-scans to one stale pose. ros.live_pose is a plain threadsafe
+# holder the module's TF thread pushes into, so it keeps updating at the TF rate
+# and reading it never touches the module. Fetch it once, here, while nothing is
+# moving; from then on it is just an object.
+global live_pose
+live_pose = ros.live_pose
+
+# ==============================================================================
+# TECHNICIAN CONTROLS -- set these two, and the system derives the rest
+# ==============================================================================
+# A technician setting up a UT scan sets a STEP SIZE and a VELOCITY and expects
+# the instrument to handle everything else. On a traditional system it can: the
+# digitizer, the encoder and the bridge are one machine with one known ceiling.
+# Here they were three independent things, and the coupling between them was
+# missing entirely -- the pitch was a free parameter that scaled correctly while
+# RASTER_VELOCITY was a bare constant that did not scale at all. Set a fine pitch
+# and the arm kept sweeping at 50 mm/s, the trace rate went up in proportion, and
+# the staging pipeline fell behind without saying so.
+#
+# These two now drive everything downstream, and modules/scan_parameters.dpi
+# works out whether the machine can do it:
+#
+#   * the trace rate is velocity/step, so the pipeline's rate ceiling IS a
+#     velocity ceiling once the step is chosen. A request above it is SCALED
+#     DOWN and reported with both numbers;
+#   * a request far above it, or a scan that would run for hours or need more
+#     memory than there is, RAISES rather than quietly becoming a different scan;
+#   * the grid, the projection spot radius and the parameterization resolution
+#     all follow from the step unless they are set explicitly.
+#
+# Every scan prints its plan before it moves, and its achieved rate, queue depth
+# and observed probe speed afterwards -- so the constants the plan is built from
+# stay checkable rather than becoming folklore.
+
+# Distance between traces ALONG a pass, in metres. The primary control.
+#
+# 5 mm is a round number close to the 5.08 mm every earlier measurement
+# was taken at (that was 0.30/59, inherited from the plane scan's 60-column grid
+# -- an arbitrary constant that meant nothing at all for a mesh scan).
+SCAN_STEP_SIZE = 0.005
+
+# Distance between passes, in metres. The other axis of the same choice.
+SCAN_LINE_SPACING = 0.010
+
+# Requested probe speed along a pass, in metres per second. This is what the
+# technician asks for; what is used is min(this, the pipeline ceiling), reported
+# either way.
+SCAN_VELOCITY = 0.050
+
+# How a MoveIt velocity SCALING turns into probe speed in this cell, as
+# (scaling, measured m/s) pairs.
+#
+# CartesianMove's vel is a fraction of the robot's JOINT limits; what a
+# technician sets is a speed. The conversion is a property of the work cell, and it
+# is NOT one constant. Measured over a bowed plate, two passes each,
+# pass-to-pass agreement about 1%:
+#
+#     scaling   observed        implied full scale
+#     0.0050     7.9 mm/s         1.58 m/s
+#     0.0100    15.6 mm/s         1.56 m/s
+#     0.0200    30.3 mm/s         1.52 m/s
+#     0.0350    47.2 mm/s         1.35 m/s
+#     0.0500    52.9 mm/s         1.06 m/s
+#
+# So it is linear at about 1.55 m/s full scale up to ~30 mm/s and then saturates
+# near 53 mm/s: past a scaling of about 0.035 the robot simply will not go
+# faster. Taking the single ratio at 0.05 -- the one number the old constant was
+# built from -- over-commands everything slower by half, which is exactly what
+# happened: a scan asking for 10 mm/s ran at 15.6 and its staging queue grew to
+# 39 because it was producing 50% more traces per second than planned.
+#
+# Two consequences worth knowing at the panel: this robot cannot sweep faster
+# than ~53 mm/s, and below 7.9 mm/s the mapping is extrapolated rather than
+# measured (the plan says so). Every scan reports observed against requested and
+# prints the table entry to add if they disagree -- that is how this list grows.
+ROBOT_VELOCITY_CALIBRATION = [
+    (0.0050, 0.0079),
+    (0.0100, 0.0156),
+    (0.0200, 0.0303),
+    (0.0350, 0.0472),
+    (0.0500, 0.0529),
+]
+
+# How the gated amplitude reaches the projected image.
+#
+#   "live"      project each trace as it is staged, so the picture builds while
+#              the scan runs. Costs a second serialised globalrev wait per trace
+#              and is the reason the sustained ceiling is 10 traces/s.
+#   "deferred"  record only, then replay /ut/trace_poses + the gate output
+#              through the projector when the scan finishes. Measured at 62
+#              traces/s against 5.5 live -- 11x -- and produces an identical
+#              image. The right choice for a fine scan, and the reason the trace
+#              list exists.
+#   "off"       no projector at all. The trace list is still recorded, so
+#              project_traces() can be run later by hand.
+#
+# Adjustable live from the Scan Settings panel; see ScanSettingsPanel.
+PROJECTION_MODE = "live"
+
+# None means "derive from the step size". See scan_parameters.dpi for the
+# measurements behind the rules -- 1.6x the step for the radius (74.9% coverage
+# at 0.8x against 96.6% at 1.6x), and enough pixels for 8 across one spot.
+PROJECTION_SPOT_RADIUS = None
+PROJECTION_PIXELS = None
+
+# Refuse rather than run, unless a scan is started with force=True. These are
+# the "or say plainly that it cannot" half of the contract; each is checked
+# against the printed plan before anything moves.
+MAX_SCAN_TIME_S = 3600.0            # a scan longer than an hour is a decision
+MAX_TRACE_MEMORY = 1 << 30          # above this, storage must be file-backed
+MAX_VELOCITY_OVERAGE = 10.0         # x the ceiling; beyond this it is a mistake
+
+# Sustained trace rate of the staging pipeline, per projection mode, in Hz.
+# Both measured by over-driving a scan and watching the stager's queue grow --
+# see DEFAULT_LIMITS in modules/scan_parameters.dpi. None for a mode means "not
+# measured; plan against the serialised-globalrev floor instead", which is
+# optimistic because it counts no work at all.
+MAX_TRACE_RATE_HZ = {"live": 10.0, "deferred": 22.0, "off": 22.0}
+
+# ==============================================================================
+# ACQUISITION SOURCE
+# ==============================================================================
+# The scan reads the most recent A-scan from ASCAN_CHANNEL_PATH. Anything that
+# publishes 1D float32 recordings there will do, so switching between the
+# simulator and a real digitizer is a matter of which one is loaded below --
+# nothing downstream of ASCAN_CHANNEL_PATH changes.
+#
+#   ASCAN_SOURCE = "simulated"  loads modules/sim_ascan_source.dpi, which
+#                               free-runs synthetic A-scans onto the channel.
+#
+#   ASCAN_SOURCE = "hardware"   loads the CompuScope digitizer below and reads
+#                               its channel. Record length, sample rate and
+#                               sample type are NOT set here -- they are whatever
+#                               the card is configured for, and they can change
+#                               between runs or mid-session. Everything that
+#                               needs them asks the data (see ascan_geometry()).
+#
+# Switching between the two is this one line. ASCAN_CHANNEL_PATH follows it
+# automatically, and nothing downstream is aware of which one is loaded.
+#
+# WHAT ASCAN_TRIGGER_MODE MEANS DIFFERS BETWEEN THE TWO, and it is the only
+# thing that does:
+#
+#            simulated                        hardware
+#   timer    free-run at ASCAN_RATE_HZ        the card free-runs; the scan
+#            and let the scan sample it       samples it. run_default_scan /
+#                                             run_raster_scan.
+#   position synthesise a trace AT each       NOT AVAILABLE from software -- on
+#            crossing (models a trigger       hardware the trigger box fires the
+#            box without the hardware)        card by wire. Raises, rather than
+#                                             quietly sampling instead.
+#   timestamped  free-run and correlate       identical, and this is the
+#            by measurement timestamp         arrangement a real digitizer is
+#                                             actually driven in.
+#
+# So "timestamped" is the mode that means the same thing on both sides, which
+# is why it is the one to develop a triggered scan against.
+
+ASCAN_SOURCE = "simulated"
+
+# Channel the A-scans arrive on. Set by the branch below; override afterwards
+# only if you load a different digitizer yourself.
+ASCAN_CHANNEL_PATH = "/ut_ascan" if ASCAN_SOURCE == "simulated" else "/CS_CH1"
+
+# SIMULATOR ONLY. The real card's record length and sample rate come from the
+# card, discovered at run time -- never assume these apply to hardware.
+ASCAN_NUM_POINTS = 16000
+ASCAN_SAMPLE_RATE = 100e6
+
+# SIMULATOR ONLY. What sample type the fake digitizer produces. A real card
+# delivers raw counts (np.int8 / np.int16) or converted volts (np.float64)
+# depending on its configuration, so set this to np.int16 to check the
+# acquisition path end to end in counts before trusting it on hardware --
+# nd_accumulate_once and cscan_gate are both templated over the
+# integer types and the native type is carried through to the c-scan.
+# ASCAN_SIM_DTYPE = np.int16
+ASCAN_SIM_DTYPE = np.float32
+
+# Trigger rate of the simulated digitizer, in Hz. A real card runs at a kHz PRF;
+# this only has to be fast enough that a continuous raster row lands several
+# A-scans in every grid column. Scan2DPlaneRaster sweeps a row in a few seconds,
+# so at 50 Hz a 60 column row gets ~5 samples per column. Drop it much below
+# that and columns start coming out empty and being filled from a neighbour.
+#
+# Only used when ASCAN_TRIGGER_MODE is "timer"; "timestamped" uses
+# ASCAN_FREERUN_RATE_HZ instead, because there the card's PRF is a property of
+# the card and has nothing to do with the scan.
+ASCAN_RATE_HZ = 50.0
+
+# How the simulated digitizer decides when to acquire.
+#
+#   "timer"     free-run at ASCAN_RATE_HZ. Acquisition is decoupled from
+#               position, so how many A-scans land in a column depends on how
+#               fast the arm happened to be moving, and _RowSampler has to bin
+#               them to the nearest column afterwards. This is the default
+#               because every earlier measurement was taken against it.
+#
+#   "position"  fire once per ASCAN_TRIGGER_PITCH of probe travel, which is what
+#               a position trigger box does (see scan-trigger-box/). Trigger k is
+#               then at arc length k*pitch BY CONSTRUCTION. Set this to write and
+#               test trigger-box orchestration before the hardware exists; it is
+#               also the last thing making the simulated path time-based.
+#
+# Arc length is global along the path, so "position" is agnostic to how the path
+# is organised -- it works unchanged on a Noether surface-following toolpath,
+# where a fixed grid has no meaning at all. Note that the link move between two
+# raster rows is real travel and does fire triggers; they land while the scan is
+# not sampling and are ignored, exactly as a real box behaves.
+#
+# *** "position" ONLY WORKS WITH run_triggered_scan(), NOT run_raster_scan(). ***
+#
+# Scan2DPlaneRaster's _RowSampler POLLS the database for the most recent A-scan;
+# it does not count triggers. In "timer" mode the simulator publishes ~3x more
+# A-scans than there are columns, so polling gets one per column and the surplus
+# is discarded. Position triggering publishes exactly one per column, so every
+# sample the poll misses is an empty column that _row_entries fills from a
+# neighbour -- 225 of 720 columns on a 60x12, with columns 48..59 of every row
+# coming out byte-identical. Use Scan2DPlaneTriggered / run_triggered_scan()
+# instead: it counts triggers, so trace k IS column k.
+#
+# Left on "timer" as the default only because it is the configuration the
+# recorded measurements were taken against, and because the triggered path
+# currently exposes a robot problem (rows that end short) rather than a data
+# one.
+#
+# "timestamped" is the third mode and the one a real card needs: the simulated
+# card free-runs at ASCAN_RATE_HZ knowing nothing about the scan, and a separate
+# trigger publishes a timestamped pose per pitch of travel, taking back the
+# A-scan that was current at that instant out of its own globalrev. Needs
+# RECDB_TRANSACTION_MANAGER = "timed". See modules/timestamped_trigger.dpi.
+#
+# *** run_mesh_scan() REQUIRES "position" or "timestamped". ***
+# A surface-following toolpath has no grid to bin a free-running digitizer into,
+# so the trigger is the only thing that can be the trace index. A full 29-pass
+# mesh scan has been run with this set to "position".
+# PRF of the free-running card in "timestamped" mode. A real externally
+# triggered card runs at its own rate and knows nothing about the scan; at
+# 0.05 m/s and a 5.08 mm pitch the trace rate is ~10 Hz, so 1 kHz gives ~100
+# shots per trace and the correlation picks the right one out of them. Also the
+# rate the correlation was verified at.
+ASCAN_FREERUN_RATE_HZ = 1000.0
+
+ASCAN_TRIGGER_MODE = "timestamped"
+
+# None means "SCAN_STEP_SIZE", which is the whole point of the technician
+# controls: the step size the operator set IS the trigger pitch.
+#
+# Do not derive it from the plane scan's grid pitch. That pitch is a genuine
+# constraint for a rectangular scan, where trigger k has to BE column k, but it
+# is meaningless for a mesh scan: there is no grid on a surface-following
+# toolpath to take a column count from. The plane scans still derive their pitch
+# from their own grid, because there they must; everything else uses the step
+# size.
+ASCAN_TRIGGER_PITCH = None
+
+# ==============================================================================
+# SCAN SIZE AND STORAGE
+# ==============================================================================
+# The accumulated volume is SCAN_M x SCAN_N x (record length) in the digitizer's
+# own sample type (u, v, time -- u first so the viewer draws the c-scan with x
+# horizontal), all of it allocated up front. The record length and type come
+# from the card at run time, so the volume's size and dtype follow whatever it
+# is configured for; the "Allocating ..." line printed at the start of a scan
+# reports both.
+#
+# Left in the default storage manager it lives in /dev/shm, which is RAM -- fine
+# for a small scan, impossible for a large one. Point SCAN_STORAGE_DIR at a
+# directory on a real disk and the volume is a file there instead, paged in and
+# out by the kernel, so scan size is bounded by disk rather than by memory. Set
+# it to None to keep everything in memory.
+#
+# The file holds the raw array, no header. Read it back with the dtype and
+# record length the scan reported:
+#   numpy.memmap(path, dtype=<reported dtype>, mode='r',
+#                shape=(SCAN_M, SCAN_N, <reported record length>))
+
+# Grid size of the rectangular plane scans. None means "derive from
+# SCAN_STEP_SIZE and SCAN_LINE_SPACING over the scanned area", which is what the
+# technician controls are for: over the default 0.30 m square, a 5 mm step and a
+# 10 mm line spacing give 61 x 31. Set them to numbers to pin the grid instead --
+# 60/60 reproduces the historic geometry every earlier cross-check was
+# measured against, at a 5.08 mm pitch in both axes.
+#
+# For a rectangular scan the column pitch and the trigger pitch are the same
+# thing by necessity (trigger k must be column k), so pinning the grid also pins
+# the step size; the plan printed at the start of a scan says which it used.
+SCAN_M = None   # points along the u axis
+SCAN_N = None   # points along the v axis
+
+# World (x, y) of the scan's first point. None means "wherever the probe happens
+# to be", which drifts as the arm is jogged around and can put part of the scan
+# outside the robot's reach. This default sits inside the UR10e's workspace in
+# the simulated cell.
+SCAN_ORIGIN = (0.75, -0.35)
+# Where scans are written. A literal path is one machine's home and nobody
+# else's, so resolve the same way the capture tool does: what the site says,
+# then the mount the work cell actually has, then this account's own home.
+SCAN_STORAGE_DIR = (os.environ.get("TARI_SCANDATA")
+                    or os.environ.get("SCANDATA_ROOT")
+                    or ("/data/scandata" if os.path.isdir("/data/scandata")
+                        else os.path.expanduser("~/scandata")))
+
+# WHICH WORK CELL THIS CONFIG IS RUNNING IN, and in which mode. The work-cell
+# manifest under tari_bringup already describes the robot, the sensors and the
+# topics; naming it here lets this config read the rest of that description instead
+# of repeating it. What it reads today is the WORK VOLUME -- the box parts are
+# placed inside, which every reconstruction crops to. See modules/work_cell.dpi.
+CELL_NAME = "ex-ur10e-1"
+CELL_MODE = "sim"
+
+# Time-of-flight gate the c-scan reduces over, in seconds. Adjustable live from
+# the C-Scan Settings panel.
+#
+# This wants to sit BETWEEN the front wall and the back wall echoes. A gate that
+# includes the front wall makes every position return the front wall amplitude,
+# because the c-scan is a peak over the gate -- the image comes out uniform and
+# tells you nothing. For the simulated specimen the front wall is at 6.8 us and
+# the back wall at 13.6 us, so 8.5-12.5 us images the flat bottom holes between
+# them.
+CSCAN_START_TOF = 8.5e-6
+CSCAN_END_TOF = 12.5e-6
+
+# Scaling passed to every move, as a fraction of the robot's limits.
+MOVE_VELOCITY = 0.1
+MOVE_ACCEL = 0.1
+
+# Fallback scaling for the continuous sweeps, used only when no scan plan is in
+# force -- a bare Scan2DPlane*() call made without going through a plan, or a
+# manual sweep from the prompt.
+#
+# Every scan started the normal way sets its own scaling from SCAN_VELOCITY via
+# the plan, because THIS constant not scaling with the pitch is the whole defect
+# the technician controls exist to fix: it stayed at 0.05 (about 50 mm/s) no
+# matter how fine the step got, and the trace rate went up in proportion until
+# the staging pipeline fell behind in silence. See raster_velocity().
+RASTER_VELOCITY = 0.05
+RASTER_ACCEL = 0.05
+
+# Smallest fraction of a commanded pass the arm is allowed to actually cover.
+#
+# 1.0 for the rectangular scans, and not negotiable there: the volume is indexed
+# by grid position, so a row that stops three quarters of the way along does not
+# leave a gap -- the acquisition fills the rest from a neighbour and the c-scan
+# looks complete and is fabricated. That went unnoticed for a long time, which is
+# why the Cartesian stage now refuses a short path outright rather than logging
+# it. Nothing trips it since approach_row_start() started choosing the arm
+# configuration; it exists to make a regression loud.
+#
+# The surface-following scans use PATH_MIN_FRACTION instead, which is lower on
+# purpose -- see run_mesh_scan().
+RASTER_MIN_FRACTION = 1.0
+
+# ==============================================================================
+# SURFACE-FOLLOWING (NOETHER) SCANS
+# ==============================================================================
+# Scenario B: an existing mesh of the specimen goes in, a toolpath comes back,
+# and the scan follows it. Nothing here is used by the plane scans.
+#
+# The mesh is interpreted in WORLD coordinates -- principal_axis_noether_srv
+# loads it with pcl and emits the vertex positions as poses directly, subtracting
+# z_offset. So the file has to be positioned in the work cell already, and a mesh
+# authored about its own origin will plan a toolpath in the floor.
+#
+# None means "use the synthesised test plate", which is the default because it is
+# the only mesh in this tree the arm can actually reach -- see make_test_plate()
+# and the note on curved_scan.ply below.
+NOETHER_MESH = None
+
+# ==============================================================================
+# SCENARIO C: NO MESH YET -- RECONSTRUCT ONE FIRST
+# ==============================================================================
+# Where obtain_specimen_mesh() gets a mesh from. "auto" is scenario B's exact
+# previous behaviour -- NOETHER_MESH if it is set, the synthesised test plate
+# otherwise -- so the verified path is unchanged until this is deliberately
+# moved off "auto".
+#
+#   "auto"     NOETHER_MESH if set, else the test plate   (today's behaviour)
+#   "file"     NOETHER_MESH, and fail if it is not set
+#   "plate"    the synthesised test plate, the regression specimen
+#   "azure"    reconstruct a rough mesh with the Azure Kinect
+#   "keyence"  reconstruct a high-resolution mesh with the Keyence profiler
+SPECIMEN_SOURCE = "auto"
+
+# The region of the table a reconstruction sweep covers and integrates inside,
+# as (xmin, ymin, xmax, ymax) in world metres. Everything outside it is
+# discarded, so this is the parameter that decides whether a reconstruction is
+# the specimen or the specimen plus the table and the arm. Defaults to the same
+# ground the test plate occupies.
+SPECIMEN_REGION = (SCAN_ORIGIN[0], SCAN_ORIGIN[1],
+                   SCAN_ORIGIN[0] + 0.30, SCAN_ORIGIN[1] + 0.30)
+
+# How the camera holds its range to that region. The depth mode has a minimum
+# RANGE, not a minimum height, and "pan" buys that range by standing off to the
+# side and aiming back -- which is what makes it reachable. See
+# SPECIMEN_DEPTH_MODE in ECAutomatedScan.dgp for the whole argument, and
+# AZURE_DEPTH_MODES in modules/mesh_reconstruction.dpi for the table.
+SPECIMEN_DEPTH_MODE = "NFOV_UNBINNED"
+SPECIMEN_SWEEP_STYLE = "pan"     # "pan" or "dome"
+SPECIMEN_ALLOW_DEAD_ZONE = False
+SPECIMEN_SWEEP_SLANT = None      # None = the depth mode's minimum + 30 mm
+SPECIMEN_SWEEP_CAMERA_HEIGHT = None  # None derives it from the work volume top
+SPECIMEN_SWEEP_DIRECTIONS = 4
+SPECIMEN_PAN_STOPS = (4, 2)
+SPECIMEN_SWEEP_HEIGHT = None     # "dome" only; derived from the depth mode
+SPECIMEN_SWEEP_STOPS = (5, 5)    # "dome" only
+
+# Which Keyence reconstruction backend this cell uses. A LOAD-TIME choice, not a
+# runtime argument, because it decides which services must be running -- and that
+# should be visible at bring-up rather than discovered when a scan calls it.
+#
+#   "pc"   tari_pc_reconstruction  -- /start_recording, /stop_and_process (Open3D)
+#   "key"  tari_key_reconstruction -- /start_key_rec, /stop_key_rec (PCL)
+#
+# Both ship. Exercising either against real hardware needs the
+# keyence_experimental driver, which in turn needs keyence_interfaces; that
+# package is not published anywhere and must be copied in from a cell.
+KEYENCE_BACKEND = "pc"
+
+# Run the reconstruction through tari_mesh_filter before planning on it.
+#
+# OFF, and it takes a deliberate argument to turn on, because not one of the
+# three filters that service offers is right for a specimen in general:
+#
+#   * the COLOUR filter is the eddy-current green tape, (0.0, 0.55, 0.44) at
+#     0.15, and would delete an untaped part entirely;
+#   * the VERTEX filter is a plane in world z. There is no cell-wide value for
+#     it: the cut height is a property of the specimen, not of the work cell.
+#     0.98 is right for this test plate (top 1.03) and
+#     deletes the calibration plate (top 0.948) in its entirety. Nor can it be
+#     derived -- this cell's bench is an optical breadboard that reconstructs
+#     across 34 mm of z, and the cal plate is 19.6 mm thick, so no plane keeps
+#     the part and drops the support;
+#   * DELETE_LOOSE_PARTS keeps the BIGGEST connected component, which is the
+#     same design error as the reconstruction server's largest-DBSCAN-cluster
+#     rule. A part with holes through it does not come back as one component,
+#     and the bench inside the work volume is bigger than the part is (0.25 m^2
+#     of it against a 0.09 m^2 plate here) -- so it deletes the specimen, keeps
+#     the table, and reports success.
+#
+# What crops is the work cell's WORK VOLUME, declared once in the work-cell manifest
+# and applied by every reconstruction before a vertex exists. See work_cell.dpi.
+# clean_mesh() remains for a caller who knows their specimen and wants one of
+# the three deliberately: obtain_specimen_mesh(clean=True, cutoff=<world z>).
+#
+# What this does NOT solve, and nothing here does yet: separating a thin part
+# from the surface it rests on. The work volume bounds the work cell, not the part,
+# so a reconstruction of a part on a bench contains some bench.
+SPECIMEN_CLEAN_MESH = False
+
+# Where the synthesised test plate goes and what shape it is. Deliberately over
+# the same ground as the flat scan (SCAN_ORIGIN, height 1.0), because that is
+# ground the arm is known to cover; the bow is what makes it a surface-following
+# scan rather than a raster in disguise.
+TEST_PLATE_SIZE = 0.30
+TEST_PLATE_HEIGHT = 1.00
+TEST_PLATE_BOW = 0.03      # metres of rise at mid-span; 0 gives a flat plate
+TEST_PLATE_DIVISIONS = 61
+
+# The real specimen mesh, kept here because it is what scenario B is ultimately
+# for -- but see mesh_path_feasibility() before scanning it. Measured against
+# this cell:
+#
+#   * every sampled pose is KINEMATICALLY reachable (IK with collision checking
+#     off: 10/10 at every standoff), so reach is not what stops it;
+#   * what fails is collision, and not with the specimen -- the planning scene
+#     has no world objects at all. It is the ARM against `robot_environment`,
+#     the work-cell enclosure mesh, in every branch that reaches those poses;
+#   * shifting the mesh in y does nothing (0/15 segments usable at dy = 0.15,
+#     0.30, 0.40). Lifting it 0.30 m in z gives 11/15. So it is height, and
+#     0.30 m is far more standoff than a scan has;
+#   * its own normals are a median 49.6 degrees from vertical with a 90th
+#     percentile of 89 degrees -- this is a strongly corrugated scanned surface,
+#     not a gently curved plate -- so a probe following them has to swing
+#     through most of a hemisphere, which is the other half of why nothing
+#     plans.
+#
+# In short: that part is not scannable where it currently sits, and moving it is
+# a cell decision, not a code one.
+CURVED_SPECIMEN_MESH = "/home/user/ros_ws/src/tari-ros/tari_ur_launch/meshes/curved_scan.ply"
+
+# Distance between raster lines on the surface, metres. This is the row pitch of
+# the scan, so it plays the part SCAN_N does for the plane raster -- which is
+# why it is now just SCAN_LINE_SPACING, one control for one physical quantity
+# whichever kind of scan is being set up. Set this to a number to override it
+# for the mesh path alone.
+NOETHER_LINE_SPACING = SCAN_LINE_SPACING
+
+# SUBTRACTED from every mesh z, so NEGATIVE lifts the toolpath above the surface.
+# The service's own field name notwithstanding, +0.05 drives the probe 50 mm INTO
+# the part. Immersion UT wants standoff, so this is negative.
+NOETHER_Z_OFFSET = -0.05
+
+# Translation applied to the whole toolpath AND to the projection surface, for
+# placing a mesh that was not authored in cell coordinates. It has to be applied
+# to both or the traces land on the wrong part of the projected image.
+NOETHER_MESH_OFFSET = (0.0, 0.0, 0.0)
+
+# "surface" follows the mesh normals; "fixed" holds one orientation for the whole
+# path. Surface-following is the point of the exercise, but a specimen whose
+# normals swing further than the wrist can follow inside the work cell leaves
+# "fixed" as the only thing that runs -- and for a mild curve with a standoff
+# transducer it is a legitimate choice, not a fallback.
+NOETHER_ORIENTATION = "surface"
+
+# Where the roll about the tool's own axis comes from. NOT cosmetic.
+#
+# Noether emits x along the raster direction and z along the normal, and on some
+# lines it emits x and y SWAPPED for a run of waypoints -- a commanded 90 degree
+# roll and 90 back, several times within one straight pass whose surface normal
+# never changes. Measured on the test plate: 9 of 29 passes did it, the other 20
+# had exactly 0.0 degrees of within-pass orientation change, and on one affected
+# pass wrist_3 travelled 557 degrees to achieve 20. It is also where the 4x
+# trajectory-state counts and the 70-second passes came from.
+#
+#   "fixed"    (default) roll from a fixed world reference: the tool z still
+#              follows the surface, and the roll changes only as much as the
+#              normal forces. Least wrist motion, no discontinuities, and
+#              correct because a UT transducer is rotationally symmetric about
+#              its own axis -- the roll carries no information for us.
+#   "path"     x along the direction of travel, recomputed from the positions
+#              instead of trusted. Use when the tool is NOT symmetric.
+#   "planner"  keep Noether's. Reproduces the fault above; kept for that.
+NOETHER_TOOL_ROLL = "fixed"
+
+# UV parameterization for the projection surface. "planar" projects onto the
+# surface's own principal plane -- one island, no seams, and comparable to a
+# rectangular c-scan. "angle_based" is the seam-and-unwrap recipe from
+# x3dConverter.py, general but with no simple relation to the part.
+NOETHER_UV_METHOD = "planar"
+
+# Serpentine the raster so consecutive lines run in alternate directions. The
+# segment boundaries come from the planner either way (segment_start_indices), so
+# this does not have to be inferred.
+NOETHER_SNAKE = True
+
+# Minimum fraction of a Noether segment the arm must cover for the pass to be
+# accepted. Deliberately NOT 1.0.
+#
+# Noether puts a waypoint wherever a raster plane crosses a mesh edge, so the
+# segments are ragged: 73 of them on curved_scan.ply, from 2 to 278 waypoints.
+# Demanding 100% of every one of those fails often, and unlike a rectangular row
+# a short pass here costs only coverage -- there is no grid to shift, and every
+# trace carries the pose it was taken at. So accept a mostly-complete pass, and
+# report exactly what was covered.
+PATH_MIN_FRACTION = 0.6
+
+# Segments shorter than this are link moves between raster lines, not scanning
+# passes. The planner reports its own boundaries, so this only has to separate
+# "line" from "hop between lines", not find them.
+PATH_MIN_SEGMENT_M = 0.02
+
+# ==============================================================================
+# GEOMETRY-FREE RECORDING
+# ==============================================================================
+# The rectangular volume above is the quick-look: it needs no mesh, no
+# reconstruction and no registration, which is the whole reason this plane scan
+# exists. It is also the fragile representation -- one trace out of place shifts
+# every later point -- and it has no meaning at all for a surface-following
+# toolpath from Noether, whose lines are ragged and whose length is whatever the
+# mesh made it.
+#
+# So the scan also records a flat trace list with the probe pose attached to
+# every trace. Geometry then lives in the poses rather than in array indices,
+# both accumulators are fed from one staged A-scan, and the data can be re-gridded
+# or projected afterwards without re-scanning. Costs a few MB of poses.
+RECORD_TRACE_LIST = True
+
+# Project the gated amplitude onto a parameterized surface as well. For a plane
+# the surface is synthesised from the scan corners -- two triangles with a
+# trivial UV map, already in world coordinates, so there is nothing to register.
+# This is the representation that survives arbitrary toolpaths; the rectangular
+# c-scan is not.
+#
+# The projector has to be instantiated MUTABLE in order to accumulate, which
+# requires spatialnde2 at 976aa6b or later: before that fix a producing mutable
+# math channel wedged globalrevision completion permanently, the database then
+# retained every globalrev with the fds for its /dev/shm segments open, and the
+# process died of "Too many open files" part way through a 60x60. A full 60x60
+# with projection on:
+#
+#     3600 points, 658.6 s, fds flat at 154, latest_defined == latest_ready
+#     throughout (37k globalrevs), all three holes in the projected image
+#
+# Live projection costs about 1.3 s/row against the no-projection baseline
+# (11.0 vs 9.7 s/row) and is bounded by the robot, not by the projector.
+#
+# The alternative remains available and is faster by an order of magnitude:
+# project AFTER the scan from /ut/traces + /ut/trace_poses, which is what they
+# exist for. Measured on the same 3600 traces: 58.1 s, 62 traces/s, identical
+# image. That is PROJECTION_MODE = "deferred" (or project_traces() by hand), and
+# it is how you retune the spot radius, the gate or the surface without
+# re-scanning.
+#
+# PROJECTION_MODE, PROJECTION_PIXELS and PROJECTION_SPOT_RADIUS are set in the
+# technician controls at the top of this file. Both of the latter default to
+# None, meaning "derive from the step size" -- the rule of thumb below is what
+# they derive from.
+#
+# The radius is one splat on the surface, in METRES ALONG THE SURFACE --
+# project_onto_parameterization scales it by dpixels_duvcoords *
+# duvcoords_dinplane, so it is a real physical size, not a UV fraction.
+#
+# It has to be comfortably larger than half the trace pitch or the projection
+# comes out as a lattice of dots with unfilled gaps between them: the splat
+# kernel falls off smoothly and reaches zero well inside the nominal radius.
+# At the 5.08 mm pitch of a 60x60 over 0.30 m, measured coverage of the scanned
+# area was 74.9% at 0.004 and 96.6% at 0.008, with the same defect contrast
+# either way (18.3/15.1/10.2 against the 18.3/15.0/10.0 the hole amplitudes
+# predict) -- so the gaps cost coverage, not accuracy. 0.008/0.00508 is the 1.6x
+# that scan_parameters.dpi now applies for any step size.
+
+# Attach the projection to the model for the viewer during acquisition. Without
+# this the projection channel accumulates correctly but nothing renders it: it
+# lives under /ut/proj/graphics/ and there is no display handler for a bare
+# loaded_part_geometry_recording, so the compositor logs "Failed to find
+# recording_display handler" every frame and the viewer shows nothing.
+#
+# The textured part is a rendering input, so it can pull CPU-side geometry
+# recalculation into every projection revision. Set it False and call
+# projector.add_textured_part() after the scan if that cost shows up.
+#
+# It has not shown up. It made no measurable difference over a 60x3 scan
+# (33.5 s / 153 fds on, 33.4 s / 154 fds off), and the full 60x60 above ran with
+# it on at 11.0 s/row with flat fds. Left on, so the viewer draws the projection
+# while the scan runs.
+PROJECTION_TEXTURED_PART = True
+
+# Tilt of the simulated specimen, as (d_tof/dx, d_tof/dy) in seconds of extra
+# round trip per metre of probe travel. This is water path, so it slides every
+# echo together -- front wall, flat bottom holes and back wall alike -- exactly
+# as a tilted plate, a curved part or a sagging fixture would.
+#
+# (0.0, 0.0) is a flat specimen at constant standoff. That is the default
+# because the rectangular volume, the legacy /ut_cscan and the fixed gate below
+# all agree there, and those agreements are the regression checks for this
+# stack. It is also why the tracking gate went so long without a scan behind it:
+# with constant standoff a fixed gate reproduces the picture exactly, so nothing
+# ever demanded the tracking path.
+#
+# Set this together with the tracking CSCAN_GATES below to exercise that path.
+# 10 us/m along x is 3.0 us across the 0.30 m scan, which at 1480 m/s in water
+# is 2.2 mm of standoff, about 0.42 degrees -- unremarkable for a real setup,
+# and enough to break a fixed gate outright:
+#
+#   * the front wall walks from 6.8 us at x=0 to 9.8 us at x=0.30, so from
+#     x=0.17 onward it is INSIDE the fixed 8.5-12.5 us gate and saturates it at
+#     the front wall amplitude;
+#   * the 11.5 us hole at (0.120, 0.210) walks to 12.7 us and drops out of the
+#     fixed gate entirely.
+#
+# Both confirmed on a 30x30 tilted scan, reducing the SAME 900-trace list with
+# both gates (see CSCAN_GATES below for the numbers).
+#
+# Only relevant to ASCAN_SOURCE = "simulated"; real hardware brings its own
+# standoff variation.
+SPECIMEN_TILT = (0.0, 0.0)
+# SPECIMEN_TILT = (10.0e-6, 0.0)
+
+# Gate chain for the generalized c-scan (snde.cscan_gate). Each entry may
+# reference an earlier gate's time-of-flight output via "track", which makes its
+# start/end offsets from that gate rather than absolute times -- a tracking gate.
+# Modes: CSCAN_MODE_MAX / MIN / MAXABS / PEAK2PEAK / THRESHOLD_POS / THRESHOLD_NEG
+# / THRESHOLD_ABS / MEAN.
+#
+# The default is a fixed gate matching CSCAN_START_TOF..CSCAN_END_TOF, so the
+# gate chain reproduces the legacy /ut_cscan exactly on a flat specimen.
+CSCAN_GATES = [
+    {"name": "cscan", "mode": snde.CSCAN_MODE_MAX, "start": CSCAN_START_TOF, "end": CSCAN_END_TOF},
+]
+# Tracking pair, to be used with a non-zero SPECIMEN_TILT (or any real specimen
+# whose standoff varies). Gate "fw" finds the front wall by first threshold
+# crossing; gate "cscan" then runs 1.7-5.7 us AFTER it instead of at 8.5-12.5 us
+# absolute. Those are the same numbers measured from the front wall, so on a
+# flat specimen this chain reproduces the fixed-gate image -- and on a tilted
+# one it keeps reproducing it while the fixed gate falls apart.
+#
+# Measured on a 30x30 scan at SPECIMEN_TILT = (10e-6, 0), reducing the same
+# 900-trace list both ways (true hole amplitudes 0.55 / 0.45 / 0.30,
+# true background 0.030):
+#
+#                       hole 1   hole 2   hole 3   background   image > 0.5
+#     fixed  8.5-12.5    0.540    0.791    0.081      0.383         44.9%
+#     tracking fw+1.7     0.540    0.444    0.299      0.029          1.4%
+#
+# The fixed gate reads the front wall (0.8) instead of hole 2, loses hole 3
+# entirely, and saturates the 45% of the image beyond u = 0.17 m where the
+# front wall has walked inside it. The tracking gate is within 2% of truth
+# everywhere, and its 1.4% is hole 1 itself.
+#
+# fw's window has to span the whole front wall excursion (6.8-9.8 us at this
+# tilt), and its threshold has to sit above the noise floor (0.01) and below the
+# front wall amplitude (0.8). It takes the FIRST crossing, so the hole echoes
+# further down the trace cannot capture it however large they are. Note that a
+# threshold crossing lands on the RISING EDGE, about 200 ns before the echo
+# peak for these 5 MHz bursts -- fw_tof came back at 6.60-9.76 us against a true
+# 6.80-9.80, RMS 143 ns. That bias is constant, so it cancels out of the
+# tracking offsets; it does mean fw_tof is not a depth measurement.
+# CSCAN_GATES = [
+#     {"name": "fw",    "mode": snde.CSCAN_MODE_THRESHOLD_POS,
+#      "start": 5.0e-6, "end": 11.0e-6, "threshold": 0.3},
+#     {"name": "cscan", "mode": snde.CSCAN_MODE_MAXABS,
+#      "start": 1.7e-6, "end": 5.7e-6, "track": "fw"},
+# ]
+
+# ==============================================================================
+
+
+if SCAN_STORAGE_DIR is not None:
+    os.makedirs(SCAN_STORAGE_DIR, exist_ok=True)
+    scan_storage_manager = snde.setup_file_storage_manager(recdb, SCAN_STORAGE_DIR)
+else:
+    scan_storage_manager = None
+
+transact = recdb.start_transaction()
+staging_chan = transact.define_channel('/current_ascan', "main")
+cscan_start_chan = transact.define_channel('/cscan_start', "main")
+cscan_end_chan = transact.define_channel('/cscan_end', "main")
+
+# A placeholder only, so the channel exists and the viewer has something to
+# show. Deliberately one sample of float32 rather than a guess at the record
+# length: on hardware neither the length nor the type is known until the card
+# produces a trace, and an externally triggered card may produce none until the
+# scan starts. Every real trace is staged with the card's own length and type
+# (_stage_ascan), and the accumulators are instantiated only after the first
+# one, so nothing downstream ever sees this.
+staging_rec = snde.create_ndarray_ref(transact, staging_chan, snde.SNDE_RTN_FLOAT32)
+staging_rec.allocate_storage([1], False)
+staging_rec.data[:] = 0
+staging_rec.rec.mark_data_and_metadata_ready()
+
+s_ref = snde.create_ndarray_ref(transact, cscan_start_chan, snde.SNDE_RTN_FLOAT64)
+s_ref.allocate_storage([1], False)
+s_ref.data[0] = CSCAN_START_TOF
+s_ref.rec.mark_data_and_metadata_ready()
+
+e_ref = snde.create_ndarray_ref(transact, cscan_end_chan, snde.SNDE_RTN_FLOAT64)
+e_ref.allocate_storage([1], False)
+e_ref.data[0] = CSCAN_END_TOF
+e_ref.rec.mark_data_and_metadata_ready()
+
+# cscan_gate takes every gate parameter as a channel, which is what lets the Qt
+# panel retune a gate live. The quick-look gate over the volume is a plain MAX
+# between two absolute times, so it needs no threshold and no reference -- but
+# both parameters are still channels, so they exist and hold the values that
+# mean "unused": threshold 0.0, and a ZERO-LENGTH reference array.
+#
+# Zero length, not a missing channel: an absent reference would have to be a
+# null parameter, and then the dependency graph would not say what this function
+# depends on. A zero-length recording says "no reference" explicitly and lets one
+# math function serve both fixed and tracking gates.
+cscan_threshold_chan = transact.define_channel('/cscan_threshold', "main")
+th_ref = snde.create_ndarray_ref(transact, cscan_threshold_chan, snde.SNDE_RTN_FLOAT64)
+th_ref.allocate_storage([1], False)
+th_ref.data[0] = 0.0
+th_ref.rec.mark_data_and_metadata_ready()
+
+cscan_noref_chan = transact.define_channel('/cscan_no_reference', "main")
+nr_ref = snde.create_ndarray_ref(transact, cscan_noref_chan, snde.SNDE_RTN_FLOAT64)
+nr_ref.allocate_storage([0], False)
+nr_ref.rec.mark_data_and_metadata_ready()
+
+transact.end_transaction().globalrev_wait().wait_complete()
+
+global scan_origin
+scan_origin = None   # (x,y) of the first scan point, set by Scan2DPlane
+
+def probe_position_relative_to_scan():
+    """Where the probe is, relative to the start of the scan, for the simulator.
+
+    THREE components, and the third one matters. The simulated defect map is a
+    plan view and uses only x and y, but the position trigger integrates arc
+    length over everything this returns -- and a surface-following toolpath
+    changes height while it scans. Measured in the plan view alone, travel is
+    under-counted by 1/cos(slope): 1.5% at 10 degrees, 6% at 20, 41% at 45. That
+    is not noise, it is a systematic shortfall in trigger count, and one missing
+    trigger shifts every later trace along the pass.
+
+    It happened not to matter on the bowed test plate, because there each pass
+    runs at constant x and the bow only varies with x -- so every pass is
+    horizontal even though the surface is not. That is a property of that plate,
+    not of surface-following scans, and it is exactly the kind of coincidence
+    that hides a bug until the specimen changes.
+
+    Live TF via the context-free holder, so this is safe -- and cheap -- to call
+    from the digitizer's acquisition thread while the scan thread is inside a
+    move. Returns None before the scan has an origin, which makes the simulated
+    specimen featureless until a scan actually starts.
+
+    z is not offset by anything: only differences are used for arc length, and
+    the defect lookup ignores it.
+    """
+    xyz = live_pose.xyz()
+    if xyz is None or scan_origin is None:
+        return None
+    return (xyz[0] - scan_origin[0], xyz[1] - scan_origin[1], xyz[2])
+
+global ascan_source
+ascan_source = None
+
+def _scan_module_dir():
+    """Locate dgpfiles/modules regardless of where this config was launched from.
+    include() resolves relative paths against the launcher's working directory,
+    not against this file, so 'modules/foo.dpi' only works from one place."""
+    here = os.path.abspath(os.getcwd())
+    for _ in range(4):
+        for cand in (os.path.join(here, "dgpfiles", "modules"),
+                     os.path.join(here, "modules")):
+            if os.path.isdir(cand):
+                return cand
+        here = os.path.dirname(here)
+    raise RuntimeError("cannot find dgpfiles/modules from %s" % (os.getcwd(),))
+
+# Geometry-free recording, structured toolpaths, and projection. Included
+# unconditionally: they define classes and helpers, and cost nothing until used.
+# Recorded once, because a .dpi has no __file__ of its own and noether_path.dpi
+# has to find the Blender helper script sitting beside it.
+global SCAN_MODULE_DIR
+SCAN_MODULE_DIR = _scan_module_dir()
+
+# FIRST, because everything else reports through it. progress.dpi is the shared
+# "say what is happening during the slow parts" helper: rate-limited plain
+# lines with elapsed time, a fraction, an honest ETA and a closing line that
+# prints even when the stage is killed. It depends on nothing, so it goes at
+# the top of the list; the mesh reconstruction, the Noether planning and the
+# specimen stages all call into it.
+include(None, os.path.join(SCAN_MODULE_DIR, "progress.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "toolpath_segments.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "trace_acquisition.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "surface_projection.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "triggered_acquisition.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "noether_path.dpi"))
+# The independent tooling-clearance check. Loaded next to noether_path.dpi
+# because it is the same kind of thing -- geometry over a planned path, no ROS
+# and no robot -- and because mesh_scan.dpi and mesh_reconstruction.dpi both
+# refuse to fly a sweep without it (they warn and continue if it is absent).
+include(None, os.path.join(SCAN_MODULE_DIR, "tooling_clearance.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "pitch_crossings.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "timestamped_trigger.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "scan_parameters.dpi"))
+
+# The limits the plan is checked against, assembled from the technician controls
+# above. Everything not overridden there keeps the measured default and the
+# comment explaining where it came from.
+global SCAN_LIMITS
+SCAN_LIMITS = dict(DEFAULT_LIMITS)
+SCAN_LIMITS["max_trace_rate_hz"] = dict(MAX_TRACE_RATE_HZ)
+SCAN_LIMITS["max_scan_time_s"] = MAX_SCAN_TIME_S
+SCAN_LIMITS["max_trace_memory_bytes"] = MAX_TRACE_MEMORY
+SCAN_LIMITS["max_clamp_factor"] = MAX_VELOCITY_OVERAGE
+
+if ASCAN_SOURCE == "simulated":
+    include(None, os.path.join(_scan_module_dir(), "sim_ascan_source.dpi"))
+    # position_fn, not set_position(): the simulator synthesises each A-scan at
+    # wherever the probe actually is when that A-scan is triggered, which is what
+    # a real digitizer sweeping a continuous row does. Pushing the position in
+    # from the scan can only ever describe where the probe was at the last point
+    # the scan thread was free to look.
+    # The trigger pitch is the technician's step size. A plane scan overrides it
+    # with its own grid pitch at the moment the grid is known (see
+    # Scan2DPlaneTriggered), because there trigger k has to BE column k; nothing
+    # else has a grid to agree with.
+    _trigger_pitch = ASCAN_TRIGGER_PITCH
+    if _trigger_pitch is None:
+        _trigger_pitch = SCAN_STEP_SIZE
+    # "timestamped" runs the simulated card FREE, like a real one: it publishes
+    # every shot at rate_hz and knows nothing about the scan. The trigger is a
+    # separate object that correlates by timestamp -- which is the only
+    # arrangement a real digitizer can be driven in.
+    _sim_mode = "timer" if ASCAN_TRIGGER_MODE == "timestamped" else ASCAN_TRIGGER_MODE
+    ascan_source = start_sim_ascan_source(recdb, ASCAN_CHANNEL_PATH,
+                                          num_points=ASCAN_NUM_POINTS,
+                                          sample_rate=ASCAN_SAMPLE_RATE,
+                                          rate_hz=(ASCAN_FREERUN_RATE_HZ
+                                                   if ASCAN_TRIGGER_MODE == "timestamped"
+                                                   else ASCAN_RATE_HZ),
+                                          position_fn=probe_position_relative_to_scan,
+                                          standoff_tof_gradient=SPECIMEN_TILT,
+                                          trigger_mode=_sim_mode,
+                                          trigger_pitch_m=_trigger_pitch,
+                                          output_dtype=ASCAN_SIM_DTYPE)
+    if ASCAN_TRIGGER_MODE == "timestamped":
+        if transmgr is None:
+            raise RuntimeError("ASCAN_TRIGGER_MODE='timestamped' needs "
+                               "RECDB_TRANSACTION_MANAGER='timed' -- the correlation "
+                               "IS the timestamp ordering, and the ordered manager "
+                               "does not provide it.")
+        # The card keeps free-running on ASCAN_CHANNEL_PATH; this becomes the
+        # object the acquisition arms, and it hands back the A-scan that was
+        # current at each crossing.
+        #
+        # Keep a name for the simulated card itself: ascan_source is about to be
+        # rebound to the trigger, and the card is the thing that counts shots the
+        # recording database refused (dropped_acquisitions). Without this the
+        # only evidence of a dropped sample is transmgr.late_transactions, which
+        # says how many but not which producer.
+        sim_ascan_card = ascan_source
+        ascan_source = TimestampedTriggerSource(
+            recdb, transaction_clock, ASCAN_CHANNEL_PATH,
+            probe_position_relative_to_scan, _trigger_pitch,
+            pose_path="/ut/trigger_pose")
+        print("  A-scan trigger: timestamped correlation against a free-running "
+              "%.0f Hz card, one trace per %.3f mm"
+              % (ASCAN_FREERUN_RATE_HZ, _trigger_pitch*1e3))
+    if ASCAN_TRIGGER_MODE == "position":
+        print("  A-scan trigger: position, one per %.3f mm of travel"
+              % (_trigger_pitch*1e3,))
+elif ASCAN_SOURCE == "hardware":
+    # The GaGe CompuScope. It owns ASCAN_CHANNEL_PATH and is configured
+    # independently of this file -- record length, sample rate and whether it
+    # reports raw counts (int8/int16) or volts (float64) are all set on the card
+    # and can change between runs. Nothing here hardcodes any of them; see
+    # ascan_geometry().
+    from dgpython_gage_compuscope.cs import CompuScope
+    from dgpython_gage_compuscope import gc
+
+    CS = CompuScope("CS", recdb, 0, 0, 0, 0, Mode="SINGLE")
+    # The card free-runs and knows nothing about the scan, so there is no
+    # "source object" to arm the way the simulator provides one. What the
+    # triggered acquisition needs instead is a correlator, and that is not
+    # simulator-specific: TimestampedTriggerSource reads each trace out of the
+    # globalrev its own trigger's pose transaction produced, whatever put it
+    # there. Building it here is what makes run_triggered_scan() work on
+    # hardware -- without it ascan_source stays None, Scan2DPlaneTriggered
+    # refuses, and the card silently gets only the two sampling paths.
+    ascan_source = None
+    if ASCAN_TRIGGER_MODE == "timestamped":
+        if transmgr is None:
+            raise RuntimeError("ASCAN_TRIGGER_MODE='timestamped' needs "
+                               "RECDB_TRANSACTION_MANAGER='timed' -- the correlation "
+                               "IS the timestamp ordering, and the ordered manager "
+                               "does not provide it.")
+        ascan_source = TimestampedTriggerSource(
+            recdb, transaction_clock, ASCAN_CHANNEL_PATH,
+            probe_position_relative_to_scan,
+            SCAN_STEP_SIZE if ASCAN_TRIGGER_PITCH is None else ASCAN_TRIGGER_PITCH,
+            pose_path="/ut/trigger_pose")
+        print("  A-scan trigger: timestamped correlation against the card's own "
+              "free-running output on %s" % (ASCAN_CHANNEL_PATH,))
+    elif ASCAN_TRIGGER_MODE == "position":
+        # "position" means something different here than it does for the
+        # simulator. There, the source synthesises a trace AT the crossing; a
+        # real card cannot be made to do that from software, so a position
+        # trigger on hardware is a WIRE -- the trigger box fires the card
+        # directly (see scan-trigger-box/). Nothing in this config drives that,
+        # and pretending otherwise would produce a scan that silently samples
+        # instead of triggering, so say so rather than continue.
+        raise RuntimeError(
+            "ASCAN_TRIGGER_MODE='position' with ASCAN_SOURCE='hardware' is not "
+            "something this config can arrange: the card is triggered by the "
+            "trigger box in hardware, not by software. Use 'timestamped' to "
+            "correlate the free-running card against the probe position, or "
+            "'timer' for the sampling paths (run_default_scan / "
+            "run_raster_scan).")
+else:
+    raise ValueError("ASCAN_SOURCE must be 'simulated' or 'hardware', not %r" % (ASCAN_SOURCE,))
+
+# ==============================================================================
+# THE REUSABLE PIECES
+# ==============================================================================
+# Everything below this line lives in .dpi includes rather than inline here,
+# because the reconstruction stage has to call the same code from
+# ClientScannerTest.dgp as well, and a .dgp is not importable.
+#
+# Order matters only in that a .dpi is executed where it is included, so
+# anything running at include time sees the config above it.  These define
+# functions and classes and run nothing, so they are grouped rather than
+# scattered back through the file.
+
+# First, because everything that crops anything asks it where the work cell is.
+include(None, os.path.join(SCAN_MODULE_DIR, "work_cell.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "digitizer.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
+
+# THE WORK CELL'S MEASURED SPEED CURVE REPLACES THE ONE ABOVE, when the manifest has
+# one for this mode. After scan_plan.dpi because that is what consumes it, and
+# before anything plans. The config's own value stays as
+# ROBOT_VELOCITY_CALIBRATION_CONFIG.
+adopt_measured_velocity_curve()
+
+include(None, os.path.join(SCAN_MODULE_DIR, "scan_settings_panel.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "plane_scan.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "mesh_scan.dpi"))
+# The Keyence's measuring window and the three checks that keep the sensor
+# inside it; mesh_reconstruction.dpi warns and continues without it.
+include(None, os.path.join(SCAN_MODULE_DIR, "keyence_standoff.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "mesh_reconstruction.dpi"))
+# Before mesh_reconstruction can be pointed at a part, something has to say
+# where the part IS. yolo_region() derives the region a sweep takes from a
+# detection; it is optional in the sense that every route in also accepts a
+# region typed by hand, which is what a specimen the detector cannot see needs.
+include(None, os.path.join(SCAN_MODULE_DIR, "part_detection.dpi"))
+include(None, os.path.join(SCAN_MODULE_DIR, "specimen.dpi"))
+# Simulation only in effect: place_gazebo_specimen() puts the test plate into a
+# running Gazebo so there is something for the Azure to reconstruct. Included
+# unconditionally because it defines functions and starts nothing -- its Gazebo
+# service calls only happen when it is called, and on hardware nobody calls it.
+include(None, os.path.join(SCAN_MODULE_DIR, "sim_specimen.dpi"))
+
+
+global capture_point
+def capture_point(label=None):
+    """Snapshot the probe pose for one corner of a taught scan area.
+
+    This is the three-point workflow's only input: drive the probe to a corner,
+    call this, repeat three times, hand the three to Scan2DPlaneTriggered. See
+    docs/three-point-plane-scan.md.
+
+    It exists rather than telling people to write `p1 = ros.t` because of what
+    ros.t is before TF arrives: the motion module initialises it to an EMPTY
+    TransformStamped -- frame_id '', stamp 0, position (0,0,0), orientation
+    identity -- and it is never None, so a bare capture cannot tell "the probe
+    is here" from "this process has never heard from TF". Teaching three corners
+    from that is silent: the corners are all identical, the plane is degenerate,
+    and the first sign of trouble is a scan somewhere else entirely. A dgpy that
+    comes up while DDS discovery is stale stays in exactly that state.
+
+    Returns the TransformStamped, which is a snapshot: the TF thread rebinds
+    ros.t on every poll rather than mutating it, so captures stay distinct while
+    the arm keeps moving.
+    """
+    t = ros.t
+    if t is None or not t.header.frame_id or not t.child_frame_id:
+        raise RuntimeError(
+            "no probe pose yet: ros.t is still the empty transform this module "
+            "starts with, so nothing has been heard from TF. The cell is not "
+            "running, or this process cannot see it -- check that the bring-up "
+            "is up and that `ros2 topic echo /tf` shows traffic. Capturing now "
+            "would teach a corner at the origin.")
+    xyz = (t.transform.translation.x, t.transform.translation.y,
+           t.transform.translation.z)
+    print("  captured %s: x %.4f  y %.4f  z %.4f  (%s -> %s)"
+          % (label or "point", xyz[0], xyz[1], xyz[2],
+             t.header.frame_id, t.child_frame_id))
+    return t
+
+
+global scan_corners
+def scan_corners(size=0.30, height=1.0, origin=None):
+    """Three TransformStamped corners for a square scan area.
+
+    origin is (x, y) in world coordinates; leaving it None starts from wherever
+    the probe is, which is convenient but drifts -- a scan started from a
+    position the arm has wandered to can run off the edge of the workspace, and
+    every point past the limit just logs "Ensure point is reachable". Pin it for
+    anything you intend to compare.
+    """
+    p1 = ros.t
+    waited = 0.0
+    # An EMPTY transform counts as "no TF yet", not as a pose. ros.t is never
+    # None -- the module initialises it to a blank TransformStamped -- so
+    # waiting on None alone returns instantly with a corner at the origin.
+    while (p1 is None or not p1.header.frame_id) and waited < 30.0:
+        print("waiting for TF ...")
+        time.sleep(1.0)
+        waited += 1.0
+        p1 = ros.t
+    if p1 is None or not p1.header.frame_id:
+        raise RuntimeError("no TF for probe_end after %.0f s; is the simulation running?" % waited)
+
+    p1 = copy.deepcopy(p1)
+    if origin is not None:
+        p1.transform.translation.x = float(origin[0])
+        p1.transform.translation.y = float(origin[1])
+    p1.transform.translation.z = height
+
+    p2 = copy.deepcopy(p1)
+    p2.transform.translation.x += size
+
+    p3 = copy.deepcopy(p1)
+    p3.transform.translation.y += size
+
+    return p1, p2, p3
+
+global run_default_scan
+def run_default_scan(m=None, n=None, size=0.30, height=1.0, origin=SCAN_ORIGIN, max_points=None):
+    """Point-to-point scan of a square area. Stops at every point.
+
+    No scan plan and no velocity derivation, deliberately: the arm stops at every
+    point and takes one A-scan while stationary, so there is no sweep speed to
+    constrain and the cost is MoveIt's plan-and-execute cycle (0.3-0.5 s per
+    point regardless of step size). SCAN_STEP_SIZE still chooses the grid.
+    """
+    _m, _n = plane_grid_size(size)
+    m = _m if m is None else m
+    n = _n if n is None else n
+    p1, p2, p3 = scan_corners(size=size, height=height, origin=origin)
+    print("Scanning %dx%d over %.2f m from (%.3f, %.3f, %.3f)"
+          % (m, n, size, p1.transform.translation.x, p1.transform.translation.y, height))
+    return Scan2DPlane(p1, p2, p3, m, n, max_points=max_points)
+
+global run_raster_scan
+def run_raster_scan(m=None, n=None, size=0.30, height=1.0, origin=SCAN_ORIGIN,
+                    max_rows=None, force=False):
+    """Continuous scan of a square area: one trajectory per row."""
+    _m, _n = plane_grid_size(size)
+    m = _m if m is None else m
+    n = _n if n is None else n
+    p1, p2, p3 = scan_corners(size=size, height=height, origin=origin)
+    print("Raster scanning %dx%d over %.2f m from (%.3f, %.3f, %.3f)"
+          % (m, n, size, p1.transform.translation.x, p1.transform.translation.y, height))
+    return Scan2DPlaneRaster(p1, p2, p3, m, n, max_rows=max_rows, force=force)
+
+global run_triggered_scan
+def run_triggered_scan(m=None, n=None, size=0.30, height=1.0, origin=SCAN_ORIGIN,
+                       max_rows=None, force=False):
+    """Continuous scan of a square area, acquisition driven by the position trigger."""
+    _m, _n = plane_grid_size(size)
+    m = _m if m is None else m
+    n = _n if n is None else n
+    p1, p2, p3 = scan_corners(size=size, height=height, origin=origin)
+    print("Triggered scanning %dx%d over %.2f m from (%.3f, %.3f, %.3f)"
+          % (m, n, size, p1.transform.translation.x, p1.transform.translation.y, height))
+    return Scan2DPlaneTriggered(p1, p2, p3, m, n, max_rows=max_rows, force=force)
+
+global run_mesh_scan
+def run_mesh_scan(mesh=None, max_passes=None, replan=False, force=False, **kwargs):
+    """Plan a mesh with Noether and scan it. Scenario B, end to end."""
+    if replan or mesh_scan_path is None or mesh is not None:
+        plan_mesh_path(mesh=mesh, **kwargs)
+    return Scan2DMeshPath(max_passes=max_passes, force=force)
+
+print("UTPlaneScan ready.")
+print("  A-scan source: %s" % (ASCAN_SOURCE,))
+print(describe_ascan())
+print("  volume storage: %s" % (SCAN_STORAGE_DIR if scan_storage_manager is not None else "memory"))
+print("  step size %.2f mm, line spacing %.2f mm, velocity %.1f mm/s, projection %s"
+      % (SCAN_STEP_SIZE*1e3, SCAN_LINE_SPACING*1e3, SCAN_VELOCITY*1e3,
+         PROJECTION_MODE))
+print("  show_scan_panel()   the technician panel: step, velocity, gate, projection")
+print("  preview_scan_plan() what those settings would cost, without moving")
+print("  project_traces()    rebuild the projected image from the trace list")
+print("  run_default_scan()  point to point, stops at every point")
+print("  run_raster_scan()   continuous, one trajectory per row (needs /execute_raster)")
+print("  run_triggered_scan() continuous, one trace per trigger (ASCAN_TRIGGER_MODE 'timestamped' or 'position')")
+print("  or Scan2DPlane / Scan2DPlaneRaster / Scan2DPlaneTriggered with your own corners.")
+print("  run_mesh_scan()     surface-following scan of a mesh, via Noether")
+print("                      plan_mesh_path() then mesh_path_feasibility() first if")
+print("                      the specimen is new -- it moves nothing and it is the")
+print("                      difference between a scan and an afternoon.")

@@ -1,0 +1,406 @@
+# ==============================================================================
+# THE TECHNICIAN'S FRONT PANEL
+# ==============================================================================
+# A Qt panel is the least application-specific thing in a scan config: this one
+# reads and writes the technician globals (SCAN_STEP_SIZE, SCAN_LINE_SPACING,
+# SCAN_VELOCITY, PROJECTION_*), drives the gate channels and calls
+# preview_scan_plan(), and knows nothing about which specimen is being scanned
+# or how it was planned.
+#
+# The three groups and why they are split that way: see the class docstring.
+
+global cscan_panel
+cscan_panel = None
+
+global ScanSettingsPanel
+class ScanSettingsPanel(Qt.QtWidgets.QWidget):
+    """The technician's front panel: set up a scan, gate it, choose how it draws.
+
+    Three groups, and the split is not cosmetic -- they differ in WHEN they take
+    effect, which is the thing an operator most needs to know:
+
+      Scan        step size, line spacing, velocity. These size the accumulators
+                  and the grid, so they are read when a scan STARTS and cannot
+                  change under one that is running. The panel therefore shows
+                  what they would produce rather than pretending to apply them.
+      Gate        start and end of the time-of-flight window. Every gate bound is
+                  its own recording channel, so these retune the c-scan LIVE over
+                  data already acquired -- which is what those channels are for.
+      Projection  mode, spot radius, resolution. Mode is live; the other two
+                  rebuild the projection math function, which necessarily empties
+                  the image, so they are applied by a button and paired with the
+                  replay that fills it back in from the trace list.
+    """
+
+    def __init__(self, recdb):
+        super().__init__()
+        self.recdb = recdb
+
+        self.setWindowTitle("Scan Settings")
+        layout = Qt.QtWidgets.QVBoxLayout()
+        layout.addWidget(self._scan_group())
+        layout.addWidget(self._gate_group())
+        layout.addWidget(self._projection_group())
+        layout.addStretch(1)
+        self.setLayout(layout)
+        self.refresh_plan()
+
+    # -- scan setup --------------------------------------------------------
+
+    def _scan_group(self):
+        box = Qt.QtWidgets.QGroupBox("Scan setup (applies to the next scan)")
+        form = Qt.QtWidgets.QFormLayout()
+
+        self.step_spin = self._mm_spin(SCAN_STEP_SIZE, 0.01, 50.0, 0.5)
+        form.addRow("Step size (mm):", self.step_spin)
+
+        self.spacing_spin = self._mm_spin(SCAN_LINE_SPACING, 0.05, 200.0, 1.0)
+        form.addRow("Line spacing (mm):", self.spacing_spin)
+
+        self.velocity_spin = self._mm_spin(SCAN_VELOCITY, 0.1, 500.0, 5.0)
+        form.addRow("Velocity (mm/s):", self.velocity_spin)
+
+        # A plan is arithmetic over a handful of constants -- cheap -- but a
+        # spinbox drag fires per step, so coalesce.
+        self.plan_debounce = Qt.QtCore.QTimer(self)
+        self.plan_debounce.setSingleShot(True)
+        self.plan_debounce.setInterval(200)
+        self.plan_debounce.timeout.connect(self.apply_scan_settings)
+        for spin in (self.step_spin, self.spacing_spin, self.velocity_spin):
+            # request_plan_update, not plan_debounce.start directly:
+            # valueChanged carries the new value, and QTimer.start() takes an
+            # INTERVAL, so connecting them makes a spin of 5.0 restart the timer
+            # with a 5 ms interval.
+            spin.valueChanged.connect(self.request_plan_update)
+
+        # Monospaced, because it is a table of numbers and a proportional font
+        # makes a column of millimetres unreadable.
+        self.plan_label = Qt.QtWidgets.QLabel("")
+        self.plan_label.setFont(Qt.QtGui.QFont("monospace"))
+        form.addRow(self.plan_label)
+
+        box.setLayout(form)
+        return box
+
+    def _mm_spin(self, value_m, lo_mm, hi_mm, step_mm):
+        spin = Qt.QtWidgets.QDoubleSpinBox()
+        spin.setDecimals(2)
+        spin.setRange(lo_mm, hi_mm)
+        spin.setSingleStep(step_mm)
+        spin.setValue(float(value_m)*1e3)
+        spin.setKeyboardTracking(False)
+        return spin
+
+    def request_plan_update(self, _value=None):
+        self.plan_debounce.start()
+
+    def apply_scan_settings(self):
+        """An operator edited a control: push it into the config.
+
+        Writing the globals ONLY from here, and never from refresh_plan(), is
+        load-bearing. The panel is shown again at the start of every scan, and
+        showing it is dispatched asynchronously to the Qt thread -- so a version
+        of this that wrote the globals on every refresh raced the scan that had
+        just asked for it, and whichever won decided the step size. Measured: two
+        identical Scan2DMeshPath() calls after a programmatic step change, one at
+        1.0 mm and one silently back at the panel's 5.0 mm.
+
+        Show is now read-only and edits are the only writer, so there is nothing
+        to race.
+        """
+        global SCAN_STEP_SIZE, SCAN_LINE_SPACING, SCAN_VELOCITY
+        SCAN_STEP_SIZE = self.step_spin.value()*1e-3
+        SCAN_LINE_SPACING = self.spacing_spin.value()*1e-3
+        SCAN_VELOCITY = self.velocity_spin.value()*1e-3
+        self.refresh_plan()
+
+    def refresh_plan(self):
+        """Show what the current settings would produce. Writes nothing."""
+        try:
+            # force=True: a preview reports what is wrong, it does not refuse.
+            # Refusing is the scan's job, and it still will.
+            self.plan_label.setText(format_scan_plan(preview_scan_plan(force=True)))
+        except Exception as e:
+            self.plan_label.setText("cannot plan: %s" % (e,))
+
+    def refresh_from_config(self):
+        """Take the controls back from the config, without writing to it.
+
+        What the panel is showing has to follow a setting changed from the
+        prompt or by a scan, or the two disagree and the next edit silently
+        reverts it. Signals blocked so putting a value into a spinbox does not
+        come straight back as an edit.
+        """
+        for spin, value in ((self.step_spin, SCAN_STEP_SIZE),
+                            (self.spacing_spin, SCAN_LINE_SPACING),
+                            (self.velocity_spin, SCAN_VELOCITY)):
+            blocked = spin.blockSignals(True)
+            spin.setValue(float(value)*1e3)
+            spin.blockSignals(blocked)
+        blocked = self.mode_combo.blockSignals(True)
+        idx = self.mode_combo.findData(PROJECTION_MODE)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+        self.mode_combo.blockSignals(blocked)
+        self.refresh_plan()
+
+    # -- the gate ----------------------------------------------------------
+
+    def _gate_group(self):
+        box = Qt.QtWidgets.QGroupBox("Gate (live)")
+        form = Qt.QtWidgets.QFormLayout()
+
+        # Every gate change costs a full reduction over the whole volume, so
+        # coalesce a drag into one update once the value settles rather than
+        # firing one per step.
+        self.debounce = Qt.QtCore.QTimer(self)
+        self.debounce.setSingleShot(True)
+        self.debounce.setInterval(250)
+        self.debounce.timeout.connect(self.update_gates)
+
+        # The gate is in TIME, and its range is the record the digitizer is
+        # actually producing -- not a hardcoded span. A CompuScope reconfigured
+        # for a longer record or a different sample rate changes both the limit
+        # and what a given number means, so both are read from the data.
+        #
+        # If the A-scan carries no time axis, cscan_gate falls
+        # back to scale=1.0 and the gate really is a sample index; say so on the
+        # label rather than showing microseconds that are not microseconds.
+        geom = ascan_geometry(timeout=5.0, require=False)
+        self.dt = geom["dt"] if geom else 0.0
+        self.npoints = geom["num_points"] if geom else 0
+        self.in_time = self.dt > 0.0
+
+        if self.in_time:
+            units, self.to_channel, self.from_channel = "us", 1e-6, 1e6
+            limit = self.npoints*self.dt*1e6
+            note = "record is %.3f us" % limit
+        else:
+            # No time axis: the channel value IS the sample index.
+            units, self.to_channel, self.from_channel = "sample", 1.0, 1.0
+            limit = float(self.npoints) if self.npoints else 1e9
+            note = ("no time axis on %s -- gate is sample index"
+                    % (ASCAN_CHANNEL_PATH,))
+        if not limit > 0.0:
+            limit = 1e9
+            note = "no A-scan yet; range unknown until the digitizer produces one"
+
+        form.addRow(Qt.QtWidgets.QLabel(note))
+
+        self.start_spin = Qt.QtWidgets.QDoubleSpinBox()
+        self.start_spin.setDecimals(3 if self.in_time else 0)
+        self.start_spin.setRange(0.0, limit)
+        self.start_spin.setValue(min(CSCAN_START_TOF*self.from_channel, limit))
+        self.start_spin.setKeyboardTracking(False)
+        self.start_spin.valueChanged.connect(self.request_update)
+        form.addRow("C-Scan Start (%s):" % units, self.start_spin)
+
+        self.end_spin = Qt.QtWidgets.QDoubleSpinBox()
+        self.end_spin.setDecimals(3 if self.in_time else 0)
+        self.end_spin.setRange(0.0, limit)
+        self.end_spin.setValue(min(CSCAN_END_TOF*self.from_channel, limit))
+        self.end_spin.setKeyboardTracking(False)
+        self.end_spin.valueChanged.connect(self.request_update)
+        form.addRow("C-Scan End (%s):" % units, self.end_spin)
+
+        box.setLayout(form)
+        return box
+
+    def request_update(self):
+        self.debounce.start()
+
+    def update_gates(self):
+        start_val = self.start_spin.value() * self.to_channel
+        end_val = self.end_spin.value() * self.to_channel
+        try:
+            with self.recdb.start_transaction() as trans:
+                s_ref = snde.create_ndarray_ref(trans, cscan_start_chan, snde.SNDE_RTN_FLOAT64)
+                s_ref.allocate_storage([1], False)
+                s_ref.data[0] = start_val
+                s_ref.rec.mark_data_and_metadata_ready()
+
+                e_ref = snde.create_ndarray_ref(trans, cscan_end_chan, snde.SNDE_RTN_FLOAT64)
+                e_ref.allocate_storage([1], False)
+                e_ref.data[0] = end_val
+                e_ref.rec.mark_data_and_metadata_ready()
+        except Exception as e:
+            print("update_gates error:", e)
+
+    # -- projection --------------------------------------------------------
+
+    PROJECTION_MODES = (
+        ("live", "Live -- draws while scanning, ~10 traces/s ceiling"),
+        ("deferred", "Deferred -- replay after the scan, 11x faster"),
+        ("off", "Off -- record only"),
+    )
+
+    def _projection_group(self):
+        box = Qt.QtWidgets.QGroupBox("Projection")
+        form = Qt.QtWidgets.QFormLayout()
+
+        self.mode_combo = Qt.QtWidgets.QComboBox()
+        for mode, label in self.PROJECTION_MODES:
+            self.mode_combo.addItem(label, mode)
+        idx = self.mode_combo.findData(PROJECTION_MODE)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+        self.mode_combo.currentIndexChanged.connect(self.set_projection_mode)
+        form.addRow("Mode:", self.mode_combo)
+
+        radius, pixels = projection_settings()
+
+        # Zero means "derive from the step size", which is the default and the
+        # thing an operator should normally leave alone -- so it is a value of
+        # the control rather than a separate checkbox.
+        self.radius_spin = Qt.QtWidgets.QDoubleSpinBox()
+        self.radius_spin.setDecimals(2)
+        self.radius_spin.setRange(0.0, 100.0)
+        self.radius_spin.setSingleStep(0.5)
+        self.radius_spin.setSpecialValueText("auto (%.1f mm)" % (radius*1e3))
+        self.radius_spin.setValue(0.0 if PROJECTION_SPOT_RADIUS is None
+                                  else PROJECTION_SPOT_RADIUS*1e3)
+        self.radius_spin.setKeyboardTracking(False)
+        form.addRow("Spot radius (mm):", self.radius_spin)
+
+        self.pixels_combo = Qt.QtWidgets.QComboBox()
+        self.pixels_combo.addItem("auto (%d)" % pixels, 0)
+        for px in SCAN_LIMITS["pixel_steps"]:
+            self.pixels_combo.addItem(str(px), px)
+        if PROJECTION_PIXELS:
+            found = self.pixels_combo.findData(int(PROJECTION_PIXELS))
+            if found >= 0:
+                self.pixels_combo.setCurrentIndex(found)
+        form.addRow("Resolution (px):", self.pixels_combo)
+
+        buttons = Qt.QtWidgets.QHBoxLayout()
+        apply_btn = Qt.QtWidgets.QPushButton("Apply (clears image)")
+        apply_btn.clicked.connect(self.apply_projection)
+        buttons.addWidget(apply_btn)
+        replay_btn = Qt.QtWidgets.QPushButton("Re-project from traces")
+        replay_btn.clicked.connect(self.replay_projection)
+        buttons.addWidget(replay_btn)
+        holder = Qt.QtWidgets.QWidget()
+        holder.setLayout(buttons)
+        form.addRow(holder)
+
+        self.projection_status = Qt.QtWidgets.QLabel("")
+        self.projection_status.setWordWrap(True)
+        form.addRow(self.projection_status)
+
+        box.setLayout(form)
+        return box
+
+    def set_projection_mode(self, _index=None):
+        """Live, and deliberately so.
+
+        Switching to "deferred" partway through a scan that is falling behind
+        drops the second globalrev wait out of the per-trace path from the next
+        trace on, and the picture is filled in from the trace list at the end
+        instead. That is a real recovery, not a preference.
+        """
+        global PROJECTION_MODE
+        PROJECTION_MODE = self.mode_combo.currentData()
+        self.projection_status.setText("mode is now %r%s" % (
+            PROJECTION_MODE,
+            "; the image will be built at the end of the scan"
+            if PROJECTION_MODE == "deferred" else ""))
+        self.refresh_plan()
+
+    def apply_projection(self, _checked=False):
+        """Rebuild the projection math function with the new spot and resolution.
+
+        This EMPTIES the image: the radius and the pixel count are constructor
+        arguments of project_point_onto_parameterization, so changing either
+        means a new function on a new output recording, and the accumulated
+        picture cannot come with it. Which is exactly why the replay exists --
+        press the other button and it comes back from the trace list in seconds.
+        """
+        global PROJECTION_SPOT_RADIUS, PROJECTION_PIXELS
+        r = self.radius_spin.value()
+        PROJECTION_SPOT_RADIUS = (r*1e-3) if r > 0.0 else None
+        px = self.pixels_combo.currentData()
+        PROJECTION_PIXELS = int(px) if px else None
+        self.refresh_plan()
+
+        if projector is None:
+            self.projection_status.setText(
+                "settings stored; they will be used when a scan builds a surface")
+            return
+        radius, pixels = projection_settings()
+        self._in_background(
+            "applying spot %.2f mm at %d px" % (radius*1e3, pixels),
+            self._restart_projector, radius, pixels)
+
+    def _restart_projector(self, radius, pixels):
+        projector.radius = radius
+        projector.horizontal_pixels = pixels
+        projector.vertical_pixels = pixels
+        projector.restart()
+        return "spot %.2f mm at %d px; image cleared" % (radius*1e3, pixels)
+
+    def replay_projection(self, _checked=False):
+        self._in_background("re-projecting ...", self._replay)
+
+    def _replay(self):
+        res = project_traces(quiet=True)
+        return ("re-projected %d trace(s) in %.1f s (%.0f traces/s)"
+                % (res["projected"], res["elapsed"],
+                   res["projected"]/res["elapsed"] if res["elapsed"] else 0.0))
+
+    def _in_background(self, busy_text, fn, *args):
+        """Run a database operation off the Qt main thread.
+
+        Not optional. Restarting the projector is a transaction and a replay is
+        thousands of them; done from the Qt thread the whole viewer -- including
+        the projection the operator is watching -- freezes until it finishes.
+        InitFreeThread is what makes a bare thread safe to touch dgpy from.
+        """
+        self.projection_status.setText(busy_text)
+
+        def work():
+            from dataguzzler_python import context
+            context.InitFreeThread()
+            try:
+                msg = fn(*args)
+            except Exception as e:
+                msg = "failed: %s" % (e,)
+            print("  projection: %s" % msg)
+            QtWrapper.DispatchToQtMainThreadLoop(
+                None, self.projection_status.setText, "projection_status",
+                (msg,), {})
+
+        threading.Thread(target=work, daemon=True).start()
+
+# The old name, because it is what a session that predates the scan and
+# projection controls will type.
+global CScanSettingsPanel
+CScanSettingsPanel = ScanSettingsPanel
+
+global _show_cscan_panel
+def _show_cscan_panel():
+    """Raise the scan settings panel, creating it once per session.
+
+    Recreating it per scan used to be harmless because it held only the gate
+    bounds. It is not harmless now: the panel OWNS the step size, the line
+    spacing and the velocity, so throwing it away and rebuilding it from the
+    globals in the middle of a session would quietly discard whatever the
+    operator had dialled in but not yet scanned with.
+    """
+    global cscan_panel
+    def create_panel():
+        global cscan_panel
+        if cscan_panel is None:
+            cscan_panel = ScanSettingsPanel(recdb)
+        else:
+            # Read-only: this runs on the Qt thread while the scan that asked
+            # for it is already reading the same settings. See
+            # apply_scan_settings().
+            cscan_panel.refresh_from_config()
+        cscan_panel.show()
+        cscan_panel.raise_()
+    QtWrapper.DispatchToQtMainThreadLoop(None, create_panel, "create_panel", (), {})
+
+global show_scan_panel
+def show_scan_panel():
+    """Open the technician panel without starting a scan."""
+    _show_cscan_panel()

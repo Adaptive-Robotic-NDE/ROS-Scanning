@@ -1,0 +1,73 @@
+from dataguzzler_python import dgpy
+import spatialnde2 as snde
+import sys
+import time
+import os
+import numpy as np
+import rclpy
+import dgpython_rosmotion as rosm
+
+print(sys.executable, sys.version)
+
+# 1. Base Setup
+include(dgpy, "dgpy_startup.dpi")
+include(dgpy, "Qt.dpi", prefer_pyqt=True)
+include(snde, "recdb.dpi", enable_opencl=True)
+include(snde, "recdb_gui.dpi")
+
+rclpy.init()
+
+# 2. Hardware / Simulation Instantiation
+from ament_index_python.packages import get_package_share_directory
+tari_ur_description_pkg = get_package_share_directory('tari_ur_description')
+eddie_current_probe_mesh = os.path.join(tari_ur_description_pkg, 'meshes', 'ecProbe.x3d')
+
+ros = rosm.motion('ros', recdb, 'probe_end', 'world', eoat_mesh=eddie_current_probe_mesh)
+include(rosm, "services.dpi")
+
+# 3. Include Core Logic Modules
+include(None, "modules/direct_mesh.dpi") 
+include(None, "modules/toolpath.dpi")
+include(None, "modules/sim_ut_acquisition.dpi")
+include(None, "modules/scan_projection.dpi")
+include(None, "modules/scan_orchestrator.dpi")
+
+# Initialize managers
+projection_manager = ScanProjectionManager(recdb, ros)
+ascan_chan, cscan_scalar_chan, probe_pose_copy_chan = setup_sim_ut_channels(recdb)
+
+# 4. Define Execution Wrap Function
+def run_ultrasound_scan(mesh_path="/home/user/software_ws/ROS-Scanning/dgpfiles/flat_plate.x3d", line_spacing=0.02):
+    if not os.path.exists(mesh_path):
+        print(f"Error: Mesh file {mesh_path} does not exist.")
+        return
+
+    # Clear / Reuse existing state safely
+    specimen_tree, specimen_pose = load_mesh_to_scene(recdb, ros, mesh_path)
+    
+    # Fixed axis is used here for simplicity, passing the service client
+    origin_point = [0.97258, -0.32009, 0.97]
+    toolpath_poses = generate_fixed_axis_toolpath(fixed_axis_noether_client, mesh_path, line_spacing=line_spacing, origin=origin_point)
+    
+    if not toolpath_poses or not toolpath_poses.poses:
+        print("Failed to generate valid toolpath.")
+        return
+
+    num_poses = len(toolpath_poses.poses)
+    n = int(np.ceil(np.sqrt(num_poses)))
+    m = int(np.ceil(num_poses / n))
+    
+    projection_manager.setup_scalar_accumulator("/cscan_scalar", "/ndaccum_cscan", n, m)
+    projection_manager.setup_scalar_accumulator("/sim_ut_ascan", "/ndaccum_sim_ut_ascan", n, m)
+    projection_manager.setup_projection(specimen_tree, specimen_pose, "/cscan_scalar")
+
+    # Define the lambda for triggering data capture
+    capture_callback = lambda: mock_capture_ultrasound(recdb, ros, ascan_chan, cscan_scalar_chan, probe_pose_copy_chan)
+
+    # Run the scan using the chosen methodology
+    run_point_by_point_scan(ros, projection_manager, toolpath_poses, capture_callback)
+
+print("Setup complete. You can now execute `run_ultrasound_scan()` to start the simulation.")
+
+if __name__ == '__main__':
+    time.sleep(2) # Allow ROS to initialize fully

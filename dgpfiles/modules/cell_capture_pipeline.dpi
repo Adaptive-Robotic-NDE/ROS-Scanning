@@ -1,0 +1,676 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  cell_capture_pipeline.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Cell-capture scenarios that record the automated scan pipeline's own
+#   motions.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# CELL CAPTURE, PART 5: scenarios 4, 5, 7 and 8 -- the ones that fly the pipeline
+# ==============================================================================
+# These call the pipeline's own functions with EXPLICIT arguments (orient,
+# voxel size, sweep height, ...) rather than their defaults, which change under
+# them: a take has to say what it measured.
+
+# Each .dpi is its own function body: another part's imports are not visible.
+import contextlib
+import json
+import math
+import os
+import time
+
+import numpy as np
+
+global _cap_specimen_contact
+global capture_azure_sweeps
+global capture_keyence_sweeps
+global capture_contact
+global capture_full_pipeline
+global _cap_cylinder
+global _cap_cylinder_mesh
+global _cap_tooling_envelope
+global _cap_pass_clearance
+
+
+# ------------------------------------------------------------------------------
+# 4. Azure sweeps
+# ------------------------------------------------------------------------------
+
+def capture_azure_sweeps(region=None, lighting=None, variants=("pipeline", "tilted", "high"),
+                         height_step=0.10, stops=None, specimen=None, notes=None,
+                         voxel_length=0.006, sdf_trunc=0.024):
+    """SCENARIO 4. The pipeline's own sweep, a tilted one and a second height,
+    each with the live TSDF running, one take each.
+
+    "pipeline" is reconstruct_rough() exactly as it flies, "tilted" adds
+    the camera tilt, and "high"/"low" move the camera. What "move the camera"
+    means depends on SPECIMEN_SWEEP_STYLE, and the two are not interchangeable:
+
+      dome  heights are ABSOLUTE WORLD z and "high"/"low" step `height_step`,
+            so they really are the same part seen from further away.
+      pan   heights are ABOVE THE AIM PLANE and come from AZURE_PAN_HEIGHTS;
+            "high"/"low" take the top and bottom rungs. The slant range is held
+            constant by construction, so these change the obliquity rather than
+            the standoff.
+
+    Run it once per lighting condition: change the lights, then
+    capture_azure_sweeps(lighting="dim"). The live mesh is copied into each take
+    as live_azure.ply.
+    """
+    if region is None:
+        region = globals().get("detected_region")
+    if region is None:
+        raise ValueError("pass region=(xmin, ymin, xmax, ymax), or run detect_part() first")
+    region = tuple(float(v) for v in region)
+    lighting = lighting or _session()["lighting"] or "normal"
+    # WHICH SWEEP, because the two take different numbers and mixing them up
+    # refuses every direction. reconstruct_specimen() routes `height` to the pan
+    # branch or the dome branch depending on SPECIMEN_SWEEP_STYLE
+    # (specimen.dpi), and they do NOT mean the same thing:
+    #
+    #   dome:  height is an ABSOLUTE WORLD z for the camera, which is what
+    #          sweep_height_for() returns -- support_z + the depth mode's
+    #          minimum + the margin.
+    #   pan:   height is the camera's height ABOVE THE AIM PLANE, chosen from
+    #          AZURE_PAN_HEIGHTS; the standoff is bought sideways instead.
+    #
+    # Passing sweep_height_for() to the pan branch hands it an absolute camera z
+    # -- around 1.455 m, against the 0.5 m a rung is -- as a height above the
+    # part, and every direction is then refused with "the camera 1455 mm above
+    # the part and 0 mm clear of the region".
+    style = str(globals().get("SPECIMEN_SWEEP_STYLE")
+                or AZURE_SWEEP_STYLE_DEFAULT).lower()
+    if style == "pan":
+        # None is "as the pipeline flies it": pan_height_for() walks
+        # AZURE_PAN_HEIGHTS from the top and takes the first rung that reaches,
+        # which is the arm's business and not something to second-guess here.
+        base = (None if globals().get("SPECIMEN_SWEEP_CAMERA_HEIGHT") is None
+                else float(SPECIMEN_SWEEP_CAMERA_HEIGHT))
+        # Through globals(), not as a bare name: a .dpi is a function body, so
+        # a constant another .dpi forgot to declare `global` is simply absent
+        # here and raises NameError on the production system before the scenario can start.
+        rungs = tuple(float(v) for v in (globals().get("AZURE_PAN_HEIGHTS")
+                                         or (0.50, 0.45, 0.40, 0.35, 0.30)))
+        # A pan sweep holds its SLANT RANGE constant by construction, so a
+        # different rung changes the obliquity rather than the standoff -- which
+        # is still worth a take, but it is not the "same part, further away"
+        # comparison the dome variants are.
+        table = {"pipeline": (base, False), "tilted": (base, True),
+                 "high": (max(rungs), False), "low": (min(rungs), False)}
+    else:
+        height = (sweep_height_for() if SPECIMEN_SWEEP_HEIGHT is None
+                  else float(SPECIMEN_SWEEP_HEIGHT))
+        table = {"pipeline": (height, False), "tilted": (height, True),
+                 "high": (height + height_step, False),
+                 "low": (height - height_step, False)}
+    stops = tuple(int(v) for v in (stops or SPECIMEN_SWEEP_STOPS))
+    out = {}
+    for variant in variants:
+        h, rot = table[variant]
+        params = {"region": region, "variant": variant, "height": h, "rot": rot,
+                  "style": style, "stops": stops, "voxel_length": voxel_length,
+                  "sdf_trunc": sdf_trunc, "lighting": lighting}
+        _capture_say("  %s: %s sweep, camera %s%s"
+                     % (variant, style,
+                        "as the pipeline derives it" if h is None
+                        else ("%.0f mm above the part" % (1e3*h) if style == "pan"
+                              else "at z %.3f m" % h),
+                        ", tilted" if rot else ""))
+        take = None
+        try:
+            with capture_scenario("azure_%s_%s" % (variant, lighting), sets=("core", "azure"),
+                                  expect_s=480.0, params=params, pipeline=True,
+                                  lighting=lighting, specimen=specimen, notes=notes) as take:
+                mesh = reconstruct_specimen(
+                    source="azure", region=region, name=take.name,
+                    source_kwargs={"voxel_length": voxel_length, "sdf_trunc": sdf_trunc},
+                    height=h, x=stops[0], y=stops[1], rot=rot)
+                take.results["live_mesh"] = mesh
+                take.keep_file(mesh, "live_azure.ply")
+        except Exception as e:
+            _capture_say("  %s: %s" % (variant, (str(e).splitlines() or [repr(e)])[0]))
+        out[variant] = {"take": take.dir if take else None,
+                        "live_mesh": take.results.get("live_mesh") if take else None,
+                        "aborted": bool(take and take.aborted),
+                        "errors": list(take.errors) if take else ["did not start"]}
+    return out
+
+
+# ------------------------------------------------------------------------------
+# 5. Keyence sweeps
+# ------------------------------------------------------------------------------
+
+def _cap_cylinder(names, radius):
+    """The cylinder from two points taught on its crest, and its radius.
+
+    The CREST points were chosen over fitting the Azure mesh: they are exact
+    where the Azure mesh is noisy and lighting-dependent -- which is the very
+    thing this capture is for -- and they are the same points the contact
+    scenario needs anyway."""
+    a, b = _cap_point(names[0]), _cap_point(names[1])
+    R = float(radius or CAPTURE_CYLINDER_RADIUS)
+    u = (b - a)/np.linalg.norm(b - a)
+    zup = np.array([0.0, 0.0, 1.0])
+    up = zup - np.dot(zup, u)*u
+    up = up/np.linalg.norm(up)
+    side = np.cross(u, up)
+    return {"a": a, "b": b, "R": R, "u": u, "up": up, "side": side,
+            "axis0": a - R*up, "L": float(np.dot(b - a, u))}
+
+
+def _cap_cylinder_mesh(c, phi_deg=120.0, nphi=97, nt=41):
+    """The taught cylinder as a triangulated patch in world coordinates.
+
+    tooling_clearance.dpi measures against triangles, and the cylinder here is
+    analytic (two crest points and a radius), so it has to be turned into a
+    surface. +/-120 degrees about the crest rather than +/-90: the tooling is
+    75 mm wide and reaches round the flank well past the pass it is flying, and
+    a patch that stops at the equator would let the far side of the bracket hang
+    below the part and read as clear.
+    """
+    phis = np.radians(np.linspace(-phi_deg, phi_deg, int(nphi)))
+    ts = np.linspace(0.0, c["L"], int(nt))
+    m = (np.cos(phis)[:, None]*c["up"][None, :]
+         + np.sin(phis)[:, None]*c["side"][None, :])
+    verts = (c["axis0"][None, None, :] + ts[None, :, None]*c["u"][None, None, :]
+             + c["R"]*m[:, None, :]).reshape(-1, 3)
+    nt = int(nt)
+    i, j = np.meshgrid(np.arange(int(nphi) - 1), np.arange(nt - 1), indexing="ij")
+    a = (i*nt + j).reshape(-1)
+    tris = np.concatenate([np.stack([a, a + nt, a + 1], axis=1),
+                           np.stack([a + 1, a + nt, a + nt + 1], axis=1)])
+    return verts, tris.astype(np.int64)
+
+
+def _cap_tooling_envelope():
+    """The whole end-of-arm assembly, from the live robot description.
+
+    None (with a loud warning) if it cannot be built, because the capture tool
+    must still run -- but then the clearance check falls back to the probe tip
+    alone, which is the blind spot that lets the rest of the tooling reach the
+    part while the tip reads clear, so the take says which check it got.
+    """
+    try:
+        return tooling_envelope()
+    except Exception as e:
+        _capture_say("  WARNING: no tooling envelope (%s) -- clearance falls back to "
+                     "the probe TIP only, which does not see the rest of the tooling"
+                     % ((str(e).splitlines() or [repr(e)])[0],))
+        return None
+
+
+def _cap_pass_clearance(p0, p1, q, c, mesh=None, envelope=None, steps=9):
+    """How close the WHOLE tooling comes to the cylinder along one pass.
+
+    Returns (metres, which link, how it was measured). The pass is a straight
+    line at a fixed orientation, so nine samples cover it: the cylinder does not
+    curve along its axis, and the ends are where the finite patch matters.
+    """
+    if envelope is None:
+        gap = min(float(np.linalg.norm(np.cross(p - c["axis0"], c["u"])))
+                  for p in (p0, p1)) - c["R"]
+        return gap, "probe tip", "tip only"
+    pts = np.array([np.asarray(p0) + t*(np.asarray(p1) - np.asarray(p0))
+                    for t in np.linspace(0.0, 1.0, int(steps))])
+    path = ScanPath(pts, np.array([q]*int(steps)), [0], source="cylinder pass")
+    rep = path_clearance(path, mesh, envelope=envelope, outward=c["up"])
+    worst = int(np.argmin(rep["clearance"]))
+    return float(rep["min_m"]), rep["link"][worst], "whole tooling"
+
+
+def capture_keyence_sweeps(rough_mesh=None, region=None, raster=True,
+                           cylinder=("cyl_a", "cyl_b"), radius=None,
+                           angles_deg=(0, 20, -20, 40, -40), margin_mm=10.0,
+                           line_spacing=0.02, clearance=None, specimen=None, lighting=None):
+    """SCENARIO 5. Keyence sweeps with the live reconstruction running.
+
+    raster=True: the pipeline's raster over the rough mesh exactly as
+    reconstruct_fine() plans it, with orient="fixed", roll "path", no
+    serpentine, 20 mm lines, 10 mm/s.
+
+    cylinder=(crest_a, crest_b): passes along the cylinder between two points
+    taught on its crest (shrunk by margin_mm at each end), at each angle in
+    angles_deg round the axis, the sensor turned to face the surface there, one
+    live tari_pc_reconstruction around all of them. None skips it.
+    """
+    results = {}
+    if raster:
+        rough = rough_mesh or globals().get("rough_mesh") or globals().get("specimen_mesh")
+        if rough is None:
+            results["raster"] = "skipped: no rough mesh (capture_azure_sweeps() first, or rough_mesh=)"
+        else:
+            params = {"rough_mesh": rough, "region": region, "orient": "fixed", "roll": "path",
+                      "snake": False, "line_spacing": line_spacing, "z_offset": 0.0,
+                      "velocity": CAPTURE_SPEED_NEAR, "backend": KEYENCE_BACKEND}
+            take = None
+            try:
+                with capture_scenario("keyence_raster", sets=("core", "keyence"),
+                                      expect_s=1800.0, params=params, pipeline=True,
+                                      specimen=specimen, lighting=lighting) as take:
+                    mesh = reconstruct_specimen(
+                        source="keyence", rough_mesh=rough, region=region, name=take.name,
+                        source_kwargs={"line_spacing": line_spacing, "z_offset": 0.0,
+                                       "velocity": CAPTURE_SPEED_NEAR},
+                        orient="fixed", roll="path", snake=False)
+                    take.results["live_mesh"] = mesh
+                    take.keep_file(mesh, "live_keyence.ply")
+            except Exception as e:
+                _capture_say("  raster: %s" % ((str(e).splitlines() or [repr(e)])[0],))
+            results["raster"] = {"take": take.dir if take else None,
+                                 "live_mesh": take.results.get("live_mesh") if take else None,
+                                 "errors": list(take.errors) if take else ["did not start"]}
+    if cylinder:
+        c = _cap_cylinder(cylinder, radius)
+        clearance = CAPTURE_CLEARANCE if clearance is None else clearance
+        off = _cap_keyence_offset()
+        t0, t1 = margin_mm/1000.0, c["L"] - margin_mm/1000.0
+        # The whole end-of-arm assembly against the cylinder, not the probe tip
+        # against the cylinder. These passes place lj_v7080_optical_frame on the
+        # flank; the eddy-current probe is 75 mm away on the same plate and is
+        # what actually arrives at the part first. Measured in simulation on the
+        # pipeline's own raster: the sensor sits correctly in its window while
+        # ec_probe is 5-6 mm INSIDE the specimen.
+        cyl_env = _cap_tooling_envelope()
+        cyl_mesh = _cap_cylinder_mesh(c) if cyl_env is not None else None
+        clear_how = "tip only" if cyl_env is None else "whole tooling"
+        passes, refused = [], []
+        for deg in angles_deg:
+            th = math.radians(deg)
+            m = math.cos(th)*c["up"] + math.sin(th)*c["side"]
+            s0 = c["axis0"] + t0*c["u"] + c["R"]*m
+            s1 = c["axis0"] + t1*c["u"] + c["R"]*m
+            cands = [_cap_tool_quat(m, c["u"]), _cap_tool_quat(m, -c["u"])]
+            try:
+                q = _cap_pick_quat(cands, [[_cap_probe_for_optical(s0, qq, off),
+                                            _cap_probe_for_optical(s1, qq, off)] for qq in cands])
+            except CaptureRefused as e:
+                refused.append((deg, "outside the work volume"))
+                continue
+            p0, p1 = _cap_probe_for_optical(s0, q, off), _cap_probe_for_optical(s1, q, off)
+            gap, link, how = _cap_pass_clearance(p0, p1, q, c, mesh=cyl_mesh,
+                                                 envelope=cyl_env)
+            if gap < clearance:
+                refused.append((deg, round(gap, 5), link))
+                continue
+            passes.append((deg, q, p0, p1, s0, s1, gap, link))
+            _capture_say("  %+d deg pass: %s clears by %+.1f mm (closest %s)"
+                         % (deg, how, gap*1e3, link))
+        if refused:
+            _capture_say("  cylinder angles refused (%s closer than %.0f mm; "
+                         "angle, metres, link): %s" % (clear_how, clearance*1e3, refused))
+        surface = np.array([c["axis0"] + t*c["u"] + c["R"]*(math.cos(a)*c["up"] + math.sin(a)*c["side"])
+                            for t in np.linspace(0.0, c["L"], 9)
+                            for a in np.radians(np.linspace(-90, 90, 13))])
+        params = {"crest": list(cylinder), "radius": c["R"], "axis_point": c["axis0"].tolist(),
+                  "axis_dir": c["u"].tolist(), "length": c["L"], "margin_mm": margin_mm,
+                  "angles_deg": [p[0] for p in passes], "refused": refused,
+                  "clearance_m": clearance, "clearance_check": clear_how,
+                  "clearance_mm": {p[0]: round(p[6]*1e3, 2) for p in passes},
+                  "clearance_link": {p[0]: p[7] for p in passes},
+                  "keyence_offset": off.tolist(), "axis_from": "taught crest points"}
+        take = None
+        try:
+            with capture_scenario("keyence_cylinder", sets=("core", "keyence"),
+                                  expect_s=len(passes)*(c["L"]/CAPTURE_SPEED_NEAR + 90.0) + 300.0,
+                                  params=params, pipeline=True, near_points=surface,
+                                  uses=list(cylinder), specimen=specimen,
+                                  lighting=lighting) as take:
+                src = keyence_reconstruction_class(KEYENCE_BACKEND)(check_profiles=False)
+                deg, q, p0, p1 = passes[0][:4]
+                capture_transit((p0, q), "cylinder: to the %+d deg pass" % deg)
+                src.sweep_path = ScanPath(np.array([p0, p1]), np.array([q, q]), [0],
+                                          source="cylinder pass")
+                src.start()
+                _cap_profile_check(take, "on the crest", require=False)
+                mesh = None
+                skipped = take.results.setdefault("unreachable", [])
+                try:
+                    for i, (deg, q, p0, p1, s0, s1, gap, link) in enumerate(passes):
+                        if i:
+                            try:
+                                capture_transit((p0, q), "cylinder: to the %+d deg pass" % deg)
+                            except (CaptureRefused, CaptureMotionFailed) as e:
+                                # One angle the arm cannot take is a result; the
+                                # others are still worth having.
+                                skipped.append({"angle_deg": deg, "why": (str(e).splitlines() or [""])[0]})
+                                _capture_say("  %+d deg pass not reachable, skipped" % deg)
+                                continue
+                        ta = capture_node.now_ns()
+                        capture_move([(p1, q)], "cylinder: %+d deg pass along the axis" % deg)
+                        take.event(event="pass", angle_deg=deg, surface_start=s0.tolist(),
+                                   surface_end=s1.tolist(), tooling_gap_m=gap,
+                                   tooling_link=link, clearance_check=clear_how,
+                                   t_start_ros_ns=ta, t_end_ros_ns=capture_node.now_ns())
+                    time.sleep(1.0)
+                finally:
+                    try:
+                        mesh = src.stop(os.path.join(take.dir, "live_keyence_cylinder.ply"))
+                    except Exception as e:
+                        take.errors.append("stop_and_process: %s" % (e,))
+                take.results["live_mesh"] = mesh
+                take.results["saved_files"] = list(getattr(src, "saved_files", []) or [])
+        except Exception as e:
+            _capture_say("  cylinder: %s" % ((str(e).splitlines() or [repr(e)])[0],))
+        results["cylinder"] = {"take": take.dir if take else None,
+                               "live_mesh": take.results.get("live_mesh") if take else None,
+                               "errors": list(take.errors) if take else ["did not start"]}
+    return results
+
+
+# ------------------------------------------------------------------------------
+# 7. Contact
+# ------------------------------------------------------------------------------
+
+def _ec_arm():
+    src = globals().get("ec_source")
+    if src is None:
+        return None
+    rows = []
+
+    def sink(ascan, pos, s_m, index, _rows=rows):
+        z = np.asarray(ascan).reshape(-1)
+        p = tuple(float(v) for v in pos) if pos is not None else (float("nan"),)*3
+        _rows.append((time.time(), complex(z[0]) if z.size else complex("nan"), p,
+                      float(s_m), int(index)))
+    src.arm(sink, emit_on_arm=True)
+    return rows
+
+
+def _ec_disarm(take, rows, label):
+    src = globals().get("ec_source")
+    if src is None or rows is None:
+        return None
+    src.disarm()
+    path = os.path.join(take.dir, "ec_%s.npz" % label)
+    np.savez(path, wall_time=np.array([r[0] for r in rows]),
+             impedance=np.array([r[1] for r in rows], dtype=np.complex128),
+             position=np.array([r[2] for r in rows]), s_m=np.array([r[3] for r in rows]),
+             index=np.array([r[4] for r in rows]),
+             trigger_report=json.dumps(_cap_jsonable(src.trigger_report())))
+    return path
+
+
+@contextlib.contextmanager
+def _cap_specimen_contact(links=None, declare=True):
+    """Declare the probe's contact with the specimen for the duration, then undo it.
+
+    A capture scenario that presses the probe onto the part is a CONTACT
+    scenario, and a planner that refuses contact refuses the measurement. With
+    the specimen in the planning scene and nothing declared, the start state of
+    every move made from the part is in collision: `onto contact_a along the
+    tool axis` came back at 86%, `off contact_a` at 14%, and `over contact_a:
+    lift off` at 100% of a plan that then moved 1.0 mm of the 10 it was
+    commanded. All three read as planner faults. They are not -- they are the
+    planner correctly refusing to interpolate out of a state it has been told is
+    illegal.
+
+    mesh_scan and surface_path_scan have declared this for their own scans since
+    the eddy-current path scan needed it. The capture tool never did, so the
+    operator had to know to call allow_specimen_contact() first -- and if they
+    did not, the failure arrived mid-take as a refused move with a message about
+    planning.
+
+    RESTORED ON THE WAY OUT, and only what this changed. If contact was already
+    declared when the take started -- the operator did it by hand, or a scan is
+    in progress -- it is left declared, because taking away a protection setting
+    somebody else chose is worse than leaving one on. If this turned it on, this
+    turns it off, so a later standoff scenario gets the part's protection back.
+
+    Never fatal. A take that cannot reach move_group's scene has bigger
+    problems than the matrix, and the alternative to a warning here is a
+    scenario that will not start.
+    """
+    allow = globals().get("allow_specimen_contact")
+    links = list(links or globals().get("TOOLING_CONTACT_LINKS") or ())
+    declared = False
+    if declare and allow is not None and links:
+        try:
+            scene_id = globals().get("SPECIMEN_SCENE_ID", "specimen")
+            if scene_id in planning_scene_objects():
+                already = tuple(globals().get("specimen_contact_allowed") or ())
+                if set(links) <= set(already):
+                    _capture_say("  contact with the specimen is already declared for "
+                          "%s; left as it was" % (", ".join(already),))
+                else:
+                    allow(links)
+                    declared = True
+            else:
+                # Not an error and not silent: with no specimen in the scene
+                # nothing is collision checked against the part either, which is
+                # a different and larger thing than contact not being declared.
+                _capture_say("  no specimen in the planning scene, so there is no "
+                      "contact to declare -- and nothing is checked against the "
+                      "part either.")
+        except Exception as e:                                    # noqa: BLE001
+            _capture_say("  WARNING: could not declare the probe's contact with the "
+                  "specimen (%s). Moves made from the part may be refused as "
+                  "collisions; allow_specimen_contact(%r) by hand, or "
+                  "remove_specimen_from_scene() is the blunt way out."
+                  % (e, links))
+    try:
+        yield declared
+    finally:
+        if declared:
+            try:
+                allow(links, allow=False)
+            except Exception as e:                                # noqa: BLE001
+                _capture_say("  WARNING: could not withdraw the contact declaration "
+                      "(%s). The probe may still touch the specimen as far as "
+                      "the planner is concerned; allow_specimen_contact(%r, "
+                      "allow=False) clears it." % (e, links))
+
+
+def capture_contact(points=("contact_a", "contact_b"), tilts_deg=(0, 3, -3, 6, -6),
+                    rotations_deg=(0.0,), tilt_axis="travel", approach_mm=20.0,
+                    speed_mm_s=None, ec=None, force_limit=None,
+                    max_orientation_diff_deg=5.0, declare_contact=True):
+    """SCENARIO 7. Spring-loaded eddy-current probe passes between taught points.
+
+    Teach both points with the probe ON the cylinder, compressed as it should
+    be when scanning, and with the same orientation (the probe's roll is locked
+    during an EC scan, so the pass keeps the orientation taught at the first
+    point). Each pass: over the start, down onto it ALONG THE TOOL AXIS, straight
+    to the end point, up off it along the tool axis -- never beyond the taught
+    points. Each tilt turns the probe about its own tip, about the travel
+    direction (tilt_axis="travel") or across it ("across"), so the tip stays on
+    the taught line. Wrench, joint states and TF are recorded.
+
+    `rotations_deg` turns the probe about ITS OWN AXIS -- which coil orientation
+    the split-D presents to the flaw -- and the ladder is flown once per
+    rotation, giving a (rotation x tilt) matrix rather than a tilt ladder. A
+    split-D answers to cracks across its split, so this is the axis that decides
+    which flaw ORIENTATION is being looked for, and the notches on the 99073
+    exist in two orientations; (0, 90) flies both without re-teaching.
+
+    THE TILT AXIS DOES NOT CO-ROTATE. Tilt stays about a fixed world direction
+    -- travel, or across it -- while rotation turns the tool about its own z.
+    If tilt were taken in the rotated tool frame the two factors would not be
+    separable and the matrix would not mean anything: a cell at (90 deg, +6 deg)
+    has to be the same tilt as (0 deg, +6 deg), applied to a differently
+    oriented coil.
+
+    WRIST 3 MOVES ONE-FOR-ONE WITH ROTATION, so a rotation can walk the wrist
+    out of the measured cable band even though the tip has not moved. Every
+    motion here goes through the cable guard, which refuses and names the angle
+    and the band -- but it refuses at the FIRST MOVE OF THAT PASS, part way into
+    a run. Check before committing the day to it:
+
+        ec_joint_report()            wrist 3 along the planned path
+        wrist3_band_deg(tilt=(0,0))  the band it has to land inside
+
+    The measured no-tilt band is +16.1..+301.1 deg and nothing here wraps an
+    angle: +200 is inside it and -160 is outside, and they are the same tool
+    orientation.
+
+    ec=True (default: when ec_ready() says the DAQ is live) also records the
+    eddy-current signal through ec_source, one ec_rot<rot>_tilt<tilt>.npz per
+    pass in the take. THIS PART IS UNTESTED: there is no DAQ off the cell.
+
+    CONTACT IS DECLARED TO THE PLANNER for the duration and withdrawn after --
+    see _cap_specimen_contact(). This is a contact scenario and the probe spends
+    the whole take pressed into a specimen that is a collision object, so
+    without it the moves made FROM the part are refused: three of them on
+    2026-10-05, at 14%, 86% and a plan that reported 100% and then moved a
+    tenth of what it was told. declare_contact=False keeps every protection,
+    for the case where the refusal is the thing being tested.
+    """
+    a, b = _cap_point(points[0]), _cap_point(points[1])
+    qa = tuple(taught_points[points[0]]["xyzw"])
+    qb = tuple(taught_points[points[1]]["xyzw"])
+    diff = 2.0*math.degrees(math.acos(min(1.0, abs(float(np.dot(qa, qb))))))
+    if diff > max_orientation_diff_deg:
+        raise CaptureRefused("the probe's orientation at %s and %s differs by %.1f deg; "
+                             "teach them with the same orientation" % (points + (diff,)))
+    u = (b - a)/np.linalg.norm(b - a)
+    za = quat_to_matrix(qa)[:, 2]
+    axis = u if tilt_axis == "travel" else np.cross(za, u)/np.linalg.norm(np.cross(za, u))
+    # THE NEAR-PART SPEED LIMIT BINDS, AND IT SAYS SO. A probe on the part is
+    # held to CAPTURE_SPEED_NEAR whatever is asked for, which is right -- but it
+    # used to clamp in silence, and the take's own params recorded the CLAMPED
+    # value, so neither the operator nor the artifact said the request had not
+    # been honoured. A latency ladder run at 4, 10 and 20 mm/s on 2026-10-06
+    # produced two speeds and nobody could tell from the data why.
+    speed = CAPTURE_SPEED_NEAR
+    if speed_mm_s:
+        speed = min(CAPTURE_SPEED_NEAR, speed_mm_s/1000.0)
+        if speed < speed_mm_s/1000.0 - 1e-9:
+            print("  %.1f mm/s was asked for; %.1f mm/s is the near-part limit "
+                  "(CAPTURE_SPEED_NEAR) and that is what will be flown. Raise "
+                  "the limit deliberately if a faster pass is the measurement."
+                  % (float(speed_mm_s), speed*1e3))
+    force_limit = CAPTURE_CONTACT_FORCE_LIMIT if force_limit is None else force_limit
+    use_ec = ec if ec is not None else bool(globals().get("ec_ready") and ec_ready()[0])
+    if use_ec and globals().get("ec_source") is None:
+        setup_ec()
+    L = float(np.linalg.norm(b - a))
+    params = {"points": list(points), "tilts_deg": list(tilts_deg),
+              "rotations_deg": list(rotations_deg), "tilt_axis": tilt_axis,
+              "approach_mm": approach_mm, "speed_mps": speed,
+              "speed_requested_mps": (speed_mm_s/1000.0 if speed_mm_s else None),
+              "force_limit_n": force_limit,
+              "ec": use_ec, "orientation_diff_deg": diff, "pass_length_m": L,
+              "declare_contact": bool(declare_contact)}
+    with _cap_specimen_contact(declare=declare_contact), \
+         capture_scenario("contact", sets=("core",),
+                          expect_s=len(tilts_deg)*len(rotations_deg)
+                                   *(L/speed + 2*approach_mm/1000.0/speed + 90.0) + 120.0,
+                          params=params, near_points=_cap_densify([a, b], 0.005),
+                          uses=list(points)) as take:
+        q = qa
+        for rot in rotations_deg:
+            # Rotation about the probe's OWN axis: za is the taught tool z in
+            # world, so this turns the coil in place and leaves the tip where it
+            # was taught. Applied to qa first; the tilt below is then taken
+            # about a fixed WORLD axis, so the two stay separable -- see the
+            # docstring.
+            q_rot = quat_mul(_cap_q_axis(za, math.radians(rot)), qa) if rot else qa
+            for deg in tilts_deg:
+                q = quat_mul(_cap_q_axis(axis, math.radians(deg)), q_rot)
+                z = quat_to_matrix(q)[:, 2]
+                tag = "%+g deg" % deg if not rot else "rot %+g, %+g deg" % (rot, deg)
+                try:
+                    capture_transit((a + approach_mm/1000.0*z, q),
+                                    "contact %s: over %s" % (tag, points[0]))
+                    capture_move([(a, q)], "contact %s: onto %s along the tool axis"
+                                 % (tag, points[0]), speed=speed, force_limit=force_limit)
+                except CaptureSkip:
+                    continue
+                rows = _ec_arm() if use_ec else None
+                t0, m0 = capture_node.now_ns(), time.monotonic()
+                capture_move([(b, q)], "contact %s: pass %s -> %s" % (tag, points[0], points[1]),
+                             speed=speed, force_limit=force_limit)
+                t1, m1 = capture_node.now_ns(), time.monotonic()
+                # A plain tilt ladder keeps the OLD name, so a default
+                # capture_contact() produces artifacts identical to previous
+                # takes and stays comparable with them. Only a run that
+                # actually sweeps rotation says so in the name.
+                label = ("tilt%+g" % deg if len(rotations_deg) == 1 and not rot
+                         else "rot%+g_tilt%+g" % (rot, deg))
+                ec_file = _ec_disarm(take, rows, label) if use_ec else None
+                w = np.array([r[1:] for r in list(capture_node.wrench) if m0 <= r[0] <= m1])
+                capture_move([(b + approach_mm/1000.0*z, q)], "contact %s: off %s along "
+                             "the tool axis" % (tag, points[1]), speed=speed)
+                take.event(event="pass", tilt_deg=deg, rotation_deg=rot,
+                           tilt_axis=tilt_axis, quat=list(q),
+                           t_start_ros_ns=t0, t_end_ros_ns=t1, ec_file=ec_file,
+                           wrench_samples=int(len(w)),
+                           force_mean=w[:, :3].mean(0).tolist() if len(w) else None,
+                           force_max_n=float(np.linalg.norm(w[:, :3], axis=1).max()) if len(w) else None)
+        env = capture_envelope()
+        here = np.asarray(live_pose.snapshot()[0], float)
+        top = env["top"] + float(CAPTURE_TRANSIT_ABOVE)
+        if here[2] < top:
+            capture_move([(np.array([here[0], here[1], top]), q)], "contact: rise clear")
+        take.results["passes"] = sum(1 for e in take.events if e.get("event") == "pass")
+    return take.results
+
+
+# ------------------------------------------------------------------------------
+# 8. Full pipeline
+# ------------------------------------------------------------------------------
+
+def capture_full_pipeline(index=0, region=None, line_spacing=None, cutoff=None, park=True):
+    """SCENARIO 8. run_automated_scan(scan=False), recorded, every motion gated."""
+    params = {"index": index, "region": region, "line_spacing": line_spacing,
+              "cutoff": cutoff, "park": park}
+    with capture_scenario("full_pipeline", sets=("core", "azure", "keyence"),
+                          expect_s=2700.0, params=params, pipeline=True) as take:
+        out = run_automated_scan(index=index, scan=False, cutoff=cutoff,
+                                 line_spacing=line_spacing, region=region, park=park)
+        for key in ("rough", "fine", "mesh", "x3d"):
+            if isinstance(out.get(key), str):
+                take.results[key] = out[key]
+                take.keep_file(out[key], "%s_%s" % (key, os.path.basename(out[key])))
+        take.results["region"] = out.get("region")
+        if out.get("path") is not None:
+            take.results["path"] = out["path"].describe()
+        take.results["plan"] = _cap_jsonable(out.get("plan"))
+    return take.results

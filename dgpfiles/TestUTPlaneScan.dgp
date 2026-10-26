@@ -1,0 +1,37 @@
+from dataguzzler_python import dgpy
+import time
+import copy
+import sys
+
+include(dgpy, "UTPlaneScan.dgp")
+
+print("Waiting for ROS TF...")
+time.sleep(2)
+p1 = ros.t
+while p1 is None:
+    print("p1 is None. waiting for tf...")
+    time.sleep(1)
+    p1 = ros.t
+
+print(f"Initial p1: x={p1.transform.translation.x}, y={p1.transform.translation.y}, z={p1.transform.translation.z}")
+
+# Collision avoidance: raise the pose to 1.0 m above the origin.
+p1.transform.translation.z = 1.0
+
+p2 = copy.deepcopy(p1)
+p2.transform.translation.x += 0.5
+
+p3 = copy.deepcopy(p1)
+p3.transform.translation.y += 0.5
+
+print("Running Scan2DPlane(p1, p2, p3, 10, 10)...")
+try:
+    Scan2DPlane(p1, p2, p3, 10, 10)
+    print("SUCCESS")
+except Exception as e:
+    import traceback
+    traceback.print_exc()
+    print("FAILED")
+    sys.exit(1)
+
+sys.exit(0)

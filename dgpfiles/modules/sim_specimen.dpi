@@ -1,0 +1,538 @@
+# ==============================================================================
+# PUT THE SPECIMEN IN THE SIMULATOR
+# ==============================================================================
+# The reconstruction stage measures a part. In simulation that means there has to
+# BE a part: Gazebo renders what is in its world, and a world containing only
+# `ground_plane` and `ur` reconstructs to nothing at all -- which presents as an
+# empty TSDF and is indistinguishable from every other way this pipeline produces
+# nothing.
+#
+# The test plate already exists twice, as the PLY the planner reads and the X3D
+# the projector reads, both written from one array by make_test_plate(). This
+# adds the third: an STL and an SDF that Gazebo can render, spawned into the
+# running world. Same array, so the surface the camera sees is the surface the
+# acceptance scan simulates. Converting a PLY to an STL by hand in a separate
+# tool -- which is how this was first done -- leaves the two free to drift, and a
+# reconstruction compared against a specimen that is not quite the specimen is
+# worse than no comparison.
+#
+# Simulation only. On hardware the part is on the table and none of this runs.
+
+import hashlib
+import os
+import struct
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global write_stl
+global write_specimen_sdf
+global place_gazebo_specimen
+global place_gazebo_mesh
+global remove_gazebo_specimen
+global gazebo_specimen_present
+global keyence_sim_scene_path
+global write_keyence_sim_scene
+global describe_keyence_sim_scene
+global KEYENCE_SIM_SCENE_DEFAULT
+global _sim_get_param
+global _sim_set_param
+
+
+#: Where the simulated profiler reads its scene from when nothing else says.
+#: The manifests declare this same path (tari_cell_configs ex-ur10e-1.yaml and
+#: tari_bringup config/cells/sim.yaml, `scene_file:` under the keyence driver),
+#: and the running node's own parameter wins over both -- see
+#: keyence_sim_scene_path().
+KEYENCE_SIM_SCENE_DEFAULT = "~/scandata/gz/keyence_sim_scene.json"
+
+
+def write_stl(path, verts, tris):
+    """Binary STL from the vertex/triangle arrays write_plate_ply() returns.
+
+    Written here rather than via Open3D or trimesh because it is forty lines and
+    the alternative is a dependency that has to be present in the container for a
+    simulation-only convenience. Binary rather than ASCII: a 61x61 plate is 7200
+    triangles, which is 360 kB binary and about 2.5 MB as text.
+
+    STL carries a per-facet normal and no vertex normals, so this recomputes the
+    facet normal from the winding. write_plate_ply() has already wound every
+    triangle to agree with the analytic surface normal, so the two agree.
+    """
+    verts = np.asarray(verts, dtype=np.float64)
+    tris = np.asarray(tris, dtype=np.int64)
+
+    p0 = verts[tris[:, 0]]
+    p1 = verts[tris[:, 1]]
+    p2 = verts[tris[:, 2]]
+    n = np.cross(p1 - p0, p2 - p0)
+    norm = np.linalg.norm(n, axis=1, keepdims=True)
+    # A degenerate triangle has no normal; STL wants zeros there rather than nan.
+    n = np.divide(n, norm, out=np.zeros_like(n), where=norm > 0.0)
+
+    with open(path, "wb") as f:
+        f.write(b"plate written by sim_specimen.dpi".ljust(80, b"\0"))
+        f.write(struct.pack("<I", tris.shape[0]))
+        for k in range(tris.shape[0]):
+            f.write(struct.pack("<12fH",
+                                n[k, 0], n[k, 1], n[k, 2],
+                                p0[k, 0], p0[k, 1], p0[k, 2],
+                                p1[k, 0], p1[k, 1], p1[k, 2],
+                                p2[k, 0], p2[k, 1], p2[k, 2],
+                                0))
+    return path
+
+
+def write_specimen_sdf(path, stl_path, name="test_plate", collision=True):
+    """An SDF wrapping one STL, static, with both a visual and a collision.
+
+    The plate's vertices are already in world coordinates -- make_test_plate()
+    builds it at SCAN_ORIGIN and TEST_PLATE_HEIGHT -- so the model pose is
+    identity and nothing has to be kept in step.
+
+    BOTH ARE NEEDED, ONE PER KIND OF SENSOR. Gazebo has two ways of seeing
+    geometry and they do not overlap:
+
+        a camera (and any `gpu_ray`) renders VISUALS through OGRE
+        a `ray` sensor raycasts against COLLISION shapes in the physics engine
+
+    The simulated Keyence is `gpu_ray` (lj_v7080.gazebo.xacro), so it needs the
+    VISUAL; a `<sensor type="ray">` needs the COLLISION. This writes both, so
+    either kind works. A specimen missing the shape its sensor uses looks, from
+    outside, like /profiles publishing steadily with width=0,
+    tari_pc_reconstruction logging "Accumulated 0 total points" for the whole
+    sweep, and /stop_and_process answering "No points were accumulated" --
+    nothing anywhere says "your part has no geometry this sensor can see". With
+    a 0.2 m box under the laser at the reference distance: 56 points per profile
+    with a <collision>, zero without it, same pose, same box.
+
+    The argument for leaving the collision out is that a solid body under a UT
+    probe flying at a few millimetres of standoff would make the planner refuse
+    the scan. It does not, in this cell: MoveIt's planning scene is built from
+    the robot description, nothing bridges Gazebo's world into it, and the
+    octomap updater is commented out in ur_moveit.launch.py -- so /move_group
+    has no 3D sensor input and no octomap parameters at all. Gazebo's own
+    physics is the only thing that sees this collision, the model is static,
+    and the probe never touches it. Pass collision=False if a cell ever does
+    bridge the two.
+    """
+    with open(path, "w") as f:
+        f.write('<?xml version="1.0"?>\n')
+        f.write('<sdf version="1.6">\n')
+        f.write('  <model name="%s">\n' % (name,))
+        f.write('    <static>true</static>\n')
+        f.write('    <link name="surface">\n')
+        f.write('      <visual name="visual">\n')
+        f.write('        <geometry>\n')
+        f.write('          <mesh><uri>file://%s</uri></mesh>\n' % (stl_path,))
+        f.write('        </geometry>\n')
+        f.write('        <material>\n')
+        f.write('          <ambient>0.7 0.7 0.75 1</ambient>\n')
+        f.write('          <diffuse>0.8 0.8 0.85 1</diffuse>\n')
+        f.write('        </material>\n')
+        f.write('      </visual>\n')
+        if collision:
+            f.write('      <collision name="collision">\n')
+            f.write('        <geometry>\n')
+            f.write('          <mesh><uri>file://%s</uri></mesh>\n' % (stl_path,))
+            f.write('        </geometry>\n')
+            f.write('      </collision>\n')
+        f.write('    </link>\n')
+        f.write('  </model>\n')
+        f.write('</sdf>\n')
+    return path
+
+
+def gazebo_specimen_present(name="test_plate", timeout=10.0):
+    """Whether Gazebo already has a model of this name."""
+    from gazebo_msgs.srv import GetModelList
+    res = _gazebo_call("/get_model_list", GetModelList, {}, timeout=timeout)
+    return name in list(res.model_names)
+
+
+def remove_gazebo_specimen(name="test_plate", timeout=10.0, settle=15.0,
+                           keyence_scene=True):
+    """Delete the model, if it is there, and WAIT until it is really gone.
+
+    /delete_entity answers success as soon as the request is queued, not when the
+    model has left the world. Spawning the same name in the window between those
+    two is accepted -- /spawn_entity also answers success -- and then the pending
+    delete removes what was just spawned, so both calls report success and the
+    world ends up with no model at all. That is the reason this waits rather
+    than returning.
+    """
+    from gazebo_msgs.srv import DeleteEntity
+    if not gazebo_specimen_present(name, timeout=timeout):
+        return False
+    res = _gazebo_call("/delete_entity", DeleteEntity, {"name": name},
+                       timeout=timeout)
+    if not res.success:
+        raise RuntimeError("could not delete Gazebo model %r: %s"
+                           % (name, res.status_message))
+    if not _wait_for_model(name, present=False, timeout=settle):
+        raise RuntimeError(
+            "Gazebo said it deleted %r but it is still in the world %.0f s "
+            "later" % (name, settle))
+    # AND TAKE IT OUT OF THE PROFILER'S SCENE. A part deleted from Gazebo but
+    # left in the scene file is the same divergence as a part spawned and not
+    # added, with the signs reversed: the camera sees an empty cell and the
+    # laser goes on measuring a part that is not there.
+    if keyence_scene:
+        try:
+            write_keyence_sim_scene([])
+        except Exception as e:                                    # noqa: BLE001
+            print("    NOTE: the model is gone from Gazebo but the simulated "
+                  "Keyence scene could not be cleared (%s); it may still "
+                  "measure it" % (e,))
+    return True
+
+
+def place_gazebo_specimen(name="test_plate", replace=True, collision=True,
+                          keyence_scene=True, **plate_kwargs):
+    """Write the test plate as an STL/SDF and spawn it into the running Gazebo.
+
+    Returns (stl, sdf). Call it once per world; `replace=True` makes calling it
+    again cheap and correct, which matters because the plate's shape is a config
+    parameter and a stale model in the world would silently be the thing the
+    camera measured.
+
+    plate_kwargs are make_test_plate()'s -- size, height, bow, divisions, origin
+    -- and default to the same TEST_PLATE_* config, so leaving them alone gives
+    Gazebo exactly the surface the planner will be given. Overriding one here and
+    not there is how the camera ends up measuring a different part from the one
+    the acceptance scan simulates.
+    """
+    # write_plate_ply() comes from noether_path.dpi, which declares it global --
+    # a .dpi is compiled as a function body, so an undeclared name would not be
+    # here to call. It is used directly rather than through make_test_plate()
+    # because what is needed is the vertex/triangle arrays and make_test_plate
+    # returns file paths; reading the PLY back would make the STL a copy of a
+    # copy.
+    size = plate_kwargs.get("size", TEST_PLATE_SIZE)
+    height = plate_kwargs.get("height", TEST_PLATE_HEIGHT)
+    bow = plate_kwargs.get("bow", TEST_PLATE_BOW)
+    divisions = plate_kwargs.get("divisions", TEST_PLATE_DIVISIONS)
+    origin = plate_kwargs.get("origin", SCAN_ORIGIN)
+
+    gz = os.path.join(_scan_work_dir(), "gz")
+    if not os.path.isdir(gz):
+        os.makedirs(gz)
+
+    ply = os.path.join(gz, name + ".ply")
+    o = np.array([origin[0], origin[1], height], dtype=np.float64)
+    _path, verts, tris = write_plate_ply(ply, o,
+                                         np.array([size, 0.0, 0.0]),
+                                         np.array([0.0, size, 0.0]),
+                                         nu=divisions, nv=divisions, bow=bow)
+
+    # The STL filename carries the SHAPE, and that is not decoration. Gazebo
+    # Classic's mesh manager caches by URI for the lifetime of gzserver, so
+    # rewriting a different plate to the same path and re-spawning renders the
+    # OLD geometry -- silently, with a model list that looks correct and a
+    # reconstruction of a part nobody asked for. A new shape gets a new URI and
+    # therefore a genuine reload. Same shape reuses the file, so the ordinary
+    # case does not litter.
+    shape = "%.4f_%.4f_%.4f_%d_%.4f_%.4f" % (size, height, bow, divisions,
+                                             origin[0], origin[1])
+    tag = hashlib.sha1(shape.encode("ascii")).hexdigest()[:8]
+    stl = write_stl(os.path.join(gz, "%s_%s.stl" % (name, tag)), verts, tris)
+    sdf = write_specimen_sdf(os.path.join(gz, name + ".sdf"), stl, name=name,
+                             collision=collision)
+    print("  simulated specimen: %.2f x %.2f m at z=%.3f, bow %.0f mm, %d triangles"
+          % (size, size, height, bow*1e3, tris.shape[0]))
+    print("    %s" % stl)
+
+    if replace and gazebo_specimen_present(name):
+        remove_gazebo_specimen(name, keyence_scene=False)
+        print("    replaced the model already in the world")
+
+    _spawn_sdf(name, sdf)
+    print("    spawned into Gazebo as %r" % (name,))
+
+    # THE SECOND HALF OF PUTTING A PART IN THE WORK CELL -- see the section
+    # comment above write_keyence_sim_scene(). The Gazebo model is what the
+    # simulated camera renders; the simulated profiler raycasts against its own
+    # scene, and without this it goes on measuring whatever was there last.
+    if keyence_scene:
+        write_keyence_sim_scene([stl])
+    return stl, sdf
+
+
+def place_gazebo_mesh(stl, name="specimen", replace=True, collision=True,
+                      keyence_scene=True):
+    """Spawn an ARBITRARY mesh into the running world, and show it to both sensors.
+
+    place_gazebo_specimen() builds a plate from the TEST_PLATE_* parameters; this
+    takes a file. Same two halves -- the Gazebo model the camera renders and the
+    profiler's own scene -- for the same reason: they are two different sensors
+    with two different ideas of the world, and spawning a model only tells one of
+    them. See write_keyence_sim_scene().
+
+    The mesh's vertices must already be in WORLD coordinates, like everything else
+    this file writes, so the model pose is identity and nothing has to be kept in
+    step.
+    """
+    if not os.path.isfile(stl):
+        raise RuntimeError("no such mesh: %s" % (stl,))
+    sdf = write_specimen_sdf(os.path.join(os.path.dirname(stl), name + ".sdf"),
+                             stl, name=name, collision=collision)
+    if replace and gazebo_specimen_present(name):
+        remove_gazebo_specimen(name, keyence_scene=False)
+        print("    replaced the model already in the world")
+    _spawn_sdf(name, sdf)
+    print("    spawned %s into Gazebo as %r" % (os.path.basename(stl), name))
+    if keyence_scene:
+        write_keyence_sim_scene([stl])
+    return stl, sdf
+
+
+def _spawn_sdf(name, sdf_path, settle=20.0):
+    from gazebo_msgs.srv import SpawnEntity
+    with open(sdf_path) as f:
+        xml = f.read()
+    # No initial_pose: the mesh vertices are already world coordinates.
+    res = _gazebo_call("/spawn_entity", SpawnEntity,
+                       {"name": name, "xml": xml}, timeout=30.0)
+    if not res.success:
+        raise RuntimeError("could not spawn %r into Gazebo: %s"
+                           % (name, res.status_message))
+    # success from /spawn_entity means the request was accepted, not that the
+    # model loaded -- a bad mesh URI, or a delete still in flight, leaves a
+    # world with no model and a service call that said yes. Confirm it.
+    if not _wait_for_model(name, present=True, settle=settle):
+        raise RuntimeError(
+            "Gazebo accepted %r but it is not in the world %.0f s later. Check "
+            "gzserver's output: the usual cause is a mesh URI it cannot read."
+            % (name, settle))
+    return res
+
+
+def _wait_for_model(name, present, timeout=15.0, settle=None):
+    """Poll get_model_list until `name`'s presence matches, or give up."""
+    deadline = time.monotonic() + float(settle if settle is not None else timeout)
+    while time.monotonic() < deadline:
+        if gazebo_specimen_present(name) == bool(present):
+            return True
+        time.sleep(0.5)
+    return gazebo_specimen_present(name) == bool(present)
+
+
+# ==============================================================================
+# THE OTHER SIMULATED SENSOR'S IDEA OF THE WORLD
+# ==============================================================================
+# SPAWNING A MODEL INTO GAZEBO IS ONLY HALF OF PUTTING A PART IN THE WORK CELL.
+#
+# The simulated Azure is a Gazebo camera: it renders the world, so a spawned
+# model is all it needs. The simulated Keyence is NOT a Gazebo sensor at all.
+# keyence_profiler_sim (tari_keyence_sim) exists because the gpu_ray it replaced
+# reported ranges up to 23 mm long at the edge of the fan, and it raycasts
+# against its OWN scene: a `plane_z` parameter and a `scene_file` naming meshes.
+# Gazebo's world is not in it. Spawning alone therefore leaves the two sensors
+# looking at different cells.
+#
+# WHAT THAT LOOKS LIKE, because it is not obvious from any one symptom: the
+# Azure reconstructs the part correctly, the mesh is good, the gauge flies to a
+# correct standoff over it -- and every profile comes back all +Inf, which reads
+# as "the arm is at the wrong height" or "the laser is off". A scene file left
+# naming a previous specimen puts the head over 100 mm off the only surface it
+# can see, and the gauge reports zero finite points at every rung of the ladder.
+# Nothing anywhere says "your specimen is not in the profiler's scene".
+#
+# So the scene is maintained HERE, next to the spawn, because the two facts are
+# one fact: what part is in the work cell.
+
+def _sim_get_param(node_name, param, timeout=5.0):
+    """One parameter off a running node, or None. Never raises for absence."""
+    import rclpy
+    from rclpy.node import Node
+    from rcl_interfaces.srv import GetParameters
+
+    client_node = Node("sim_specimen_param_client")
+    try:
+        client = client_node.create_client(
+            GetParameters, "%s/get_parameters" % (node_name,))
+        if not client.wait_for_service(timeout_sec=timeout):
+            return None
+        req = GetParameters.Request()
+        req.names = [param]
+        fut = client.call_async(req)
+        rclpy.spin_until_future_complete(client_node, fut, timeout_sec=timeout)
+        res = fut.result()
+        if res is None or not res.values:
+            return None
+        v = res.values[0]
+        # PARAMETER_NOT_SET is type 0 and carries no value.
+        if getattr(v, "type", 0) == 0:
+            return None
+        for attr in ("string_value", "double_value", "integer_value",
+                     "bool_value"):
+            if getattr(v, attr, None) not in (None, "", 0, 0.0, False):
+                return getattr(v, attr)
+        return v.string_value
+    except Exception:                                             # noqa: BLE001
+        return None
+    finally:
+        try:
+            client_node.destroy_node()
+        except Exception:                                         # noqa: BLE001
+            pass
+
+
+def _sim_set_param(node_name, param, value, timeout=5.0):
+    """Set one string parameter on a running node. True when it took."""
+    import rclpy
+    from rclpy.node import Node
+    from rcl_interfaces.srv import SetParameters
+    from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+
+    client_node = Node("sim_specimen_param_setter")
+    try:
+        client = client_node.create_client(
+            SetParameters, "%s/set_parameters" % (node_name,))
+        if not client.wait_for_service(timeout_sec=timeout):
+            return False
+        req = SetParameters.Request()
+        pv = ParameterValue(type=ParameterType.PARAMETER_STRING,
+                            string_value=str(value))
+        req.parameters = [Parameter(name=param, value=pv)]
+        fut = client.call_async(req)
+        rclpy.spin_until_future_complete(client_node, fut, timeout_sec=timeout)
+        res = fut.result()
+        return bool(res and res.results and res.results[0].successful)
+    except Exception:                                             # noqa: BLE001
+        return False
+    finally:
+        try:
+            client_node.destroy_node()
+        except Exception:                                         # noqa: BLE001
+            pass
+
+
+def keyence_sim_scene_path(node="/keyence_profiler_sim"):
+    """Where the simulated profiler reads its scene from, expanded.
+
+    THE RUNNING NODE IS ASKED FIRST, and that order is the point: `scene_file`
+    is a live parameter (its _on_set_parameters reloads the scene), so the
+    manifest's value is only where the node STARTED. Writing the manifest's path
+    when the node has been pointed elsewhere writes a file nothing reads, and the
+    failure is silent -- profiles keep arriving, all +Inf.
+    """
+    got = _sim_get_param(node, "scene_file")
+    if isinstance(got, str) and got.strip():
+        return os.path.expanduser(got.strip())
+    return os.path.expanduser(KEYENCE_SIM_SCENE_DEFAULT)
+
+
+def write_keyence_sim_scene(meshes=(), path=None, node="/keyence_profiler_sim",
+                            planes=(), say=None):
+    """Write the simulated profiler's scene: these meshes, nothing else.
+
+    `meshes` are STL/PLY paths in WORLD coordinates -- which is what
+    place_gazebo_specimen() writes, the plate's vertices already being world
+    coordinates -- so no per-mesh transform is needed and none is written.
+
+    THE BENCH IS NOT WRITTEN HERE. The node carries the bench as its own
+    `plane_z` parameter (0.9286 in both manifests) and adds it to every scene it
+    builds, so putting a plane in the file too gives the profiler two coincident
+    benches to raycast. One authority for the bench, and it is not this file.
+    Pass `planes` (z values) only for a surface the node does not already know.
+
+    Returns the path written. Raises rather than returning False: a scene that
+    was not written is a profiler measuring a world the rest of the cell is not
+    in, and every symptom of that points somewhere else.
+    """
+    import json
+
+    say = say or print
+    where = os.path.expanduser(path) if path else keyence_sim_scene_path(node)
+    missing = [m for m in meshes if not os.path.isfile(m)]
+    if missing:
+        raise RuntimeError(
+            "cannot write the simulated Keyence scene: %s does not exist. The "
+            "profiler would raycast against nothing and every profile would be "
+            "+Inf." % (", ".join(missing),))
+    spec = [{"type": "mesh", "path": os.path.abspath(m)} for m in meshes]
+    spec += [{"type": "plane", "z": float(z)} for z in planes]
+    d = os.path.dirname(where)
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    # Written whole and moved into place: the node watches mtime and reloads, so
+    # a half-written file is a scene it may try to parse.
+    tmp = where + ".partial"
+    with open(tmp, "w") as f:
+        json.dump({"scene": spec}, f, indent=1)
+        f.write("\n")
+    os.replace(tmp, where)
+
+    # AND POINT THE NODE AT IT if it is reading somewhere else -- which happens
+    # when `path` was given explicitly, and when the node started with no
+    # scene_file at all.
+    reading = keyence_sim_scene_path(node)
+    if os.path.abspath(reading) != os.path.abspath(where):
+        if _sim_set_param(node, "scene_file", where):
+            say("    pointed %s at %s" % (node, where))
+        else:
+            raise RuntimeError(
+                "wrote %s, but %s is reading %s and would not accept a new "
+                "scene_file. The simulated Keyence is looking at a different "
+                "world from the simulated camera." % (where, node, reading))
+    say("    simulated Keyence scene: %s (%d mesh(es)%s)"
+        % (where, len(meshes),
+           "" if not planes else ", %d extra plane(s)" % (len(planes),)))
+    return where
+
+
+def describe_keyence_sim_scene(node="/keyence_profiler_sim"):
+    """One line about what the simulated profiler can see. For a report."""
+    import json
+    where = keyence_sim_scene_path(node)
+    if not os.path.isfile(where):
+        return ("simulated Keyence scene: %s does not exist -- the profiler "
+                "sees only its plane_z" % (where,))
+    try:
+        with open(where) as f:
+            doc = json.load(f)
+        spec = doc["scene"] if isinstance(doc, dict) else doc
+    except Exception as e:                                        # noqa: BLE001
+        return "simulated Keyence scene: %s is unreadable (%s)" % (where, e)
+    what = []
+    for entry in spec:
+        if str(entry.get("type", "")).lower() == "mesh":
+            what.append(os.path.basename(str(entry.get("path"))))
+        else:
+            what.append(str(entry.get("type")))
+    return "simulated Keyence scene: %s -> %s" % (
+        where, ", ".join(what) or "nothing")
+
+
+def _gazebo_call(service, srv_type, fields, timeout=10.0, wait=10.0):
+    """One Gazebo service call on its own short-lived node.
+
+    Same shape as mesh_reconstruction.call_ros_service and for the same reason: a
+    service call that blocks while holding a module context is the standard way
+    to wedge this stack.
+    """
+    import rclpy
+    from rclpy.node import Node
+
+    node = Node("sim_specimen_client")
+    try:
+        client = node.create_client(srv_type, service)
+        if not client.wait_for_service(timeout_sec=wait):
+            raise RuntimeError(
+                "no %s service. This is Gazebo's own; it exists only while the "
+                "simulator is running, so on hardware -- or with the cell down "
+                "-- nothing here applies." % (service,))
+        req = srv_type.Request()
+        for key, value in fields.items():
+            setattr(req, key, value)
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+        res = future.result()
+        if res is None:
+            raise RuntimeError("%s did not answer within %.0f s" % (service, timeout))
+        return res
+    finally:
+        node.destroy_node()

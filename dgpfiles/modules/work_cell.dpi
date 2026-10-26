@@ -1,0 +1,1345 @@
+# ==============================================================================
+# WHERE THE WORK HAPPENS -- ONE BOX, READ FROM THE WORK-CELL MANIFEST
+# ==============================================================================
+# The volume parts are placed inside. Everything outside it is cropped, by every
+# stage, always.
+#
+# It is not defined here. It is `work_volume:` in the work-cell manifest that
+# tari_bringup already uses to describe the work cell -- per mode, because the
+# simulated cell and the real cell are different rooms -- and this module is the
+# one place that reads it, so a stage cannot quietly disagree with the bring-up
+# about where the work cell is.
+#
+# WHY IT EXISTS AT ALL. Without it every stage invents a crop from whatever it
+# happens to know, and those crops accumulate: a pad around a detected region
+# that swallows the part in table (30 k vertices of plate against 107 k of
+# table); a z floor guessed from the detected surface; a correction to that floor
+# when it clips the part's low steps; a support-z cutoff documented as a property
+# of the work cell that is really a property of the specimen. None of that is
+# about the part. One declared box replaces all of it.
+#
+# WHAT IT IS NOT. It bounds the WORK VOLUME, not the part. Its floor sits just
+# above the surface parts rest on, so the bench is cropped and parts on it are
+# not -- but it does not separate a thin part from a noisy support, and no z
+# plane can: this cell's bench reconstructs across 34 mm of z because it is an
+# optical breadboard, and the calibration plate is 19.6 mm thick.
+
+import contextlib
+import os
+import sys
+import threading
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global work_volume
+global require_work_volume
+global in_work_volume
+global describe_work_volume
+global work_volume_reload
+global motion_volume
+global describe_motion_volume
+global check_motion_volume
+global motion_volume_ok
+global describe_motion_volume_check
+global _MOTION_VOLUME
+global derive_safe_motion_volume
+global safe_motion_volume
+global safe_motion_volume_spec
+global describe_safe_motion_volume
+global in_safe_motion_volume
+global navigation_volume
+global _SAFE_MOTION_VOLUME
+global manifest_file
+global warning_light
+global software_versions
+global describe_software_versions
+global robot_velocity_calibration
+global robot_velocity_reload
+global describe_robot_velocity
+global adopt_measured_velocity_curve
+global _robot_velocity_from_block
+global SOFTWARE_OF_INTEREST
+global WARNING_LIGHT_ATTEMPTS
+global WARNING_LIGHT_RETRY_S
+global sensor_topics
+global sensor_topic
+
+
+_WORK_VOLUME = []          # one-element cache; empty means "not looked yet"
+_WORK_VOLUME_WHY = {}      # "why" -> the reason work_volume() came back None
+_SENSOR_TOPICS = {}        # sensor -> its topics, or None once found wanting
+_SENSOR_TOPICS_WHY = {}    # sensor -> why the manifest could not answer
+
+
+def work_volume(cell=None, mode=None, quiet=False):
+    """(frame, (xmin,ymin,zmin), (xmax,ymax,zmax)) for this cell, or None.
+
+    None means the manifest declares no box for this mode -- which is the
+    honest state on hardware, where the numbers have to be measured by touching
+    the tooling to the corners and have not been. Callers decide what to do
+    about that; most should use require_work_volume().
+
+    Cached, because every stage asks and the answer is a file on disk that does
+    not change while a config is running. work_volume_reload() drops it.
+    """
+    if _WORK_VOLUME:
+        return _WORK_VOLUME[0]
+
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    try:
+        from tari_bringup.cells import load_cell
+    except ImportError as e:
+        # Not fatal: this module is included by configs that also run outside a
+        # sourced ROS workspace, and a missing box is a documented state.
+        _WORK_VOLUME_WHY["why"] = ("tari_bringup is not importable (%s) -- "
+                                   "source ROS and the workspace" % (e,))
+        if not quiet:
+            print("  no work volume: %s" % (_WORK_VOLUME_WHY["why"],))
+        _WORK_VOLUME.append(None)
+        return None
+    try:
+        volume = load_cell(name, which).work_volume()
+    except Exception as e:
+        _WORK_VOLUME_WHY["why"] = ("cell %r mode %r would not load: %s"
+                                   % (name, which,
+                                      (str(e).splitlines() or [repr(e)])[0]))
+        if not quiet:
+            print("  no work volume: %s" % (_WORK_VOLUME_WHY["why"],))
+        _WORK_VOLUME.append(None)
+        return None
+
+    if volume is None:
+        _WORK_VOLUME_WHY["why"] = ("the manifest's work_volume.%s is null -- "
+                                   "not measured yet" % (which,))
+        if not quiet:
+            print("  cell %s mode %s declares no work volume; the reconstruction "
+                  "and the eddy-current toolpath will refuse until it is "
+                  "measured (require_work_volume() says how)" % (name, which))
+    _WORK_VOLUME.append(volume)
+    return volume
+
+
+#: One-element cache, like _WORK_VOLUME: the manifest does not change while a
+#: config runs and every guarded move asks.
+_MOTION_VOLUME = []
+
+
+def motion_volume(cell=None, mode=None, quiet=False):
+    """Where the ARM AND ITS TOOLING may go, as (frame, lo, hi), or None.
+
+    TWO VOLUMES, AND THEY ARE NOT THE SAME QUESTION:
+
+      work_volume    where a SAMPLE may be placed, and where the eddy-current
+                     probe TIP must stay. It is measured by touching the tooling
+                     to the corners, so it is as big as the part can be and no
+                     bigger.
+      motion_volume  where the arm may NAVIGATE. The tooling stands ~192 mm above
+                     the tip and reaches ~75 mm to the side, so holding all of it
+                     inside the part box costs real coverage: the Keyence's 73 mm
+                     lateral offset puts probe_end at x 1.0999 against a work
+                     volume ending at 1.100 while the LASER is correctly over the
+                     part, the first rows cannot then be approached, and the run
+                     dies with "the arm would not go to the first pose of the
+                     sweep".
+
+    None when the manifest declares none, and then capture_envelope() falls back
+    to what it has always done -- the work volume's x/y with CAPTURE_ABOVE_VOLUME
+    of headroom. So a cell that has not declared one behaves exactly as before.
+
+    NOT A LICENCE. Collision is still the planner's to refuse, and the EC toolpath
+    is still cropped to the WORK volume, because that one is about the probe tip.
+    """
+    if _MOTION_VOLUME:
+        return _MOTION_VOLUME[0]
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    volume = None
+    try:
+        from tari_bringup.cells import find_manifest
+        import yaml
+        with open(find_manifest(name)) as handle:
+            block = (yaml.safe_load(handle) or {}).get("motion_volume") or {}
+        raw = block.get(which)
+        if raw:
+            frame = raw.get("frame") or block.get("frame") or "world"
+            volume = (frame, tuple(float(v) for v in raw["min"]),
+                      tuple(float(v) for v in raw["max"]))
+    except Exception as e:                                        # noqa: BLE001
+        if not quiet:
+            print("  no motion volume for %s/%s (%s); using the work volume's "
+                  "x-y with headroom above it, as before"
+                  % (name, which, (str(e).splitlines() or [repr(e)])[0][:60]))
+        volume = None
+    _MOTION_VOLUME.append(volume)
+    return volume
+
+
+def describe_motion_volume():
+    """One line for a startup banner, or None when none is declared."""
+    volume = motion_volume(quiet=True)
+    if volume is None:
+        return None
+    _frame, lo, hi = volume
+    return ("motion volume (bounds the TOOLING, not the part): "
+            "x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f m"
+            % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+
+
+def check_motion_volume(samples=3, quat=None, verbose=True, timeout=5.0):
+    """Can the arm actually reach every corner of the motion volume? NO MOTION.
+
+    THE ONE NUMBER IN THE MANIFEST THAT IS NOT MEASURED. The work volume is
+    touched off -- an operator drives the tooling to each corner and the number is
+    where the arm actually was. The motion volume cannot be touched off, because
+    it is where the arm may GO rather than where a part may BE, and its corners
+    are in free space. It is derived instead: the work volume widened by the
+    tooling's own reach. So it has to be CHECKED rather than measured, and this is
+    the check.
+
+    Asks the same two services the pipeline asks -- `/compute_ik` for reach and
+    `/check_state_validity` for collision against the environment model -- at a
+    `samples` x `samples` x `samples` grid over the box, corners included. Nothing
+    moves, and it costs one IK and one validity call per point.
+
+    -> {"ok", "n", "unreachable", "colliding", "unknown", "points", "volume"}.
+    `points` carries every failure as (xyz, why), so a face that needs pulling in
+    can be read off rather than guessed at.
+
+    `ok` is True only when every point both reaches and is collision-free.
+    UNKNOWN IS NOT OK: a service that did not answer is not permission to widen a
+    box the arm will be allowed to fly through.
+
+    THE ENVIRONMENT MODEL IS THE AUTHORITY HERE, and that is the standing
+    assumption this rests on: the environment is modelled completely, so a pose
+    the planner does not report as a collision is safe. A wall, a pedestal or a
+    fixture that is NOT in the URDF is invisible to this, and no amount of
+    sampling will find it. Walk the cell before trusting a widened box for the
+    first time.
+    """
+    volume = motion_volume(quiet=True)
+    if volume is None:
+        if verbose:
+            print("  no motion volume declared for %s/%s -- capture_envelope() "
+                  "falls back to the work volume's x-y with headroom, as it "
+                  "always did. Nothing to check." % (CELL_NAME, CELL_MODE))
+        return None
+    _frame, lo, hi = volume
+    node = globals().get("capture_node")
+    if node is None or "ros" not in globals():
+        raise RuntimeError(
+            "check_motion_volume() needs the capture node and `ros`: it asks "
+            "/compute_ik and /check_state_validity, which is the whole point -- "
+            "the same two services the pipeline asks.")
+    n = max(2, int(samples))
+    axes = [np.linspace(float(lo[i]), float(hi[i]), n) for i in range(3)]
+    if quat is None:
+        # Tool pointing down, which is the orientation every sweep and every
+        # raster uses. A box the arm can reach with the tool pointing SIDEWAYS is
+        # not the box this is about.
+        quat = (0.0, 0.0, 0.0, 1.0)
+    rep = {"volume": volume, "n": 0, "unreachable": 0, "colliding": 0,
+           "unknown": 0, "points": [], "ok": False}
+    seed = None
+    try:
+        seed = node.current_joints()
+    except Exception:                                             # noqa: BLE001
+        seed = None
+    pose_of = globals().get("_cap_pose")
+    for x in axes[0]:
+        for y in axes[1]:
+            for z in axes[2]:
+                xyz = (float(x), float(y), float(z))
+                rep["n"] += 1
+                q = None
+                try:
+                    target = (pose_of(np.asarray(xyz), quat)
+                              if callable(pose_of) else (xyz, quat))
+                    q = ros.SolveIK(target, seed=seed, timeout=timeout)
+                except Exception:                                 # noqa: BLE001
+                    q = None
+                if q is None:
+                    rep["unreachable"] += 1
+                    rep["points"].append((xyz, "no IK solution"))
+                    continue
+                seed = list(q)
+                valid = None
+                try:
+                    valid = ros.CheckStateValidity(list(q), timeout=timeout)
+                except Exception:                                 # noqa: BLE001
+                    valid = None
+                if valid is False:
+                    rep["colliding"] += 1
+                    rep["points"].append((xyz, "in collision"))
+                elif valid is None:
+                    rep["unknown"] += 1
+                    rep["points"].append((xyz, "validity service did not answer"))
+    rep["ok"] = motion_volume_ok(rep)
+    if verbose:
+        for line in describe_motion_volume_check(rep):
+            print(line)
+    return rep
+
+
+def motion_volume_ok(rep):
+    """Does this check_motion_volume() report pass? -> bool.
+
+    COLLISION AND UNKNOWN FAIL. REACH DOES NOT, and the distinction is the point.
+
+    The motion volume is a PERMISSION box: it says where the arm is allowed to
+    try, and the guard refuses anything outside it. Nothing requires every point
+    INSIDE it to be reachable -- a pose the arm cannot reach fails at the planner
+    whether or not the box allowed it, so a box that is permissive in a corner
+    costs nothing. An arm's reach envelope is roughly spherical and a box is not,
+    so its CORNERS are the first thing to fall outside: on a perfectly serviceable
+    box, 14 of 27 grid points can have no IK solution, spread over all six faces.
+    Failing on that would be crying wolf.
+
+    What the box CAN get wrong is being widened into something solid, and that is
+    the collision count. UNKNOWN fails for the same reason CheckStateValidity()
+    returns None rather than False: a service that did not answer is not
+    permission.
+
+    ONE CAVEAT ON THE REACH NUMBER, so nobody reads more into it than is there:
+    `/compute_ik` may be collision-aware, in which case a pose that is really
+    blocked can come back as "no IK solution" rather than as a collision. So a
+    LARGE unreachable count next to a zero collision count is worth a look even
+    though it does not fail -- it may be the same fact wearing the other label.
+
+    Separated from the sampling so it can be checked on the host with no cell;
+    see motion_volume_test.py.
+    """
+    if not rep:
+        return False
+    return not (int(rep.get("colliding") or 0) or int(rep.get("unknown") or 0))
+
+
+def describe_motion_volume_check(rep):
+    """check_motion_volume()'s report as lines, for a banner or a log."""
+    if rep is None:
+        return ["  no motion volume declared; nothing to check"]
+    _frame, lo, hi = rep["volume"]
+    lines = ["  motion volume x %.3f..%.3f y %.3f..%.3f z %.3f..%.3f: "
+             "%d point(s) checked, %d unreachable, %d in collision, %d unknown"
+             % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], rep["n"],
+                rep["unreachable"], rep["colliding"], rep["unknown"])]
+    if rep["ok"]:
+        lines.append("  PASS: nothing in the box is in collision. NOTE what that "
+                     "does NOT cover: anything in the cell that is not in the "
+                     "URDF.")
+        if rep["unreachable"]:
+            lines.append("  (%d point(s) have no IK solution with the tool down. "
+                         "That is NOT a fault: an arm's reach is roughly a "
+                         "sphere and a box is not, so its corners fall outside "
+                         "first, and a pose the arm cannot reach fails at the "
+                         "planner whether or not this box allowed it. Worth a "
+                         "look only if the count is large, because /compute_ik "
+                         "may be collision-aware and report a blocked pose this "
+                         "way.)" % (rep["unreachable"],))
+        return lines
+    # WHICH FACE, so the fix is a number to change rather than a guess.
+    for why in ("no IK solution", "in collision",
+                "validity service did not answer"):
+        bad = [p for p, w in rep["points"] if w == why]
+        if not bad:
+            continue
+        b = np.asarray(bad, float)
+        lines.append("  %d point(s) %s, spanning x %.3f..%.3f y %.3f..%.3f "
+                     "z %.3f..%.3f"
+                     % (len(bad), why, b[:, 0].min(), b[:, 0].max(),
+                        b[:, 1].min(), b[:, 1].max(),
+                        b[:, 2].min(), b[:, 2].max()))
+        for axis, name in ((0, "x"), (1, "y"), (2, "z")):
+            at_lo = int((np.abs(b[:, axis] - lo[axis]) < 1e-9).sum())
+            at_hi = int((np.abs(b[:, axis] - hi[axis]) < 1e-9).sum())
+            if at_lo or at_hi:
+                lines.append("      %s: %d on the %.3f face, %d on the %.3f face"
+                             % (name, at_lo, lo[axis], at_hi, hi[axis]))
+    if rep["colliding"] or rep["unknown"]:
+        lines.append("  PULL THOSE FACES IN in the manifest's motion_volume block "
+                     "and run this again. The box must still CONTAIN the work "
+                     "volume -- cable_envelope_test.py fails if it stops doing so "
+                     "-- so if a face cannot be pulled in that far, the WORK "
+                     "volume is the thing that is too big for this cell.")
+    return lines
+
+
+# ==============================================================================
+# THE SAFE MOTION VOLUME: THE ROOM, NOT THE PART AND NOT THE TOOLING
+# ==============================================================================
+# A THIRD box. work_volume is where a part may sit and where the contact probe
+# tip must stay; motion_volume is that box plus the tooling's own reach;
+# safe_motion_volume is the room an operator has walked and declared clear.
+#
+# IT EXISTS BECAUSE TILT IS EXPENSIVE IN SPACE. The tooling stack stands ~192 mm
+# above the probe tip and reaches ~75 mm to the side, so leaning the tool over to
+# follow a surface normal swings probe_end and the Azure body around by of order
+# 100 mm. Against motion_volume -- the work volume plus 150 mm of pad -- that
+# eats most of the pad, and tilted poses are then refused for leaving a box whose
+# faces were never about where the room is clear. None of the sensor stages touch
+# the part, so holding them to a box derived from where a PART may sit buys
+# nothing at all.
+#
+# DERIVED, NOT WRITTEN DOWN, and the three faces the operator said not to move
+# are the work volume's own by construction rather than by transcription:
+#
+#   y        both faces, unchanged. "It is also not safe to extend it left or
+#            right either." Nothing widens this.
+#   x_max    unchanged. There is a WALL behind the table.
+#   z_min    unchanged. That is the table, and it was touched off.
+#   x_min    base_x - reach: toward the robot, past the world origin, and on
+#            behind the robot, which the operator states is clear over the range
+#            of the arm's reach for these same y-z extents.
+#   z_max    base_z + reach.
+#
+# Deriving it is what keeps "unchanged" true when the work volume changes --
+# re-touched off, or a session running on the measured override file. It also
+# makes "contains the work volume" an identity rather than something a test has
+# to catch.
+#
+# NOT A LICENCE, exactly as for motion_volume: collision is the planner's to
+# refuse, the contact probe is still held to the work volume whenever it is in
+# contact, and wrist 3 is still bounded by the measured cable band. This box only
+# says where the arm is ALLOWED to try -- and unlike the work volume it is not
+# measured, it is an operator's statement about a room plus two numbers read out
+# of the robot description. Anything not in the URDF, the wall included, is
+# invisible to check_motion_volume().
+
+
+def derive_safe_motion_volume(work, base_xyz, reach, motion=None):
+    """(lo, hi) of the safe motion volume, from the work volume and the arm.
+
+    PURE ARITHMETIC AND NOTHING ELSE, so it can be checked on the host with no
+    cell and no manifest -- see safe_motion_volume_test.py, which is where the
+    "y matches the motion volume" and "the wall side did not move" assertions
+    live.
+
+    `work` is (lo, hi) or (frame, lo, hi); `base_xyz` is where base_link sits in
+    the work volume's frame; `reach` is the arm's reach radius about base_link,
+    in metres. `motion` is the motion volume in the same forms, and it is where
+    y comes from.
+
+    Y COMES FROM THE MOTION VOLUME, NOT THE WORK VOLUME. The work volume bounds
+    the contact probe TIP; the motion volume is that plus the tooling pad, and
+    it is what already bounded every non-contact sensor sweep. Taking y from the
+    work volume instead would make this box TIGHTER sideways than the one it
+    replaces -- y +-0.659/0.604 down to -0.465/0.401 on this bench -- and a
+    sweep over a part at the y edge that flew last week would start being
+    refused. A volume introduced to give tilted poses more room must not take
+    room away on another axis.
+
+    The operator's "not safe to extend it left or right" is about not going
+    BEYOND what is already allowed there, which is the motion volume's y.
+
+    THE RESULT ALWAYS CONTAINS `work` AND `motion`. x_max and z_min are the
+    motion volume's, y is the motion volume's, and the other two faces only ever
+    move outward -- x_min below base_x and z_max above base_z. A reach small
+    enough to put either face inside what it must contain is refused rather than
+    returned, because a "safe motion volume" that forbids a pose an existing
+    volume allows is the one failure here that would not announce itself.
+    """
+    if work is None:
+        return None
+    # (frame, lo, hi) from work_volume(), or a bare (lo, hi). Accepting both is
+    # not politeness: every caller in the pipeline holds the three-tuple, and
+    # every test holds the pair.
+    if len(work) == 3 and isinstance(work[0], str):
+        lo, hi = work[1], work[2]
+    else:
+        lo, hi = work[0], work[1]
+    lo = np.asarray(lo, dtype=np.float64).reshape(3)
+    hi = np.asarray(hi, dtype=np.float64).reshape(3)
+    base = np.asarray(base_xyz, dtype=np.float64).reshape(3)
+    reach = float(reach)
+    if not np.isfinite(reach) or reach <= 0.0:
+        raise ValueError("the arm's reach is a positive distance in metres, "
+                         "not %r" % (reach,))
+    # The box this one supersedes for non-contact motion. Every face it
+    # contributes is taken from here rather than from the work volume, so this
+    # can only ever be as permissive or more. None falls back to the work
+    # volume, which is only right for a cell that declares no motion volume.
+    if motion is None:
+        m_lo, m_hi = lo, hi
+    else:
+        if len(motion) == 3 and isinstance(motion[0], str):
+            m_lo, m_hi = motion[1], motion[2]
+        else:
+            m_lo, m_hi = motion[0], motion[1]
+        m_lo = np.asarray(m_lo, dtype=np.float64).reshape(3)
+        m_hi = np.asarray(m_hi, dtype=np.float64).reshape(3)
+        # Never tighter than the work volume on any face, whatever the manifest
+        # says: the work volume is measured and this is not.
+        m_lo = np.minimum(m_lo, lo)
+        m_hi = np.maximum(m_hi, hi)
+    out_lo = (float(base[0] - reach), float(m_lo[1]), float(m_lo[2]))
+    out_hi = (float(m_hi[0]), float(m_hi[1]), float(base[2] + reach))
+    # THE CONTAINMENT CHECK, and it is not ceremony. The two derived faces come
+    # from a base position and a reach that are read out of a description; a
+    # description that moved the arm, or a reach typed in millimetres, would
+    # otherwise hand back a box SMALLER than the work volume on one face and
+    # every legal part position would become unreachable with no message.
+    if out_lo[0] > min(lo[0], m_lo[0]) + 1e-9 or out_hi[2] < max(hi[2], m_hi[2]) - 1e-9:
+        raise ValueError(
+            "the derived safe motion volume x %.4f..%.4f z %.4f..%.4f does not "
+            "contain the work volume x %.4f..%.4f z %.4f..%.4f. base_xyz %s and "
+            "reach %.4f m cannot both be right -- check the units (metres) and "
+            "where base_link actually sits."
+            % (out_lo[0], out_hi[0], out_lo[2], out_hi[2], lo[0], hi[0],
+               lo[2], hi[2], tuple(base), reach))
+    return (out_lo, out_hi)
+
+
+#: One-element cache, like _WORK_VOLUME and _MOTION_VOLUME.
+_SAFE_MOTION_VOLUME = []
+
+
+def safe_motion_volume_spec(cell=None, mode=None, quiet=False):
+    """The manifest's `safe_motion_volume.<mode>` block as a dict, or None.
+
+    Separated from safe_motion_volume() so the YAML reading and the arithmetic
+    can be looked at one at a time, and so a mode that declares nothing is a
+    plain None rather than an exception.
+    """
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    try:
+        from tari_bringup.cells import find_manifest
+        import yaml
+        with open(find_manifest(name)) as handle:
+            block = (yaml.safe_load(handle) or {}).get("safe_motion_volume") or {}
+    except Exception as e:                                        # noqa: BLE001
+        if not quiet:
+            print("  no safe motion volume for %s/%s (%s); the motion volume "
+                  "bounds navigation, as before"
+                  % (name, which, (str(e).splitlines() or [repr(e)])[0][:60]))
+        return None
+    raw = block.get(which)
+    if not raw:
+        return None
+    out = dict(raw)
+    out.setdefault("frame", block.get("frame") or "world")
+    return out
+
+
+def safe_motion_volume(cell=None, mode=None, quiet=False):
+    """Where the arm may NAVIGATE when nothing is in contact: (frame, lo, hi).
+
+    None when the manifest declares none for this mode, and then every caller
+    falls back to motion_volume() and behaves exactly as it did before this
+    existed. That is the state for `sim`, deliberately: nobody has walked that
+    room, because there is no room.
+
+    Cached, like the other two boxes. work_volume_reload() drops all three.
+    """
+    if _SAFE_MOTION_VOLUME:
+        return _SAFE_MOTION_VOLUME[0]
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    volume = None
+    spec = safe_motion_volume_spec(cell=name, mode=which, quiet=quiet)
+    if spec:
+        frame = spec.get("frame") or "world"
+        try:
+            if spec.get("min") and spec.get("max"):
+                # VERBATIM, for a cell that wants to state the box instead of
+                # deriving it. Still required to contain the work volume: the
+                # whole point of the box is to be LARGER than the one the probe
+                # tip is held to.
+                lo = tuple(float(v) for v in spec["min"])
+                hi = tuple(float(v) for v in spec["max"])
+                work = work_volume(cell=name, mode=which, quiet=True)
+                if work is not None:
+                    wlo, whi = work[1], work[2]
+                    if (any(a > b + 1e-9 for a, b in zip(lo, wlo))
+                            or any(a < b - 1e-9 for a, b in zip(hi, whi))):
+                        raise ValueError(
+                            "the explicit safe_motion_volume.%s does not contain "
+                            "the work volume (%s..%s vs %s..%s)"
+                            % (which, lo, hi, tuple(wlo), tuple(whi)))
+                volume = (frame, lo, hi)
+            else:
+                work = work_volume(cell=name, mode=which, quiet=True)
+                if work is None:
+                    raise ValueError(
+                        "the derivation needs a work volume and this cell/mode "
+                        "declares none")
+                # The motion volume, because that is where y, x_max and z_min
+                # come from -- it is the box that already bounded non-contact
+                # motion, and this one must not be tighter than it anywhere.
+                lo, hi = derive_safe_motion_volume(
+                    work, spec["base_xyz"], spec["arm_reach"],
+                    motion=motion_volume(cell=name, mode=which, quiet=True))
+                volume = (frame, lo, hi)
+        except Exception as e:                                    # noqa: BLE001
+            # REFUSE THE BOX, NOT THE RUN. A malformed safe volume must not take
+            # out a session: falling back to motion_volume() is the behaviour
+            # that predates this block, and it is strictly tighter.
+            print("  the safe motion volume for %s/%s could not be worked out "
+                  "(%s); the motion volume bounds navigation instead, as before"
+                  % (name, which, (str(e).splitlines() or [repr(e)])[0]))
+            volume = None
+    _SAFE_MOTION_VOLUME.append(volume)
+    return volume
+
+
+def navigation_volume(quiet=True):
+    """(lo, hi) the arm may NAVIGATE in when nothing is in contact, or None.
+
+    ONE PLACE RESOLVES THE PRECEDENCE, so a stage cannot quietly pick a
+    different box from the one the banner printed:
+
+        safe_motion_volume  the room, when the operator has declared one
+        motion_volume       the work volume plus the tooling's reach
+        work_volume         when neither exists, which is the oldest behaviour
+
+    NOT FOR CONTACT. The eddy-current probe tip is held to work_volume()
+    whenever it is touching the part, and nothing here changes that -- see
+    _crop_path_to_work_volume() in mesh_reconstruction.dpi, which takes the
+    bounds it is given and defaults to the work volume.
+    """
+    for fn in ("safe_motion_volume", "motion_volume"):
+        f = globals().get(fn)
+        v = f(quiet=quiet) if callable(f) else None
+        if v is not None:
+            return (np.asarray(v[1], float), np.asarray(v[2], float))
+    v = work_volume()
+    if v is None:
+        return None
+    return (np.asarray(v[1], float), np.asarray(v[2], float))
+
+
+def in_safe_motion_volume(points, margin=0.0):
+    """Boolean mask of which (n,3) world points are inside the safe volume.
+
+    Falls through to in_work_volume() when no safe volume is declared, so a
+    caller does not have to know whether this cell has one.
+    """
+    volume = safe_motion_volume(quiet=True)
+    if volume is None:
+        return in_work_volume(points, margin=margin)
+    _frame, lo, hi = volume
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    return np.all((p >= np.asarray(lo) - margin)
+                  & (p <= np.asarray(hi) + margin), axis=1)
+
+
+def describe_safe_motion_volume():
+    """Lines for a startup banner, or None when no safe volume is declared.
+
+    Says what the box DOES NOT cover as well as what it does, because the one
+    way to misread it is as permission for the contact probe.
+    """
+    volume = safe_motion_volume(quiet=True)
+    if volume is None:
+        return None
+    _frame, lo, hi = volume
+    spec = safe_motion_volume_spec(quiet=True) or {}
+    lines = ["  safe motion volume (bounds NON-CONTACT motion and the TOOLING): "
+             "x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f m"
+             % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2])]
+    if spec.get("min") and spec.get("max"):
+        lines.append("    stated outright in the cell manifest, not derived")
+    else:
+        lines.append("    derived: y and x_max and the floor are the work "
+                     "volume's unchanged; x_min = base_x - reach (behind the "
+                     "robot) and the ceiling = base_z + reach")
+        lines.append("    base_link at %s in the description, reach %.4f m "
+                     "(ur10e default_kinematics a2+a3+d5); NOT measured"
+                     % (tuple(float(v) for v in spec.get("base_xyz", ())),
+                        float(spec.get("arm_reach", float("nan")))))
+    lines.append("    the CONTACT probe tip is still held to the work volume; "
+                 "this box is for sensor stages and transit only")
+    # IT MUST NEVER BE TIGHTER THAN THE BOX IT REPLACES, AND THIS CHECKS.
+    # The safe volume is enormously larger than the motion volume toward and
+    # behind the robot and overhead; y, x_max and z_min are taken from the
+    # motion volume precisely so it cannot be smaller anywhere. An earlier
+    # version took y from the WORK volume, which padded nothing, and that made
+    # the box 194 mm narrower on each y face than the one it replaced -- a
+    # sweep over a part at the y edge would have started being refused by a
+    # volume introduced to give poses MORE room. If that ever comes back, this
+    # says so at startup rather than letting it arrive as a refused pose.
+    mv = globals().get("motion_volume")
+    mv = mv(quiet=True) if callable(mv) else None
+    if mv is not None:
+        tight = []
+        for i, axis in ((0, "x"), (1, "y"), (2, "z")):
+            if lo[i] > mv[1][i] + 1e-9:
+                tight.append("%s_min %+.3f -> %+.3f" % (axis, mv[1][i], lo[i]))
+            if hi[i] < mv[2][i] - 1e-9:
+                tight.append("%s_max %+.3f -> %+.3f" % (axis, mv[2][i], hi[i]))
+        if tight:
+            lines.append("    BUG -- this box is TIGHTER than the motion volume "
+                         "it replaces on: %s" % ("; ".join(tight),))
+            lines.append("      that is never intended. y, x_max and z_min are "
+                         "supposed to come straight from the motion volume, so "
+                         "a sweep that flew before cannot be refused by this. "
+                         "Treat a refused sensor pose as this, not as reach.")
+        else:
+            lines.append("    y %+.3f..%+.3f and the wall side x_max %+.3f are "
+                         "the motion volume's own, so nothing that flew before "
+                         "is refused by this box"
+                         % (lo[1], hi[1], hi[0]))
+    return "\n".join(lines)
+
+
+def work_volume_reload():
+    """Forget the cached boxes and sensor topics, so an edited manifest is
+    picked up."""
+    del _MOTION_VOLUME[:]
+    del _SAFE_MOTION_VOLUME[:]
+    del _WORK_VOLUME[:]
+    _WORK_VOLUME_WHY.clear()
+    _SENSOR_TOPICS.clear()
+    _SENSOR_TOPICS_WHY.clear()
+    return work_volume()
+
+
+def manifest_file(cell=None):
+    """(where tari_bringup finds this cell's manifest, the file to edit).
+
+    (None, None) when tari_bringup is not importable or has no such cell. The
+    two differ when the manifest comes from a colcon install: with
+    --symlink-install the installed file is a symlink to the source, and
+    realpath() is the source; without it the installed file is a COPY, and an
+    edit there is lost on the next build.
+    """
+    name = CELL_NAME if cell is None else cell
+    try:
+        from tari_bringup.cells import find_manifest
+        found = find_manifest(name)
+    except Exception:
+        return None, None
+    return found, os.path.realpath(found)
+
+
+def require_work_volume(what="this stage"):
+    """The box, or a refusal that tells the operator how to measure it.
+
+    Use this wherever proceeding without a box means cropping to something
+    invented instead -- every reconstruction, and any toolpath that must stay
+    inside the cell. Refusing is the point: the failure it prevents is silent
+    and expensive.
+
+    The message is written for the person at the cell, because on hardware
+    this is the FIRST thing a new cell hits and it is expected: the manifest
+    ships the hardware box as null on purpose, so it cannot be a copy of the
+    simulation's room.
+    """
+    volume = work_volume()
+    if volume is not None:
+        return volume
+
+    why = _WORK_VOLUME_WHY.get("why") or "no work_volume for this mode"
+    found, source = manifest_file()
+    sweep = globals().get("SPECIMEN_SWEEP_HEIGHT")
+    if source is None:
+        where = ("config/cells/%s.yaml in the cell package on TARI_CELL_PATH "
+                 "(tari_cell_configs; source tari_setup.bash, or start dgpy with "
+                 "TARI_CELL_PATH=tari_cell_configs)" % (CELL_NAME,))
+    else:
+        where = source
+    lines = [
+        "%s needs this cell's WORK VOLUME, and %s has none for mode %r: %s."
+        % (what, CELL_NAME, CELL_MODE, why),
+        "On hardware that is expected until it has been measured -- the box is "
+        "measured at the cell, never copied from the simulation.",
+        "",
+        "1. MEASURE IT (probe tip, world frame, metres; arm jogged by hand):",
+        "     capture_touch_off()   (dgpfiles/modules/cell_capture.dpi) walks "
+        "through the touches. The running config then uses the",
+        "     box at once, through a local override manifest, and the block to "
+        "fold into the file in step 2 is written too.",
+        "   By hand instead: touch the probe tip to the bench -- at contact, "
+        "WITHOUT compressing the spring -- at two",
+        "   opposite corners of the area parts will be placed in, and read the "
+        "tip at each with",
+        "     ros.t.transform.translation              (at this prompt)",
+        "     ros2 run tf2_ros tf2_echo world probe_end",
+        "   xmin/xmax and ymin/ymax are the two touches. zmin = the bench z you "
+        "touched + 0.0015, so the bench is",
+        "   cropped and parts resting on it are not. zmax = the tallest part's top "
+        "+ at least 0.05%s."
+        % ((", and at most %.2f (SPECIMEN_SWEEP_HEIGHT - 0.10) so the Azure "
+            "never integrates the arm's own tooling" % (sweep - 0.10,))
+           if sweep else ""),
+        "",
+        "2. WRITE IT into %s:" % (where,),
+        "     work_volume:",
+        "       frame: world",
+        "       %s:" % (CELL_MODE,),
+        "         min: [xmin, ymin, zmin]",
+        "         max: [xmax, ymax, zmax]",
+    ]
+    if found and source and found != source:
+        lines.append("   (tari_bringup reads it through %s, a symlink to that "
+                     "file -- same file, nothing to rebuild.)" % (found,))
+    elif found and "/install/" in found:
+        lines.append("   (That is an INSTALLED COPY. Edit the source under "
+                     "ros_ws/src instead and colcon build the package, or the "
+                     "edit is lost on the next build.)")
+    lines += [
+        "",
+        "3. RELOAD (by hand only; capture_touch_off() does it): "
+        "work_volume_reload() at this prompt -- no restart -- and confirm with",
+        "     ros2 run tari_bringup tari_cell_info --cell %s --mode %s"
+        % (CELL_NAME, CELL_MODE),
+    ]
+    raise RuntimeError("\n".join(lines))
+
+
+def in_work_volume(points, margin=0.0):
+    """Boolean mask of which (n,3) world points are inside the box.
+
+    `margin` widens the test, for asking "is this mesh ROUGHLY inside" without
+    tripping on the millimetre of noise at an edge.
+    """
+    volume = require_work_volume("in_work_volume()")
+    _frame, lo, hi = volume
+    p = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    lo = np.asarray(lo) - margin
+    hi = np.asarray(hi) + margin
+    return np.all((p >= lo) & (p <= hi), axis=1)
+
+
+def describe_work_volume():
+    """One line, for a config's startup banner.
+
+    It says "the probe tip" because the box bounds probe_end and nothing else.
+    The tooling stands about 192 mm above the tip and reaches ~75 mm to the
+    side, so a pose whose TIP is inside this box can still have the Keyence head
+    outside it -- which is a real thing the pan planner reports rather than
+    refuses. Leaving the frame unsaid invites reading the box as a bound on the
+    whole assembly.
+    """
+    volume = work_volume()
+    if volume is None:
+        return "  work volume: none declared for %s/%s" % (CELL_NAME, CELL_MODE)
+    frame, lo, hi = volume
+    return ("  work volume (bounds the PROBE TIP): x %.3f..%.3f  y %.3f..%.3f  "
+            "z %.3f..%.3f m (%.0f x %.0f x %.0f mm in %s)"
+            % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2],
+               (hi[0]-lo[0])*1e3, (hi[1]-lo[1])*1e3, (hi[2]-lo[2])*1e3, frame))
+
+
+# ==============================================================================
+# THE WORK CELL'S OWN SPEED CURVE
+# ==============================================================================
+# A MoveIt velocity scaling is a fraction of the arm's JOINT limits, not a speed.
+# The technician's control is in mm/s, so something has to convert, and the
+# conversion is a measured property of this cell -- not of this code and not of
+# the robot model. capture_robot_velocity() (cell_capture_scenarios.dpi) flies a
+# ladder of speeds and records the pair.
+#
+# IT BELONGS IN THE WORK-CELL MANIFEST, for the same reason the work volume and
+# the cable envelope do: the manifest travels with the work cell and the capture
+# file does not. A number that lives only in a config is transcribed by hand every
+# time, and a number transcribed by hand is a number that is eventually not
+# transcribed -- the pipeline then converts through a curve measured somewhere
+# else, commands the wrong scaling, and the arm sweeps at a speed nobody asked
+# for.
+#
+# PER MODE, and never substituted across modes. A simulated curve applied to real
+# hardware is exactly the failure above; a mode that declares none gets None here
+# and the caller says so rather than borrowing the other mode's.
+#
+# WHAT THE TABLE IS: [(scaling, measured m/s), ...] ascending, as
+# velocity_from_scaling() and velocity_scaling_for() consume it
+# (scan_parameters.dpi). It also carries the SPAN it was measured over, because
+# the curve is path-length dependent -- a move much shorter than the span is
+# mostly acceleration ramp and never reaches the speed the table promises.
+
+_ROBOT_VELOCITY = []          # one-element cache; empty means "not looked yet"
+
+
+def robot_velocity_calibration(cell=None, mode=None, quiet=False):
+    """This cell's measured speed curve, or None.
+
+    -> {"table": [(scaling, mps), ...], "measured", "span_m", "limit_mps",
+        "source"} or None when the manifest declares none for this mode.
+
+    Cached like the work volume: every planned scan asks, and the answer is a
+    file that does not change while a config runs.
+    """
+    if _ROBOT_VELOCITY:
+        return _ROBOT_VELOCITY[0]
+    name = CELL_NAME if cell is None else cell
+    which = CELL_MODE if mode is None else mode
+    got = why = None
+
+    # THE CAPTURE FILE FIRST, THE MANIFEST SECOND -- the same order the cable
+    # envelope uses, and for the same reason. A session on the machine that just
+    # ran capture_robot_velocity() should use what it measured, with no edit and no
+    # restart; every other machine uses the manifest, which is what travels with
+    # the work cell. Without this the operator has to hand-edit a file before the
+    # measurement they just took has any effect, which is the step that gets
+    # skipped.
+    locate = globals().get("_robot_velocity_file")
+    path = locate() if callable(locate) else None
+    if path and os.path.exists(path):
+        try:
+            import json
+            with open(path) as handle:
+                doc = json.load(handle)
+            got = _robot_velocity_from_block(doc, name, which, source=path)
+        except Exception as e:                                    # noqa: BLE001
+            why = "%s is unreadable (%s)" % (
+                path, (str(e).splitlines() or [repr(e)])[0][:60])
+            got = None
+
+    if got is None:
+        try:
+            from tari_bringup.cells import find_manifest
+            import yaml
+            found = find_manifest(name)
+            with open(found) as handle:
+                block = (yaml.safe_load(handle) or {}).get("robot_velocity") or {}
+            raw = block.get(which)
+            if raw:
+                got = _robot_velocity_from_block(raw, name, which, source=found)
+            elif why is None:
+                why = "the manifest declares no robot_velocity.%s" % (which,)
+        except Exception as e:                                    # noqa: BLE001
+            if why is None:
+                why = (str(e).splitlines() or [repr(e)])[0][:70]
+            got = None
+
+    if got is None and not quiet:
+        print("  no measured velocity curve for %s/%s (%s); the config's "
+              "ROBOT_VELOCITY_CALIBRATION is used instead" % (name, which, why))
+    _ROBOT_VELOCITY.append(got)
+    return got
+
+
+def _robot_velocity_from_block(raw, cell, mode, source=None):
+    """Validate and normalise one mode's `robot_velocity:` block.
+
+    REFUSES A TABLE THAT WOULD SILENTLY MISLEAD, rather than passing it on.
+    velocity_from_scaling() and velocity_scaling_for() interpolate between
+    consecutive rows and neither raises on a degenerate table -- they return a
+    number that is simply wrong. The shapes that matter:
+
+      * fewer than two rows: nothing to interpolate between.
+      * a scaling that does not increase: two speeds claimed for one command.
+      * a speed that FALLS as the scaling rises: false about any real arm, and it
+        makes the inverse ambiguous -- every speed inside the dip has two
+        scalings, and the inverse silently returns the lower one, so the cell is
+        commanded slower than asked for ever after.
+    """
+    rows = raw.get("table")
+    if not rows:
+        raise ValueError("robot_velocity.%s has no `table`" % (mode,))
+    table = []
+    for row in rows:
+        if len(row) != 2:
+            raise ValueError("robot_velocity.%s row %r is not [scaling, mps]"
+                             % (mode, row))
+        table.append((float(row[0]), float(row[1])))
+    table.sort()
+    if len(table) < 2:
+        raise ValueError(
+            "robot_velocity.%s has one row, so there is nothing to interpolate "
+            "between; measure at least two speeds" % (mode,))
+    for (s0, v0), (s1, v1) in zip(table, table[1:]):
+        if s1 <= s0:
+            raise ValueError(
+                "robot_velocity.%s repeats the scaling %.5f, which asserts two "
+                "speeds for one command" % (mode, s0))
+        if v1 <= v0:
+            raise ValueError(
+                "robot_velocity.%s says scaling %.5f gives %.4f m/s and the "
+                "larger scaling %.5f gives %.4f m/s. A speed that falls as the "
+                "scaling rises is false about any arm, and it makes the inverse "
+                "ambiguous -- every speed in the dip has two scalings and the "
+                "pipeline would take the slower one for good."
+                % (mode, s0, v0, s1, v1))
+    return {"table": table,
+            "measured": raw.get("measured"),
+            "span_m": None if raw.get("span_m") is None else float(raw["span_m"]),
+            "limit_mps": (None if raw.get("limit_mps") is None
+                          else float(raw["limit_mps"])),
+            "cell": cell, "mode": mode, "source": source}
+
+
+def adopt_measured_velocity_curve(name="ROBOT_VELOCITY_CALIBRATION", quiet=False):
+    """Replace a config's transcribed speed curve with this cell's measured one.
+
+    Call once, AFTER the includes: it writes into the config's own global so every
+    existing consumer -- velocity_from_scaling(), velocity_scaling_for(),
+    plan_scan() -- picks it up with no change.
+
+    -> the table now in force, and True if it came from the manifest.
+
+    WHY REPLACE RATHER THAN ASK. Those three functions are called from a dozen
+    places and take the table as an argument sourced from this one global. Adding a
+    manifest lookup to each is a dozen chances to miss one, and a missed one
+    converts through the stale curve while the report says the new one is in force.
+    One assignment cannot be half done.
+
+    The config's own value stays reachable as <name>_CONFIG, so a run can say what
+    it would have used and a bench session can put it back deliberately.
+    """
+    g = globals()
+    cal = robot_velocity_calibration(quiet=quiet)
+    config_table = list(g.get(name) or ())
+    g[name + "_CONFIG"] = config_table
+    if cal is None:
+        if not quiet:
+            print(describe_robot_velocity(fallback=config_table))
+        return config_table, False
+    g[name] = [tuple(row) for row in cal["table"]]
+    if not quiet:
+        print(describe_robot_velocity(fallback=config_table))
+        if config_table and config_table != g[name]:
+            # The two disagreeing is the normal case and worth one line: it is the
+            # difference between the curve somebody typed and the curve this arm
+            # has, and it is what decides every commanded speed.
+            print("    the config's own %d-row table is NOT in force (kept as "
+                  "%s_CONFIG); the manifest's measurement is"
+                  % (len(config_table), name))
+    return g[name], True
+
+
+def robot_velocity_reload():
+    """Drop the cache, so an edited manifest is picked up without a restart."""
+    del _ROBOT_VELOCITY[:]
+    return robot_velocity_calibration()
+
+
+def describe_robot_velocity(fallback=None, pass_length_m=None):
+    """One line on which speed curve is in force, and whether it fits the scan.
+
+    `fallback` is the config's own table, so the line can say plainly that a
+    transcribed curve is being used. `pass_length_m` is how long the moves this
+    curve is about to be applied to actually are: the curve is path-length
+    dependent, and applying one measured over 300 mm to a 50 mm pass is the
+    known way to get a speed nobody asked for.
+    """
+    cal = robot_velocity_calibration(quiet=True)
+    if cal is None:
+        n = len(fallback or ())
+        return ("  velocity curve: NOT MEASURED for %s/%s -- using the config's "
+                "own %d-row table. Every commanded speed is only as right as "
+                "that. capture_robot_velocity() writes a manifest block."
+                % (CELL_NAME, CELL_MODE, n))
+    table = cal["table"]
+    # WHICH FILE, not just "measured". The capture file and the manifest can
+    # disagree -- the capture is fresher on the machine that made it, the manifest
+    # is what every other machine sees -- and an operator reading a speed needs to
+    # know which one is in force before re-measuring or editing either.
+    where = cal.get("source") or "an unnamed source"
+    line = ("  velocity curve: measured, %d rows, scaling %.5f..%.5f -> "
+            "%.1f..%.1f mm/s (%s)\n    from %s"
+            % (len(table), table[0][0], table[-1][0],
+               table[0][1]*1e3, table[-1][1]*1e3,
+               cal["measured"] or "undated", where))
+    if cal["span_m"] and pass_length_m:
+        ratio = float(pass_length_m)/cal["span_m"]
+        if ratio < 0.5:
+            line += ("\n    MEASURED OVER %.0f mm, APPLIED TO %.0f mm passes. A "
+                     "move this much shorter is mostly acceleration ramp and "
+                     "will not reach the speed this table promises -- read the "
+                     "observed probe speed in the scan report, not the plan."
+                     % (cal["span_m"]*1e3, float(pass_length_m)*1e3))
+    return line
+
+
+# ==============================================================================
+# WHAT SOFTWARE IS ACTUALLY RUNNING
+# ==============================================================================
+# The work cell, the container and a developer's host run different builds of the
+# same stack, and the differences are invisible until they cost a run. A
+# dataguzzler install eighteen months behind the workspace produced a KeyError
+# inside the Ctrl-C handler -- a fault that had been fixed long before, in a
+# traceback that named none of this. A compiled extension older than the library
+# it links against produces a segfault instead.
+#
+# None of that is diagnosable after the fact from a log that does not say what was
+# loaded. So a config prints this at startup: the version of each thing that
+# matters and WHERE it was imported from, because on a machine with a system
+# install and a workspace checkout the path is the part that resolves the
+# argument.
+
+SOFTWARE_OF_INTEREST = (
+    ("dataguzzler_python", "dataguzzler-python"),
+    ("spatialnde2", "spatialnde2"),
+    ("spatialnde2_ec_functions", "the compiled EC conditioning"),
+    ("numpy", "numpy"),
+    ("open3d", "open3d"),
+)
+
+
+def _module_facts(module_name):
+    """(version, path) for an importable module, without importing it fresh.
+
+    Already-imported modules are read as they are: the question is what THIS
+    process is running, not what a fresh import would find.
+    """
+    import importlib
+    mod = sys.modules.get(module_name)
+    if mod is None:
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception as e:                                # noqa: BLE001
+            return (None, (str(e).splitlines() or [repr(e)])[0])
+    version = None
+    for attr in ("__version__", "version", "VERSION"):
+        got = getattr(mod, attr, None)
+        if isinstance(got, str):
+            version = got
+            break
+    if version is None:
+        try:
+            from importlib.metadata import version as _dist_version
+            version = _dist_version(module_name.replace("_", "-"))
+        except Exception:                                    # noqa: BLE001
+            version = "unknown"
+    return (version, getattr(mod, "__file__", None) or "(built in)")
+
+
+def software_versions():
+    """{module: {"version", "path", "label"}} for the stack this process loaded."""
+    out = {}
+    for module_name, label in SOFTWARE_OF_INTEREST:
+        version, path = _module_facts(module_name)
+        out[module_name] = {"version": version, "path": path, "label": label}
+    return out
+
+
+def describe_software_versions():
+    """The startup lines saying what is loaded. One per component.
+
+    A component that is absent says so rather than being left out: "open3d is not
+    importable" is the answer to a reconstruction that will not run, and a silent
+    omission is not.
+    """
+    lines = ["  software loaded by this process:",
+             "    python                       %s"
+             % (sys.version.split()[0],)]
+    ros_distro = os.environ.get("ROS_DISTRO")
+    if ros_distro:
+        lines.append("    ROS                          %s" % (ros_distro,))
+    for module_name, label in SOFTWARE_OF_INTEREST:
+        version, path = _module_facts(module_name)
+        if version is None:
+            lines.append("    %-28s NOT IMPORTABLE (%s)" % (label, path))
+            continue
+        lines.append("    %-28s %s" % (label, version))
+        lines.append("    %-28s   from %s" % ("", path))
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# THE WARNING LIGHT
+# ==============================================================================
+# A UR digital output drives the work cell's warning light: output 0 on
+# ex-ur10e-1. ClientScannerTest.dgp switches it on at the start of start() and
+# off in that function's `finally`. The
+# automated stages hold it with `with warning_light(...)` around anything that
+# moves the arm. The pin is the config's WARNING_LIGHT_PIN; None means this
+# cell has no light, and every hold is then a no-op.
+
+_LIGHT = {"depth": 0, "state": None, "unavailable": None, "log": []}
+_LIGHT_LOCK = threading.Lock()
+
+#: Attempts at switching the light ON before a run is refused.
+#:
+#: The light is a safety interlock and a dark light still refuses to move -- that
+#: does not change. What changes is how quickly it gives up. Two of the ways
+#: set_io fails are transient and cost a whole run apiece:
+#:
+#:   "no /io_and_status_controller/set_io service"  the service did not appear
+#:       within the discovery window, which a busy or freshly restarted graph can
+#:       miss even though the controller is running.
+#:   "set_io did not answer within 15 s"            it was found and then did not
+#:       reply, which is the same graph being busy rather than a dark light.
+#:
+#: Neither says the lamp is off; both say nobody could ask. A retry distinguishes
+#: them, and the second attempt costs seconds against a twenty-minute scan.
+WARNING_LIGHT_ATTEMPTS = 3
+
+#: Seconds between those attempts.
+WARNING_LIGHT_RETRY_S = 2.0
+
+
+def _switch_with_retry(pin, on, attempts):
+    """set_digital_out, retried. -> (ok, reason_of_last_failure).
+
+    Only worth retrying while it keeps failing for a reason that is about
+    reaching the service rather than about the output itself, and the two are not
+    distinguishable from here -- so it simply tries again, a bounded number of
+    times, and reports the last reason if none of them worked.
+    """
+    reason = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            set_digital_out(pin, on)
+            return (True, None)
+        except Exception as e:                                # noqa: BLE001
+            reason = (str(e).splitlines() or [repr(e)])[0]
+            if attempt < attempts:
+                print("  warning light: %s did not answer (%s); retrying "
+                      "(%d of %d)"
+                      % ("switch ON" if on else "switch off", reason,
+                         attempt + 1, attempts))
+                time.sleep(WARNING_LIGHT_RETRY_S)
+    return (False, reason)
+
+
+def _light_switch(pin, on, what):
+    """Switch the light and say so. Raises only when it may not stay dark."""
+    required = globals().get("WARNING_LIGHT_REQUIRED")
+    if required is None:
+        required = (CELL_MODE == "hardware")
+    if _LIGHT["unavailable"] is not None and not required:
+        # Simulation, already found wanting once: every further set_io would
+        # cost its full service wait for nothing.
+        return False
+    # Retried only where a retry can save something: switching ON before the arm
+    # moves, and only when the light is required, which is the case that refuses
+    # the run. A single attempt everywhere else keeps simulation and the switch-off
+    # path as quick as they were.
+    attempts = (globals().get("WARNING_LIGHT_ATTEMPTS", 1)
+                if (on and required) else 1)
+    ok, reason = _switch_with_retry(pin, on, attempts)
+    if not ok:
+        _LIGHT["log"].append((time.monotonic(),
+                              bool(on), False, what))
+        if on and required:
+            raise RuntimeError(
+                "could not switch the warning light ON (UR digital output %d): "
+                "%s. Refusing to move the arm with the light dark. Check the UR "
+                "driver's io_and_status_controller is running (ros2 service list "
+                "| grep set_io); WARNING_LIGHT_REQUIRED = False overrides this."
+                % (pin, reason))
+        if on:
+            _LIGHT["unavailable"] = reason
+            print("  no warning light (%s) -- continuing, because "
+                  "WARNING_LIGHT_REQUIRED is off in %s mode" % (reason, CELL_MODE))
+        else:
+            print("  WARNING: could not switch the warning light OFF (UR digital "
+                  "output %d): %s. Switch it off at the teach pendant, I/O tab."
+                  % (pin, reason))
+        return False
+    _LIGHT["state"] = bool(on)
+    _LIGHT["log"].append((time.monotonic(),
+                          bool(on), True, what))
+    print("  warning light %s (digital output %d) -- %s"
+          % ("ON" if on else "off", pin, what))
+    return True
+
+
+def warning_light(what="automated motion"):
+    """Hold the work cell's warning light ON for a block of automated motion.
+
+        with warning_light("Keyence raster"):
+            ...
+
+    On when the block starts, off when it ends -- including when it raises,
+    and including KeyboardInterrupt. Holds NEST: the light goes off only when
+    the outermost hold ends, so run_automated_scan() holds it across every
+    stage while each stage, called on its own from the prompt, still holds it
+    for itself.
+
+    If the light cannot be switched on and WARNING_LIGHT_REQUIRED is true --
+    the default on hardware -- the block does not run: the arm does not move
+    with the light dark. In simulation there is no UR I/O controller, so the
+    failure is reported once and the stages carry on.
+
+    If the dgpy process dies mid-stage nothing can switch it off: the teach
+    pendant's I/O tab can.
+    """
+    @contextlib.contextmanager
+    def _hold():
+        pin = globals().get("WARNING_LIGHT_PIN")
+        if pin is None:
+            yield None
+            return
+        with _LIGHT_LOCK:
+            _LIGHT["depth"] += 1
+            first = _LIGHT["depth"] == 1
+        try:
+            if first:
+                _light_switch(int(pin), True, what)
+            yield int(pin)
+        finally:
+            with _LIGHT_LOCK:
+                _LIGHT["depth"] -= 1
+                last = _LIGHT["depth"] == 0
+            if last:
+                _light_switch(int(pin), False, what)
+    return _hold()
+
+
+# ==============================================================================
+# WHICH TOPICS -- THE SAME ONES THE BRING-UP GAVE ITS CONSUMERS
+# ==============================================================================
+# industrial_reconstruction and yolo are pointed at a sensor's topics by the
+# bring-up, from `sensors.<name>.topics` in this same manifest. A stage here that
+# reads a camera must read the SAME topics, or it measures the depth scale,
+# frame and rate of a stream the reconstruction is not using. Topic names written
+# down on the dgpy side are the simulation's, and on hardware nothing publishes
+# them.
+
+def sensor_topics(sensor="azure", quiet=False):
+    """{key: topic, ..., "frame": frame} for one of this cell's sensors, or None.
+
+    The manifest's topics for this mode after the per-mode merge -- for the
+    Azure, color / depth / camera_info / points -- plus the frame its images are
+    stamped with. None when tari_bringup is not importable, the cell will not
+    load, or the sensor is absent in this mode; the reason is kept for
+    sensor_topic()'s error, because a print() from a worker thread is lost.
+    Cached; work_volume_reload() drops it along with the box.
+    """
+    if sensor in _SENSOR_TOPICS:
+        return _SENSOR_TOPICS[sensor]
+    topics = None
+    try:
+        from tari_bringup.cells import load_cell
+        spec = load_cell(CELL_NAME, CELL_MODE).sensor(sensor)
+    except Exception as e:
+        _SENSOR_TOPICS_WHY[sensor] = ("cell %s mode %s would not load (%s)"
+                                      % (CELL_NAME, CELL_MODE,
+                                         (str(e).splitlines() or [repr(e)])[0]))
+    else:
+        if spec["present"]:
+            topics = dict(spec["topics"])
+            topics["frame"] = spec.get("frame")
+        else:
+            _SENSOR_TOPICS_WHY[sensor] = ("cell %s has no %s in %s mode"
+                                          % (CELL_NAME, sensor, CELL_MODE))
+    if topics is None and not quiet:
+        print("  no %s topics: %s" % (sensor, _SENSOR_TOPICS_WHY[sensor]))
+    _SENSOR_TOPICS[sensor] = topics
+    return topics
+
+
+def sensor_topic(sensor, key, fallback=None):
+    """One topic from sensor_topics(), or a refusal that says what to do.
+
+    `fallback` is the SIMULATED camera's name, used only in simulation and only
+    when the manifest cannot answer. On hardware there is no fallback: a
+    simulation name there is a topic nothing publishes, so the consumer starts
+    cleanly and receives nothing -- the failure this exists to prevent. The
+    usual cause is a dgpy session started without the site layer on
+    TARI_CELL_PATH, which also leaves work_volume() empty.
+    """
+    topic = (sensor_topics(sensor) or {}).get(key)
+    if topic:
+        return topic
+    why = _SENSOR_TOPICS_WHY.get(sensor) or (
+        "the manifest declares no %s.%s" % (sensor, key))
+    if fallback is not None and CELL_MODE == "sim":
+        print("  %s.%s: %s; using the simulated camera's %s"
+              % (sensor, key, why, fallback))
+        return fallback
+    raise RuntimeError(
+        "no %s.%s topic for cell %s mode %s: %s. The bring-up pointed its "
+        "consumers at the manifest's topics and this has to read the same ones. "
+        "A dgpy session needs the site layer on TARI_CELL_PATH (source "
+        "tari_setup.bash, or export TARI_CELL_PATH=tari_cell_configs); "
+        "`ros2 run tari_bringup tari_cell_info --cell %s --mode %s` shows what "
+        "is declared."
+        % (sensor, key, CELL_NAME, CELL_MODE, why, CELL_NAME, CELL_MODE))

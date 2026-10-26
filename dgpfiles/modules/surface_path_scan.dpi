@@ -1,0 +1,1147 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  surface_path_scan.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Instrument-independent acquisition half of a surface-following scan.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# The instrument-independent half of a surface-following scan.
+#
+# Scan2DMeshPath() in mesh_scan.dpi was written for ultrasound and does two
+# separable things. One is ACQUISITION: work out which segments are passes, how
+# many traces they should yield, enter each pass in a configuration that can also
+# finish it, sweep it, decide where a trigger at arc length s actually was, drop a
+# pass that will not plan and account for the coverage lost. None of that knows or
+# cares what the instrument measures.
+#
+# The other is PRESENTATION: allocate /ut_cscan and /ut_scan_volume, wire a
+# cscan_gate chain, stage an A-scan. All of that is specific to a waveform
+# digitizer, and an eddy-current instrument -- one complex number per point, no
+# time axis, no gate -- shares none of it.
+#
+# Copying the acquisition half to add an instrument is how ClientScannerTest.dgp
+# and UTPlaneScan.dgp each grew their own version of the same motion logic, and
+# the copies drifted. So the acquisition half lives here once, and an instrument
+# supplies the presentation as callables.
+#
+# WHAT AN INSTRUMENT HAS TO PROVIDE
+#
+#   source                  armed per pass; see triggered_acquisition.dpi for the
+#                           contract. trigger_mode must be position-like.
+#   stage(data, meta, pose) stage one reading. Runs on the source's acquisition
+#                           thread, so it must not touch a dgpy module.
+#   prepare(n_traces)       size the accumulators before the first pass.
+#   setup_after_first()     define the math the readings feed. Called ONCE, after
+#                           the first reading is staged and before any more --
+#                           nd_accumulate_once consumes whatever is on its input
+#                           at instantiation as entry 0.
+#
+# and optionally `panel()` to raise a display and `projector_prefix` to put the
+# projected image somewhere other than /scan/proj.
+
+import os
+import threading
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global run_surface_path_scan
+global surface_scan_callables
+global scan_origin
+global contact_motion
+global contact_lift
+global contact_approach
+global contact_retract
+global first_touchdown_hook
+global MotionRecorder
+global path_motion_report
+global format_motion_report
+global fly_surface_path
+global path_joint_report
+global last_motion_recorder
+global APPROACH_PHASES
+last_motion_recorder = None
+
+
+def surface_scan_callables(path, segs, position_origin, contact=None, phase=None):
+    """Build approach/sweep/pose_at for a toolpath.
+
+    `position_origin` MUST match the coordinate convention of the source's
+    position_fn, and getting it wrong misplaces every trace without any error.
+    UTPlaneScan's probe_position_relative_to_scan() subtracts the scan origin, so
+    pose_at has to add it back: pass the footprint corner. A position_fn that
+    returns world coordinates -- ECAutomatedScan's probe_position() does -- needs
+    (0.0, 0.0), or the origin is counted twice and the whole scan lands one
+    footprint away from the part.
+
+    Separated from run_surface_path_scan() so it can be tested, and so an
+    instrument that needs to wrap one of them -- to fire an external trigger at a
+    pass boundary, say -- can build the standard three and replace one.
+
+    `contact` (contact_motion()) is for a probe that touches the part: the
+    approach becomes lift / transit / descend along the tool axis, and the sweep
+    is capped at the near-part speed. `phase`, if given, is called with "lift",
+    "transit" and "descend" as each begins -- the dry run tags its samples by it.
+    """
+    positions = np.array(path.positions, dtype=np.float64)
+    quats = np.array(path.quats, dtype=np.float64)
+
+    def approach(idx, end_idx):
+        if contact is not None:
+            return contact_approach(contact, positions, quats, idx, end_idx,
+                                    phase=phase)
+        # Solve the FAR end first and seed the start from it, so the pass is
+        # entered in a configuration that can also finish it. Which
+        # configuration a pass is entered in decides how far along it the
+        # Cartesian sweep gets, so this is not the same as "move there".
+        start_pose = _pose_stamped(positions[idx], quats[idx])
+        end_pose = _pose_stamped(positions[end_idx], quats[end_idx])
+        q = ros.ApproachInConfiguration(
+            start_pose, end_pose,
+            **(globals().get("joint_move_kwargs") or (lambda: {}))())
+        if q is not None:
+            return True
+        print("    no row-spanning configuration for this pass")
+        return False
+
+    def sweep(start, end):
+        poses = PoseArray()
+        poses.header.frame_id = "world"
+        for k in range(start, end):
+            poses.poses.append(_pose_msg(positions[k], quats[k]))
+        vel = raster_velocity()
+        speed_mps = (globals().get("raster_tool_speed") or (lambda: None))()
+        if contact is not None:
+            # In contact for the whole pass: never faster than the near-part
+            # speed, whatever the plan would allow. The m/s figure is clamped
+            # the same way as the scaling, from the same pair, so the two cannot
+            # disagree about what this pass is allowed to do.
+            vel = min(vel, contact["near_scaling"])
+            near_mps = contact.get("near_speed_mps")
+            if near_mps:
+                speed_mps = (float(near_mps) if speed_mps is None
+                             else min(speed_mps, float(near_mps)))
+        # A row of waypoints: the looser IK threshold, or it truncates. See
+        # scan_plan.dpi's motion_kind().
+        #
+        # tool_speed_kwargs() is EMPTY unless set_tool_speed_solver(True) has
+        # been called, so this call is unchanged by default -- see the block
+        # comment in scan_plan.dpi for what turning it on does and does not buy.
+        r = (globals().get("cartesian_move") or ros.CartesianMove)(
+            poses, vel=vel, acc=RASTER_ACCEL, min_fraction=PATH_MIN_FRACTION,
+            **(globals().get("tool_speed_kwargs") or (lambda *a: {}))(speed_mps))
+        return _move_result(r)
+
+    def pose_at(seg, s_m, xy):
+        start, end = seg
+        s0 = path.s_m[start]
+        idx = int(np.searchsorted(path.s_m[start:end], s0 + s_m) + start)
+        idx = min(max(idx, start), end-1)
+        pos = positions[idx]
+        x, y = float(pos[0]), float(pos[1])
+        if xy is not None:
+            # The trigger's xy is measured and interpolated to the exact
+            # crossing, so it beats the commanded value. z and the orientation
+            # still come from the path -- the surface is what says how high the
+            # probe was and which way it was pointing.
+            x = float(xy[0]) + position_origin[0]
+            y = float(xy[1]) + position_origin[1]
+        return pose7_from_parts((x, y, float(pos[2])), tuple(quats[idx]))
+
+    return approach, sweep, pose_at
+
+
+def first_touchdown_hook(approach, on_first_contact):
+    """`approach` wrapped so on_first_contact() runs once, at the first touchdown.
+
+    THE ONLY MOMENT THE PROBE IS ON THE PART AND NOTHING HAS BEEN MEASURED YET.
+    An instrument that has to be set up against the material -- an eddy-current
+    bridge balanced on unflawed metal, say -- has exactly one place to do it, and
+    the surrounding order leaves no other:
+
+        prepare(n)          the accumulators are sized. The probe is IN THE AIR
+        approach(pass 1)    lift / transit / descend -- the probe touches down
+        >>>  here  <<<
+        stage(trace 0)      the first reading, which must already be correct
+        setup_after_first   the math that consumes trace 0 is wired on it
+
+    prepare() is too early and setup_after_first() is too late: by then a reading
+    has been staged and it is entry zero of the trace list for the rest of the
+    scan.
+
+    ONCE PER SCAN, NOT ONCE PER PASS. The probe descends onto the part at the
+    start of every pass, so a per-pass hook would re-run instrument setup dozens
+    of times and step the baseline between passes -- which stripes the image by
+    line, exactly the fault EC_SERPENTINE exists to avoid. A pass that fails to
+    plan is not a touchdown either, so the hook waits for the first pass actually
+    entered.
+
+    It runs on the thread that called the scan -- the same one that calls
+    ros.Move() -- so it may call into a dgpy module. `stage` may not.
+
+    An exception from the hook propagates out of the scan, which happens before
+    any trace is staged and leaves run_surface_path_scan()'s own teardown to lift
+    the probe off the part. The attempt is marked before the call, so a hook that
+    raises is never retried on the next pass.
+    """
+    state = {"attempted": False}
+
+    def wrapped(idx, end_idx):
+        ok = approach(idx, end_idx)
+        if ok and not state["attempted"]:
+            state["attempted"] = True
+            on_first_contact()
+        return ok
+
+    wrapped.touchdown_state = state
+    return wrapped
+
+
+def run_surface_path_scan(path, x3d, source, stage, prepare, setup_after_first,
+                          max_passes=None, force=False, panel=None,
+                          projector_prefix="/scan/proj", label="Surface path scan",
+                          pitch_m=None, position_relative_to_origin=True,
+                          contact=None, on_first_contact=None, on_pass=None):
+    """Acquire along a planned toolpath. No grid, no rectangular volume.
+
+    Returns the report from run_triggered_path_scan(), after printing the plan,
+    the per-pass progress and the outcome.
+
+    A pass that will not plan is DROPPED and reported rather than aborting the
+    scan. Noether segments are ragged -- 73 of them, 2 to 278 waypoints, on one
+    real mesh -- and with a trace list a dropped pass costs coverage there and
+    nothing anywhere else, which is not true of a grid.
+
+    `on_first_contact` is called once, the instant the probe first touches the
+    part and before any reading is staged: see first_touchdown_hook() for why
+    that is the only place instrument setup against the material can go. Only
+    meaningful with `contact`.
+
+    `on_pass(index, segment_report)` is called after every pass that acquired
+    anything and is how an instrument gets that pass onto disk before the next
+    one starts -- the only thing that makes a scan survive the process that
+    took it. Passed straight to run_triggered_path_scan(); see there for what it
+    may and may not do, and ec_trace_store.dpi for the eddy-current one.
+    """
+    if getattr(source, "trigger_mode", "timer") not in (
+            "position", "timestamped", "timestamped-ec"):
+        raise RuntimeError(
+            "%s needs a position-like trigger, not %r. There is no grid here to "
+            "bin a free-running instrument into, so the trigger IS the trace "
+            "index." % (label, getattr(source, "trigger_mode", "timer")))
+
+    segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    if max_passes is not None:
+        segs = segs[:max_passes]
+    if not segs:
+        raise RuntimeError(
+            "no segment on this path is longer than PATH_MIN_SEGMENT_M (%.3f m), "
+            "so there is nothing to scan. Either the mesh is smaller than that "
+            "or the planner returned only link moves." % (PATH_MIN_SEGMENT_M,))
+
+    # No grid here, so nothing constrains the pitch: the requested step size is
+    # the step size.
+    # source=source, not the module global: this function is the
+    # INSTRUMENT-INDEPENDENT half of a scan and it already has the source it was
+    # handed. Retuning `ascan_source` instead retunes nothing for any config
+    # whose source is something else (the eddy-current one is ec_source), and
+    # returns None for the pitch. See set_trigger_pitch() in scan_plan.dpi.
+    pitch = set_trigger_pitch(SCAN_STEP_SIZE if pitch_m is None else pitch_m,
+                              source=source)
+
+    # The toolpath's own footprint corner. Published as `scan_origin` because
+    # the simulated specimen keys its defect map on position relative to it, and
+    # used as the pose_at offset only when the source reports relative
+    # coordinates -- see surface_scan_callables().
+    #
+    # `scan_origin` is ONE cell-wide variable, deliberately: plane_scan.dpi and
+    # mesh_scan.dpi write it too, and its readers
+    # (UTPlaneScan.dgp's probe_position_relative_to_scan(), the simulated
+    # specimen) want whichever scan is running now. Only one scan mode runs at a
+    # time. Allowlisted in dpi_exports_test.py; do not rename it per mode.
+    global scan_origin
+    footprint = (float(path.positions[:, 0].min()), float(path.positions[:, 1].min()))
+    scan_origin = footprint
+    position_origin = footprint if position_relative_to_origin else (0.0, 0.0)
+
+    if panel is not None:
+        panel()
+
+    travel = sum(path.segment_length_m(s) for s in segs)
+    print("%s: %d passes, %.3f m of travel, %d traces expected at %.2f mm"
+          % (label, len(segs), travel, path.trace_count(pitch, segs), pitch*1e3))
+
+    # The projection extent is the surface's own footprint, not a pass length:
+    # the parameterization spans the whole part, so that is what the pixel count
+    # has to resolve the spot against.
+    extent = float(max(path.positions[:, 0].ptp(), path.positions[:, 1].ptp()))
+    plan = plan_current_scan(path_length_m=travel, passes=len(segs),
+                             step_m=pitch, projection_extent_m=extent,
+                             force=force)
+
+    # A CONTACT SCAN MUST DECLARE ITS CONTACT, or the planner refuses the
+    # measurement. plan_ec_path() puts the specimen mesh in the planning scene --
+    # that is what makes MoveIt's collision check mean anything -- and with it
+    # there, a pose whose probe tip is ON the surface is in collision BY
+    # CONSTRUCTION -- at every pose of the scan, and deeper still by whatever
+    # contact preload the path was planned with.
+    #
+    # THIS IS WHAT A MISSING DECLARATION LOOKS LIKE. Nothing errors.
+    # computeCartesianPath simply stops just short of the surface and reports the
+    # fraction it managed:
+    #
+    #     descent onto the pass start refused (planner 0.95)
+    #     pass 1/9: SKIPPED, 0.080 m of coverage lost
+    #     ... every one of 9 passes ...
+    #     Eddy-current path scan complete: 0 traces (720 expected)
+    #
+    # 0.95 of a 10 mm descent is 9.5 mm: the probe stopped half a millimetre off
+    # the part, which _straight_move's min_fraction=1.0 correctly refuses,
+    # because half a millimetre of lift-off is not a contact scan.
+    #
+    # Declared here, in the instrument-independent half and gated on `contact`,
+    # so that any probe that touches the part gets it by construction rather than
+    # only in whichever scan happens to ask.
+    #
+    # Only when contact is not None: a standoff scan must keep every protection
+    # it has. A stage that plans for a standoff sensor while a contact probe
+    # rides on the same plate can otherwise drive that probe into a curved part.
+    if contact is not None and globals().get("allow_specimen_contact") is not None:
+        try:
+            if SPECIMEN_SCENE_ID in planning_scene_objects():
+                links = contact.get("links") or TOOLING_CONTACT_LINKS
+                allow_specimen_contact(links)
+                print("  contact declared to the planner for %s; every other "
+                      "link must still clear the part"
+                      % (", ".join(links) or "nothing",))
+            else:
+                print("  the specimen is not in the planning scene, so there is "
+                      "no contact to declare -- and nothing is collision "
+                      "checked against the part either.")
+        except Exception as e:                              # noqa: BLE001
+            print("  WARNING: could not declare the probe's contact with the "
+                  "specimen (%s). Every pass will be refused as a collision at "
+                  "the descent; remove_specimen_from_scene() is the blunt way "
+                  "out." % (e,))
+
+    prepare(path.trace_count(pitch, segs))
+    approach, sweep, pose_at = surface_scan_callables(path, segs, position_origin,
+                                                      contact=contact)
+    if on_first_contact is not None:
+        approach = first_touchdown_hook(approach, on_first_contact)
+
+    def _setup():
+        setup_after_first(plan, x3d, projector_prefix)
+
+    def _progress(si, nseg, seg_report, elapsed):
+        if seg_report.get("skipped"):
+            print("  pass %d/%d: SKIPPED, %.3f m of coverage lost, %.1f s elapsed"
+                  % (si+1, nseg, seg_report["length_m"], elapsed))
+            return
+        L = seg_report["length_m"]
+        frac = seg_report.get("fraction")
+        print("  pass %d/%d: %d traces (expected %d), commanded %.3f m / observed "
+              "%.3f m (%.0f%%)%s, %.1f s elapsed"
+              % (si+1, nseg, seg_report["staged"], seg_report["expected"], L,
+                 seg_report["observed_m"],
+                 100.0*seg_report["observed_m"]/L if L else 0.0,
+                 "" if frac is None else ", planner %.0f%%" % (100.0*frac),
+                 elapsed))
+
+        # IS ANY OF THIS REACHING THE IMAGE? Asked after the first pass that
+        # staged anything, and then occasionally, because the end-of-scan report
+        # only runs when a scan ENDS -- and the scans that need this news are
+        # the ones that do not. Both eddy-current scans of 2026-10-01 stopped
+        # abnormally (the pendant dropped External Control on one, the operator
+        # aborted the other) and neither printed a projection line, so whether
+        # traces were landing is simply not recorded anywhere.
+        #
+        # A ray that misses the surface is dropped inside
+        # project_point_onto_parameterization without raising, so an empty image
+        # is silent by construction. Two hours of scanning can complete with
+        # nothing in it and nothing said.
+        #
+        # It WARNS and does not stop: every trace carries the pose it was taken
+        # at, so a scan whose projection is empty still records usable data and
+        # can be re-projected offline. Aborting would throw away a good
+        # measurement over a presentation fault.
+        check = globals().get("scan_projection_status")
+        staged = seg_report.get("staged") or 0
+        if callable(check) and staged > 0 and (si == 0 or (si + 1) % 25 == 0):
+            try:
+                st = check(quiet=True)
+                pr = (st or {}).get("projector")
+                if isinstance(pr, dict) and (pr.get("offered") or 0) > 0 \
+                        and pr.get("landed") == 0:
+                    print("  ** NOTHING IS REACHING THE PROJECTED IMAGE: %d trace(s) "
+                          "offered after pass %d and 0 image cells have data. The "
+                          "scan continues -- the traces carry their own poses and "
+                          "can be re-projected offline -- but the live image will "
+                          "stay empty." % (pr["offered"], si + 1))
+                    print(describe_projection_status(pr))
+            except Exception as e:                            # noqa: BLE001
+                print("  (projection status unavailable: %s)" % (e,))
+
+    # Hold move_group's IK in local mode for the scan: it starts global for
+    # interactive work, and a global solver may change arm branch mid-path and
+    # truncate a row. See motion_profile() in scan_plan.dpi.
+    _ik_hold = motion_profile("scan")
+    _ik_hold.__enter__()
+    try:
+        report = run_triggered_path_scan(path, source, pitch,
+                                         approach, sweep, stage, pose_at,
+                                         setup_after_first=_setup, segments=segs,
+                                         progress=_progress,
+                                         on_segment_failure="skip",
+                                         on_pass=on_pass)
+    finally:
+        source.disarm()
+        ros.WaitUnPauseAcquisition()
+        if contact is not None:
+            # Off the part before anything else moves. A scan that stopped on
+            # an exception has left the probe wherever it was -- in contact.
+            try:
+                contact_retract(contact, positions=path.positions)
+            except Exception as e:
+                print("  WARNING: could not lift the probe off the part (%s). "
+                      "Jog it clear before moving anything else." % (e,))
+        _ik_hold.__exit__(None, None, None)
+
+    print("%s complete: %d traces (%d expected), %.1f s, %.3f s/trace."
+          % (label, report["staged"], report["expected_traces"], report["elapsed"],
+             report["elapsed"]/max(report["staged"], 1)))
+    if report.get("skipped"):
+        lost = sum(s["length_m"] for s in report["skipped"])
+        print("  %d pass(es) dropped, %.3f m of planned coverage not acquired. "
+              "The traces that were taken are still correct -- each carries its "
+              "own pose -- but that ground was not scanned."
+              % (len(report["skipped"]), lost))
+    report_scan_outcome(report)
+    finish_projection()
+    return report
+
+
+# ==============================================================================
+# CONTACT MOTION -- ONTO AND OFF THE PART ONLY ALONG THE TOOL'S OWN AXIS
+# ==============================================================================
+# An ultrasound probe at 50 mm of standoff can be taken from one pass to the
+# next any way the planner likes. A contact probe cannot. The approach to a pass
+# is ApproachInConfiguration(): a JOINT move, and the tip's path during a joint
+# move is whatever the arm's geometry makes it -- between two points ON the
+# surface it can dip into the part or drag across it, and nothing checks,
+# because the part is not in MoveIt's planning scene. So a contact scan leaves
+# and reaches the surface only along the tool axis, at the near-part speed:
+#
+#   lift     straight back along the tool axis until the probe is h clear
+#   transit  ApproachInConfiguration() to h above the next pass's start --
+#            seeded from h above its end, so the configuration can finish it
+#   descend  straight down the tool axis onto the start
+#
+# h is lift_m for a short hop (the next pass starts within short_hop_m: the
+# next line of a snake, or of a small region) and approach_m otherwise.
+# ClientScannerTest.dgp's routine() did this by hand for its single approach --
+# 100 mm above the first point, then 50, then down; 50 then 100 up at the end.
+
+def _move_result(result):
+    """(success, fraction) from a CartesianMove result.
+
+    Here rather than borrowed from plane_scan.dpi's _move_outcome(), because a
+    config that scans surfaces -- ECAutomatedScan -- does not include the plane
+    scan at all, and a borrowed name is then a NameError on the first sweep.
+    """
+    inner = getattr(result, "result", None)
+    ok = bool(getattr(inner, "success", False))
+    frac = getattr(inner, "fraction", None)
+    return ok, (float(frac) if frac is not None else None)
+
+
+def contact_motion(lift_m=0.010, approach_m=0.050, short_hop_m=0.030,
+                   near_speed_mps=0.010, transit_joint_scaling=None, accel=0.05,
+                   axis_speed_mps=None, links=None):
+    """The settings a contact scan moves by, as one dict.
+
+    near_speed_mps is the speed of the sweep and of every move onto or off the
+    part, converted to a MoveIt scaling through the cell's velocity calibration
+    (motion_scaling(), scan_plan.dpi). transit_joint_scaling is the MoveIt
+    scaling for the joint move between passes; None keeps MoveJoints' default of
+    0.1, and that is NOT a Cartesian speed limit -- the dry run reports the peak
+    tip speed it actually produced.
+
+    axis_speed_mps is the lift and the descent, along the tool axis; None is
+    near_speed_mps. It is separate because the velocity calibration was
+    measured on horizontal sweeps: a vertical move at the same scaling peaked
+    25% faster in simulation (12.5 mm/s commanded as 10).
+
+    `links` are the links ALLOWED TO TOUCH the specimen, which
+    run_surface_path_scan() declares to the planner before the first pass. None
+    means TOOLING_CONTACT_LINKS (ec_probe, probe_holder). It belongs in this dict
+    because it is part of what "this scan touches the part" means: a contact
+    scan that does not say which links touch is one whose passes the planner
+    refuses, silently, as a truncated Cartesian path.
+    """
+    to_scaling = globals().get("motion_scaling") or (lambda v: float(v))
+    axis = near_speed_mps if axis_speed_mps is None else axis_speed_mps
+    return {"lift_m": float(lift_m), "approach_m": float(approach_m),
+            "short_hop_m": float(short_hop_m),
+            "near_speed_mps": float(near_speed_mps),
+            "near_scaling": float(to_scaling(near_speed_mps)),
+            "axis_speed_mps": float(axis),
+            "axis_scaling": float(to_scaling(axis)),
+            "transit_joint_scaling": (None if transit_joint_scaling is None
+                                      else float(transit_joint_scaling)),
+            "accel": float(accel),
+            "links": (None if links is None else tuple(links))}
+
+
+def _probe_now():
+    """(xyz, quat) of probe_end from the context-free TF holder, or None."""
+    snap = live_pose.snapshot()
+    if snap is None:
+        return None
+    return (np.asarray(snap[0], dtype=np.float64),
+            np.asarray(snap[1], dtype=np.float64))
+
+
+def _straight_move(p0, q0, p1, q1, scaling, accel):
+    r = (globals().get("cartesian_move") or ros.CartesianMove)(
+        [_pose_msg(p0, q0), _pose_msg(p1, q1)],
+        vel=scaling, acc=accel, min_fraction=1.0)
+    return _move_result(r)
+
+
+def _nearest_distance(points, p):
+    if points is None or not len(points):
+        return float("inf")
+    d = np.asarray(points, dtype=np.float64) - np.asarray(p, dtype=np.float64)
+    return float(np.sqrt((d*d).sum(axis=1).min()))
+
+
+def contact_lift(contact, height, phase=None):
+    """Back the probe straight off along its own axis by `height`, slowly."""
+    now = _probe_now()
+    if now is None:
+        print("    no probe pose from TF; not lifting")
+        return False
+    if height <= 0.0:
+        return True
+    p, q = now
+    if phase is not None:
+        phase("lift")
+    ok, frac = _straight_move(p, q, p + quat_to_matrix(q)[:, 2]*float(height), q,
+                              contact.get("axis_scaling", contact["near_scaling"]),
+                              contact["accel"])
+    if not ok:
+        print("    lift of %.0f mm along the tool axis refused (planner %s)"
+              % (height*1e3, frac))
+    return ok
+
+
+def contact_approach(contact, positions, quats, idx, end_idx, phase=None):
+    """Put the probe on the start of a pass: lift, transit in the air, descend.
+
+    positions/quats are the whole toolpath; they double as the surface, so
+    "how far is the probe from the part" is the distance to the nearest
+    planned point. A probe already that far clear -- parked, or lifted by an
+    approach that then failed -- is not lifted again, or repeated failures
+    would walk it up and out of reach.
+    """
+    positions = np.asarray(positions, dtype=np.float64)
+    quats = np.asarray(quats, dtype=np.float64)
+    start, qs = positions[idx], quats[idx]
+    end, qe = positions[end_idx], quats[end_idx]
+    now = _probe_now()
+    if now is None:
+        print("    no probe pose from TF; cannot approach")
+        return False
+    hop = float(np.linalg.norm(now[0] - start))
+    h = contact["lift_m"] if hop <= contact["short_hop_m"] else contact["approach_m"]
+    clear = _nearest_distance(positions, now[0])
+    if clear < h - 0.001 and not contact_lift(contact, h - clear, phase=phase):
+        return False
+    up_s = start + quat_to_matrix(qs)[:, 2]*h
+    up_e = end + quat_to_matrix(qe)[:, 2]*h
+    if phase is not None:
+        phase("transit")
+    kw = {}
+    if contact.get("transit_joint_scaling"):
+        kw = {"vel": contact["transit_joint_scaling"],
+              "acc": contact["transit_joint_scaling"]}
+    if ros.ApproachInConfiguration(_pose_stamped(up_s, qs), _pose_stamped(up_e, qe),
+                                   **kw) is None:
+        print("    no configuration reaches %.0f mm above both ends of this pass"
+              % (h*1e3,))
+        return False
+    if phase is not None:
+        phase("descend")
+    ok, frac = _straight_move(up_s, qs, start, qs,
+                              contact.get("axis_scaling", contact["near_scaling"]),
+                              contact["accel"])
+    if not ok:
+        print("    descent onto the pass start refused (planner %s)" % (frac,))
+    return ok
+
+
+def contact_retract(contact, positions=None, phase=None):
+    """Lift off at the end of a contact scan, to approach_m clear of the part."""
+    now = _probe_now()
+    clear = _nearest_distance(positions, now[0]) if (now is not None and
+                                                    positions is not None) else 0.0
+    if clear >= contact["approach_m"] - 0.001:
+        return True
+    return contact_lift(contact, contact["approach_m"] - min(clear, contact["approach_m"]),
+                        phase=phase)
+
+
+# ==============================================================================
+# A DRY RUN: THE SCAN'S OWN MOTION, NO INSTRUMENT, MEASURED
+# ==============================================================================
+# Simulation has no contact and no spring, so what it can answer is geometric:
+# can every pass be entered and finished, does the tip follow the planned line
+# and the planned normal, does the roll stay where it was locked, how far the
+# wrist turns, how fast the tip moves in each kind of motion, and how close to
+# the part it comes between passes. fly_surface_path() flies exactly what the
+# scan flies -- the same approach, the same sweep, the same speeds, the same
+# motion profile -- while MotionRecorder samples TF and /joint_states, and
+# path_motion_report() turns the samples into those answers.
+
+class MotionRecorder(object):
+    """probe_end from TF and the six joints from /joint_states, phase-tagged.
+
+    tag(phase, seg) labels everything recorded after it. Poses come from the
+    live_pose holder (no module context needed, safe from any thread), stamped
+    with the TF lookup's own monotonic time; joints from a private rclpy node
+    spun on its own thread, stamped on receipt.
+    """
+
+    JOINTS = ("shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+              "wrist_1_joint", "wrist_2_joint", "wrist_3_joint")
+
+    def __init__(self, sample_hz=50.0, joint_topic="/joint_states"):
+        self.period = 1.0/float(sample_hz)
+        self.joint_topic = joint_topic
+        self._lock = threading.Lock()
+        self._tag = ("idle", -1)
+        self._poses = []
+        self._joints = []
+        self._stop = threading.Event()
+        self._threads = []
+        self._node = None
+        self._executor = None
+        self.joint_error = None
+
+    def tag(self, phase, seg=None):
+        with self._lock:
+            self._tag = (str(phase), self._tag[1] if seg is None else int(seg))
+
+    def start(self):
+        self._stop.clear()
+        t = threading.Thread(target=self._sample_poses, daemon=True,
+                             name="motion_recorder_poses")
+        t.start()
+        self._threads.append(t)
+        try:
+            self._start_joints()
+        except Exception as e:
+            self.joint_error = repr(e)
+        return self
+
+    def _sample_poses(self):
+        try:
+            from dataguzzler_python import context
+            context.InitFreeThread()
+        except Exception:
+            pass
+        last = None
+        while not self._stop.is_set():
+            snap = live_pose.snapshot()
+            if snap is not None and snap[2] != last:
+                last = snap[2]
+                with self._lock:
+                    tag = self._tag
+                self._poses.append((float(snap[2]), tag[0], tag[1])
+                                   + tuple(float(v) for v in snap[0])
+                                   + tuple(float(v) for v in snap[1]))
+            time.sleep(self.period)
+
+    def _start_joints(self):
+        import rclpy
+        from rclpy.executors import SingleThreadedExecutor
+        from sensor_msgs.msg import JointState
+        node = rclpy.create_node("motion_recorder_%d_%d"
+                                 % (os.getpid(), int(time.monotonic()*1000) % 100000))
+        names = self.JOINTS
+
+        def cb(msg):
+            now = time.monotonic()
+            try:
+                order = list(msg.name)
+                pos = [msg.position[order.index(n)] for n in names]
+            except (ValueError, IndexError):
+                return
+            with self._lock:
+                tag = self._tag
+            self._joints.append((now, tag[0], tag[1]) + tuple(float(v) for v in pos))
+
+        node.create_subscription(JointState, self.joint_topic, cb, 50)
+        ex = SingleThreadedExecutor()
+        ex.add_node(node)
+        self._node, self._executor = node, ex
+
+        def spin():
+            while not self._stop.is_set():
+                try:
+                    ex.spin_once(timeout_sec=0.1)
+                except Exception as e:
+                    self.joint_error = repr(e)
+                    break
+        t = threading.Thread(target=spin, daemon=True, name="motion_recorder_joints")
+        t.start()
+        self._threads.append(t)
+
+    def stop(self):
+        self._stop.set()
+        for t in self._threads:
+            t.join(timeout=2.0)
+        self._threads = []
+        if self._executor is not None:
+            try:
+                self._executor.shutdown()
+            except Exception:
+                pass
+            self._executor = None
+        if self._node is not None:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+            self._node = None
+        return self
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+    def poses(self):
+        rows = list(self._poses)
+        return {"t": np.array([r[0] for r in rows], dtype=np.float64),
+                "phase": [r[1] for r in rows],
+                "seg": np.array([r[2] for r in rows], dtype=np.int64),
+                "xyz": np.array([r[3:6] for r in rows], dtype=np.float64).reshape(-1, 3),
+                "quat": np.array([r[6:10] for r in rows], dtype=np.float64).reshape(-1, 4)}
+
+    def joints(self):
+        rows = list(self._joints)
+        return {"t": np.array([r[0] for r in rows], dtype=np.float64),
+                "phase": [r[1] for r in rows],
+                "seg": np.array([r[2] for r in rows], dtype=np.int64),
+                "q": np.array([r[3:9] for r in rows], dtype=np.float64).reshape(-1, 6)}
+
+
+def _tool_z(quats):
+    q = np.asarray(quats, dtype=np.float64).reshape(-1, 4)
+    q = q/np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-300)
+    x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return np.stack([2.0*(x*z + y*w), 2.0*(y*z - x*w), 1.0 - 2.0*(x*x + y*y)], axis=1)
+
+
+def _polyline_nearest(points, poly):
+    """For each point: distance to the polyline, nearest edge, parameter on it."""
+    P = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    W = np.asarray(poly, dtype=np.float64).reshape(-1, 3)
+    if len(W) == 1:
+        return (np.linalg.norm(P - W[0], axis=1), np.zeros(len(P), dtype=np.int64),
+                np.zeros(len(P)))
+    A = W[:-1]
+    AB = W[1:] - A
+    L2 = (AB*AB).sum(axis=1)
+    L2 = np.where(L2 > 0.0, L2, 1e-18)
+    dist = np.empty(len(P))
+    edge = np.empty(len(P), dtype=np.int64)
+    frac = np.empty(len(P))
+    chunk = max(1, int(2e6 // max(1, len(A))))
+    for i in range(0, len(P), chunk):
+        p = P[i:i+chunk, None, :]
+        u = np.clip(((p - A)*AB).sum(axis=2)/L2, 0.0, 1.0)
+        c = A + u[..., None]*AB
+        dd = ((p - c)**2).sum(axis=2)
+        j = dd.argmin(axis=1)
+        r = np.arange(len(j))
+        dist[i:i+chunk] = np.sqrt(dd[r, j])
+        edge[i:i+chunk] = j
+        frac[i:i+chunk] = u[r, j]
+    return dist, edge, frac
+
+
+def _nearest_points(points, cloud):
+    """Index of the nearest cloud point to each point, and the distance."""
+    P = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    C = np.asarray(cloud, dtype=np.float64).reshape(-1, 3)
+    idx = np.empty(len(P), dtype=np.int64)
+    dist = np.empty(len(P))
+    chunk = max(1, int(2e6 // max(1, len(C))))
+    for i in range(0, len(P), chunk):
+        dd = ((P[i:i+chunk, None, :] - C[None, :, :])**2).sum(axis=2)
+        j = dd.argmin(axis=1)
+        idx[i:i+chunk] = j
+        dist[i:i+chunk] = np.sqrt(dd[np.arange(len(j)), j])
+    return idx, dist
+
+
+def _window_speed(t, xyz, window_s=0.1):
+    """Speed over a sliding window, m/s, one value per DISTINCT reading.
+
+    The TF thread polls at 200 Hz and TF itself updates slower, so most
+    readings repeat the previous position under a new timestamp -- a stale
+    position stamped late, which biases any difference taken from it. Only the
+    first sample of each run of identical positions is kept (the moment that
+    position became visible), then the window smooths what is left.
+    """
+    t = np.asarray(t, dtype=np.float64)
+    xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+    if len(t) > 1:
+        keep = np.ones(len(t), dtype=bool)
+        keep[1:] = np.any(np.diff(xyz, axis=0) != 0.0, axis=1)
+        t, xyz = t[keep], xyz[keep]
+    if len(t) < 2:
+        return np.zeros(len(t))
+    j = np.clip(np.searchsorted(t, t + window_s), 0, len(t) - 1)
+    dt = t[j] - t
+    ok = dt > 0.5*window_s
+    v = np.zeros(len(t))
+    v[ok] = np.linalg.norm(xyz[j[ok]] - xyz[ok], axis=1)/dt[ok]
+    return v
+
+
+def _mx(values, default=None):
+    vals = [v for v in values if v is not None]
+    return max(vals) if vals else default
+
+
+def _mn(values, default=None):
+    vals = [v for v in values if v is not None]
+    return min(vals) if vals else default
+
+
+APPROACH_PHASES = ("approach", "lift", "transit", "descend")
+
+
+def path_motion_report(path, segs, passes, poses, joints,
+                       reference=(1.0, 0.0, 0.0), up=(0.0, 0.0, 1.0),
+                       clearance_lateral_m=0.02):
+    """What a flown path did, against what was planned. Pure numpy.
+
+    passes: [{"pass": k, "approach_ok", "sweep_ok", "fraction", ...}] with k an
+    index into segs. poses/joints: MotionRecorder.poses()/joints(), tagged
+    "sweep" or one of APPROACH_PHASES with the pass index.
+
+    Signs: normal offsets are along the planned tool z, which points AWAY from
+    the surface, so positive is off the part and negative is into it.
+    """
+    positions = np.asarray(path.positions, dtype=np.float64)
+    normals = _tool_z(path.quats)
+    ph = np.array(poses["phase"], dtype=object)
+    sg = np.asarray(poses["seg"])
+    t = np.asarray(poses["t"])
+    xyz = np.asarray(poses["xyz"])
+    qq = np.asarray(poses["quat"])
+    jph = np.array(joints["phase"], dtype=object)
+    jsg = np.asarray(joints["seg"])
+    jq = np.asarray(joints["q"])
+    # The planned surface, densely: a transit's closest approach is measured as
+    # a straight-line distance to it. Not along the normal -- on a
+    # reconstructed mesh the normals are noisy, and a projection onto one has
+    # read 0.8 mm for a probe that was 50 mm clear.
+    dense = positions[::max(1, len(positions)//60000)]
+
+    per = []
+    for rec in passes:
+        out = dict(rec)
+        k = int(rec["pass"])
+        start, end = segs[k]
+        m = (ph == "sweep") & (sg == k)
+        if m.sum() >= 2 and end - start >= 2:
+            P, Q, T = xyz[m], qq[m], t[m]
+            W = positions[start:end]
+            N = normals[start:end]
+            d, e, u = _polyline_nearest(P, W)
+            c = W[e] + u[:, None]*(W[e+1] - W[e]) if len(W) > 1 else W[e]
+            n = N[e]*(1.0 - u)[:, None] + N[np.minimum(e+1, len(N)-1)]*u[:, None]
+            n = n/np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+            off = ((P - c)*n).sum(axis=1)
+            s_w = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(W, axis=0), axis=1))])
+            s = s_w[e] + u*(s_w[np.minimum(e+1, len(W)-1)] - s_w[e])
+            tw = np.unwrap(np.radians(tool_twist_deg(Q, reference)))
+            tz = _tool_z(Q)
+            terr = np.degrees(np.arccos(np.clip((tz*n).sum(axis=1), -1.0, 1.0)))
+            dur = float(T[-1] - T[0])
+            out.update({
+                "samples": int(m.sum()),
+                "path_error_max_mm": float(d.max()*1e3),
+                "path_error_rms_mm": float(np.sqrt((d*d).mean())*1e3),
+                "normal_offset_mean_mm": float(off.mean()*1e3),
+                "normal_offset_min_mm": float(off.min()*1e3),
+                "normal_offset_max_mm": float(off.max()*1e3),
+                "progress_m": float(s.max() - s.min()),
+                "planned_m": float(s_w[-1]),
+                "observed_speed_mps": float((s.max() - s.min())/dur) if dur > 0 else None,
+                "sweep_peak_speed_mps": float(_window_speed(T, P).max()),
+                "twist_range_deg": float(np.degrees(tw.max() - tw.min())),
+                "twist_abs_max_deg": float(np.degrees(np.abs((tw + np.pi) % (2*np.pi) - np.pi).max())),
+                "tilt_max_deg": float(tool_tilt_deg(Q, up).max()),
+                "tilt_error_max_deg": float(terr.max()),
+            })
+        jm = (jph == "sweep") & (jsg == k)
+        if jm.any():
+            w3 = np.degrees(jq[jm, 5])
+            out.update({"wrist3_sweep_min_deg": float(w3.min()),
+                        "wrist3_sweep_max_deg": float(w3.max()),
+                        "wrist3_sweep_range_deg": float(w3.max() - w3.min())})
+        for name in APPROACH_PHASES:
+            mm = (ph == name) & (sg == k)
+            if mm.sum() >= 2:
+                out["%s_peak_speed_mps" % name] = float(_window_speed(t[mm], xyz[mm]).max())
+        # Clearance is a question about the TRANSIT -- the joint move in the
+        # air. A lift starts on the surface and a descent ends on it by design,
+        # so including them would always read zero.
+        am = np.isin(ph, ("transit", "approach")) & (sg == k)
+        if am.any():
+            _j, dist = _nearest_points(xyz[am], dense)
+            out["transit_min_distance_mm"] = float(dist.min()*1e3)
+        jam = np.isin(jph, APPROACH_PHASES) & (jsg == k)
+        if jam.any():
+            w3 = np.degrees(jq[jam, 5])
+            out["wrist3_approach_range_deg"] = float(w3.max() - w3.min())
+        per.append(out)
+
+    swept = [p for p in per if p.get("sweep_ok")]
+    summary = {
+        "passes": len(per),
+        "approached": sum(1 for p in per if p.get("approach_ok")),
+        "swept_ok": len(swept),
+        "fraction_min": _mn([p.get("fraction") for p in per if p.get("approach_ok")]),
+        "path_error_max_mm": _mx([p.get("path_error_max_mm") for p in per]),
+        "normal_offset_min_mm": _mn([p.get("normal_offset_min_mm") for p in per]),
+        "normal_offset_max_mm": _mx([p.get("normal_offset_max_mm") for p in per]),
+        "twist_in_pass_max_deg": _mx([p.get("twist_range_deg") for p in per]),
+        "twist_abs_max_deg": _mx([p.get("twist_abs_max_deg") for p in per]),
+        "tilt_max_deg": _mx([p.get("tilt_max_deg") for p in per]),
+        "tilt_error_max_deg": _mx([p.get("tilt_error_max_deg") for p in per]),
+        "sweep_speed_mean_mps": (float(np.mean([p["observed_speed_mps"] for p in per
+                                                if p.get("observed_speed_mps")]))
+                                 if any(p.get("observed_speed_mps") for p in per) else None),
+        "sweep_peak_speed_mps": _mx([p.get("sweep_peak_speed_mps") for p in per]),
+        "transit_min_distance_mm": _mn([p.get("transit_min_distance_mm") for p in per]),
+        "wrist3_sweep_range_max_deg": _mx([p.get("wrist3_sweep_range_deg") for p in per]),
+        "wrist3_approach_range_max_deg": _mx([p.get("wrist3_approach_range_deg") for p in per]),
+        "approach_s_mean": (float(np.mean([p["approach_s"] for p in per if "approach_s" in p]))
+                            if any("approach_s" in p for p in per) else None),
+        "sweep_s_mean": (float(np.mean([p["sweep_s"] for p in per if "sweep_s" in p]))
+                         if any("sweep_s" in p for p in per) else None),
+    }
+    for name in APPROACH_PHASES:
+        summary["%s_peak_speed_mps" % name] = _mx([p.get("%s_peak_speed_mps" % name)
+                                                   for p in per])
+    if len(jq):
+        w3 = np.degrees(jq[:, 5])
+        summary["wrist3_min_deg"] = float(w3.min())
+        summary["wrist3_max_deg"] = float(w3.max())
+    allsw = (ph == "sweep")
+    if allsw.sum() >= 2:
+        tw = tool_twist_deg(qq[allsw], reference)
+        c0 = float(np.angle(np.mean(np.exp(1j*np.radians(tw)))))
+        rel = (np.radians(tw) - c0 + np.pi) % (2*np.pi) - np.pi
+        summary["twist_over_run_deg"] = float(np.degrees(rel.max() - rel.min()))
+    return {"passes": per, "summary": summary,
+            "reference": tuple(float(v) for v in np.asarray(reference).reshape(-1))}
+
+
+def format_motion_report(report, label="dry run"):
+    s = report["summary"]
+
+    def f(v, fmt="%.1f", scale=1.0):
+        return "n/a" if v is None else fmt % (v*scale)
+
+    lines = [
+        "%s: %d passes tried, %d entered, %d swept (lowest planner fraction %s)"
+        % (label, s["passes"], s["approached"], s["swept_ok"], f(s["fraction_min"], "%.2f")),
+        "  tracking   up to %s mm off the planned line; along the normal %s..%s mm "
+        "(+ = off the surface)" % (f(s["path_error_max_mm"], "%.2f"),
+                                  f(s["normal_offset_min_mm"], "%+.2f"),
+                                  f(s["normal_offset_max_mm"], "%+.2f")),
+        "  tilt       up to %s deg from vertical; the tool axis follows the planned "
+        "normal to within %s deg" % (f(s["tilt_max_deg"]), f(s["tilt_error_max_deg"], "%.2f")),
+        "  roll       within a pass at most %s deg; over the run %s deg (reference x=%s)"
+        % (f(s["twist_in_pass_max_deg"], "%.2f"), f(s.get("twist_over_run_deg"), "%.2f"),
+           report.get("reference")),
+        "  speed      sweep %s mm/s observed (peak %s); lift peak %s, descend peak %s, "
+        "transit peak %s mm/s" % (f(s["sweep_speed_mean_mps"], "%.1f", 1e3),
+                                  f(s["sweep_peak_speed_mps"], "%.1f", 1e3),
+                                  f(s.get("lift_peak_speed_mps"), "%.1f", 1e3),
+                                  f(s.get("descend_peak_speed_mps"), "%.1f", 1e3),
+                                  f(s.get("transit_peak_speed_mps"), "%.1f", 1e3)),
+        "  clearance  closest the tip came to the planned surface in transit: %s mm"
+        % (f(s["transit_min_distance_mm"]),),
+        "  wrist_3    %s..%s deg over the run; up to %s deg within a sweep, %s within "
+        "an approach" % (f(s.get("wrist3_min_deg")), f(s.get("wrist3_max_deg")),
+                         f(s["wrist3_sweep_range_max_deg"]),
+                         f(s["wrist3_approach_range_max_deg"])),
+        "  time       %s s approaching and %s s sweeping per pass, on average"
+        % (f(s["approach_s_mean"]), f(s["sweep_s_mean"])),
+    ]
+    return "\n".join(lines)
+
+
+def fly_surface_path(path, segs=None, contact=None, label="dry run",
+                     sample_hz=50.0, reference=None, segment_ids=None):
+    """Fly a planned toolpath the way the scan would, with no instrument.
+
+    Same approach (contact lift/transit/descend when `contact` is given), same
+    sweep at the plan's velocity, same motion profile -- only nothing is armed
+    and nothing is staged. Returns path_motion_report()'s dict plus the pass
+    list, and leaves the recorder in `last_motion_recorder` for anything else
+    worth asking of the samples.
+
+    Call plan_current_scan() first: the sweep speed is the plan's.
+    """
+    global last_motion_recorder
+    if segs is None:
+        segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    if reference is None:
+        reference = getattr(path, "roll_reference", (1.0, 0.0, 0.0))
+    ids = list(segment_ids) if segment_ids is not None else list(range(len(segs)))
+    rec = MotionRecorder(sample_hz=sample_hz)
+    approach, sweep, _pose_at = surface_scan_callables(
+        path, segs, (0.0, 0.0), contact=contact, phase=lambda name: rec.tag(name))
+    passes = []
+    started = time.monotonic()
+    _ik_hold = motion_profile("scan")
+    _ik_hold.__enter__()
+    rec.start()
+    try:
+        for k, (start, end) in enumerate(segs):
+            rec.tag("approach", k)
+            ta = time.monotonic()
+            ok_a = bool(approach(start, end - 1))
+            entry = {"pass": k, "segment": ids[k], "waypoints": end - start,
+                     "approach_ok": ok_a, "approach_s": time.monotonic() - ta,
+                     "planned_length_m": path.segment_length_m((start, end))}
+            if ok_a:
+                rec.tag("sweep", k)
+                ts = time.monotonic()
+                ok, frac = sweep(start, end)
+                entry.update({"sweep_ok": bool(ok), "fraction": frac,
+                              "sweep_s": time.monotonic() - ts})
+            else:
+                entry.update({"sweep_ok": False, "fraction": 0.0})
+            rec.tag("idle", k)
+            passes.append(entry)
+            print("  %s pass %d (segment %d): approach %s, sweep %s%s"
+                  % (label, k + 1, ids[k], "ok" if ok_a else "FAILED",
+                     "ok" if entry.get("sweep_ok") else "FAILED",
+                     "" if entry.get("fraction") is None
+                     else " at %.0f%%" % (100.0*entry["fraction"])))
+    finally:
+        if contact is not None:
+            rec.tag("retract", -1)
+            try:
+                contact_retract(contact, positions=path.positions)
+            except Exception as e:
+                print("  WARNING: could not lift the probe off the part (%s)" % (e,))
+        rec.stop()
+        _ik_hold.__exit__(None, None, None)
+        last_motion_recorder = rec
+    report = path_motion_report(path, segs, passes, rec.poses(), rec.joints(),
+                                reference=reference)
+    report["elapsed_s"] = time.monotonic() - started
+    report["joint_error"] = rec.joint_error
+    report["text"] = format_motion_report(report, label=label)
+    print(report["text"])
+    return report
+
+
+def path_joint_report(path, segs, per_pass=5):
+    """Wrist configurations along a toolpath from IK alone -- no motion.
+
+    Each pass is solved the way ApproachInConfiguration() enters it: the far
+    end first, then back along the pass, each solve seeded from the last. So the
+    wrist_3 values are the ones the arm would actually hold, not whichever
+    branch a lone solve returns.
+    """
+    per = []
+    for k, (a, b) in enumerate(segs):
+        idxs = np.unique(np.linspace(a, b - 1, max(2, int(per_pass))).round().astype(int))
+        seed = None
+        vals = []
+        failed = False
+        for i in idxs[::-1]:
+            q = ros.SolveIK(_pose_stamped(path.positions[i], path.quats[i]), seed=seed)
+            if q is None:
+                failed = True
+                break
+            vals.append(q)
+            seed = q
+        entry = {"pass": k, "ik_ok": not failed, "solved": len(vals)}
+        if vals:
+            w3 = np.degrees([v[5] for v in vals])
+            entry.update({"wrist3_min_deg": float(w3.min()),
+                          "wrist3_max_deg": float(w3.max()),
+                          "wrist3_range_deg": float(w3.max() - w3.min())})
+        per.append(entry)
+    ok = [p for p in per if "wrist3_min_deg" in p]
+    summary = {"passes": len(per), "ik_ok": sum(1 for p in per if p["ik_ok"]),
+               "wrist3_min_deg": _mn([p.get("wrist3_min_deg") for p in ok]),
+               "wrist3_max_deg": _mx([p.get("wrist3_max_deg") for p in ok]),
+               "wrist3_in_pass_max_deg": _mx([p.get("wrist3_range_deg") for p in ok])}
+    return {"passes": per, "summary": summary}

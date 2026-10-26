@@ -1,0 +1,478 @@
+# Stand-in for an externally triggered ultrasonic digitizer.
+#
+# It publishes 1D float32 A-scans onto a channel, which is what a real externally
+# triggered card looks like from the recording database's point of view. Nothing
+# downstream should be able to tell the difference: a scan reads the most recent
+# recording on the channel, and does not care what put it there.
+#
+# Two trigger modes, and the difference is the point of this module:
+#
+#   "timer"     free-run at rate_hz. Simple, and what everything here was built
+#               against, but acquisition is then decoupled from position: how
+#               many A-scans land in a grid column depends on how fast the arm
+#               happened to be moving, so the scan has to bin them afterwards.
+#
+#   "position"  fire once per trigger_pitch_m of probe travel, like a position
+#               trigger box driving the card's external trigger. Trigger k is
+#               then at arc length k*pitch BY CONSTRUCTION, which is what makes
+#               the trigger index and the column index the same thing and makes
+#               all the nearest-column binning unnecessary. Arc length is global
+#               along the path, so this is agnostic to how the path is organised
+#               -- a serpentine raster, a Noether surface-following toolpath and
+#               disconnected regions are all the same to it.
+#
+#               Arc length is measured over EVERY component position_fn returns.
+#               Pass a 3D position for a toolpath that changes height while it
+#               scans: measuring in the plan view alone under-counts travel by
+#               1/cos(slope), which on a surface-following path is a systematic
+#               loss of triggers -- 6% on a 20 degree slope, and every trace
+#               after it shifted along the pass.
+#
+# The point of having "position" here before any hardware exists is that the
+# orchestration for the trigger box can be written and tested against it.
+#
+# To swap in real hardware, don't include this file at all -- load the digitizer
+# module instead and point the scan's ASCAN_CHANNEL_PATH at whatever channel it
+# publishes. See the acquisition source block at the top of UTPlaneScan.dgp.
+
+import time
+import threading
+import numpy as np
+import spatialnde2 as snde
+from dataguzzler_python import context
+
+
+class SimAScanSource(object):
+    def __init__(self, recdb, channel_path, num_points, sample_rate, rate_hz, position_fn,
+                 standoff_tof_gradient=(0.0, 0.0),
+                 trigger_mode="timer", trigger_pitch_m=None, poll_hz=200.0,
+                 output_dtype=np.float32, full_scale=1.0):
+        # A real digitizer reports raw counts (int8/int16) or converted volts
+        # (float64) depending on how it is configured, and the whole acquisition
+        # path has to survive either. Being able to make the simulator emit
+        # integers is the only way to exercise that without the card: the
+        # staging channel, nd_accumulate_once and cscan_gate are
+        # all supposed to carry the native type through, and this is what proves
+        # it. full_scale is the amplitude that maps to the type's maximum.
+        self.output_dtype = np.dtype(output_dtype)
+        self.full_scale = float(full_scale)
+        self.is_integer = np.issubdtype(self.output_dtype, np.integer)
+        self.recdb = recdb
+        self.channel_path = channel_path
+        self.num_points = num_points
+        self.sample_rate = sample_rate
+        self.period = 1.0 / rate_hz
+        self.position_fn = position_fn
+
+        if trigger_mode not in ("timer", "position"):
+            raise ValueError("trigger_mode must be 'timer' or 'position', not %r"
+                             % (trigger_mode,))
+        if trigger_mode == "position":
+            if position_fn is None:
+                raise ValueError("trigger_mode='position' needs a position_fn -- "
+                                 "there is nothing to trigger on otherwise")
+            if not trigger_pitch_m or trigger_pitch_m <= 0.0:
+                raise ValueError("trigger_mode='position' needs a positive trigger_pitch_m")
+        self.trigger_mode = trigger_mode
+        self.trigger_pitch_m = trigger_pitch_m
+        self.poll_period = 1.0 / poll_hz
+
+        # Arming. A trigger box is armed for a pass and disarmed at the end of
+        # it: while armed every trigger is delivered to the sink, and arming
+        # resets the phase so trigger 0 is at the start of the pass and trigger k
+        # is at exactly k*pitch along it. That per-pass reset is what
+        # ScanPath.trace_count() counts, and it is what makes the trigger index
+        # usable as a column index.
+        self._init_trigger_state(trigger_pitch_m)
+
+        # Standoff variation, as seconds of extra round trip per metre of probe
+        # travel in (x, y). A tilted plate, a curved part or a sagging fixture
+        # all look like this from the digitizer: the water path changes, so
+        # EVERY echo -- front wall, defects, back wall -- slides together. That
+        # is the whole reason gates have to track rather than sit at fixed
+        # times, and with this at (0,0) the specimen is flat and a fixed gate is
+        # indistinguishable from a tracking one, which is why no scan had ever
+        # exercised the tracking path.
+        self.standoff_tof_gradient = tuple(standoff_tof_gradient)
+
+        self._quit = False
+        self.count = 0
+        self.errors = 0
+        # Shots refused by the recording database because their timestamp could
+        # no longer be ordered. See _publish().
+        self.dropped_acquisitions = 0
+
+        # Position is pushed in by the scan rather than pulled from a callback.
+        # Pulling meant calling into the ROS motion module on every publish,
+        # which serialises the acquisition thread against ros.Move() -- the scan
+        # holds that module's context for the whole move round trip, so the
+        # digitizer could only publish between moves and fell from 20 Hz to 2 Hz.
+        # capturedata() then spent ~0.5 s per point waiting for an A-scan.
+        self._position = None
+        self._position_lock = threading.Lock()
+
+        with self.recdb.start_transaction() as trans:
+            self.chan = trans.define_channel(self.channel_path, "main")
+
+        self.t_axis = np.arange(self.num_points) / self.sample_rate
+
+        self._thread = threading.Thread(target=self._acquisition_loop)
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _init_trigger_state(self, trigger_pitch_m):
+        """The trigger's own state, with no database and no thread -- so a
+        test harness can build one without either.
+
+        Crossing detection is PitchCrossingDetector (pitch_crossings.dpi),
+        shared with the real timestamped source; that file says why progress
+        is a chord from the last crossing and not a sum of steps. The lock
+        makes arm() atomic with respect to the poll that is in progress: with
+        a flag the watcher honoured next time round, a crossing already being
+        processed was delivered to the new sink with the old phase.
+        """
+        self._lock = threading.Lock()
+        self._detector = PitchCrossingDetector(trigger_pitch_m or 1.0)
+        self.triggers = 0
+        self._sink = None
+        self._armed = False
+        self._emit_on_arm = True
+        self.armed_triggers = 0
+        self.armed_s_m = 0.0
+        # Deliveries this arming may make; surplus crossings are counted and
+        # dropped. See arm().
+        self._budget = None
+        self.armed_over_budget = 0
+        self.over_budget = 0
+
+    @property
+    def travelled_m(self):
+        """Progress the trigger has seen, in total. See pitch_crossings.dpi."""
+        return self._detector.travelled_m
+
+    @property
+    def raw_travelled_m(self):
+        return self._detector.raw_travelled_m
+
+    @property
+    def burst_dropped(self):
+        return self._detector.burst_dropped
+
+    def metadata(self):
+        meta = snde.constructible_metadata()
+        meta.AddMetaDatum(snde.metadatum_str("ande_array-axis0_coord", "Time"))
+        meta.AddMetaDatum(snde.metadatum_dblunits("ande_array-axis0_scale", 1.0 / self.sample_rate, "s"))
+        meta.AddMetaDatum(snde.metadatum_dblunits("ande_array-axis0_offset", 0.0, "s"))
+        meta.AddMetaDatum(snde.metadatum_str("ande_array-ampl_coord", "Amplitude"))
+        meta.AddMetaDatum(snde.metadatum_str("ande_array-ampl_units",
+                                             "counts" if self.is_integer else "V"))
+        return meta
+
+    # Flat bottom holes in the simulated specimen: (x, y, radius, time of
+    # flight, echo amplitude), positions in metres relative to wherever the scan
+    # started. Different depths as well as different sizes, so that moving the
+    # c-scan gate brings different holes in and out -- which is the thing the
+    # gate controls are there to do.
+    DEFECTS = (
+        (0.075, 0.075, 0.022,  9.4e-6, 0.55),
+        (0.200, 0.100, 0.030, 10.2e-6, 0.45),
+        (0.120, 0.210, 0.018, 11.5e-6, 0.30),
+    )
+
+    FRONT_WALL_TOF = 6.8e-6
+    FRONT_WALL_AMP = 0.8
+    BACK_WALL_TOF = 13.6e-6
+    BACK_WALL_AMP = 0.16
+
+    def set_position(self, x, y):
+        """Tell the simulator where the probe is. Cheap, non-blocking, and safe
+        to call from the scan thread between moves."""
+        with self._position_lock:
+            self._position = (x, y)
+
+    def current_position(self):
+        if self.position_fn is not None:
+            return self.position_fn()
+        with self._position_lock:
+            return self._position
+
+    def standoff_shift(self, pos):
+        """Extra round-trip time at this probe position, in seconds.
+
+        Linear in (x, y), which is a tilted plate. Applied to every echo
+        equally, because it is water path and not material.
+        """
+        gx, gy = self.standoff_tof_gradient
+        if pos is None or (gx == 0.0 and gy == 0.0):
+            return 0.0
+        return gx*pos[0] + gy*pos[1]
+
+    def synthesize(self, pos=None):
+        """Front wall, an optional flat-bottom-hole echo, and a back wall, as
+        damped 5 MHz tone bursts. If a position_fn was supplied the defects are
+        localised in space, so a completed scan produces a real c-scan image;
+        without one every A-scan is identical, which is fine for a plumbing
+        test but shows nothing.
+
+        pos overrides the current probe position. The position trigger passes the
+        interpolated position of the trigger crossing rather than wherever the
+        probe has got to by the time the loop wakes up -- otherwise the trigger
+        would be exact and the data attached to it would not be."""
+        ascan = (np.random.standard_normal(self.num_points) * 0.01).astype(np.float32)
+
+        echoes = [(self.FRONT_WALL_TOF, self.FRONT_WALL_AMP)]
+
+        if pos is None:
+            pos = self.current_position()
+        defect = None
+        if pos is not None:
+            # pos may be 2D or 3D: the defect map is a plan view, so only the
+            # first two components mean anything here. Arc length uses all of
+            # them -- see _position_trigger_loop.
+            x, y = pos[0], pos[1]
+            for hx, hy, r, tof, amp in self.DEFECTS:
+                if np.sqrt((x - hx)**2 + (y - hy)**2) < r:
+                    defect = (tof, amp)
+                    break
+
+        if defect is not None:
+            echoes.append(defect)
+            # A hole shadows the back wall behind it.
+            echoes.append((self.BACK_WALL_TOF, 0.05))
+        else:
+            echoes.append((self.BACK_WALL_TOF, self.BACK_WALL_AMP))
+
+        shift = self.standoff_shift(pos)
+
+        for tof, amp in echoes:
+            tof = tof + shift
+            dt = self.t_axis - tof
+            ascan += (amp * np.exp(-np.abs(dt) * 5e6) * np.cos(2 * np.pi * 5e6 * dt)).astype(np.float32)
+
+        ascan = np.clip(ascan, -self.full_scale, self.full_scale)
+        if self.is_integer:
+            # Raw counts, as a card actually delivers them. Everything
+            # downstream must keep this type rather than casting it.
+            info = np.iinfo(self.output_dtype)
+            scale = min(abs(info.max), abs(info.min)) / self.full_scale
+            return np.rint(ascan*scale).astype(self.output_dtype)
+        return ascan.astype(self.output_dtype)
+
+    # -- arming -----------------------------------------------------------
+
+    def arm(self, sink, emit_on_arm=True, max_triggers=None):
+        """Deliver triggers to sink until disarm(), restarting the phase.
+
+        sink(ascan, pos, s_m, index) runs on the acquisition thread, so it must
+        not call into a dgpy module -- staging into the recording database is
+        fine, blocking on the robot is not.
+
+        emit_on_arm=False suppresses the trigger at the start of the pass, for
+        when the caller has already staged that one itself. The phase reference
+        is still taken there, so trigger k still lands at k*pitch along the pass.
+
+        max_triggers caps how many triggers this arming delivers (the arm-time
+        one included, if emitted). A raster pass of m columns has m-1 crossings
+        after its start trace; the m-th would be column m, which does not
+        exist, and staging it shifts every later row. Surplus crossings are
+        counted in armed_over_budget and never reach the sink.
+        """
+        if self.trigger_mode != "position":
+            raise RuntimeError("arm() needs trigger_mode='position'")
+        with self._lock:
+            self._sink = sink
+            self.armed_triggers = 0
+            self.armed_s_m = 0.0
+            self.armed_over_budget = 0
+            self._budget = None if max_triggers is None else int(max_triggers)
+            self._emit_on_arm = bool(emit_on_arm)
+            self._detector.reset()
+            self._armed = True
+
+    def disarm(self):
+        """Stop delivering to the sink. Returns how many triggers this pass saw."""
+        with self._lock:
+            self._armed = False
+            self._sink = None
+            return self.armed_triggers
+
+    def _publish(self, pos=None, s_m=None):
+        """One A-scan. One call == one trigger.
+
+        Unarmed, it goes onto the channel, which is what a free-running digitizer
+        looks like and what every 'latest recording' consumer reads.
+
+        Armed, it goes to the sink INSTEAD. That is not an optimisation: only one
+        recording-database transaction may be open at a time, so an acquisition
+        thread that publishes while the consumer stages puts two threads in
+        contention for it. Doing both wedged solidly -- the stager sat in
+        end_transaction() while this thread sat in start_transaction() and the
+        scan sat waiting for the stager. The armed trace is being staged anyway,
+        so publishing it as well is pure duplication; skip it and this thread
+        never touches the database at all, which is also what keeps it free to
+        watch the probe.
+        """
+        # When this shot was "taken". Under timed_transaction_manager the
+        # transaction's timestamp is the correlation key, so it belongs to the
+        # acquisition, not to whenever the transaction got opened -- same rule
+        # the real digitizer follows (dgpython-gage-compuscope). Under the
+        # ordered manager it is simply recorded.
+        acq_time = self.recdb.transmgr.get_current_time()
+
+        try:
+            data = self.synthesize(pos)
+        except Exception as e:
+            self.errors += 1
+            if self.errors < 5:
+                print("sim_ascan_source synthesize: %s" % (e,))
+            return
+
+        if self._armed and self._sink is not None:
+            self._deliver(data, pos, s_m)
+            return
+
+        try:
+            transact = self.recdb.start_transaction(acq_time)
+        except snde.snde_error as refused:
+            # The database would not order this timestamp behind what it has
+            # already committed. That is a dropped sample, not a fault: count it
+            # and carry on, exactly as the real card does. Sustained growth means
+            # TRANSACTION_LATENCY is too small for this publish rate.
+            self.dropped_acquisitions += 1
+            if self.dropped_acquisitions <= 5:
+                # First line only: snde_error.what() appends a C++ backtrace,
+                # and a dropped sample is routine, not a crash.
+                print("sim_ascan_source: acquisition dropped (%d so far): %s"
+                      % (self.dropped_acquisitions, str(refused).split("\n")[0]))
+            return
+
+        try:
+            with transact as trans:
+                ref = snde.create_ndarray_ref(trans, self.chan,
+                                              snde_typenum_for(data))
+                ref.rec.metadata = self.metadata()
+                ref.rec.mark_metadata_done()
+                ref.allocate_storage([self.num_points])
+                ref.data[:] = data
+                ref.rec.mark_data_ready()
+            self.count += 1
+        except Exception as e:
+            self.errors += 1
+            if self.errors < 5:
+                print("sim_ascan_source: %s" % (e,))
+
+    def _deliver(self, data, pos, s_m):
+        """Hand one trigger to the sink, if armed and within the budget."""
+        if not self._armed or self._sink is None:
+            return
+        if self._budget is not None and self.armed_triggers >= self._budget:
+            self.armed_over_budget += 1
+            self.over_budget += 1
+            return
+        try:
+            self._sink(data, pos, self.armed_s_m if s_m is None else s_m,
+                       self.armed_triggers)
+            self.armed_triggers += 1
+        except Exception as e:
+            self.errors += 1
+            if self.errors < 5:
+                print("sim_ascan_source sink: %s" % (e,))
+
+    def _acquisition_loop(self):
+        context.InitFreeThread()
+        if self.trigger_mode == "position":
+            self._position_trigger_loop()
+        else:
+            self._timer_loop()
+
+    def _timer_loop(self):
+        while not self._quit:
+            self._publish()
+            time.sleep(self.period)
+
+    # A real trigger box fires on distance travelled, not on a clock, and it does
+    # not care where the probe is in any grid -- it emits a pulse every pitch of
+    # progress along whatever path the machine follows. That is what makes it
+    # work for a Noether toolpath as well as a raster. How "progress" is
+    # measured, and the burst cap, are PitchCrossingDetector's.
+    def _position_trigger_loop(self):
+        while not self._quit:
+            pos = self.current_position()
+            if pos is None:
+                time.sleep(self.poll_period)
+                continue
+
+            with self._lock:
+                # The scan retunes the pitch between passes (set_trigger_pitch).
+                self._detector.pitch_m = float(self.trigger_pitch_m)
+                primed = self._detector.primed
+                crossings = self._detector.feed(pos)
+                if not primed:
+                    # Trigger 0 where the probe starts, so trigger k is at
+                    # exactly k*pitch of progress from it.
+                    self.armed_s_m = 0.0
+                    if self._emit_on_arm or not self._armed:
+                        self._publish(tuple(crossings[0][0]), 0.0)
+                        self.triggers += 1
+                else:
+                    for p_k, s_k, frac in crossings:
+                        self.armed_s_m = s_k
+                        self._publish(tuple(p_k), s_k)
+                        self.triggers += 1
+
+            time.sleep(self.poll_period)
+
+    def trigger_report(self):
+        """What the trigger actually did, for checking it against the path."""
+        if self.trigger_mode != "position":
+            return {"mode": self.trigger_mode, "published": self.count,
+                    "errors": self.errors}
+        expected = self.travelled_m/self.trigger_pitch_m if self.trigger_pitch_m else 0.0
+        return {"mode": "position",
+                "pitch_m": self.trigger_pitch_m,
+                "triggers": self.triggers,
+                "published": self.count,
+                "travelled_m": self.travelled_m,
+                "raw_travelled_m": self.raw_travelled_m,
+                "expected_triggers": expected,
+                "error_triggers": self.triggers - 1 - expected,
+                "over_budget": self.over_budget,
+                "burst_dropped": self.burst_dropped,
+                "dropped_acquisitions": self.dropped_acquisitions,
+                "errors": self.errors}
+
+    def stop(self):
+        self._quit = True
+        self._thread.join(timeout=2.0)
+
+
+global start_sim_ascan_source
+def start_sim_ascan_source(recdb, channel_path, num_points=1000, sample_rate=100e6,
+                           rate_hz=20.0, position_fn=None,
+                           standoff_tof_gradient=(0.0, 0.0),
+                           trigger_mode="timer", trigger_pitch_m=None, poll_hz=200.0,
+                           output_dtype=np.float32, full_scale=1.0):
+    """Start publishing simulated A-scans on channel_path and return the source.
+
+    Tell it where the probe is with set_position(x, y) as the scan moves.
+    Alternatively pass position_fn, a callable returning (x,y[,z]) in metres or
+    None -- but only if it is cheap and lock free, because it runs on the
+    acquisition thread for every A-scan. Either way this module never imports
+    or touches ROS.
+
+    standoff_tof_gradient is (d_tof/dx, d_tof/dy) in s/m: a non-zero value
+    tilts the specimen so every echo slides with position, which is what a
+    tracking gate exists to follow.
+
+    trigger_mode="position" with trigger_pitch_m set fires one A-scan per pitch
+    of probe travel instead of on a timer, which is what a position trigger box
+    does. rate_hz is then unused. Requires position_fn -- there is nothing to
+    trigger on without one.
+    """
+    return SimAScanSource(recdb, channel_path, num_points, sample_rate, rate_hz, position_fn,
+                          standoff_tof_gradient=standoff_tof_gradient,
+                          trigger_mode=trigger_mode,
+                          trigger_pitch_m=trigger_pitch_m,
+                          poll_hz=poll_hz,
+                          output_dtype=output_dtype,
+                          full_scale=full_scale)

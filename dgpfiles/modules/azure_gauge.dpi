@@ -1,0 +1,1797 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  azure_gauge.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Measures the depth-camera mesh against the line profiler on the part
+#   itself.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# THE KEYENCE MEASURES HOW WRONG THE AZURE MESH IS, ON THE PART, WITH NO TOUCH-OFF
+# ==============================================================================
+# The Azure Kinect's depth reads every surface about 12.45 mm TOO FAR. Eight
+# independent measurements spanning two targets and 20 mm of surface height
+# give -11.6 to -13.6 mm, mean -12.4, sd 0.7. A contact touch-off agrees with
+# the Keyence twice, 0.7 mm apart on ground steel and 0.13 mm apart on paper,
+# and the URDF tree rules out any shared arm error -- so it is the depth value,
+# and a single scalar correction takes 12 mm to under 1 mm over the whole
+# field.
+#
+# THAT CORRECTION IS A CALIBRATION, AND CALIBRATIONS DRIFT. A drifted one is
+# silent. A Keyence raster planned over a mesh that reads a surface-ground
+# plate 13.6 mm low across it and 22 mm low at one end flies the head at 58 mm
+# against a 57 mm hard limit, brings 26-39% of the plate back as points
+# scattered over 16 mm instead of a flat, and leaves the head nearly in contact
+# with the part. Every stage downstream reports success.
+#
+# keyence_standoff.dpi catches that DURING a raster: its pre-flight gate asks
+# the sensor at the first pose and refuses a sweep whose mesh is more than
+# KEYENCE_MESH_BIAS_LIMIT_M out. Nothing else measures the residual
+# disagreement BEFORE a raster is planned, on the actual part, at several
+# places, so that the number can be trusted, reported, or fed back. That is
+# this file, and it is what makes the pipeline self-correcting: the Azure's
+# constant correction is a number the work cell re-measures every session, in
+# about a minute, with no human touch-off.
+#
+# THIS NEVER TOUCHES THE PART. It is an optical gauge. The Keyence is a
+# triangulation profiler standing off 57..103 mm; nothing here contacts
+# anything, nothing here requires a contact touch-off, and nothing here may
+# ever grow one -- that is the standing rule keyence_standoff.dpi records and
+# it applies with full force to a gauge whose whole point is that it runs
+# unattended.
+#
+# ------------------------------------------------------------------------------
+# THE ARITHMETIC, RE-DERIVED FROM THE DATASHEET AND THE CONSTANTS
+# ------------------------------------------------------------------------------
+# The LJ-V7080 measures a surface from CAL_KEYENCE_RANGE_M[0] to
+# CAL_KEYENCE_RANGE_M[1] -- 57 to 103 mm from the head -- which is the
+# CAL_KEYENCE_REF_DIST reference distance of 80 mm plus or minus 23 mm. The
+# window is therefore 46 mm wide. The optical frame sits ON the reference
+# plane, so _cal_pose_for_sensor(aim, q, distance, "lj_v7080_optical_frame")
+# puts the head `CAL_KEYENCE_REF_DIST + distance` from `aim`.
+#
+# Place the head so that the MESH-PREDICTED surface sits at
+#
+#     start_standoff = 100 mm            (the reference distance + 20 mm)
+#
+# and define the one number this file exists to produce:
+#
+#     delta = z_keyence_measured - z_mesh        positive: THE MESH READS LOW
+#
+# The head was placed off the MESH, so the distance to the REAL surface is
+#
+#     actual standoff = start_standoff - delta
+#
+# and the grab returns something exactly while that lies inside the window:
+#
+#     57 <= 100 - delta <= 103        <=>        -3 mm <= delta <= +43 mm
+#
+# So ONE position at 100 mm tolerates delta anywhere from -3 to +43 mm. The
+# cell's own bias is about +12.45 mm, a third of the way into that, which is
+# why THE FIRST GRAB NORMALLY JUST WORKS and hands back delta directly.
+#
+# AND THE HEADROOM IS ON THE DANGEROUS SIDE ON PURPOSE. The direction that
+# hurts is large POSITIVE delta -- the mesh reads low, so the head is placed
+# too close -- and from 100 mm it takes 43 mm of mesh error to reach the 57 mm
+# limit. At the 80 mm reference distance (what a raster commands) it takes 23,
+# and the 22 mm drift described above spends all but one of those. Standing
+# off at the far end of the window buys 20 mm of it back for nothing, because
+# a surface beyond the FAR limit costs a retry and a surface inside the NEAR
+# limit costs the part.
+#
+# ------------------------------------------------------------------------------
+# THE LADDER IS THE FALLBACK, NOT THE METHOD
+# ------------------------------------------------------------------------------
+# The only case the first position does not cover is a mesh that reads HIGH by
+# more than 3 mm: the real surface is then beyond the far limit and the grab
+# returns nothing at all. Step the head DOWN by AZURE_GAUGE_STEP_M and grab
+# again. 20 mm is chosen because the window is 46 mm wide, so one step CANNOT
+# SKIP OVER the surface -- consecutive windows overlap by 26 mm. In delta:
+#
+#     head at 100 mm    returns for    -3 .. +43 mm
+#     head at  80 mm                  -23 .. +23 mm
+#     head at  60 mm                  -43 ..  +3 mm
+#                                     -------------
+#     three rungs cover              -43 .. +43 mm, contiguous
+#
+# which is why AZURE_GAUGE_TRIES is 3. A fourth rung adds no coverage; it only
+# walks the head further down.
+#
+# TWO RULES BOUND IT, AND THEY COME FROM THE TWO WAYS A NO-RETURN CAN HAPPEN.
+# A grab that returns nothing proves delta is outside that rung's window, and
+# does NOT say which side. The ladder acts on the far-side explanation, so:
+#
+#   RULE A -- never command a pose whose PREDICTED actual standoff is below
+#     CAL_KEYENCE_RANGE_M[0] + CAL_KEYENCE_RANGE_MARGIN_M (62 mm). At the first
+#     rung the prediction is the mesh at face value, so this refuses a caller
+#     who asks to start at 60 mm. At later rungs the mesh has been REFUTED --
+#     the previous rung proved the surface is beyond its far limit, so the mesh
+#     reads high by at least (previous rung - 103 mm) -- and the prediction is
+#     updated by that evidence, which puts every rung of the default ladder at
+#     83 mm of predicted actual standoff rather than at its commanded value.
+#
+#   RULE B -- when the sensor DID return something and its own heights say the
+#     surface is inside the NEAR limit, stop. The near-side explanation is then
+#     not a hypothesis, it is a measurement, and stepping down is exactly the
+#     wrong move. check_profile() already computes this (its RANGE problem
+#     carries standoff, standoff_min and standoff_max) and _cal_profile_points
+#     leaves it in _CAL["last_profile_check"], so it costs nothing.
+#
+#   RULE C -- the contact floor, for the case where the sensor returns NOTHING
+#     and near cannot be told from far. The near-side reading of the first
+#     rung's silence is that the mesh reads LOW by at least
+#     (start_standoff - 57 mm) = 43 mm; under THAT reading the head at rung k
+#     is (s_k - 43) mm from the surface. Stop before that reaches zero. With
+#     the defaults it permits 100, 80 and 60 and refuses 40, which is the same
+#     three rungs the coverage argument gives and the same place
+#     _cal_pose_for_sensor's own window check stops (a 40 mm head standoff is
+#     outside 57..103 and it refuses to compute the pose at all).
+#
+# Three independent arguments, one answer: the ladder is 100, 80, 60 and then
+# it says so and stops.
+#
+# ------------------------------------------------------------------------------
+# WHY THREE POINTS AND NOT ONE
+# ------------------------------------------------------------------------------
+# A drifted mesh is not uniformly wrong: 13.6 mm on average across a plate and
+# about 22 mm at one end of the same plate. A single point measures the offset
+# and calls the tilt zero; three non-collinear points measure both, and the
+# residual about their plane says whether "one number plus a tilt" describes
+# the disagreement at all. The points are taken from the mesh's OWN vertices,
+# as a centre plus a ring, so each sample is guaranteed to lie on the surface.
+#
+# AND THEY ARE SPREAD OVER THE DETECTED REGION, NOT OVER THE MESH. A TSDF mesh
+# extends as far as the sweep integrated, which is well past the part, so "the
+# mesh's own extent" is the wrong extent: a ring spread over it lands 60-96 mm
+# OUTSIDE the detected region and every sample measures the BENCH. The gauge
+# then reports agreement to -0.00 mm about the TABLE and passes a mesh that is
+# wrong everywhere the raster is about to fly, while the bench-to-part STEP
+# leaks into the plane fit as a tilt of 18 mrad at sd 2.2 mm that is a tilt of
+# nothing.
+#
+# The region that says where the part is exists at stage 2a -- stage 1 produced
+# it and left it in `detected_region` -- so the gauge takes it, drops every
+# vertex outside it before it chooses anything, and says which region it used.
+# With no region anywhere it falls back to the mesh's extent, which is what a
+# hand call with nothing but a PLY has to do.
+#
+# AND THE PLANE IS FITTED ACROSS THE SAMPLES, NEVER WITHIN A GRAB. One static
+# profiler pose measures a LINE: 31 mm long, microns wide, every point at
+# y == 0 in the sensor frame. fit_plane() handed a line returns the plane of
+# least scatter, whose normal is the sensor's y axis, at a residual of exactly
+# zero -- which is reported as "0.000 mm rms flat" at a tilt of 90.06 degrees,
+# and means nothing. So each grab contributes ONE HEIGHT (the median world z of
+# its points, which needs no plane and no support check), and the tilt comes
+# from those heights against their xy. The lever is then the width of the part,
+# not the width of a patch: verify_calibration's +/-45 mm patch cannot resolve
+# its own 10 mrad criterion, and a 200 mm spread can.
+#
+# ------------------------------------------------------------------------------
+# THE PIPELINE IS NEVER ASKED TO CONFIRM A MOVE
+# ------------------------------------------------------------------------------
+# NO MOVE MADE BY THE AUTONOMOUS PIPELINE PROMPTS ANYONE. Prompting before a
+# move belongs in the calibration routines, which have somebody at the
+# keyboard; it does not belong in a pipeline run.
+#
+# _cal_fly_or_refuse(), which is verify_calibration()'s Keyence leg, goes
+# capture_move() -> _decide() -> confirm() in cell_capture_node.dpi -- and that
+# confirm() DELIBERATELY REFUSES TO BE AUTOMATED ON HARDWARE:
+#
+#     if CAPTURE_AUTO_CONFIRM and CELL_MODE != "sim":
+#         raise CaptureRefused("... every motion on the production system is confirmed by
+#             the operator.")
+#
+# That contract is RIGHT and nothing here weakens it. CAPTURE_AUTO_CONFIRM is
+# not set, confirm() is not patched, and cell_capture_node.dpi is untouched. A
+# capture scenario and a calibration run have somebody at the keyboard; they
+# keep every prompt.
+#
+# The rule is about the ROUTE, not about the gate on it. The pipeline's own
+# moves do not go through capture_move() at all: the Azure sweep and the
+# Keyence raster fly `ros` directly -- ApproachInConfiguration,
+# cartesian_move(), MoveJoints -- where `ros` is the session-wide cable guard
+# install_cable_guard() put there. That path does not prompt. So the gauge has
+# two routes, and the DEFAULT IS THE SILENT ONE:
+#
+#   confirm_moves=False (default, and what run_automated_scan gets)
+#       _gauge_fly_unattended(): the guards asked explicitly, then the same
+#       primitives the sweep uses. No prompt, no operator, nothing to answer.
+#
+#   confirm_moves=True (a hand call at the dgpy prompt, which IS calibration-ish)
+#       _cal_fly_or_refuse(): previewed, confirmed, monitored.
+#
+# WHICH GUARDS THE SILENT ROUTE KEEPS, AND HOW. Removing a prompt must not
+# remove a check, so each one is named and asked for explicitly BEFORE anything
+# is commanded -- a refusal costs the sample point and the arm has not moved:
+#
+#   the work volume     _check_envelope() on the densified straight line, the
+#                       same helper and the same 5 mm spacing capture_move()
+#                       uses. This is the one guard the pipeline's `ros` does
+#                       NOT carry -- install_cable_guard() asks one question and
+#                       this is not it -- so the gauge asks it itself, and for
+#                       the joint route it asks it again on the FK of every
+#                       sampled configuration, which is what capture_move_joints
+#                       does and is the only way a joint path's bulge is seen.
+#   the cable envelope  _check_wrist3() on the configurations at both ends, at
+#                       the tilt each one commands -- and then the guarded `ros`
+#                       checks it a second time on the motion itself, because
+#                       install_cable_guard() is in front of every call.
+#   the speed limits    _speed_class() gives near/away and its limit in m/s;
+#                       path_motion_scaling() converts that to the MoveIt
+#                       scaling for THIS path, falling back to the work-cell-wide
+#                       velocity curve -- the same two-step the sweep uses, and
+#                       the reason it exists is that handing a speed through as
+#                       a scaling flies it about 1.6x too fast.
+#   the Keyence window  unchanged: keyence_standoff_gate() per rung plus RULES
+#                       A, B and C above. Nothing about the prompt touched it.
+#   the operator's stop scan_checkpoint() between points, which is how a sweep
+#                       notices that External Control was stopped on the pendant.
+#
+# AND ONE IT DOES NOT. capture_move() wraps the motion in _Monitor, which
+# watches TF in flight and stops the arm on a real overspeed. _Monitor is
+# internal to cell_capture_motion.dpi and is not reachable from here, and the
+# pipeline's own sweeps do not have it either -- every Azure and Keyence row
+# goes out through the guarded `ros` with the scaling as its only speed bound.
+# So the silent route keeps the speed LIMIT and not the in-flight watchdog,
+# which is a statement about the pipeline and not about the gauge.
+# confirm_moves=True is the route that has the watchdog.
+#
+# ------------------------------------------------------------------------------
+# WHAT ELSE IT REUSES, AND WHY NOTHING HERE IS A NEW MOTION PRIMITIVE
+# ------------------------------------------------------------------------------
+# Every pose is placed by _cal_pose_for_sensor(). Every grab goes out through
+# _cal_profile_points(), which drops the
+# +Inf out-of-range columns (REP-117; pc2's skip_nans tests isnan and does not
+# remove an infinity) and runs check_profile() -- so "the grab is not a
+# measurement" arrives here as one CalibrationRefused with the reason in it,
+# and is exactly the signal the ladder needs. The plan-time standoff gate is
+# keyence_standoff_gate(), asked per rung with the near floor RULE A computes
+# and the far end left open, because a gauge that deliberately stands off at
+# the far end of the window is not a raster and must not be graded as one.
+#
+# Numpy and math only. No scipy, no open3d, no ROS except through the
+# calibration helpers above. Python 3.10 and numpy 1.23 at the work cell.
+
+import os
+import json
+import math
+import time
+
+import numpy as np
+
+# A .dpi is compiled and executed as a FUNCTION BODY, and every .dpi shares one
+# globals() dict -- so a top-level def or assignment binds a LOCAL of the
+# include unless it is declared global first, invisible to every other module.
+# dpi_exports_test.py refuses the pattern; everything defined below is listed
+# here.
+global AZURE_GAUGE_START_STANDOFF
+global AZURE_GAUGE_POINTS
+global AZURE_GAUGE_MAX_MM
+global AZURE_GAUGE_STEP_M
+global AZURE_GAUGE_TRIES
+global AZURE_GAUGE_RING_FRACTION
+global AZURE_GAUGE_EDGE_INSET_M
+global AZURE_GAUGE_MIN_SPREAD_M
+global AZURE_GAUGE_TF_TOL_M
+global AZURE_GAUGE_ARRIVE_TOL_M
+global AZURE_GAUGE_ACC_SCALING
+global gauge_mesh_against_keyence
+global gauge_standoff_rungs
+global gauge_sample_points
+global describe_gauge
+global last_gauge_result
+global _gauge_say
+global _gauge_surface
+global _gauge_region
+global _gauge_plane_fit
+global _gauge_profile_facts
+global _gauge_finalise
+global _gauge_save
+global _gauge_move
+global _gauge_stops
+global _gauge_fly_unattended
+global _gauge_scaling
+global _gauge_accel
+global _gauge_flew
+global _gauge_joint_path_ok
+global _GaugePath
+
+
+#: Where the head is put for the FIRST grab, metres from the mesh-predicted
+#: surface. The reference distance + 20 mm, i.e. the far end of the measuring
+#: window, which is what buys the 43 mm of tolerance on the dangerous side.
+#: See the header: -3 .. +43 mm of mesh error returns from here.
+AZURE_GAUGE_START_STANDOFF = 0.100
+
+#: How many places on the mesh to measure, by default. Three is the minimum
+#: that gives an offset AND a tilt, and a drifted mesh has both.
+AZURE_GAUGE_POINTS = 3
+
+#: The disagreement a caller may gate on, mm. The same 2.0 mm
+#: verify_calibration uses (CAL_VERIFY_DZ_MM), and for the same reason: a
+#: single scalar correction takes this cell's 12.4 mm to under 1 mm, so 2 mm
+#: passes a corrected cell with room and fails a drifted one.
+AZURE_GAUGE_MAX_MM = 2.0
+
+#: How far the head steps DOWN after a grab that returned nothing, metres.
+#: Strictly less than the 46 mm window, so consecutive rungs overlap and the
+#: surface cannot be stepped over.
+AZURE_GAUGE_STEP_M = 0.020
+
+#: How many rungs of that ladder. Three cover -43 .. +43 mm of mesh error and
+#: a fourth adds no coverage. See RULE C in the header for what stops it.
+AZURE_GAUGE_TRIES = 3
+
+#: The sample ring's radius, as a fraction of the mesh's half-extent. 0.7
+#: keeps the ring off the edge -- where a reconstructed mesh is worst and a
+#: Noether raster runs off it anyway -- while spending most of the lever.
+AZURE_GAUGE_RING_FRACTION = 0.7
+
+#: And an absolute inset from the mesh's bounding box, metres, in case the
+#: fraction above is generous on a small part.
+AZURE_GAUGE_EDGE_INSET_M = 0.010
+
+#: Below this xy spread the tilt is not reported at all, metres.
+#:
+#: NOT A STYLE CHOICE. verify_calibration measured 15.04 mrad against a
+#: 10.0 mrad tolerance on a grab whose true full-field tilt was 1.06 mrad,
+#: because 1522 points at 0.64 mm rms over a +/-45 mm patch cannot resolve
+#: 10 mrad. A tilt is a height difference divided by a baseline, so a short
+#: baseline turns sensor noise into an alarm. 40 mm of baseline with the
+#: Keyence's 0.1 mm noise is about 2.5 mrad of resolution, which is the floor
+#: at which the number starts meaning something.
+AZURE_GAUGE_MIN_SPREAD_M = 0.040
+
+#: How far the two independent readings of delta may disagree, metres.
+#:
+#: The world-frame reading subtracts the mesh's z from the transformed points'
+#: z; the sensor-frame reading subtracts the measured standoff from the
+#: commanded one. They are the same quantity from the two ends of the pipeline
+#: and agree to the sensor's own noise unless TF and the commanded pose
+#: disagree -- a stale transform, a description that moved since the pose was
+#: computed, an arm that did not arrive. Reported, not refused: it is a note
+#: about the work cell, and the world-frame number is the one used.
+AZURE_GAUGE_TF_TOL_M = 0.001
+
+#: How close the tool must land to the pose that was commanded before the
+#: unattended route calls the move flown, metres.
+#:
+#: A LAST-RESORT TEST, NOT A PRECISION ONE. `result.success` is the authority
+#: and is what the sweep reads; this is for the one call that may not carry a
+#: success flag at all -- ros.MoveJoints falls back to a direct trajectory
+#: command when there is no execute_joint_move server, and hands back that
+#: goal's result instead. A gauge whose whole arithmetic assumes the head
+#: arrived cannot read "unknown" as yes. 5 mm is far below the 20 mm
+#: ladder step, so it cannot confuse one rung with another, and far above any
+#: planner residual. The 1 mm agreement between the two readings of delta above
+#: is the precision test, and it stays a note rather than a refusal.
+AZURE_GAUGE_ARRIVE_TOL_M = 0.005
+
+#: MoveIt ACCELERATION scaling floor for a gauge approach. NOT the velocity
+#: scaling, which is what this used to be; see _gauge_accel() for the ramp-time
+#: arithmetic that makes acc == vel wrong at any speed, and for the three
+#: things that bound the replacement. 0.05 is RASTER_ACCEL, what the
+#: eddy-current raster already flies while the probe is in contact with the
+#: specimen, and half the 0.1 the reconstruction sweep flies in free space.
+AZURE_GAUGE_ACC_SCALING = 0.05
+
+#: The last result, for an operator who did not keep the return value.
+last_gauge_result = None
+
+
+def _gauge_say(say):
+    """The reporting sink: the caller's, else the calibration module's."""
+    if say is not None:
+        return say
+    fn = globals().get("_cal_say")
+    return fn if fn is not None else (lambda msg: print(msg))
+
+
+class _GaugePath(object):
+    """The three attributes keyence_standoff_gate() reads off a toolpath.
+
+    A DELIBERATE ADAPTER, NOT A SECOND PATH TYPE. The gate casts the sensor's
+    own optical axis from every waypoint of a plan and measures how far the
+    first surface is, and that is exactly the check a gauge pose needs -- it
+    catches a nearer piece of the part between the head and the point that was
+    aimed at, which no amount of arithmetic about the sampled vertex can. The
+    gate wants positions, quats and segments; a gauge rung is one segment of
+    one waypoint, so this says so rather than inventing a parallel check.
+    """
+
+    def __init__(self, positions, quats):
+        self.positions = np.asarray(positions, float).reshape(-1, 3)
+        self.quats = np.asarray(quats, float).reshape(-1, 4)
+        self.segments = [(0, self.positions.shape[0])]
+        self.source = "azure gauge"
+
+
+def _gauge_surface(mesh=None):
+    """(geom, what) for the surface the Azure believes in. Refuses a guess.
+
+    `mesh` is anything _surface_geometry() accepts -- a PLY path, a
+    (verts, tris) pair, read_ply_mesh()'s (verts, normals, tris), a float world
+    z or {"plane_z": z} -- and defaults to the session's `rough_mesh`, which is
+    what reconstruct_rough() leaves behind and what the Keyence raster is
+    planned over. THE POINT OF THIS GAUGE IS THE MESH, so there is no sensible
+    default surface and no fallback: with none, it refuses.
+    """
+    if mesh is None:
+        mesh = globals().get("rough_mesh")
+    if mesh is None:
+        raise CalibrationRefused(
+            "gauge_mesh_against_keyence() measures the disagreement between "
+            "the AZURE MESH and the Keyence, and there is no mesh. Run "
+            "reconstruct_rough() first, or pass mesh= a PLY on disk, a "
+            "(verts, tris) pair, or a world z for a flat. Nothing has been "
+            "guessed and the arm has not moved.")
+    geom = _surface_geometry(mesh)
+    if geom is None:
+        raise CalibrationRefused(
+            "the surface handed to gauge_mesh_against_keyence() came back as "
+            "nothing. Pass mesh= a PLY on disk, a (verts, tris) pair, or a "
+            "world z for a flat.")
+    return geom, _describe_surface(mesh, geom)
+
+
+def _gauge_region(region):
+    """((xmin, ymin, xmax, ymax), where it came from), or (None, why not).
+
+    THE REGION IS WHERE THE PART IS, AND THE MESH IS NOT. See the header:
+    samples spread over a TSDF mesh, which extends as far as the sweep
+    integrated, can all land on the bench outside the part.
+
+    `region=None` takes `detected_region`, which stage 1 of run_automated_scan()
+    sets on both its branches -- the detector's box, or the one a caller passed
+    by hand -- and which is therefore exactly right at stage 2a with no change
+    anywhere else. That is the same fallback keyence_standoff.dpi and
+    mesh_reconstruction.dpi already use, for the same reason and spelled the
+    same way. `region=False` says "the whole mesh" out loud, for a hand call on
+    a PLY that has nothing to do with the session's last part.
+
+    Validated through check_region() when that is loaded, because the one thing
+    a region gets wrong is its ORDER: (xmin, xmax, ymin, ymax) is what a person
+    types, and the two orders differ silently. A gauge is not the place to
+    invent a second opinion about that.
+    """
+    if region is False:
+        return None, "the whole mesh (region=False)"
+    where = "given to the gauge"
+    if region is None:
+        region = globals().get("detected_region")
+        where = "the detected region"
+    if region is None:
+        return None, "the mesh's own extent (nothing has detected a region)"
+    fn = globals().get("check_region")
+    if fn is not None:
+        region = fn(region, "the azure gauge")
+        if region is None:
+            return None, "the mesh's own extent"
+    r = tuple(float(v) for v in region)
+    if len(r) != 4:
+        raise CalibrationRefused(
+            "region= for the azure gauge must be (xmin, ymin, xmax, ymax) in "
+            "world metres, not %d values." % (len(r),))
+    return r, where
+
+
+def _gauge_scaling(poses, v_limit):
+    """(MoveIt velocity scaling for `poses` at `v_limit` m/s, where it came from).
+
+    THE SAME TWO-STEP THE SWEEP USES. CartesianMove's `vel` is a fraction of the
+    joint velocity limits and not a speed, and on this cell the mapping between
+    them is a curve, not a constant: handing a speed straight through as a
+    scaling flew a 28 mm/s sweep at ~40. This path's own kinematics decide it
+    when IK along the path can be had (path_motion_scaling(), which is derived
+    FROM the limit), and the cell-wide velocity curve decides it when they
+    cannot -- which is exactly the order _reconstruct() and capture_move() both
+    settled on, and for the measurements behind it see path_motion_scaling().
+    """
+    per_path = globals().get("path_motion_scaling")
+    if per_path is not None:
+        try:
+            s = per_path(poses, float(v_limit))
+        except Exception:                                     # noqa: BLE001
+            s = None
+        if s is not None:
+            return float(s), "this path's own IK"
+    curve = globals().get("motion_scaling")
+    if curve is not None:
+        try:
+            return float(curve(float(v_limit))), "the cell-wide velocity curve"
+        except Exception:                                     # noqa: BLE001
+            pass
+    return float(v_limit), "the limit itself (this cell has no velocity curve)"
+
+
+def _gauge_accel(vel):
+    """MoveIt ACCELERATION scaling for a gauge approach, given its velocity scaling.
+
+    NOT `vel`. Passing the velocity scaling through as the acceleration scaling
+    is what this used to do, and it is a different mistake from passing a speed
+    through as a scaling -- it is not wrong about the units, it is wrong about
+    which limit the number belongs to. Velocity scaling and acceleration scaling
+    are independent fractions of two different joint limits (120-180 deg/s and
+    5.0 rad/s^2 on this arm, tari_ur_description/config/joint_limits.yaml), and
+    tying them together makes the RAMP TIME a constant:
+
+        t_ramp = (vel * v_max) / (acc * a_max) = v_max / a_max  when acc == vel
+
+    which on this arm is 0.42-0.63 s no matter how slow the move is. At the
+    gauge's own scaling -- about 0.0032 for the 10 mm/s near-the-part class --
+    a 56-60 mm descent therefore spends over a second of its ~7 s ramping, and
+    it is the only class in the pipeline whose worst joint velocity reaches only
+    11-16% of its scaled limit: it never settles at cruise. The three gauge
+    points in results16 took 192.1 s, 36.5 s and 65.5 s, with the SHORTER of
+    two moves (56.6 mm against 60.0 mm) taking 1.8x longer -- the signature of
+    a profile that is all ramp, where duration goes as sqrt(length) rather than
+    as length. (Most of that 192 s was the planner's unconditional time-stretch,
+    which divided accelerations by k^2; that is fixed in tari_cpp_mtc and only
+    the fallback path pays it now. The ramp is what is left, and it is this
+    number's.)
+
+    WHAT BOUNDS IT, since this is a probe approaching a part and 0.1 is not a
+    number to copy from somewhere else:
+
+    1. It cannot raise the peak speed, so it is not what the near-the-part speed
+       rule constrains. The velocity scaling bounds joint speed directly and
+       tari_cpp_mtc's checkTrajectory() enforces both that and max_tip_speed in
+       metres per second at the tool. Whatever this is, the descent still runs
+       at the speed class _speed_class() computed for it.
+    2. Higher is SAFER on the only measure that matters close to a surface.
+       Travel after a stop is commanded is v^2/(2a): at the 10 mm/s class that
+       is 3.1 mm at acceleration scaling 0.0032 and 0.2 mm at 0.05. Tying
+       acceleration to a small velocity does not make the approach gentle, it
+       makes it unable to stop.
+    3. The ceiling is evidence rather than arithmetic. 0.05 is RASTER_ACCEL,
+       what the eddy-current raster flies while the probe is IN CONTACT with the
+       specimen, and it is half the 0.1 the reconstruction sweep flies in free
+       space. A non-contact descent to a 100 mm standoff is strictly less
+       hazardous than a contact pass, so 0.05 is a value already flown near this
+       part rather than one borrowed from free space. 0.1 would shorten the ramp
+       by a further 0.02 s and has evidence only in free space, so it is not
+       taken.
+
+    max() rather than a plain constant: a fast away-from-the-part leg may be
+    authorised a velocity scaling above this, and giving such a move LESS
+    acceleration than velocity would put the long ramp straight back.
+    """
+    return max(float(vel), float(AZURE_GAUGE_ACC_SCALING))
+
+
+def _gauge_flew(res, xyz, label):
+    """(did that move get the head there, why not). Never raises.
+
+    THE RESULT FIRST, ARRIVAL AS THE BACKSTOP. `result.success` is what
+    _fly_scanpath() reads off every sweep row and it is the authority whenever
+    it is there. ros.MoveJoints does not always carry one -- with no
+    execute_joint_move server it falls back to a direct trajectory command and
+    returns that goal's result -- and a gauge whose arithmetic assumes the head
+    arrived must not read "no success flag" as success. So when there is none,
+    live TF is asked instead, against AZURE_GAUGE_ARRIVE_TOL_M.
+    """
+    r = getattr(res, "result", None)
+    if r is not None and hasattr(r, "success"):
+        if bool(getattr(r, "success", False)):
+            return True, ""
+        frac = float(getattr(r, "fraction", 0.0) or 0.0)
+        if frac >= 0.999:
+            return False, ("planned in full, EXECUTION refused -- mtc_node's "
+                           "log says why")
+        if frac <= 1e-9:
+            return False, ("the planner reached none of it, or a guard refused "
+                           "it (the refusal is printed above)")
+        return False, "the planner reached %.0f%% of the move" % (100.0*frac,)
+    if res is None:
+        return False, "the motion module refused the target"
+    snap = live_pose.snapshot()
+    if snap is None:
+        return False, ("the move returned no result and there is no TF for "
+                       "probe_end, so whether it arrived is unknown")
+    d = float(np.linalg.norm(np.asarray(snap[0], float).reshape(3)
+                             - np.asarray(xyz, float).reshape(3)))
+    if d <= float(AZURE_GAUGE_ARRIVE_TOL_M):
+        return True, ""
+    return False, ("the move returned no success flag and the tool is %.1f mm "
+                   "from where it was sent, over the %.1f mm this counts as "
+                   "arrived" % (1e3*d, 1e3*float(AZURE_GAUGE_ARRIVE_TOL_M)))
+
+
+def _gauge_joint_path_ok(q0, q1, label):
+    """Check a joint move end to end BEFORE it is commanded. Raises, or returns.
+
+    THE WHOLE POINT IS THE BULGE. A joint move's tip does not travel in a
+    straight line, so checking its endpoints against the work volume checks
+    nothing about where the tooling actually goes -- and this route exists
+    precisely for the poses whose straight line would not plan. So it is the
+    check capture_move_joints() makes, made the same way: sample the
+    interpolated joint path every 2 degrees of the largest joint change, run FK
+    on every sample, and hold the tip to the envelope and wrist 3 to the band
+    for the tilt FK says each configuration commands.
+
+    NO FK MEANS NO MOVE. capture_move_joints() refuses a move it cannot check
+    ("the move cannot be checked, so it is not made") and so does this: an
+    unchecked joint path near a part is the thing the guards are for.
+    """
+    a = np.asarray(q0, float).reshape(6)
+    b = np.asarray(q1, float).reshape(6)
+    dq = np.abs(b - a)
+    n = int(min(60, max(8, math.degrees(float(dq.max()))/2.0)))
+    path = [a + t*(b - a) for t in np.linspace(0.0, 1.0, n)]
+    node = globals().get("capture_node")
+    fks = None
+    if node is not None:
+        try:
+            fks = [node.fk(q, links=("probe_end",)) for q in path]
+        except Exception:                                     # noqa: BLE001
+            fks = None
+    if fks is None or any(f is None for f in fks):
+        raise CaptureRefused(
+            "%s: /compute_fk did not answer, so the joint path cannot be "
+            "checked against the work volume and it is not made" % (label,))
+    tip = np.array([f[0][0] for f in fks], float)
+    _check_envelope(tip, label)
+    _check_wrist3([list(q) for q in path], label, quats=[f[0][1] for f in fks])
+    return tip
+
+
+def _gauge_fly_unattended(xyz, quat, label):
+    """Get the head to one gauge pose ON THE PIPELINE'S MOTION PATH. NO PROMPT.
+
+    THIS IS THE DEFAULT AND IT IS THE DEFAULT ON PURPOSE. It is what
+    run_automated_scan() gets, and the autonomous pipeline never asks an
+    operator to approve a move. Nothing here reaches
+    confirm(), sets CAPTURE_AUTO_CONFIRM or touches cell_capture_node.dpi: the
+    primitives below are the ones the Azure sweep and the Keyence raster already
+    fly, and they have never prompted.
+
+    Returns _cal_fly_to()'s dict shape -- {"ok", "route", "why", "tried"} -- so
+    it is interchangeable with _cal_fly_or_refuse() at the call site, and raises
+    CalibrationRefused when no route reached the pose, which costs THAT SAMPLE
+    POINT and not the run.
+
+    EVERY GUARD IS ASKED BEFORE ANYTHING IS COMMANDED. The work volume, the
+    cable band and the speed limit are checked first, so a refusal happens with
+    the arm still where it was; see the header for which guard is which and for
+    the one thing this route does not have (_Monitor's in-flight watchdog, which
+    the pipeline's own sweeps do not have either).
+    """
+    # cell_capture_motion.dpi's guards, by name, because losing one silently is
+    # the failure this whole file exists to catch in another form. With any of
+    # them missing there is nothing to check the work volume WITH, so this
+    # refuses rather than flying unchecked -- and names the confirmed route,
+    # which needs the same module anyway but at least says so to a human.
+    need = ("_check_envelope", "_check_wrist3", "_speed_class", "_cap_densify",
+            "_cap_pose", "_ik_target", "capture_node", "live_pose",
+            "CaptureRefused", "ros")
+    missing = [k for k in need if globals().get(k) is None]
+    if missing:
+        raise CalibrationRefused(
+            "%s: the unattended gauge route needs %s, and this session has "
+            "none of them -- so nothing would check the work volume. Include "
+            "cell_capture.dpi, or call "
+            "gauge_mesh_against_keyence(confirm_moves=True) to fly it the "
+            "confirmed way with an operator at the keyboard. The arm has not "
+            "moved." % (label, ", ".join(missing)))
+    x1 = np.asarray(xyz, float).reshape(3)
+    q1 = tuple(float(v) for v in quat)
+    snap = live_pose.snapshot()
+    if snap is None:
+        raise CalibrationRefused(
+            "%s: there is no TF for probe_end, so where the arm is now is "
+            "unknown and the path to this pose cannot be checked against the "
+            "work volume. Is the robot driver publishing joint_states? Nothing "
+            "moved." % (label,))
+    x0 = np.asarray(snap[0], float).reshape(3)
+    q0 = tuple(float(v) for v in snap[1])
+    tried = []
+
+    # -- THE GUARDS ---------------------------------------------------------
+    # WHAT IS CHECKED HERE IS WHAT IS CERTAIN: the straight line's envelope, the
+    # speed class, and the arm's CURRENT wrist angle, which is a fact and not a
+    # prediction.
+    #
+    # The destination's wrist angle is a prediction, and it is checked as one --
+    # `local_only=True`, so the branch judged is the branch the node that will
+    # fly the move would choose. A PREDICTION MADE IN A MODE THE EXECUTOR IS NOT
+    # IN IS NOT EVIDENCE ABOUT THE EXECUTOR: whatever _ik_target() offers under
+    # the `transit` profile is move_group in GLOBAL mode, free to ignore the
+    # seed, and it will happily return the out-of-band branch (-178.5 deg where
+    # the in-band equivalent is +181.5) for a small lateral step, which refuses
+    # the move on both routes before either is tried.
+    #
+    # AND A PREDICTION THAT DID NOT COME BACK REFUSES NOTHING. Local IK failing
+    # to converge says nothing about the wrist; route 1 is guarded on the motion
+    # itself by the cable-guarded `ros`, and route 2 checks its whole
+    # interpolated path by FK before it commands anything.
+    q_pred = None
+    try:
+        samples = _cap_densify([x0, x1])
+        _check_envelope(samples, label)
+        cls, vmax = _speed_class(samples)
+        q_here = capture_node.current_joints()
+        try:
+            q_pred = _ik_target(x1, q1, local_only=True)
+        except Exception:                                     # noqa: BLE001
+            q_pred = None
+        pairs = []
+        if q_here is not None:
+            pairs.append(([float(v) for v in q_here], q0))
+        if q_pred is not None:
+            pairs.append(([float(v) for v in q_pred], q1))
+        if pairs:
+            _check_wrist3([p for p, _q in pairs], label,
+                          quats=[q for _p, q in pairs])
+    except CaptureRefused as e:
+        raise CalibrationRefused("%s: %s" % (label, str(e).splitlines()[0]))
+
+    # -- 1. THE STRAIGHT LINE, on the pipeline's own primitive ---------------
+    # cartesian_move() rather than ros.CartesianMove, which is what every scan
+    # call site uses: it picks the IK settings this KIND of move needs, and a
+    # single-waypoint step wants the tight threshold (0.01 mm rather than 0.1,
+    # or the step lands short). `ros` is the cable guard, so the band is checked
+    # a second time on the motion itself.
+    vel, how = _gauge_scaling([(x0, q0), (x1, q1)], vmax)
+    move = globals().get("cartesian_move") or ros.CartesianMove
+    res = move([_cap_pose(x1, q1)], vel=vel, acc=_gauge_accel(vel),
+               min_fraction=1.0)
+    ok, why = _gauge_flew(res, x1, label)
+    if ok:
+        return {"ok": True, "route": "cartesian", "why": None, "tried": tried,
+                "scaling": vel, "scaling_from": how, "speed_class": cls}
+    tried.append(("cartesian", why))
+
+    # -- 2. THE SAME ENDPOINT, REACHED IN JOINT SPACE ------------------------
+    # verify_calibration's own second route and for its own reason: a leg that
+    # will not plan as a straight line usually plans in joint space, and only
+    # the ENDPOINT of a gauge move is measured, so any route that arrives is as
+    # good as any other. Checked first, by FK, over the whole path.
+    # THE GLOBAL IK FALLBACK BELONGS HERE AND ONLY HERE. A branch the arm is not
+    # in is a legitimate thing to TRY when the straight line would not plan --
+    # only the endpoint of a gauge move is measured, so any route that arrives is
+    # as good as another -- and _gauge_joint_path_ok() checks the whole
+    # interpolated path by FK before anything is commanded. It is NOT a
+    # legitimate thing to refuse the move on, which is why the guards above ask
+    # local IK only.
+    q_there = q_pred
+    if q_there is None:
+        try:
+            q_there = _ik_target(x1, q1)
+        except Exception:                                     # noqa: BLE001
+            q_there = None
+    if q_there is None:
+        tried.append(("joint move", "no IK solution for the pose from here"))
+    else:
+        q_here = capture_node.current_joints()
+        if q_here is None:
+            tried.append(("joint move", "joint_states are not arriving"))
+        else:
+            try:
+                _gauge_joint_path_ok(q_here, q_there, label)
+            except CaptureRefused as e:
+                tried.append(("joint move", str(e).splitlines()[0]))
+            else:
+                jmk = (globals().get("joint_move_kwargs") or (lambda: {}))()
+                # At least as long as travelling the straight line at the class
+                # limit would take, so the duration asked for cannot itself be
+                # the thing that exceeds the limit. JOINT_MOVE_SCALING is the
+                # cell's own bound on top, which is what every automated joint
+                # move in the pipeline goes at.
+                secs = max(4.0, float(np.linalg.norm(x1 - x0))/max(vmax, 1e-3))
+                # min_duration_s, not secs alone. `secs` is honoured only by the
+                # direct fallback, and it is a DEFAULT on most paths -- making it
+                # binding everywhere turned ApproachInConfiguration's secs=6.0
+                # into a six-second crawl for every raster-row approach. This is
+                # one of the few places a duration bound is actually computed
+                # rather than defaulted, so this is where it is asked for.
+                res = ros.MoveJoints([float(v) for v in q_there], secs=secs,
+                                     min_duration_s=secs, plan=True, **jmk)
+                ok, why = _gauge_flew(res, x1, label)
+                if ok:
+                    return {"ok": True, "route": "joint move", "why": None,
+                            "tried": tried, "scaling": vel,
+                            "scaling_from": how, "speed_class": cls}
+                tried.append(("joint move", why))
+    # ONE LINE, and every route on it. The caller records
+    # str(e).splitlines()[0] against the sample point -- which is right, a
+    # sample's `why` is one line -- so a refusal whose reasons are on the second
+    # and third lines arrives as "it did not reach it" and nothing else.
+    # _cal_fly_or_refuse()'s multi-line form is for an operator reading a
+    # traceback; this one has to survive being stored.
+    raise CalibrationRefused(
+        "%s: the arm did not reach this pose by any route (%s), so nothing has "
+        "been measured there."
+        % (label, "; ".join("%s: %s" % t for t in tried) or "no route to try"))
+
+
+def _gauge_stops():
+    """The exception types that END THE RUN rather than costing one point.
+
+    CaptureStopped (the arm was physically stopped and a human has to look at
+    the cell), CaptureAbort (the operator pressed q), KeyboardInterrupt -- and
+    ScanAborted, WHICH THE UNATTENDED ROUTE NEEDS. With no prompt to answer, the
+    operator's only control is the pendant, and scan_checkpoint() is what turns
+    that into a stop. It raises ScanAborted, which is none of the other three --
+    so without it here the partial result would be neither finalised nor saved
+    and `last_gauge_result` would still hold the previous run's.
+
+    Resolved at call time because robot_supervisor.dpi is optional: a config
+    without it has no ScanAborted to name, and the other three still apply.
+    """
+    out = [CaptureStopped, CaptureAbort, KeyboardInterrupt]
+    t = globals().get("ScanAborted")
+    if isinstance(t, type) and issubclass(t, BaseException):
+        out.append(t)
+    return tuple(out)
+
+
+def _gauge_move(xyz, quat, label, confirm_moves=False):
+    """Fly one gauge pose. UNATTENDED BY DEFAULT; confirmed when asked.
+
+    The one place the two routes are chosen between, so there is exactly one
+    answer to "did this run prompt?" and it is a parameter rather than a mode.
+    See the header.
+    """
+    if confirm_moves:
+        return _cal_fly_or_refuse(xyz, quat, label)
+    return _gauge_fly_unattended(xyz, quat, label)
+
+
+def gauge_sample_points(geom, n=None, ring_fraction=None, inset=None,
+                        envelope=None, region=None):
+    """`n` points on the mesh, spread over the PART. (n, 3) world.
+
+    TAKEN FROM THE MESH'S OWN VERTICES, and that is the whole trick: a vertex
+    is guaranteed to lie on the surface, so its z IS the mesh's prediction
+    there and no ray cast, no interpolation and no search band is involved. The
+    targets are a centre plus a ring at AZURE_GAUGE_RING_FRACTION of the
+    half-extent; each target takes the nearest vertex in xy.
+
+    `region` is (xmin, ymin, xmax, ymax) in world metres, or None for the mesh's
+    whole extent. SPREADING OVER THE MESH'S EXTENT IS A TRAP: a TSDF mesh
+    reaches as far as the sweep integrated, so the ring can land 60-96 mm
+    outside the detected region, every point measures the BENCH, and the gauge
+    reports -0.00 mm about a surface the raster is never going to fly over.
+    Vertices outside the region are dropped BEFORE the extent is computed, so
+    the centre, the radius and every chosen vertex are the part's -- not clipped
+    afterwards, which would move the ring rather than resize it. None spreads
+    over the whole mesh, because a hand call with nothing but a PLY has no
+    region to be given.
+
+    A ring rather than a line, because three collinear points measure a tilt in
+    one direction and call the other zero. A centre as well, from n >= 4, so the
+    residual about the fitted plane can see a bowl -- the Azure's own field has
+    one, 0.64 mm centre to 0.36 mm edge over 645 x 848 mm.
+
+    `envelope` is capture_envelope()'s dict, or None. Vertices outside the work
+    volume in xy are dropped before anything is chosen: "the mesh's reachable
+    extent" is the part of it the arm may be over, and the arm cannot reach a
+    part of the mesh that sticks out of the volume. The refusal that matters is
+    still capture_move()'s, on the pose, at flight time.
+    """
+    n = int(AZURE_GAUGE_POINTS if n is None else n)
+    if n < 1:
+        raise CalibrationRefused("gauge_mesh_against_keyence(n=%d): there is "
+                                 "nothing to measure." % (n,))
+    frac = float(AZURE_GAUGE_RING_FRACTION if ring_fraction is None
+                 else ring_fraction)
+    inset = float(AZURE_GAUGE_EDGE_INSET_M if inset is None else inset)
+    if geom[0] != "mesh":
+        raise CalibrationRefused(
+            "the surface is %s, which has no extent to spread sample points "
+            "over -- a plane is infinite and carries no vertices. Pass "
+            "points=[(x, y), ...] (or (x, y, z) triples) to say where to "
+            "measure." % ("a horizontal plane at z %.4f" % (geom[1],)
+                          if geom[0] == "plane" else geom[0],))
+    V = np.asarray(geom[1], float).reshape(-1, 3)
+    if V.shape[0] < n:
+        raise CalibrationRefused(
+            "the mesh has %d vertices and %d sample points were asked for."
+            % (V.shape[0], n))
+    keep = np.ones(V.shape[0], bool)
+    if envelope is not None:
+        lo, hi = envelope["lo"], envelope["hi"]
+        keep = ((V[:, 0] >= lo[0]) & (V[:, 0] <= hi[0]) &
+                (V[:, 1] >= lo[1]) & (V[:, 1] <= hi[1]))
+        if int(keep.sum()) < n:
+            raise CalibrationRefused(
+                "only %d of the mesh's %d vertices are inside the work volume "
+                "in xy, and %d sample points were asked for. The part is "
+                "outside the measured volume, or the volume is wrong: "
+                "capture_touch_off() measures it."
+                % (int(keep.sum()), V.shape[0], n))
+    if region is not None:
+        r = [float(v) for v in region]
+        inr = ((V[:, 0] >= r[0]) & (V[:, 0] <= r[2]) &
+               (V[:, 1] >= r[1]) & (V[:, 1] <= r[3]))
+        if int((keep & inr).sum()) < n:
+            raise CalibrationRefused(
+                "only %d of the mesh's %d vertices are inside the region "
+                "x %.3f..%.3f y %.3f..%.3f, and %d sample points were asked "
+                "for. The mesh and the region describe different parts -- a "
+                "region left over from an earlier run, or a mesh of something "
+                "else. Pass region= the right one, or region=False to spread "
+                "the samples over the whole mesh (which on a TSDF mesh can put "
+                "every one of them on the bench). Nothing has moved."
+                % (int((keep & inr).sum()), V.shape[0],
+                   r[0], r[2], r[1], r[3], n))
+        keep = keep & inr
+    P = V[keep]
+    x0, x1 = float(P[:, 0].min()), float(P[:, 0].max())
+    y0, y1 = float(P[:, 1].min()), float(P[:, 1].max())
+    cx, cy = 0.5*(x0 + x1), 0.5*(y0 + y1)
+    # The radius is the tighter of the two rules and is never negative.
+    r = max(0.0, min(frac*0.5*(x1 - x0) - inset, frac*0.5*(y1 - y0) - inset))
+    targets = []
+    if n >= 4:
+        targets.append((cx, cy))
+    ring = n - len(targets)
+    # Offset the first spoke off the axes so a rectangular part does not put
+    # two of three points on the same row.
+    for k in range(ring):
+        a = 2.0*math.pi*k/ring + math.pi/6.0
+        targets.append((cx + r*math.cos(a), cy + r*math.sin(a)))
+    chosen, taken = [], set()
+    for tx, ty in targets:
+        d = (P[:, 0] - tx)**2 + (P[:, 1] - ty)**2
+        order = np.argsort(d, kind="stable")
+        pick = None
+        for i in order[:max(64, n*8)]:
+            if int(i) not in taken:
+                pick = int(i)
+                break
+        if pick is None:
+            pick = int(order[0])
+        taken.add(pick)
+        chosen.append(P[pick])
+    return np.asarray(chosen, float).reshape(-1, 3)
+
+
+def gauge_standoff_rungs(start=None, step=None, tries=None, range_m=None,
+                         margin=None):
+    """The step-down ladder, and the rules that bound it.
+
+    Returns (rungs, stop_reason): the commanded head standoffs in metres, in
+    flight order, and why there are not more of them. Raises
+    CalibrationRefused when the FIRST rung is already unsafe -- that is a
+    caller error, not a short ladder.
+
+    Every number here is derived in the header; this is where the derivation is
+    executable. Nothing is hardcoded: the window and the margin come from
+    CAL_KEYENCE_RANGE_M and CAL_KEYENCE_RANGE_MARGIN_M.
+    """
+    lo, hi = (float(CAL_KEYENCE_RANGE_M[0]), float(CAL_KEYENCE_RANGE_M[1])) \
+        if range_m is None else (float(range_m[0]), float(range_m[1]))
+    m = float(CAL_KEYENCE_RANGE_MARGIN_M if margin is None else margin)
+    s0 = float(AZURE_GAUGE_START_STANDOFF if start is None else start)
+    dz = float(AZURE_GAUGE_STEP_M if step is None else step)
+    k_max = int(AZURE_GAUGE_TRIES if tries is None else tries)
+    width = hi - lo
+    if dz <= 0.0:
+        raise CalibrationRefused(
+            "a step of %.1f mm is not a step down. The ladder only ever moves "
+            "the head CLOSER, and only after the sensor has proved the surface "
+            "is beyond its far limit." % (1e3*dz,))
+    if dz >= width:
+        raise CalibrationRefused(
+            "a step of %.1f mm over a %.0f mm measuring window can SKIP THE "
+            "SURFACE: consecutive rungs would not overlap, so a mesh error "
+            "between two of them returns nothing at either and the gauge "
+            "concludes the wrong thing. Use less than %.0f mm."
+            % (1e3*dz, 1e3*width, 1e3*width))
+    rungs, why = [], ""
+    s = s0
+    for k in range(max(0, k_max)):
+        # RULE A. What the actual standoff is predicted to be, given every
+        # no-return so far. At the first rung that is the mesh at face value;
+        # afterwards the mesh has been refuted on the far side and the bound on
+        # how LOW it can read is (previous rung - hi), which is negative.
+        delta_max = 0.0 if not rungs else (rungs[-1] - hi)
+        predicted = s - delta_max
+        if predicted < lo + m:
+            if not rungs:
+                raise CalibrationRefused(
+                    "a start standoff of %.1f mm would put the head %.1f mm "
+                    "from the surface the mesh predicts, inside the %.0f mm "
+                    "near limit plus its %.0f mm margin. The LJ-V7080 returns "
+                    "WRONG VALUES at the bottom of its range rather than "
+                    "failing, and that is what this gauge exists to catch: it "
+                    "has cost 26-39%% of a plate. Start at %.0f mm (the "
+                    "reference distance + 20 mm) and let the ladder come down."
+                    % (1e3*s, 1e3*predicted, 1e3*lo, 1e3*m,
+                       1e3*AZURE_GAUGE_START_STANDOFF))
+            why = ("the next rung at %.0f mm would predict an actual standoff "
+                   "of %.0f mm, inside the %.0f mm near limit plus its %.0f mm "
+                   "margin" % (1e3*s, 1e3*predicted, 1e3*lo, 1e3*m))
+            break
+        # RULE C. The contact floor. The other reading of the FIRST rung's
+        # silence is a mesh that reads low by at least (s0 - lo); under it the
+        # head at this rung is (s - (s0 - lo)) from the surface. Stop before
+        # that reaches the margin.
+        if rungs:
+            worst = s - (rungs[0] - lo)
+            if worst < m:
+                why = ("a rung at %.0f mm is refused: if the no-returns so far "
+                       "were the NEAR side rather than the far side -- which a "
+                       "profiler that returns nothing cannot distinguish -- the "
+                       "mesh reads at least %.0f mm low and the head would be "
+                       "%.1f mm from the surface"
+                       % (1e3*s, 1e3*(rungs[0] - lo), 1e3*worst))
+                break
+        rungs.append(s)
+        s -= dz
+    else:
+        if k_max > 0:
+            covered_lo = rungs[-1] - hi
+            why = ("%d rung(s) are available; between them they return for a "
+                   "mesh error of %+.0f .. %+.0f mm"
+                   % (len(rungs), 1e3*covered_lo, 1e3*(rungs[0] - lo)))
+    if not rungs:
+        raise CalibrationRefused(
+            "tries=%d leaves no pose to fly." % (k_max,))
+    return rungs, why
+
+
+def _gauge_profile_facts(pts_s, ref, window):
+    """What one grab says about itself, in the sensor's own frame.
+
+    `standoff = ref_dist - z` is the convention keyence_driver_node packs and
+    keyence_profile_standoff() documents: positive z is TOWARDS the head, so
+    z = +0.023 is the near limit and z = -0.023 the far one. Returns
+    (standoffs (m,), side) where side is "near", "far" or None for where the
+    median sits relative to the guarded window -- RULE B's input.
+    """
+    z = np.asarray(pts_s, float).reshape(-1, 3)[:, 2]
+    d = ref - z[np.isfinite(z)]
+    if d.size == 0:
+        return d, None
+    med = float(np.median(d))
+    lo, hi = window
+    return d, ("near" if med < lo else ("far" if med > hi else None))
+
+
+def _gauge_plane_fit(xy, delta):
+    """(offset, tilt_mrad or None, rms) of a plane through (x, y) -> delta.
+
+    UNITS, BECAUSE THEY DO NOT MATCH AND THE TILT IS WHERE THAT BITES. `xy` is
+    in METRES and `delta` in MILLIMETRES, which is how both arrive and how both
+    are reported -- so the fitted gradient is mm per metre and has to be
+    divided by a thousand before an angle is taken from it. Left unconverted, a
+    40 mrad tilt comes out as 1546 mrad (88.6 degrees) -- not a subtle wrong
+    answer, but one that is easy to mistake for a frame convention problem.
+
+    Fitted on xy RELATIVE TO THE CENTROID, so the constant term is the mean
+    disagreement over the samples rather than an extrapolation to the origin --
+    at a metre of reach an ill-conditioned intercept is the difference between
+    a number and a rumour.
+
+    Three points fit a plane EXACTLY, so the rms is 0.0 there by construction
+    and is not evidence of anything. It starts carrying information at n >= 4.
+    """
+    A = np.asarray(xy, float).reshape(-1, 2)
+    d = np.asarray(delta, float).reshape(-1)
+    n = d.size
+    if n == 0:
+        return float("nan"), None, float("nan")
+    c = A.mean(axis=0)
+    if n < 3:
+        off = float(d.mean())
+        return off, None, float(math.sqrt(float(((d - off)**2).mean())))
+    M = np.column_stack([np.ones(n), A[:, 0] - c[0], A[:, 1] - c[1]])
+    coef, _res, rank, _sv = np.linalg.lstsq(M, d, rcond=None)
+    if rank < 3:
+        # Collinear samples. The gradient across the line is not measured, so
+        # reporting a tilt from it would be reporting the fit's own arbitrary
+        # choice -- the 90.06 degree answer in the header, one dimension down.
+        off = float(d.mean())
+        return off, None, float(math.sqrt(float(((d - off)**2).mean())))
+    resid = d - M.dot(coef)
+    rms = float(math.sqrt(float((resid**2).mean())))
+    grad = 1e-3*math.hypot(float(coef[1]), float(coef[2]))   # mm/m -> m/m
+    tilt = 1e3*math.atan(grad)
+    return float(coef[0]), tilt, rms
+
+
+def _gauge_save(res, take, say):
+    """The samples and the verdict, inside the take. Never raises.
+
+    ONE FILE, because the expensive half of this is the arm time and the cheap
+    half is the arithmetic: a gauge run that produced a number nobody can
+    re-derive next week has to be flown again.
+    """
+    if take is None or not getattr(take, "dir", None):
+        return None
+    try:
+        d = os.path.join(take.dir, "azure_gauge")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "gauge.json")
+        text = json.dumps(res, indent=2, sort_keys=True, default=float)
+        _cal_atomic_write(path, lambda f: f.write(text.encode("utf-8")))
+        say("      saved %s" % (path,))
+        return path
+    except Exception as e:                                    # noqa: BLE001
+        say("      (the gauge result could not be saved: %s: %s)"
+            % (type(e).__name__, e))
+        return None
+
+
+def gauge_mesh_against_keyence(mesh=None, points=None, n=3, start_standoff=None,
+                               step=0.020, tries=3, say=None, take=None,
+                               region=None, confirm_moves=False):
+    """MEASURE HOW WRONG THE AZURE MESH IS, WITH THE KEYENCE, ON THE PART.
+
+    AN OPTICAL GAUGE. NOTHING HERE TOUCHES THE PART, ever, and nothing here
+    needs a contact touch-off or an operator's judgement. The Keyence is a
+    triangulation profiler standing off 57..103 mm and every pose in this
+    routine is placed to keep it there with margin. Do not add a contact step.
+
+    AND IT DOES NOT PROMPT. `confirm_moves=False`, the default, is the route
+    run_automated_scan() gets: the same primitives the Azure sweep and the
+    Keyence raster fly, with the work volume, the cable band and the speed limit
+    asked for explicitly before anything is commanded, and nothing to answer.
+    The autonomous pipeline must never ask an operator to approve a move.
+    `confirm_moves=True` is for a hand call at the dgpy prompt, which is
+    calibration-ish: it flies _cal_fly_or_refuse() exactly as
+    verify_calibration() does, so every move is previewed, confirmed and watched
+    by _Monitor. See the header for which route keeps which guard.
+
+    It flies the Keyence over `n` places on the mesh, one after another, and at
+    each one subtracts the mesh's own predicted height from the height the
+    sensor measures:
+
+        delta = z_keyence - z_mesh      POSITIVE MEANS THE MESH READS LOW
+
+    which is the direction of this cell's standing +12.45 mm bias. A caller
+    gates on abs(dz_mm) <= AZURE_GAUGE_MAX_MM before planning a Keyence raster
+    over an Azure mesh. Ungated, a raster over a mesh 13.6 mm low flies the head
+    at 58 mm against a 57 mm limit and brings 26-39% of a surface-ground plate
+    back as noise, which is then meshed.
+
+    Arguments:
+
+      mesh            anything _surface_geometry() accepts -- a PLY path, a
+                      (verts, tris) pair, (verts, normals, tris), a world z or
+                      {"plane_z": z}. Defaults to the session's `rough_mesh`.
+                      REFUSES rather than guessing when there is none.
+      points          where to measure, instead of letting the mesh choose:
+                      (x, y) pairs (z comes from the mesh) or (x, y, z) triples
+                      (taken as the mesh's prediction, so no mesh is needed).
+      n               how many places. 3 or more gives a tilt as well as an
+                      offset; ignored when `points` is given.
+      start_standoff  head-to-predicted-surface for the first grab, metres.
+                      Default AZURE_GAUGE_START_STANDOFF, 0.100 -- the far end
+                      of the window, which is what leaves 43 mm of headroom on
+                      the side that hurts.
+      step            how far the head steps DOWN after a grab that returned
+                      nothing, metres. Must be under the 46 mm window width.
+      tries           how many rungs of that ladder, at most. Three cover
+                      -43 .. +43 mm of mesh error; see the header.
+      say             where the running commentary goes. Default _cal_say.
+      take            a capture_scenario()'s take, if the caller has one. Given
+                      one, the result is written into it AND THE LASER IS THE
+                      CALLER'S; with none, this switches the Keyence laser on
+                      and off around the measurement itself.
+      region          (xmin, ymin, xmax, ymax) in world metres: where the PART
+                      is, so the samples are spread over it rather than over the
+                      mesh, which extends as far as the sweep integrated.
+                      Default None takes `detected_region`, which stage 1 of
+                      run_automated_scan() sets on both its branches and which
+                      is therefore already correct at stage 2a. `region=False`
+                      spreads them over the whole mesh, which on a TSDF mesh can
+                      put every one of them on the bench.
+                      Ignored when `points` names the places explicitly.
+      confirm_moves   False (default, AND WHAT THE PIPELINE MUST USE): fly the
+                      unattended route, no prompt. True: fly
+                      _cal_fly_or_refuse(), which previews and asks the operator
+                      before every move -- right for a hand call, wrong for an
+                      autonomous run.
+
+    Returns a dict:
+
+      ok            bool   every sampled point produced a valid Keyence reading
+      n_measured    int
+      n_requested   int
+      dz_mm         float  mean (keyence - mesh); + means the mesh reads LOW
+      tilt_mrad     float  from a plane fit across the samples -- None when
+                           there are fewer than three of them, when they turn
+                           out collinear, or when their xy spread is under
+                           AZURE_GAUGE_MIN_SPREAD_M and a tilt would be noise
+                           rather than a measurement. CHECK FOR None.
+      residual_mm   float  rms of the samples about that plane. Exactly 0.0 at
+                           n == 3, which fits a plane exactly.
+      samples       list   per point: xy, z_mesh, z_keyence, standoff_used,
+                           tries_used, n_profiles, n_points, and the rest
+      why           str    empty when ok, else why it stopped
+
+    plus dz_sd_mm, tilt_resolution_mrad, spread_mm, within_tolerance,
+    tolerance_mm, mesh_correction_mm, implied_standoff_mm,
+    margin_to_limit_mm, rungs_mm, surface, region, region_from,
+    confirm_moves and notes.
+
+    About a minute for three points. Nothing is solved, written to a URDF or
+    deployed: this MEASURES, and what to do about the number is the caller's.
+    """
+    say = _gauge_say(say)
+    ref = float(CAL_KEYENCE_REF_DIST)
+    lo_hard, hi_hard = (float(CAL_KEYENCE_RANGE_M[0]),
+                        float(CAL_KEYENCE_RANGE_M[1]))
+    margin = float(CAL_KEYENCE_RANGE_MARGIN_M)
+    s0 = float(AZURE_GAUGE_START_STANDOFF if start_standoff is None
+               else start_standoff)
+    rungs, ladder_why = gauge_standoff_rungs(start=s0, step=step, tries=tries)
+    # WHERE THE PART IS, resolved before anything is chosen or flown, so a
+    # region that is malformed or describes another part is a refusal with the
+    # arm still parked. See _gauge_region() and the header.
+    #
+    # NOT RESOLVED AT ALL when `points` names the places: the caller being
+    # explicit leaves the region nothing to add, and recording one in the saved
+    # result that had no effect on where the head went would be a lie in the
+    # only file that says what this measurement was.
+    if points is None:
+        reg, reg_from = _gauge_region(region)
+    else:
+        reg, reg_from = None, ("the %d place(s) the caller named"
+                               % (len(points),))
+        if region is not None and region is not False:
+            say("    (region= is ignored: points= says where to measure)")
+
+    # -- where to measure ---------------------------------------------------
+    geom, what = (None, None)
+    aim = None
+    if points is not None:
+        P = np.asarray(points, float).reshape(len(points), -1)
+        if P.shape[1] == 3:
+            aim = P.astype(float)
+            if mesh is not None:
+                geom, what = _gauge_surface(mesh)
+            else:
+                what = "the %d point(s) given" % (aim.shape[0],)
+        elif P.shape[1] == 2:
+            geom, what = _gauge_surface(mesh)
+            if geom[0] == "plane":
+                aim = np.column_stack([P, np.full(P.shape[0], float(geom[1]))])
+            else:
+                # Nearest vertex in xy, which is the same rule
+                # gauge_sample_points() uses and for the same reason: the
+                # vertex's own z IS the mesh's prediction there.
+                V = np.asarray(geom[1], float).reshape(-1, 3)
+                idx = [int(np.argmin((V[:, 0] - x)**2 + (V[:, 1] - y)**2))
+                       for x, y in P]
+                aim = V[idx]
+        else:
+            raise CalibrationRefused(
+                "points= must be (x, y) pairs or (x, y, z) triples; got %d "
+                "columns." % (P.shape[1],))
+    else:
+        geom, what = _gauge_surface(mesh)
+        env = None
+        fn = globals().get("capture_envelope")
+        if fn is not None:
+            try:
+                env = fn()
+            except Exception:                                 # noqa: BLE001
+                env = None
+        aim = gauge_sample_points(geom, n=n, envelope=env, region=reg)
+    n_req = int(aim.shape[0])
+    # WHAT THE GATE IS HANDED. _surface_geometry() parses a PLY from disk every
+    # time it is called, and the gate calls it once per pose -- so the surface
+    # is handed on in the form it has already been parsed INTO, which that same
+    # function accepts unchanged: a (verts, tris) pair, or the plane's z.
+    surface = None if geom is None else (
+        float(geom[1]) if geom[0] == "plane" else (geom[1], geom[2]))
+
+    window = (lo_hard + margin, hi_hard - margin)
+    prof_topic = sensor_topic("keyence", "profiles", "/profiles")
+    q_home = _cal_tool_quat(0.0, 0.0, 0.0)
+    # THE SENSOR'S PLACE AND ITS AXIS, READ FROM LIVE TF AND NOT ASSUMED. The
+    # optical frame's -z is the measuring direction (the head sits at
+    # +keyence_ref_dist along its +z), so the third column of the probe_end ->
+    # optical rotation, negated, is the look direction in the probe_end frame.
+    # On the ec tooling that rotation is a pure Rz(+90 deg) and it comes out as
+    # probe_end's -z exactly -- but a cell that tilts the head gets the tilt
+    # for free, which is the whole reason it is read.
+    T_ps = _cal_tf("probe_end", "lj_v7080_optical_frame")
+    axis = -np.asarray(T_ps, float)[:3, 2]
+
+    res = {"ok": False, "n_measured": 0, "n_requested": n_req,
+           "dz_mm": float("nan"), "tilt_mrad": None,
+           "residual_mm": float("nan"), "samples": [], "why": "",
+           "dz_sd_mm": float("nan"), "tilt_resolution_mrad": None,
+           "spread_mm": 0.0, "tolerance_mm": float(AZURE_GAUGE_MAX_MM),
+           "within_tolerance": False, "mesh_correction_mm": float("nan"),
+           "implied_standoff_mm": float("nan"),
+           "margin_to_limit_mm": float("nan"),
+           "start_standoff_mm": 1e3*s0,
+           "rungs_mm": [1e3*v for v in rungs],
+           "ladder": ladder_why, "surface": what,
+           "ref_dist_mm": 1e3*ref,
+           "window_mm": [1e3*window[0], 1e3*window[1]],
+           "region": None if reg is None else list(reg),
+           "region_from": reg_from,
+           "confirm_moves": bool(confirm_moves),
+           "notes": []}
+
+    say("")
+    say("  AZURE MESH vs THE KEYENCE, over %s" % (what,))
+    if points is not None:
+        say("    at the %d place(s) the caller named" % (n_req,))
+    elif reg is None:
+        say("    sampled over %s -- NOT over a region. A reconstructed mesh "
+            "reaches as far as the sweep integrated, so on a part smaller than "
+            "the mesh this CAN MEASURE THE BENCH INSTEAD OF THE PART."
+            % (reg_from,))
+    else:
+        say("    sampled inside %s, x %.3f..%.3f y %.3f..%.3f"
+            % (reg_from, reg[0], reg[2], reg[1], reg[3]))
+    say("    moves: %s"
+        % ("CONFIRMED -- the operator approves each one (confirm_moves=True)"
+           if confirm_moves else
+           "unattended, on the pipeline's own motion path; no prompt"))
+    say("    %d point(s); the head starts %.0f mm off the mesh-predicted "
+        "surface (the %.0f mm reference distance %+.0f mm), which returns for a "
+        "mesh error of %+.0f .. %+.0f mm"
+        % (n_req, 1e3*s0, 1e3*ref, 1e3*(s0 - ref),
+           1e3*(s0 - hi_hard), 1e3*(s0 - lo_hard)))
+    if len(rungs) > 1:
+        say("    fallback ladder %s mm, for a mesh that reads HIGH and puts "
+            "the surface beyond the far limit; %s"
+            % (", ".join("%.0f" % (1e3*v) for v in rungs), ladder_why))
+    say("    NOTHING HERE TOUCHES THE PART: it is an optical gauge.")
+
+    own_laser = take is None and globals().get("capture_laser") is not None
+    if own_laser:
+        capture_laser(True)
+    said_kinds = set()
+    try:
+        for i in range(n_req):
+            a = np.asarray(aim[i], float).reshape(3)
+            label = "gauge %d/%d at (%.3f, %.3f)" % (i + 1, n_req, a[0], a[1])
+            # THE OPERATOR'S ONLY CONTROL DURING AN UNATTENDED RUN IS THE
+            # PENDANT, and this is where stopping External Control becomes a
+            # hold rather than four moves issued at a deactivated controller --
+            # the same call _fly_scanpath() makes at every sweep row boundary.
+            # No-op when robot_supervisor.dpi is not loaded, and nearly free.
+            _ckpt = globals().get("scan_checkpoint")
+            if callable(_ckpt):
+                _ckpt("azure gauge point %d/%d" % (i + 1, n_req))
+            s_row = {"xy": [float(a[0]), float(a[1])],
+                     "z_mesh": float(a[2]), "z_keyence": None,
+                     "standoff_used": None, "tries_used": 0,
+                     "n_profiles": 0, "n_points": 0, "label": label,
+                     "delta_mm": None, "standoff_measured_mm": None,
+                     "delta_from_standoff_mm": None, "ok": False, "why": "",
+                     "scatter_mm": None, "side": None}
+            tried = []
+            for k, s in enumerate(rungs):
+                s_row["tries_used"] = k + 1
+                # RULE A, as the gate's own near limit. The far end is left at
+                # the sensor's own: a gauge stands off at the far end of the
+                # window on purpose and must not be graded as a raster.
+                delta_max = 0.0 if k == 0 else (rungs[k - 1] - hi_hard)
+                near_floor = lo_hard + margin + delta_max
+                xyz = _cal_pose_for_sensor(a, q_home, s - ref,
+                                           "lj_v7080_optical_frame")
+                if surface is not None:
+                    # THROUGH THE EXISTING GATE, not around it: it casts the
+                    # sensor's axis at the mesh and measures how far the FIRST
+                    # surface really is, which is not the same question as how
+                    # far this pose intended it to be. A nearer piece of the
+                    # part between the head and the vertex that was aimed at,
+                    # or a ray that finds nothing because the aim is past the
+                    # mesh's edge, show up here and nowhere else.
+                    #
+                    # GRADED AGAINST THE SENSOR'S OWN 57..103 mm, margin zero,
+                    # and RULE A is applied separately below. A gauge stands
+                    # off at the FAR end of the window on purpose, so the
+                    # symmetric guard a raster is held to would refuse its
+                    # first rung for being 100 mm; and narrowing the gate's
+                    # window by handing it a different range_m would make its
+                    # own printed line ("the LJ-V7080 measures from ... ") say
+                    # something untrue. Two checks, each saying what it means.
+                    #
+                    # A REFUSAL HERE COSTS THIS SAMPLE POINT AND NOT THE RUN,
+                    # and it does NOT step down: the commanded standoff falls
+                    # by 20 mm at the next rung, so a pose refused for a nearer
+                    # surface is refused harder one rung down. Nothing moved.
+                    try:
+                        keyence_standoff_gate(
+                            _GaugePath([xyz], [q_home]), surface,
+                            margin=0.0, range_m=(lo_hard, hi_hard),
+                            what="%s, head at %.0f mm" % (label, 1e3*s),
+                            quiet=True, drop=0.0,
+                            tf_offset=np.asarray(T_ps, float)[:3, 3],
+                            axis=axis, ref_dist=ref)
+                    except ValueError as e:
+                        why1 = str(e).splitlines()[0]
+                        tried.append("%.0f mm: refused by the standoff gate "
+                                     "before flying -- %s" % (1e3*s, why1))
+                        say("    %s at %.0f mm: REFUSED before flying -- %s"
+                            % (label, 1e3*s, why1))
+                        break
+                    # RULE A, against what the RAY found rather than against
+                    # what the pose asked for. The gate has just stored its
+                    # report; a surface the mesh puts nearer than the sampled
+                    # vertex is exactly the case where those two differ, and it
+                    # is the case that ends with the head close to the part.
+                    d_ray = last_standoff_report["standoff"]
+                    d_ray = float(np.asarray(d_ray).reshape(-1)[0])
+                    if np.isfinite(d_ray) and d_ray < near_floor:
+                        why1 = ("the mesh puts the first surface %.1f mm from "
+                                "the head, under the %.1f mm floor this rung "
+                                "may command (the %.0f mm near limit, its "
+                                "%.0f mm margin, and %.0f mm of mesh error "
+                                "already ruled out)"
+                                % (1e3*d_ray, 1e3*near_floor, 1e3*lo_hard,
+                                   1e3*margin, -1e3*delta_max))
+                        tried.append("%.0f mm: refused by the standoff gate "
+                                     "before flying -- %s" % (1e3*s, why1))
+                        say("    %s at %.0f mm: REFUSED before flying -- %s"
+                            % (label, 1e3*s, why1))
+                        break
+                # THE SAME TWO ROUTES verify_calibration's Keyence legs fly --
+                # the straight line, then the same endpoint in joint space, then
+                # a refusal that names every route tried -- carrying the work
+                # volume, the cable band and the speed limit either way. WHICH
+                # of the two is chosen by confirm_moves, and the default is the
+                # one that does not stop to ask: see _gauge_move() and the
+                # header. The pipeline is never prompted.
+                #
+                # A POSE THAT CANNOT BE REACHED COSTS THIS SAMPLE POINT, not the
+                # run: the other points are still a measurement, and a gauge
+                # that refuses the whole part because one corner is out of reach
+                # is a gauge nobody runs. It does not step down either --
+                # reachability is not what the ladder is for.
+                try:
+                    _gauge_move(xyz, q_home,
+                                "%s, head at %.0f mm" % (label, 1e3*s),
+                                confirm_moves=confirm_moves)
+                except CalibrationRefused as e:
+                    why1 = str(e).splitlines()[0]
+                    tried.append("%.0f mm: the arm did not reach it -- %s"
+                                 % (1e3*s, why1))
+                    say("    %s at %.0f mm: NOT REACHED -- %s"
+                        % (label, 1e3*s, why1))
+                    break
+                time.sleep(CAL_SETTLE_S)
+                if "_CAL" in globals():
+                    _CAL["last_profile_check"] = None
+                try:
+                    pts_s, frame, k_msg = _cal_profile_points(prof_topic)
+                except CalibrationRefused as e:
+                    chk = (globals().get("_CAL") or {}).get("last_profile_check")
+                    why1 = str(e).splitlines()[0]
+                    tried.append("%.0f mm: %s" % (1e3*s, why1))
+                    side = None
+                    if chk and chk.get("standoff") is not None:
+                        d_med = float(chk["standoff"])
+                        side = ("near" if d_med < lo_hard + margin
+                                else ("far" if d_med > hi_hard - margin
+                                      else None))
+                        s_row["side"] = side
+                    say("    %s at %.0f mm: no usable profile -- %s"
+                        % (label, 1e3*s, why1))
+                    # RULE B. The sensor's own heights say the surface is
+                    # INSIDE the near limit, so this is not the far-side case
+                    # the ladder is for and stepping down would close on the
+                    # part. Stop the whole run and say so.
+                    #
+                    # IT CANNOT ALWAYS FIRE, and that is the honest limit of
+                    # this check: out-of-range columns come back as +Inf, so a
+                    # surface wholly inside the near limit returns NO finite
+                    # points and check_profile has no standoff to report. RULE
+                    # B catches the partial case -- part of the line in range,
+                    # the median below the guard -- which is the common one on
+                    # anything tilted or stepped. The total case is what RULE C
+                    # bounds instead, by refusing to descend past the point
+                    # where that reading would imply contact.
+                    if side == "near":
+                        res["why"] = (
+                            "%s: the sensor's own heights put the surface "
+                            "%.1f mm from the head, inside the %.0f mm near "
+                            "limit. THE MESH READS LOW BY AT LEAST %.1f mm. "
+                            "The ladder steps the head DOWN and that would "
+                            "close on the part, so nothing further has been "
+                            "flown. Fix the Azure correction before planning "
+                            "any Keyence raster over this mesh."
+                            % (label, 1e3*float(chk["standoff"]), 1e3*lo_hard,
+                               1e3*(s - float(chk["standoff"]))))
+                        s_row["why"] = res["why"]
+                        res["samples"].append(s_row)
+                        raise CalibrationRefused(res["why"])
+                    continue
+                d_meas, side = _gauge_profile_facts(pts_s, ref, window)
+                s_row["side"] = side
+                T = _cal_tf("world", frame)
+                world = pts_s.dot(T[:3, :3].T) + T[:3, 3]
+                z_key = float(np.median(world[:, 2]))
+                s_row.update({
+                    "z_keyence": z_key, "standoff_used": float(s),
+                    "n_profiles": int(k_msg), "n_points": int(world.shape[0]),
+                    "delta_mm": 1e3*(z_key - float(a[2])),
+                    "standoff_measured_mm": (1e3*float(np.median(d_meas))
+                                             if d_meas.size else None),
+                    "scatter_mm": 1e3*float(np.std(world[:, 2])),
+                    "ok": True})
+                if d_meas.size:
+                    s_row["delta_from_standoff_mm"] = 1e3*(
+                        s - float(np.median(d_meas)))
+                    rep = keyence_range_report(d_meas, commanded=s,
+                                               n_profiles=int(k_msg))
+                    # SAID ONCE, NOT ONCE PER POINT. A uniform mesh error is
+                    # one fact, and describe_range_report() carries `skip` for
+                    # exactly this -- the paragraph is what is suppressed, not
+                    # the measurement, and the gauge's own line below still
+                    # gives the number at every point.
+                    for line in describe_range_report(
+                            rep, what="%s, head at %.0f mm" % (label, 1e3*s),
+                            skip=tuple(said_kinds)):
+                        say(line)
+                    said_kinds.update(rep.get("why_kinds") or ())
+                    gap = abs((s_row["delta_from_standoff_mm"] or 0.0)
+                              - s_row["delta_mm"])
+                    if gap > 1e3*AZURE_GAUGE_TF_TOL_M:
+                        note = ("%s: the world-frame and sensor-frame readings "
+                                "of the disagreement differ by %.2f mm "
+                                "(%.2f vs %.2f). TF and the commanded pose do "
+                                "not agree -- a stale transform, a description "
+                                "that moved, or an arm that did not arrive. The "
+                                "world-frame number is the one used."
+                                % (label, gap, s_row["delta_mm"],
+                                   s_row["delta_from_standoff_mm"]))
+                        res["notes"].append(note)
+                        say("    ** %s" % (note,))
+                sm = s_row["standoff_measured_mm"]
+                say("    %s: mesh z %.4f, keyence z %.4f, so the mesh reads "
+                    "%+.2f mm %s (head commanded %.0f mm, measuring at "
+                    "%s mm; %d points from %d profiles)"
+                    % (label, a[2], z_key, s_row["delta_mm"],
+                       "LOW" if s_row["delta_mm"] > 0 else "high", 1e3*s,
+                       "--" if sm is None else "%.1f" % (sm,),
+                       s_row["n_points"], s_row["n_profiles"]))
+                # THE GRAB WORKED AND THE HEAD IS IN THE GUARD BAND. Not a
+                # ladder decision -- the answer is in hand and this point is
+                # done -- but it means the mesh reads low by nearly the whole
+                # of the headroom this gauge was given, and the next thing the
+                # operator must not do is plan a raster at 80 mm.
+                if side == "near":
+                    note = ("%s measured at %.1f mm, inside the %.0f mm near "
+                            "limit plus its %.0f mm margin. The mesh reads low "
+                            "by %.1f mm, nearly the whole %.0f mm of headroom "
+                            "this gauge starts with. A raster planned over it "
+                            "at the %.0f mm reference distance would fly "
+                            "INSIDE the hard limit."
+                            % (label, sm if sm is not None else float("nan"),
+                               1e3*lo_hard, 1e3*margin, s_row["delta_mm"],
+                               1e3*(s - lo_hard), 1e3*ref))
+                    res["notes"].append(note)
+                    say("    ** %s" % (note,))
+                break
+            if not s_row["ok"]:
+                s_row["why"] = ("no rung of the ladder returned a usable "
+                                "profile: " + "; ".join(tried))
+                if not res["why"]:
+                    res["why"] = "%s: %s" % (label, s_row["why"])
+            res["samples"].append(s_row)
+    except _gauge_stops() as e:
+        # THESE END THE RUN AND ARE NOT THIS FUNCTION'S TO SWALLOW. A monitor
+        # stop means a human has to look at the work cell before the arm moves
+        # again; the taxonomy is in cell_capture_node.dpi. ScanAborted is in the
+        # tuple because the unattended route's only operator control is the
+        # pendant -- see _gauge_stops().
+        res["why"] = _cal_stop_why(e)
+        _gauge_finalise(res, say, ref, lo_hard)
+        _gauge_save(res, take, say)
+        globals()["last_gauge_result"] = res
+        raise
+    except CalibrationRefused:
+        _gauge_finalise(res, say, ref, lo_hard)
+        _gauge_save(res, take, say)
+        globals()["last_gauge_result"] = res
+        raise
+    finally:
+        if own_laser:
+            capture_laser(False)
+
+    _gauge_finalise(res, say, ref, lo_hard)
+    _gauge_save(res, take, say)
+    if take is not None and hasattr(take, "results"):
+        try:
+            take.results.update({"azure_gauge": res})
+        except Exception:                                     # noqa: BLE001
+            pass
+    globals()["last_gauge_result"] = res
+    return res
+
+
+global _gauge_finalise
+def _gauge_finalise(res, say, ref, lo_hard):
+    """Reduce the samples to the verdict, and print it. Never raises.
+
+    SEPARATE FROM THE FLYING because the interesting paths out are the ones
+    where it stopped early: a run that measured two of three points still
+    knows two thirds of the answer, and an operator standing at a cell reading
+    a refusal needs that printed rather than thrown away.
+    """
+    good = [s for s in res["samples"] if s.get("ok")]
+    res["n_measured"] = len(good)
+    res["ok"] = bool(good) and len(good) == res["n_requested"] and not res["why"]
+    if not good:
+        if not res["why"]:
+            res["why"] = ("no sampled point produced a valid Keyence reading, "
+                          "so nothing has been measured.")
+        say("    NOTHING MEASURED: %s" % (res["why"],))
+        return res
+    xy = np.asarray([s["xy"] for s in good], float)
+    d = np.asarray([s["delta_mm"] for s in good], float)
+    off, tilt, rms = _gauge_plane_fit(xy, d)
+    dx = float(xy[:, 0].max() - xy[:, 0].min()) if len(xy) else 0.0
+    dy = float(xy[:, 1].max() - xy[:, 1].min()) if len(xy) else 0.0
+    spread = math.hypot(dx, dy)
+    res["spread_mm"] = 1e3*spread
+    res["dz_mm"] = float(d.mean())
+    res["dz_sd_mm"] = float(np.std(d))
+    res["residual_mm"] = float(rms)
+    scat = [s["scatter_mm"] for s in good if s.get("scatter_mm") is not None]
+    if scat and spread > 0.0:
+        res["tilt_resolution_mrad"] = float(
+            (sum(scat)/len(scat))/res["spread_mm"]*1e3)
+    if tilt is not None and spread < float(AZURE_GAUGE_MIN_SPREAD_M):
+        note = ("the samples span %.0f mm, under the %.0f mm this file will "
+                "report a tilt over. A tilt is a height difference divided by "
+                "a baseline, and over a short baseline it is the sensor's "
+                "noise -- verify_calibration reported 15.0 mrad on a patch "
+                "whose true tilt was 1.1 mrad. The offset below is unaffected."
+                % (res["spread_mm"], 1e3*AZURE_GAUGE_MIN_SPREAD_M))
+        res["notes"].append(note)
+        say("    ** %s" % (note,))
+        tilt = None
+    res["tilt_mrad"] = tilt
+    res["mesh_correction_mm"] = res["dz_mm"]
+    res["within_tolerance"] = bool(abs(res["dz_mm"]) <= res["tolerance_mm"])
+    # WHAT IT COSTS, in the units the failure arrives in: a raster planned over
+    # this mesh puts the optical frame on the mesh, so the head flies at the
+    # reference distance MINUS the disagreement.
+    flown = ref - 1e-3*res["dz_mm"]
+    res["implied_standoff_mm"] = 1e3*flown
+    res["margin_to_limit_mm"] = 1e3*(flown - lo_hard)
+    say("")
+    say("    %d of %d point(s) measured over %.0f mm"
+        % (res["n_measured"], res["n_requested"], res["spread_mm"]))
+    say("    THE MESH READS %+.2f mm %s (sd %.2f over the points)"
+        % (res["dz_mm"], "LOW" if res["dz_mm"] > 0 else "HIGH",
+           res["dz_sd_mm"]))
+    if res["tilt_mrad"] is None:
+        say("    tilt: not measured (fewer than three usable points, "
+            "collinear, or too short a baseline)")
+    else:
+        say("    tilt %.2f mrad across the samples, %.3f mm rms about that "
+            "plane%s"
+            % (res["tilt_mrad"], res["residual_mm"],
+               "" if res["tilt_resolution_mrad"] is None else
+               " (the sensor's own scatter over this baseline is %.2f mrad, "
+               "so that is the floor)" % (res["tilt_resolution_mrad"],)))
+    say("    CONSEQUENCE: a Keyence raster planned over this mesh would fly at "
+        "%.1f mm, %.1f mm clear of the head's %.0f mm hard limit."
+        % (res["implied_standoff_mm"], res["margin_to_limit_mm"], 1e3*lo_hard))
+    # THE TWO WAYS THIS FAILS ARE NOT THE SAME FAILURE and must not print the
+    # same sentence. `within_tolerance` is about the MESH; `ok` is about whether
+    # the gauge got to finish. Down one branch, a run that measured 2 of 3
+    # points and found the mesh 0.70 mm out -- well inside a 2.0 mm tolerance --
+    # would print "OVER 2.0 mm ... Correct the Azure depth by -0.70 mm", which
+    # is a correction nobody needs for a fault that was a wrist angle. An
+    # operator who acts on that line reconstructs again and gets the same
+    # refusal.
+    if res["within_tolerance"] and res["ok"]:
+        say("    WITHIN %.1f mm: the mesh may be rastered over."
+            % (res["tolerance_mm"],))
+    elif not res["within_tolerance"]:
+        say("    OVER %.1f mm%s. DO NOT PLAN A KEYENCE RASTER OVER THIS MESH: "
+            "a raster over a mesh this wrong flies the head inside its near "
+            "limit and loses 26-39%% of the surface. "
+            "Correct the Azure depth by %+.2f mm and re-run the "
+            "reconstruction, or raster over a better surface."
+            % (res["tolerance_mm"],
+               "" if res["ok"] else " (and only %d of %d points measured, so "
+               "this number is from fewer points than were asked for)"
+               % (res["n_measured"], res["n_requested"]),
+               res["mesh_correction_mm"]))
+    else:
+        say("    INCOMPLETE: %d of %d points measured. What WAS measured is "
+            "%+.2f mm, inside the %.1f mm tolerance -- so the mesh is not the "
+            "thing that failed here and correcting the Azure depth would not "
+            "help. The reason the rest was not measured is below; fix that and "
+            "gauge again."
+            % (res["n_measured"], res["n_requested"], res["dz_mm"],
+               res["tolerance_mm"]))
+    if res["why"]:
+        say("    STOPPED: %s" % (res["why"],))
+    return res
+
+
+def describe_gauge(res=None):
+    """The last (or a given) gauge result as lines, for a report or a log."""
+    res = last_gauge_result if res is None else res
+    if not res:
+        return ["  no gauge has been run in this session"]
+    lines = ["  azure mesh vs the keyence over %s" % (res.get("surface"),),
+             "    %d of %d point(s) measured over %.0f mm; the mesh reads "
+             "%+.2f mm %s (sd %.2f)"
+             % (res.get("n_measured", 0), res.get("n_requested", 0),
+                res.get("spread_mm", 0.0), res.get("dz_mm", float("nan")),
+                "LOW" if (res.get("dz_mm") or 0.0) > 0 else "HIGH",
+                res.get("dz_sd_mm", float("nan")))]
+    if res.get("region"):
+        r = res["region"]
+        lines.append("    sampled inside %s, x %.3f..%.3f y %.3f..%.3f"
+                     % (res.get("region_from") or "a region",
+                        r[0], r[2], r[1], r[3]))
+    elif res.get("region_from"):
+        lines.append("    sampled over %s" % (res["region_from"],))
+    if res.get("tilt_mrad") is not None:
+        lines.append("    tilt %.2f mrad, %.3f mm rms about the plane"
+                     % (res["tilt_mrad"], res.get("residual_mm",
+                                                  float("nan"))))
+    for s in res.get("samples", ()):
+        lines.append("      (%.3f, %.3f) mesh %.4f keyence %s  %s mm  "
+                     "head %s mm, %d tr%s"
+                     % (s["xy"][0], s["xy"][1], s["z_mesh"],
+                        "--" if s.get("z_keyence") is None
+                        else "%.4f" % s["z_keyence"],
+                        "--" if s.get("delta_mm") is None
+                        else "%+.2f" % s["delta_mm"],
+                        "--" if s.get("standoff_used") is None
+                        else "%.0f" % (1e3*s["standoff_used"]),
+                        s.get("tries_used", 0),
+                        "" if s.get("ok") else "  FAILED: %s" % (s.get("why"),)))
+    for note in res.get("notes", ()):
+        lines.append("    ** %s" % (note,))
+    if res.get("why"):
+        lines.append("    STOPPED: %s" % (res["why"],))
+    return lines

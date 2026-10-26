@@ -1,0 +1,612 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  progress.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Elapsed-time and rate reporting for long operations.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# SAY WHAT IS HAPPENING DURING THE SLOW PARTS
+# ==============================================================================
+# The automated scan spends most of its wall time in stages that used to print
+# nothing at all. Measured on a full run:
+#
+#   Azure sweep, flying                                40 s
+#   Azure mesh extraction + Keyence path clearance     11.9 min
+#   Keyence raster, flying                            ~10 min
+#   Keyence profiles -> mesh                           minutes
+#   Eddy-current toolpath clearance gate               36 min
+#
+# With no output an operator cannot tell a working stage from a hung one, and
+# will eventually kill a stage that would have finished. This is a reporting
+# problem rather than a speed one: 36 min is an acceptable cost for a gate that
+# stops the arm hitting the part, but only if the thing says so.
+#
+# ------------------------------------------------------------------------------
+# WHAT THE OUTPUT LOOKS LIKE, AND WHY IT LOOKS LIKE THAT
+# ------------------------------------------------------------------------------
+# PLAIN APPENDED LINES. No spinner, no carriage return, no ANSI, no in-place
+# redraw. The production system runs the pipeline under `script`, and the
+# resulting typescript is read afterwards as a file -- one that is already
+# unreadable in places because something else in the stack emits escape
+# sequences. Anything that looks good live and terrible in a log file is the
+# wrong trade here: the log is how a run gets diagnosed the next day.
+#
+# EVERY LINE CARRIES A WALL CLOCK. A typescript has no timestamps of its own, so
+# "when did this stage actually start" is otherwise unanswerable. It is also the
+# quickest way for someone watching to see that the newest line is 4 s old and
+# not 4 min old.
+#
+#   [14:22:01] keyence profiles -> mesh: working, 5.0 s elapsed
+#   [14:26:31] keyence profiles -> mesh: working, 4 min 30 s elapsed
+#   [14:27:12] keyence profiles -> mesh: done in 5 min 11 s
+#
+#   [14:31:07] clearance over 284514 waypoints: starting
+#   [14:31:12] clearance over 284514 waypoints: 41200/284514 (14%) 5.0 s elapsed, ~29 s left
+#   [14:31:42] clearance over 284514 waypoints: done, 284514 in 35.2 s (8083/s)
+#
+# ------------------------------------------------------------------------------
+# THE FOUR RULES
+# ------------------------------------------------------------------------------
+# 1. RATE LIMITED, and the fast path is a counter compare rather than a clock
+#    read. A tight loop may call step() a million times, and reading the clock on
+#    every one of them is real time spent deciding not to print. So step() only
+#    increments a counter and compares it against a threshold, and the threshold
+#    is re-aimed on each actual check so that checks land roughly every quarter
+#    of the reporting interval however fast the loop turns out to be.
+#
+# 2. NO FAKE ETA. An estimate from the first few items of a loop whose cost is
+#    uneven is worse than no estimate -- an operator who is told "4 s left" and
+#    then waits 36 min stops believing the next one. An ETA appears only once the
+#    block has run for `eta_after` seconds (2 s) AND has done at least 2% of the
+#    work. Until then the line says elapsed and fraction only.
+#
+# 3. THE FINAL LINE ALWAYS PRINTS, including when the block exits by exception --
+#    that is the case that matters most, because a stage that is killed or that
+#    fails must still say how long it ran. A KeyboardInterrupt is reported as
+#    "interrupted after ...", anything else as "FAILED after ...".
+#
+# 4. NESTING IS INDENTED, AND A FAST INNER BLOCK IS SILENT. Depth is tracked per
+#    thread and each level indents two spaces. At depth 0 the opening and closing
+#    lines always print. Deeper than that, the closing line prints only if the
+#    block said something worth saying: it called .result() or .note(), it ran
+#    longer than the reporting interval, or it raised. So a step() loop wrapped
+#    around a per-item progress block does not produce one line per item, and a
+#    slow or interesting inner block still speaks. This is the deliberate choice
+#    between suppressing and indenting: BOTH, keyed on whether the inner block
+#    had anything to say.
+#
+# ------------------------------------------------------------------------------
+# GETTING THE LINE TO THE OPERATOR FROM A WORKER THREAD
+# ------------------------------------------------------------------------------
+# print() from a dgpy worker thread does not reliably reach the console: a bare
+# thread has no dgpy context, and output from it is swallowed. Every long
+# operation here is exactly that kind of thread when the pipeline is driven from
+# a script rather than typed at the prompt, which is when progress reporting
+# matters most.
+#
+# So progress_say() goes out the way the rest of this pipeline already does it
+# (robot_supervisor.dpi's _say(), cable_envelope.dpi): through _capture_say() if
+# a capture session has defined one -- it prints AND appends to the session log,
+# so a swallowed print still leaves a record -- and through a plain flushed
+# print() otherwise. progress_logfile() adds a file of its own for a run with no
+# capture session, and progress_sink() lets a GUI or a test take a copy.
+#
+# The heartbeat thread calls InitFreeThread() before it says anything, for the
+# same reason: a bare threading.Thread has no context. It touches nothing but
+# builtins, so that is belt and braces rather than a requirement.
+
+import os
+import sys
+import time
+import threading
+import datetime
+
+# A .dpi is compiled as a FUNCTION BODY sharing one globals() dict with every
+# other .dpi, so a top-level def or assignment is a LOCAL of the include unless
+# it is declared global first. Everything another module touches is listed here.
+global Progress
+global progress
+global progress_over
+global progress_step
+global progress_note
+global progress_say
+global progress_sink
+global progress_logfile
+global progress_depth
+global PROGRESS_EVERY_S
+global PROGRESS_ETA_AFTER_S
+global PROGRESS_ETA_MIN_FRACTION
+global PROGRESS_MAX_STRIDE
+global PROGRESS_ENABLED
+global PROGRESS_SINKS
+global PROGRESS_LOG
+global _progress_duration
+global _progress_state
+global _progress_lock
+
+#: Seconds between progress lines. One line every 5 s is enough for an operator
+#: to see that something is alive without burying the rest of the log: a 36 min
+#: gate produces 432 lines, which is a page and a half of a typescript.
+PROGRESS_EVERY_S = 5.0
+
+#: How long a block must have run before it is allowed to estimate a finish
+#: time. See rule 2 above.
+PROGRESS_ETA_AFTER_S = 2.0
+
+#: ...and how much of the work must be done. Both conditions, not either.
+PROGRESS_ETA_MIN_FRACTION = 0.02
+
+#: Ceiling on how many step() calls may go by between two clock reads. Bounds
+#: the worst case where a loop starts fast and then slows down -- at the cap, a
+#: loop that suddenly drops to 1 item/s would go quiet for a long time, so this
+#: is a compromise rather than "as big as possible".
+PROGRESS_MAX_STRIDE = 1 << 18
+
+#: Global off switch. Nothing in the pipeline turns this off; it is here so a
+#: test, or an operator who wants a clean transcript, can.
+PROGRESS_ENABLED = True
+
+#: Extra places every progress line is delivered, installed with progress_sink().
+PROGRESS_SINKS = []
+
+#: A file every progress line is appended to, or None. See progress_logfile().
+PROGRESS_LOG = None
+
+#: Per-thread nesting depth. A threading.local rather than a counter, because
+#: two stages running on two threads must not indent each other.
+_progress_state = threading.local()
+
+#: Serialises line emission, so a heartbeat thread and its own stage's thread
+#: cannot interleave half-written lines.
+_progress_lock = threading.RLock()
+
+
+def progress_depth():
+    """How many progress blocks are open on THIS thread."""
+    return getattr(_progress_state, "depth", 0)
+
+
+def progress_sink(fn=None, remove=False):
+    """Deliver every progress line to `fn` as well. Returns the sink list.
+
+    For a GUI panel, a test, or anything that wants a copy. A sink that raises
+    is dropped rather than being allowed to break the stage it is reporting on.
+    """
+    if fn is None:
+        return PROGRESS_SINKS
+    if remove:
+        if fn in PROGRESS_SINKS:
+            PROGRESS_SINKS.remove(fn)
+    elif fn not in PROGRESS_SINKS:
+        PROGRESS_SINKS.append(fn)
+    return PROGRESS_SINKS
+
+
+def progress_logfile(path=None):
+    """Append every progress line to `path` as well, or None to stop.
+
+    Worth setting for an unattended run: print() from a worker thread is not
+    guaranteed to reach the console, and a file is. Returns the path in use.
+    """
+    global PROGRESS_LOG
+    if path is not None:
+        path = os.path.abspath(path)
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+    PROGRESS_LOG = path
+    return PROGRESS_LOG
+
+
+def progress_say(text, depth=None):
+    """One plain line, timestamped and indented, to everywhere it should go.
+
+    Never raises. A progress line that takes down the stage it is reporting on
+    would be a spectacularly bad trade.
+    """
+    if not PROGRESS_ENABLED:
+        return
+    if depth is None:
+        depth = progress_depth()
+    line = "  [%s] %s%s" % (datetime.datetime.now().strftime("%H:%M:%S"),
+                            "  "*max(0, int(depth)), text)
+    with _progress_lock:
+        for sink in list(PROGRESS_SINKS):
+            try:
+                sink(line)
+            except Exception:
+                pass
+        said = False
+        try:
+            # The pipeline's own path when a capture session is running: it
+            # prints and it appends to the session log, so a print swallowed by
+            # a context-less worker thread still leaves a record.
+            say = globals().get("_capture_say")
+            if say is not None:
+                say(line)
+                said = True
+        except Exception:
+            said = False
+        if not said:
+            try:
+                print(line, flush=True)
+            except Exception:
+                pass
+        if PROGRESS_LOG:
+            try:
+                with open(PROGRESS_LOG, "a") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+
+
+def progress_note(text):
+    """A one-off line at the current nesting depth, through the same path.
+
+    For the facts a stage learns as it goes -- "2968678 points in, 60367 after
+    the crop" -- which belong next to the progress lines rather than in a
+    separate print() that is indented differently and lost on a worker thread.
+    """
+    progress_say(text)
+
+
+def _progress_duration(seconds):
+    """Seconds as something an operator reads without counting digits."""
+    s = float(seconds)
+    if s < 0.0:
+        s = 0.0
+    if s < 10.0:
+        return "%.1f s" % (s,)
+    if s < 60.0:
+        return "%.0f s" % (s,)
+    if s < 3600.0:
+        m = int(s//60)
+        return "%d min %02d s" % (m, int(round(s - 60*m)) % 60)
+    h = int(s//3600)
+    m = int((s - 3600*h)//60)
+    return "%d h %02d min" % (h, m)
+
+
+class Progress(object):
+    """A long operation that says how it is going. Use it as a context manager.
+
+        with progress("clearance", total=len(poses)) as p:
+            for pose in poses:
+                ...
+                p.step()
+
+        with progress("keyence profiles -> mesh", heartbeat=True):
+            call_the_blocking_service()
+
+        with progress_step("cleaning the mesh") as s:
+            rep = clean_mesh_for_planning(a, b)
+            s.result("%d -> %d faces" % (rep["faces_in"], rep["faces_out"]))
+
+    total     number of step()s expected, or None for "count them as they come".
+    heartbeat run a background thread that reports elapsed time on its own. The
+              only option for a blocking call this process does not drive --
+              a ROS service, a subprocess -- which is most of the slow stages.
+    every     seconds between lines (default PROGRESS_EVERY_S).
+    unit      what is being counted, for the lines ("waypoints", "poses", ...).
+    announce  print an opening line. Default: yes at depth 0, no when nested.
+    eta_after seconds before an ETA may be shown (default PROGRESS_ETA_AFTER_S).
+    quiet     say nothing at all; the block still times itself.
+    """
+
+    def __init__(self, what, total=None, every=None, unit="", heartbeat=False,
+                 announce=None, eta_after=None, quiet=False):
+        self.what = str(what)
+        self.total = None if total is None else int(total)
+        self.every = float(PROGRESS_EVERY_S if every is None else every)
+        self.unit = unit
+        self.heartbeat = bool(heartbeat)
+        self.announce = announce
+        self.eta_after = float(PROGRESS_ETA_AFTER_S if eta_after is None
+                               else eta_after)
+        self.quiet = bool(quiet)
+        self.n = 0
+        self.seconds = 0.0
+        self._result = None
+        self._spoke = False
+        self._depth = 0
+        self._t0 = None
+        self._last_line = 0.0
+        self._last_check = 0.0
+        self._n_at_check = 0
+        self._stride = 1
+        self._next = 1
+        self._stop = None
+        self._thread = None
+
+    # -- the fast path ---------------------------------------------------------
+    #
+    # Two bytecodes' worth of work in the common case: add, compare. Everything
+    # expensive -- the clock, the formatting, the I/O -- is behind the compare,
+    # and _check() re-aims the threshold so the compare stays true only about
+    # four times per reporting interval however fast this loop turns out to run.
+    def step(self, n=1):
+        self.n += n
+        if self.n >= self._next:
+            self._check()
+
+    def _check(self):
+        now = time.monotonic()
+        since = now - self._last_check
+        done = self.n - self._n_at_check
+        # Aim the next check a quarter of a reporting interval away, so a line
+        # is never more than ~25% late, and clamp: 1 at the slow end (a loop of
+        # one item per second should be checked every item, it costs nothing),
+        # PROGRESS_MAX_STRIDE at the fast end.
+        target = max(0.05, 0.25*self.every)
+        if since > 1e-9 and done > 0:
+            stride = int(done*target/since)
+        else:
+            stride = self._stride*4
+        self._stride = max(1, min(int(stride), PROGRESS_MAX_STRIDE))
+        self._next = self.n + self._stride
+        self._n_at_check = self.n
+        self._last_check = now
+        if now - self._last_line >= self.every:
+            self._emit(now)
+
+    # -- what the caller can add ----------------------------------------------
+    def note(self, text):
+        """A line now, whatever the rate limit says. For facts, not for ticks."""
+        self._spoke = True
+        if not self.quiet:
+            progress_say("%s: %s" % (self.what, text), self._depth)
+
+    def result(self, text):
+        """What this block achieved; goes on the closing line.
+
+        Calling it is also what makes a NESTED block worth a closing line at
+        all -- see rule 4 at the top of this file.
+        """
+        self._result = text
+        self._spoke = True
+
+    def set_total(self, total):
+        """The total, once it is known. Safe mid-flight."""
+        self.total = None if total is None else int(total)
+
+    # -- lifecycle -------------------------------------------------------------
+    def __enter__(self):
+        self.start()
+        return self
+
+    def start(self):
+        self._t0 = time.monotonic()
+        self._last_line = self._t0
+        self._last_check = self._t0
+        self._depth = progress_depth()
+        _progress_state.depth = self._depth + 1
+        announce = self.announce
+        if announce is None:
+            announce = self._depth == 0
+        if announce and not self.quiet:
+            if self.total is not None:
+                progress_say("%s: starting (%s)"
+                             % (self.what, self._count(self.total)), self._depth)
+            else:
+                progress_say("%s: starting" % (self.what,), self._depth)
+            self._spoke = True
+        if self.heartbeat:
+            self._start_heartbeat()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.finish(exc_type)
+        return False
+
+    def finish(self, exc_type=None):
+        if self._t0 is None:
+            return
+        self._stop_heartbeat()
+        self.seconds = time.monotonic() - self._t0
+        _progress_state.depth = self._depth
+        # Rule 3: the closing line is not optional, and rule 4 decides whether a
+        # NESTED block that had nothing to say is worth one.
+        show = (self._depth == 0 or exc_type is not None or self._spoke
+                or self.seconds >= self.every)
+        if show and not self.quiet:
+            progress_say(self.what + ": " + self._closing(exc_type), self._depth)
+        self._t0 = None
+
+    def _closing(self, exc_type):
+        el = _progress_duration(self.seconds)
+        if exc_type is KeyboardInterrupt:
+            return "INTERRUPTED after %s%s" % (el, self._so_far())
+        if exc_type is GeneratorExit:
+            # progress_over() whose consumer broke out of the loop. Not a
+            # failure and not worth shouting about, but still worth timing.
+            return "stopped early after %s%s" % (el, self._so_far())
+        if exc_type is not None:
+            return "FAILED after %s (%s)%s" % (el, exc_type.__name__,
+                                               self._so_far())
+        if self.n:
+            rate = self.n/self.seconds if self.seconds > 0 else 0.0
+            done = "%s in %s%s" % (self._count(self.n), el,
+                                   (" (%s/s)" % self._rate(rate))
+                                   if rate > 0 else "")
+        elif self._result:
+            return "%s (%s)" % (self._result, el)
+        else:
+            return "done in %s" % (el,)
+        return ("%s, %s" % (self._result, done)) if self._result else done
+
+    def _so_far(self):
+        if not self.n:
+            return ""
+        if self.total:
+            return " (%s of %s done)" % (self._count(self.n),
+                                         self._count(self.total))
+        return " (%s done)" % (self._count(self.n),)
+
+    def _count(self, n):
+        return "%d%s" % (n, (" " + self.unit) if self.unit else "")
+
+    def _rate(self, r):
+        if r >= 100.0:
+            return "%.0f" % (r,)
+        if r >= 1.0:
+            return "%.1f" % (r,)
+        return "%.2f" % (r,)
+
+    # -- the lines -------------------------------------------------------------
+    def _emit(self, now=None):
+        if self.quiet:
+            return
+        now = time.monotonic() if now is None else now
+        self._last_line = now
+        self._spoke = True
+        elapsed = now - self._t0
+        el = _progress_duration(elapsed)
+        if self.total:
+            frac = float(self.n)/self.total
+            text = "%s/%s (%.0f%%) %s elapsed" % (
+                self.n, self._count(self.total), 100.0*frac, el)
+            # Rule 2: an ETA has to have earned the right to be believed.
+            if (self.n > 0 and elapsed >= self.eta_after
+                    and frac >= PROGRESS_ETA_MIN_FRACTION):
+                left = elapsed*(self.total - self.n)/self.n
+                text += ", ~%s left" % (_progress_duration(left),)
+        elif self.n:
+            text = "%s so far, %s elapsed" % (self._count(self.n), el)
+        else:
+            text = "working, %s elapsed" % (el,)
+        progress_say("%s: %s" % (self.what, text), self._depth)
+
+    # -- the heartbeat ---------------------------------------------------------
+    def _start_heartbeat(self):
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._beat,
+                                        name="progress:%s" % (self.what[:32],))
+        self._thread.daemon = True
+        self._thread.start()
+
+    def _beat(self):
+        # A bare threading.Thread has no dgpy context, and output from one is
+        # swallowed. This one touches nothing but builtins, but the context is
+        # free and the failure mode without it is silence -- which is the exact
+        # thing this file exists to prevent.
+        try:
+            from dataguzzler_python.context import InitFreeThread
+            InitFreeThread()
+        except Exception:
+            pass
+        poll = max(0.05, min(0.25, self.every))
+        while not self._stop.wait(poll):
+            # Never let this thread die on a bad line: a heartbeat that stops
+            # beating looks exactly like the hang it is there to rule out.
+            try:
+                now = time.monotonic()
+                if self._t0 is not None and now - self._last_line >= self.every:
+                    with _progress_lock:
+                        if self._t0 is not None:
+                            self._emit(now)
+            except Exception:
+                pass
+
+    def _stop_heartbeat(self):
+        if self._stop is not None:
+            self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._stop = None
+        self._thread = None
+
+
+def progress(what, total=None, **kwargs):
+    """A progress block. See Progress for the arguments.
+
+        with progress("clearance", total=n) as p:
+            ...
+            p.step()
+    """
+    return Progress(what, total=total, **kwargs)
+
+
+def progress_step(what, **kwargs):
+    """One timed operation, reported in a single closing line.
+
+    No opening line and no ticking: this is for a step that is usually quick,
+    might be minutes, and has a result worth stating afterwards. A heartbeat
+    covers the "might be minutes" case, so a step that runs long stops being
+    silent without a fast one costing a line.
+
+        with progress_step("cropping") as s:
+            ...
+            s.result("2968678 -> 60367 points (98% discarded)")
+    """
+    kwargs.setdefault("heartbeat", True)
+    kwargs.setdefault("announce", False)
+    return Progress(what, total=None, **kwargs)
+
+
+def progress_over(items, what, total=None, **kwargs):
+    """Iterate `items`, reporting progress. Same arguments as Progress.
+
+        for pose in progress_over(poses, "checking poses", unit="poses"):
+            ...
+
+    A sequence supplies its own total; a generator does not, so pass one if it
+    is known -- without it the lines report a count and elapsed time, which is
+    still the difference between "alive" and "hung".
+    """
+    if total is None:
+        try:
+            total = len(items)
+        except TypeError:
+            total = None
+    with Progress(what, total=total, **kwargs) as p:
+        for item in items:
+            yield item
+            p.step()

@@ -1,0 +1,11 @@
+import spatialnde2 as snde
+import numpy as np
+
+global load_mesh_to_scene
+def load_mesh_to_scene(recdb, ros, mesh_path, specimen_model_tree='/graphics/specimen/'):
+    print(f"Loading mesh {mesh_path} into SpatialNDE2 via ros.specimenMesh...")
+    
+    # Use built-in ros.specimenMesh which automatically handles internal publishing
+    ros.specimenMesh(specimen_mesh=mesh_path, x=0.97258, y=-0.32009, z=0.97)
+    
+    return specimen_model_tree, ros.specimen_pose_channel

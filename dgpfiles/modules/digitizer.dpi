@@ -1,0 +1,88 @@
+# ==============================================================================
+# WHAT THE DIGITIZER IS ACTUALLY PRODUCING
+# ==============================================================================
+# Record length, sample period and sample type are properties of the card, set
+# independently of any config and changeable at run time -- the CompuScope can
+# report raw counts (int8/int16) or converted volts (float64) depending on how
+# it is configured. So nothing downstream may assume them. Everything asks here,
+# and here asks the data.
+#
+# Nothing here is UT-plane-specific: it is the digitizer describing itself.
+# Reads ASCAN_CHANNEL_PATH, SCAN_STORAGE_DIR and scan_storage_manager from the
+# including config.
+#
+# The time axis matters more than it looks. cscan_gate reads
+# "ande_array-axis{last}_scale" / "_offset" off the recording they reduce, and
+# DEFAULT TO scale=1.0, offset=0.0 when it is absent. So a volume built without
+# a time axis gates in SAMPLE INDICES while the panel thinks it is asking for
+# seconds -- which is exactly why the gate controls needed index values to work.
+# _volume_metadata() and TraceAccumulator now both stamp axis metadata taken
+# from the A-scan itself.
+
+# snde_typenum_for() lives in modules/trace_acquisition.dpi, which is included
+# above -- staging a trace in the type the card produced is that module's job.
+
+global ascan_geometry
+def ascan_geometry(timeout=30.0, poll=0.1, require=True):
+    """Length, sample type and time axis of the A-scans currently arriving.
+
+    Read from the most recent recording on ASCAN_CHANNEL_PATH rather than from
+    any constant in this file, because on real hardware all three are set on the
+    card and none of them are ours to assume.
+
+    Returns a dict, or None when require=False and nothing has arrived yet --
+    which is the normal state for an externally triggered card before the first
+    trigger, so callers that run before a scan starts must cope with it.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            ref = recdb.latest.ref[ASCAN_CHANNEL_PATH]
+            npoints = int(ref.data.shape[0])
+            if npoints > 0:
+                md = ref.rec.metadata
+                dt = float(md.GetMetaDatumDbl("ande_array-axis0_scale", 0.0))
+                t0 = float(md.GetMetaDatumDbl("ande_array-axis0_offset", 0.0))
+                return {"num_points": npoints,
+                        "typenum": int(ref.typenum),
+                        "dtype": ref.data.dtype,
+                        "dt": dt,
+                        "t0": t0,
+                        "duration": npoints*dt,
+                        "metadata": md}
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            if require:
+                raise RuntimeError(
+                    "no A-scan on %s after %.1f s -- is the digitizer running "
+                    "and triggering?" % (ASCAN_CHANNEL_PATH, timeout))
+            return None
+        time.sleep(poll)
+
+global volume_size_note
+def volume_size_note(m, n):
+    """How big the accumulated volume is about to be, from the real record
+    length and sample type -- both of which belong to the card, not to us."""
+    geom = ascan_geometry(timeout=30.0)
+    nsamp = geom["num_points"]
+    itemsize = np.dtype(geom["dtype"]).itemsize
+    return ("Allocating %d x %d x %d volume of %s (%.2f GB)%s ..."
+            % (m, n, nsamp, geom["dtype"], n*m*nsamp*itemsize/2**30,
+               " in %s" % SCAN_STORAGE_DIR if scan_storage_manager is not None else " in memory"))
+
+global describe_ascan
+def describe_ascan(geom=None):
+    """One line about what the digitizer is giving us. Worth printing before a
+    scan, because a card reconfigured between runs changes the volume."""
+    if geom is None:
+        geom = ascan_geometry(timeout=5.0, require=False)
+    if geom is None:
+        return "  A-scan: nothing on %s yet" % (ASCAN_CHANNEL_PATH,)
+    if geom["dt"] > 0.0:
+        return ("  A-scan: %d points of %s at %.4g MHz (%.3f us record) on %s"
+                % (geom["num_points"], geom["dtype"], 1e-6/geom["dt"],
+                   geom["duration"]*1e6, ASCAN_CHANNEL_PATH))
+    return ("  A-scan: %d points of %s on %s -- NO TIME AXIS, so gates are in "
+            "sample index, not seconds"
+            % (geom["num_points"], geom["dtype"], ASCAN_CHANNEL_PATH))

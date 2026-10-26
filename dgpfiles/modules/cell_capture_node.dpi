@@ -1,0 +1,881 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  cell_capture_node.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Capture node, session directories, motion confirmation and point
+#   teaching for cell data capture.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# CELL CAPTURE, PART 1: the capture node, the session, confirmation, teaching
+# ==============================================================================
+# Included by cell_capture.dpi; see that file for what the capture tool is for.
+#
+# The capture tool owns ONE rclpy node of its own, spun on its own executor in
+# a daemon thread. It publishes the preview (RViz) and the event stream the
+# recorder puts in every bag, and it listens to joint states, the wrist wrench
+# and the UR IO. It is NOT the motion module: nothing here goes through `ros`'s
+# dgpy context, so a header stamp built here never passes through censoring --
+# which is what SIGABRTs the process when a message with a stamp comes back out
+# of a module (see dome_sweep_path()'s docstring).
+
+import collections
+import contextlib
+import datetime
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import threading
+import time
+import traceback
+
+import numpy as np
+
+global CaptureAbort
+global CaptureSkip
+global CaptureRefused
+global CaptureMotionFailed
+global CaptureStopped
+global capture_node
+global capture_session
+global capture_status
+global confirm
+global teach_point
+global taught_points
+global forget_point
+global list_taught
+global _capture_say
+global _session
+global _CAP
+global _cap_jsonable
+global UR_JOINTS
+global UR_JOINT_VMAX
+
+
+class CaptureAbort(Exception):
+    """The operator said stop. The take is closed cleanly and kept."""
+
+
+class CaptureSkip(Exception):
+    """The operator skipped one step; the scenario decides what that means."""
+
+
+class CaptureRefused(RuntimeError):
+    """A motion broke a rule (work volume, speed, clearance) and was not run."""
+
+
+class CaptureMotionFailed(RuntimeError):
+    """A motion was run and did not complete."""
+
+
+class CaptureStopped(CaptureRefused):
+    """The monitor STOPPED the arm mid-move (overspeed, overforce). Unlike a
+    refusal before moving, this always ends the scenario, pipeline or not."""
+
+
+def _capture_root_default():
+    """Where capture sessions go, WITHOUT assuming whose home directory it is.
+
+    A literal "/home/user/scandata/capture" is the container's home and nobody
+    else's: a cell PC has its own account and its own data mount, and a session
+    that assumes otherwise dies with PermissionError before anything can be
+    recorded. The order below is: what the site says, then the mount the cell
+    actually has, then this account's own home -- never a guess at somebody
+    else's.
+    """
+    for var in ("TARI_SCANDATA", "SCANDATA_ROOT"):
+        root = os.environ.get(var)
+        if root:
+            return os.path.join(root, "capture")
+    for root in ("/data/scandata", os.path.expanduser("~/scandata")):
+        if os.path.isdir(root) and os.access(root, os.W_OK):
+            return os.path.join(root, "capture")
+    # Nothing exists yet: name the one we can create rather than failing here,
+    # so the error (if any) comes from the session start, where it says what it
+    # was trying to make.
+    return os.path.join(os.path.expanduser("~/scandata"), "capture")
+
+
+# -- settings: override from the prompt with globals()['CAPTURE_X'] = value ----
+for _k, _v in (
+        # Where sessions go: a mount if the work cell has one, so it survives a
+        # container restart, and outside every repository either way.
+        ("CAPTURE_ROOT", _capture_root_default()),
+        # Confirm every motion at the prompt. True answers yes by itself and is
+        # REFUSED in hardware mode: it exists for driving the tool from a script
+        # in simulation, where nobody is at the prompt.
+        ("CAPTURE_AUTO_CONFIRM", False),
+        # The approved speed rules, m/s: away from the part, and near it. The
+        # config's own TRANSIT_SPEED / NEAR_PART_SPEED when it has them.
+        ("CAPTURE_SPEED_AWAY", float(globals().get("TRANSIT_SPEED", 0.050))),
+        ("CAPTURE_SPEED_NEAR", float(globals().get("NEAR_PART_SPEED", 0.010))),
+        # "Near": within this distance of a known part surface or taught point,
+        # or -- when the scenario knows no geometry -- anywhere below the top of
+        # the work volume.
+        ("CAPTURE_NEAR_DISTANCE", 0.10),
+        # The work volume bounds where PARTS are (and what is reconstructed).
+        # Sensors fly above it -- the Azure dome is 0.1 m over its top in sim --
+        # so motion may go this far above the top, never below the floor and
+        # never outside its x/y.
+        ("CAPTURE_ABOVE_VOLUME", 0.25),
+        # Height above the work volume top at which lateral transits happen.
+        ("CAPTURE_TRANSIT_ABOVE", 0.05),
+        # Largest joint change, in degrees, that a PASS APPROACH may be. Above
+        # it, the approach is not a reposition near the part but a whole-arm
+        # reconfiguration, and it goes through capture_transit (up, across,
+        # down, each leg speed-bounded in Cartesian space) instead of one joint
+        # move at the near-the-part limit. Measured in the simulated cell: the
+        # raster's row approaches are 0.0-12.2 deg and peak at 8.5 of the 10
+        # mm/s allowed, while a dome-to-raster approach of 61.4 deg over a
+        # 515 mm tip path measures 16.5 mm/s, peaks at 390, and the monitor
+        # stops the arm. The joint-space speed model cannot predict a move that
+        # big; 20 deg sits between the two by a factor of 1.6 either way.
+        ("CAPTURE_APPROACH_MAX_DEG", 20.0),
+        # Minimum gap between the probe tip and a known specimen surface in the
+        # non-contact scenarios.
+        ("CAPTURE_CLEARANCE", 0.010),
+        # Overspeed: observed tool speed above limit x this is a violation. On
+        # hardware it pauses the robot program and ends the scenario.
+        ("CAPTURE_OVERSPEED_FACTOR", 1.25),
+        # Tool speed at MoveIt scaling 1, used only when IK along a path fails
+        # and the speed cannot be bounded from the joint limits. Conservative:
+        # a UR10e's tool at full reach, 120 deg/s at the shoulder, is ~2.6 m/s.
+        ("CAPTURE_FULL_SCALE_MPS", 3.0),
+        # MoveIt ACCELERATION scaling, for moves classed "away" from the part
+        # only. Acceleration and velocity scale the same joint limits, so tying
+        # them together leaves the ramp time constant however slow the move is
+        # -- about 0.6 s per ramp here -- and a five-waypoint sweep row spends
+        # most of itself ramping. The floor is what the reconstruction sweep
+        # flies on every row (acc 0.1 against vel 0.02), halved, because that is
+        # measured in free space and this applies to every away-class move. It
+        # cannot raise the peak speed: the velocity scaling bounds that and the
+        # monitor measures it.
+        ("CAPTURE_ACC_SCALING_FLOOR", 0.05),
+        ("CAPTURE_ACC_SCALING_MAX", 0.10),
+        # Contact: above this wrench force (N) during a contact pass the robot
+        # is paused (hardware).
+        ("CAPTURE_CONTACT_FORCE_LIMIT", 60.0),
+        # Recorder: frames/s kept per camera (colour+depth together), and the
+        # free space below which a take stops itself.
+        ("CAPTURE_IMAGE_RATE", 5.0),
+        ("CAPTURE_RESERVE_GB", 5.0),
+        # Measured tool speed above the limit x (1 + this) is reported as OVER
+        # THE LIMIT, and every later move of that kind is slowed to match.
+        ("CAPTURE_SPEED_TOLERANCE", 0.05),
+        # The frame whose speed the limits apply to and the monitor measures.
+        ("CAPTURE_TIP_FRAME", "probe_end"),
+        # The trajectory controller's topic interface, which an overspeed or
+        # overforce stop publishes a hold to (simulation, and hardware when the
+        # dashboard pause fails). None: the one this mode's bring-up runs.
+        ("CAPTURE_HOLD_TOPIC", None),
+        # Fallback warning-light pin if the config defines no WARNING_LIGHT_PIN.
+        ("CAPTURE_WARNING_LIGHT_PIN", 0),
+        ("CAPTURE_LASER_PIN", 1),
+        # How long teach_point() averages, and how still the arm must be.
+        ("CAPTURE_TEACH_HOLD_S", 1.0),
+        ("CAPTURE_TEACH_STILL_MM", 0.3),
+        # The fiducial cylinder, fitted to FullFiducialCylinder.ply.
+        ("CAPTURE_CYLINDER_RADIUS", 0.03169)):
+    globals().setdefault(_k, _v)
+
+UR_JOINTS = ("shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+             "wrist_1_joint", "wrist_2_joint", "wrist_3_joint")
+# tari_ur_description/config/joint_limits.yaml: 120, 120, 180, 180, 180, 180 deg/s
+UR_JOINT_VMAX = np.radians([120.0, 120.0, 180.0, 180.0, 180.0, 180.0])
+
+# Everything the capture tool keeps between calls. One dict, so a reload of the
+# module does not strand state in a closure.
+_CAP = globals().get("_CAP") or {}
+_CAP.setdefault("session", None)
+_CAP.setdefault("take", None)
+_CAP.setdefault("real_ros", globals().get("ros"))
+_CAP.setdefault("laser_unavailable", None)
+_CAP.setdefault("light_unavailable", None)
+
+taught_points = globals().get("taught_points") or {}
+
+
+def _cap_jsonable(v):
+    """JSON-able copy of request fields that may hold ROS messages."""
+    if hasattr(v, "get_fields_and_field_types"):
+        from rosidl_runtime_py import message_to_ordereddict
+        return _cap_jsonable(dict(message_to_ordereddict(v)))
+    if isinstance(v, dict):
+        return {str(k): _cap_jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_cap_jsonable(x) for x in v]
+    if isinstance(v, np.ndarray):
+        return v.tolist()
+    if isinstance(v, (np.floating, np.integer)):
+        return v.item()
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    return repr(v)
+
+
+class _CaptureNode(object):
+    """The capture tool's own ROS node: preview, events, and what it listens to."""
+
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from rclpy.parameter import Parameter
+        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy,
+                               HistoryPolicy)
+        from std_msgs.msg import String, Bool
+        from geometry_msgs.msg import PoseArray, WrenchStamped
+        from sensor_msgs.msg import JointState
+        from visualization_msgs.msg import MarkerArray
+        from moveit_msgs.msg import DisplayTrajectory
+        from moveit_msgs.srv import GetPositionFK
+        from std_srvs.srv import Trigger
+
+        self.node = Node("cell_capture", parameter_overrides=[
+            Parameter("use_sim_time", Parameter.Type.BOOL, CELL_MODE == "sim")])
+        latched = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=100,
+                             reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        one = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                         reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._String = String
+        self.events_pub = self.node.create_publisher(String, "/capture/events", latched)
+        self.preview_pub = self.node.create_publisher(PoseArray, "/capture/preview", one)
+        self.marker_pub = self.node.create_publisher(MarkerArray, "/capture/preview_markers", one)
+        # RViz's MotionPlanning display (both view_simbot.rviz and
+        # view_robot.rviz) animates whatever arrives here: the operator sees
+        # the arm go through the motion before confirming it.
+        self.display_pub = self.node.create_publisher(DisplayTrajectory,
+                                                      "/display_planned_path", 10)
+        self._lock = threading.Lock()
+        self.joints = None
+        self.joints_time = None
+        self.wrench = collections.deque(maxlen=20000)
+        self.wrench_topic = self._wrench_topic()
+        self.io = None
+        self.program_running = None
+        self.node.create_subscription(JointState, "/joint_states", self._on_joints, 50)
+        self.node.create_subscription(WrenchStamped, self.wrench_topic, self._on_wrench, 200)
+        self.node.create_subscription(Bool, "/io_and_status_controller/robot_program_running",
+                                      self._on_program, 10)
+        # The SRDF, for the named poses (DETECT_POSE, PARK_POSE) the pipeline
+        # moves to: the gate needs their joint values to check and preview them.
+        self.srdf = None
+        self.node.create_subscription(String, "/robot_description_semantic",
+                                      self._on_srdf, latched)
+        try:
+            from ur_msgs.msg import IOStates
+            self.node.create_subscription(IOStates, "/io_and_status_controller/io_states",
+                                          self._on_io, 10)
+        except Exception:
+            pass
+        self.fk_client = self.node.create_client(GetPositionFK, "/compute_fk")
+        self.pause_client = self.node.create_client(Trigger, "/dashboard_client/pause")
+        self._extras()
+        self.executor = SingleThreadedExecutor()
+        self.executor.add_node(self.node)
+        self._quit = False
+        self.thread = threading.Thread(target=self._spin, name="cell_capture_spin",
+                                       daemon=True)
+        self.thread.start()
+
+    @staticmethod
+    def _wrench_topic():
+        try:
+            from tari_bringup.record import wrench_topic
+            from tari_bringup.cells import load_cell
+            return wrench_topic(load_cell(CELL_NAME, CELL_MODE))
+        except Exception:
+            return "/force_torque_sensor_broadcaster/wrench"
+
+    def _extras(self):
+        """What a re-included module adds to a node that is already running."""
+        from trajectory_msgs.msg import JointTrajectory
+        from rcl_interfaces.srv import GetParameters
+        if getattr(self, "tf_buffer", None) is None:
+            # The tool's position WITH the stamp TF carries. The speed monitor
+            # measures in the data's own time: live_pose is stamped with when a
+            # poll happened to see a transform, and under load TF arrives in
+            # bursts, so a poll-time speed reads high -- 82.8 mm/s on a move
+            # whose TF stamps say otherwise (see _Monitor).
+            from tf2_ros import Buffer, TransformListener
+            self.tf_buffer = Buffer()
+            self.tf_listener = TransformListener(self.tf_buffer, self.node, spin_thread=False)
+            self.tip = collections.deque(maxlen=20000)
+            self._tip_stamp = None
+            self._tip_poll = 0.0
+        if getattr(self, "hold_pub", None) is None:
+            topic = CAPTURE_HOLD_TOPIC or (
+                "/joint_trajectory_controller/joint_trajectory" if CELL_MODE == "sim"
+                else "/scaled_joint_trajectory_controller/joint_trajectory")
+            self.hold_topic = topic
+            self.hold_pub = self.node.create_publisher(JointTrajectory, topic, 10)
+        if getattr(self, "param_client", None) is None:
+            self.param_client = self.node.create_client(GetParameters,
+                                                        "/mtc_hub_node/get_parameters")
+
+    def _spin(self):
+        while not self._quit:
+            try:
+                self.executor.spin_once(timeout_sec=0.01)
+            except Exception:
+                time.sleep(0.1)
+            try:
+                self._tick()
+            except Exception:
+                pass
+
+    def _tick(self):
+        now = time.monotonic()
+        if now - self._tip_poll < 0.01:
+            return
+        self._tip_poll = now
+        import rclpy.time
+        try:
+            t = self.tf_buffer.lookup_transform("world", CAPTURE_TIP_FRAME, rclpy.time.Time())
+        except Exception:
+            return
+        st = t.header.stamp.sec*1000000000 + t.header.stamp.nanosec
+        if st == self._tip_stamp:
+            return
+        self._tip_stamp = st
+        tr = t.transform.translation
+        self.tip.append((st, tr.x, tr.y, tr.z))
+
+    def tip_since(self, stamp_ns):
+        """TF-stamped tool positions newer than stamp_ns, oldest first:
+        [(stamp_ns, x, y, z)]."""
+        out = []
+        for row in reversed(self.tip):
+            if row[0] <= stamp_ns:
+                break
+            out.append(row)
+        out.reverse()
+        return out
+
+    def tip_latest_stamp(self):
+        try:
+            return self.tip[-1][0]
+        except IndexError:
+            return None
+
+    # -- subscriptions: plain data only ------------------------------------------
+    def _on_joints(self, msg):
+        pos = dict(zip(msg.name, msg.position))
+        if all(j in pos for j in UR_JOINTS):
+            with self._lock:
+                self.joints = [float(pos[j]) for j in UR_JOINTS]
+                self.joints_time = time.monotonic()
+
+    def _on_wrench(self, msg):
+        f, t = msg.wrench.force, msg.wrench.torque
+        self.wrench.append((time.monotonic(), f.x, f.y, f.z, t.x, t.y, t.z))
+
+    def _on_program(self, msg):
+        self.program_running = bool(msg.data)
+
+    def _on_srdf(self, msg):
+        self.srdf = msg.data
+
+    def named_state(self, name, group="ur_manipulator"):
+        """Joint values of an SRDF group_state, in UR_JOINTS order, or None."""
+        if not self.srdf:
+            return None
+        # Attribute order is whatever xacro wrote (it sorts them: group, name).
+        for attrs, body in re.findall(r"<group_state\b([^>]*)>(.*?)</group_state>",
+                                      self.srdf, re.S):
+            a = dict(re.findall(r'(\w+)="([^"]*)"', attrs))
+            if a.get("name") != name or a.get("group") != group:
+                continue
+            vals = {}
+            for jattrs in re.findall(r"<joint\b([^>]*)/?>", body):
+                ja = dict(re.findall(r'(\w+)="([^"]*)"', jattrs))
+                if "name" in ja and "value" in ja:
+                    vals[ja["name"]] = float(ja["value"])
+            try:
+                return [vals[j] for j in UR_JOINTS]
+            except KeyError:
+                return None
+        return None
+
+    def _on_io(self, msg):
+        self.io = {"digital_out": {int(s.pin): bool(s.state) for s in msg.digital_out_states}}
+
+    # -- reads -------------------------------------------------------------------
+    def current_joints(self, max_age=1.0):
+        with self._lock:
+            if self.joints is None or time.monotonic() - self.joints_time > max_age:
+                return None
+            return list(self.joints)
+
+    def recent_wrench(self, seconds=0.5):
+        now = time.monotonic()
+        rows = [w[1:] for w in list(self.wrench) if now - w[0] <= seconds]
+        return np.array(rows) if rows else None
+
+    def now_ns(self):
+        t = self.node.get_clock().now().nanoseconds
+        return t if t else time.time_ns()
+
+    # -- calls ---------------------------------------------------------------------
+    def call(self, client, req, timeout=5.0):
+        if not client.wait_for_service(timeout_sec=min(timeout, 5.0)):
+            return None
+        fut = client.call_async(req)
+        ev = threading.Event()
+        fut.add_done_callback(lambda f: ev.set())
+        if not ev.wait(timeout):
+            return None
+        return fut.result()
+
+    def fk(self, positions, links=("probe_end",), timeout=5.0):
+        """[(xyz, xyzw) per link] for a joint configuration, from move_group."""
+        from moveit_msgs.srv import GetPositionFK
+        req = GetPositionFK.Request()
+        req.header.frame_id = "world"
+        req.fk_link_names = list(links)
+        req.robot_state.joint_state.name = list(UR_JOINTS)
+        req.robot_state.joint_state.position = [float(v) for v in positions]
+        req.robot_state.is_diff = True
+        res = self.call(self.fk_client, req, timeout)
+        if res is None or res.error_code.val != 1:
+            return None
+        out = []
+        for ps in res.pose_stamped:
+            p, q = ps.pose.position, ps.pose.orientation
+            out.append((np.array([p.x, p.y, p.z]), (q.x, q.y, q.z, q.w)))
+        return out
+
+    def pause_robot(self):
+        """Pause the UR program (hardware): a controlled stop on the robot."""
+        from std_srvs.srv import Trigger
+        res = self.call(self.pause_client, Trigger.Request(), timeout=3.0)
+        return bool(res and res.success)
+
+    def hold_here(self):
+        """Replace whatever trajectory is running with 'stay where you are'.
+
+        A trajectory arriving on the controller's topic interface supersedes
+        the one executing, so the arm decelerates to the joint positions it
+        was at when this was called, within 0.3 s."""
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+        from builtin_interfaces.msg import Duration
+        q = self.current_joints(max_age=0.5)
+        if q is None:
+            return False
+        msg = JointTrajectory()
+        msg.joint_names = list(UR_JOINTS)
+        pt = JointTrajectoryPoint()
+        pt.positions = [float(v) for v in q]
+        pt.velocities = [0.0]*6
+        pt.time_from_start = Duration(sec=0, nanosec=300000000)
+        msg.points = [pt]
+        self.hold_pub.publish(msg)
+        return True
+
+    def stop_arm(self):
+        """Stop the arm now: overspeed or overforce. On hardware the UR
+        program is paused (the operator presses play after checking the cell);
+        if that fails, and always in simulation, the trajectory controller is
+        told to hold where it is. Returns how it was stopped, or None."""
+        if CELL_MODE == "hardware" and self.pause_robot():
+            return "UR program paused (dashboard)"
+        if self.hold_here():
+            return "trajectory replaced by a hold (%s)" % self.hold_topic
+        return None
+
+    def planning_vmax(self, timeout=3.0):
+        """Joint velocity limits (rad/s, UR_JOINTS order) that MoveIt's time
+        parameterization applies -- read from mtc_hub_node, which plans every
+        capture move. The speed bounds are only as right as these numbers.
+        Falls back to UR_JOINT_VMAX per joint that is not declared."""
+        if getattr(self, "_vmax", None) is not None:
+            return self._vmax
+        # Not answered recently: the fallback, without waiting on it again.
+        if time.monotonic() - getattr(self, "_vmax_tried", -1e9) < 60.0:
+            return np.asarray(UR_JOINT_VMAX, float)
+        self._vmax_tried = time.monotonic()
+        from rcl_interfaces.srv import GetParameters
+        names = []
+        for j in UR_JOINTS:
+            names += ["robot_description_planning.joint_limits.%s.has_velocity_limits" % j,
+                      "robot_description_planning.joint_limits.%s.max_velocity" % j]
+        req = GetParameters.Request()
+        req.names = names
+        res = self.call(self.param_client, req, timeout)
+        vmax, source = [], []
+        for i, j in enumerate(UR_JOINTS):
+            v = None
+            if res is not None and len(res.values) == len(names):
+                has, mv = res.values[2*i], res.values[2*i + 1]
+                if has.type == 1 and has.bool_value and mv.type in (2, 3):
+                    v = float(mv.double_value if mv.type == 3 else mv.integer_value)
+            vmax.append(v if v else float(UR_JOINT_VMAX[i]))
+            source.append("mtc_hub_node" if v else "UR_JOINT_VMAX")
+        if res is not None:
+            self._vmax = np.array(vmax)
+            self._vmax_source = source
+        return np.array(vmax)
+
+    def event(self, record):
+        """Publish one event (a dict) on /capture/events, where the recorder
+        puts it in the bag with its ROS time."""
+        record = dict(record)
+        record.setdefault("ros_time_ns", self.now_ns())
+        record.setdefault("wall", time.time())
+        msg = self._String()
+        msg.data = json.dumps(_cap_jsonable(record))
+        self.events_pub.publish(msg)
+        return record
+
+
+def _capture_node():
+    node = _CAP.get("node")
+    if node is None:
+        node = _CaptureNode()
+        _CAP["node"] = node
+    elif type(node) is not _CaptureNode:
+        # Re-included: keep the running node (one ROS node per process), but
+        # give it this version's methods and anything this version adds.
+        node.__class__ = _CaptureNode
+        node._extras()
+    return node
+
+
+capture_node = _capture_node()
+
+
+def _capture_say(msg):
+    """print(), plus a line in the session log -- print() from a worker thread
+    never reaches the dgpy console, and a scenario driven from a script is
+    exactly that."""
+    print(msg)
+    sess = _CAP.get("session")
+    if sess:
+        try:
+            with open(os.path.join(sess["dir"], "session.log"), "a") as f:
+                f.write("%s  %s\n" % (datetime.datetime.now().strftime("%H:%M:%S"), msg))
+        except Exception:
+            pass
+
+
+def _taught_file(root=None):
+    root = root or CAPTURE_ROOT
+    return os.path.join(root, "taught_%s_%s.json" % (CELL_NAME, CELL_MODE))
+
+
+def _save_taught():
+    data = json.dumps(_cap_jsonable(taught_points), indent=1)
+    for path in (_taught_file(),
+                 os.path.join(_CAP["session"]["dir"], "taught_points.json")
+                 if _CAP.get("session") else None):
+        if path:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(data)
+
+
+def capture_session(specimen="", lighting="normal", notes="", name=None, root=None):
+    """Start (or switch to) a capture session: one directory holding every take.
+
+    specimen/lighting/notes are the defaults every take in the session is
+    labelled with; each scenario can override them. Taught points from the last
+    session on this cell and mode are loaded -- check them with list_taught()
+    and re-teach anything that may have moved.
+    """
+    root = os.path.expanduser(root or CAPTURE_ROOT)
+    stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    sdir = os.path.join(root, name or "%s_%s_%s" % (stamp, CELL_NAME, CELL_MODE))
+    os.makedirs(os.path.join(sdir, "code"), exist_ok=True)
+    _CAP["session"] = {"dir": sdir, "specimen": specimen, "lighting": lighting,
+                       "notes": notes, "takes": 0, "started": stamp}
+    with open(os.path.join(sdir, "session.json"), "w") as f:
+        json.dump({"cell": CELL_NAME, "mode": CELL_MODE, "started": stamp,
+                   "specimen": specimen, "lighting": lighting, "notes": notes,
+                   "host": os.uname().nodename}, f, indent=1)
+    loaded = 0
+    if os.path.exists(_taught_file(root)):
+        try:
+            with open(_taught_file(root)) as f:
+                for k, v in json.load(f).items():
+                    taught_points.setdefault(k, v)
+                    loaded += 1
+        except Exception as e:
+            _capture_say("  could not read %s: %s" % (_taught_file(root), e))
+    _capture_say("capture session %s" % sdir)
+    if loaded:
+        _capture_say("  %d taught point(s) carried over from the last session -- "
+                     "list_taught() shows them; re-teach anything that moved" % loaded)
+    return sdir
+
+
+def _session():
+    if _CAP.get("session") is None:
+        capture_session()
+    return _CAP["session"]
+
+
+def confirm(prompt, extra=None):
+    """Ask the operator. Returns "go", "skip", "abort", or one of `extra`.
+
+    Enter/y = go. s = skip this step. q/n = abort the scenario (the take is
+    closed and kept). r = go, and stop asking for the rest of THIS TAKE.
+    `extra` maps single letters to answers a scenario wants, e.g. {"t": "tight"}
+    for the cable test.
+
+    WHAT `r` IS, AND WHY IT IS NOT CAPTURE_AUTO_CONFIRM. That flag is refused
+    outside simulation and stays refused: it is set before anything runs, by
+    someone who has not seen the arm move, and every motion at the cell is
+    confirmed by the operator. `r` is a different thing -- a decision made in
+    the middle of a run, by the person watching it, after the same move has
+    already succeeded in front of them. A tilt-and-rotation matrix is ten passes
+    of five prompts, and by pass two the operator is confirming the identical
+    descent for the ninth time; that is not supervision, it is a reflex, and a
+    reflex is worth less than an informed decision to stop asking.
+
+    SCOPED TO THE TAKE, and the scoping is by identity rather than by a flag
+    somebody has to remember to clear: the armed take is stored, and a prompt
+    only skips if the take it is in IS that object. So a later scenario -- a new
+    capture_contact() over different taught points, an hour later -- asks again
+    from its first move, and nothing can leak the setting across a take boundary
+    or outside a take entirely.
+
+    THERE IS NO WAY BACK except Ctrl-C, which the supervisor turns into a stop
+    at the next checkpoint without moving the arm. The line printed on arming
+    says so, because an operator who does not know the escape has been handed a
+    worse position than they were in.
+
+    Every skipped prompt is still printed and still recorded, with auto_by
+    "operator", so the take's artifact says exactly which moves a human looked
+    at and which ones they armed through.
+    """
+    take = _CAP.get("take")
+    auto_by = None
+    if CAPTURE_AUTO_CONFIRM:
+        if CELL_MODE != "sim":
+            raise CaptureRefused(
+                "CAPTURE_AUTO_CONFIRM is set in %s mode. Automatic confirmation "
+                "is for simulation only; every motion at the cell is confirmed "
+                "by the operator." % CELL_MODE)
+        # A simulation harness may stand in for the operator's other answers
+        # (the cable test's "tight"): _CAP["sim_answer"](prompt, extra).
+        fn = _CAP.get("sim_answer")
+        answer = (fn(prompt, extra) if fn else None) or "go"
+        auto_by = "sim"
+        _capture_say("  [auto-confirm, sim] %s%s" % (prompt, "" if answer == "go"
+                                                     else "  -> " + answer))
+    elif take is not None and _CAP.get("auto_rest") is take:
+        # Armed by the operator earlier in THIS take. Say what is being done
+        # anyway: the point of arming is to stop being asked, not to stop being
+        # told, and the log has to carry the move either way.
+        answer = "go"
+        auto_by = "operator"
+        _capture_say("  [running on, armed with r] %s" % (prompt,))
+    else:
+        keys = "Enter=go, s=skip, q=abort"
+        # Only offered inside a take, because that is the only thing it can be
+        # scoped to -- and never shadowing a key the scenario has claimed.
+        offer_run_on = take is not None and not (extra and "r" in extra)
+        if offer_run_on:
+            keys += ", r=run the rest of this take without asking"
+        if extra:
+            keys += ", " + ", ".join("%s=%s" % kv for kv in extra.items())
+        # If nothing is subscribed to the preview topics, the operator is being
+        # asked to confirm a motion they cannot see. Say so IN THE PROMPT:
+        # otherwise a whole take records no preview and nothing reports it.
+        # See preview_audience() in cell_capture_motion.dpi.
+        dark = globals().get("_preview_audience_line")
+        dark = dark() if dark else ""
+        if dark:
+            prompt = "%s\n  ** %s" % (prompt, dark)
+        while True:
+            ans = input("%s\n  [%s] > " % (prompt, keys)).strip().lower()
+            if ans in ("", "y", "yes", "g", "go"):
+                answer = "go"
+                break
+            if ans in ("s", "skip"):
+                answer = "skip"
+                break
+            if ans in ("q", "n", "no", "abort", "quit"):
+                answer = "abort"
+                break
+            # The scenario's own keys win over `r`, which is why offer_run_on
+            # checked for a collision rather than this branch ordering alone.
+            if extra and ans in extra:
+                answer = extra[ans]
+                break
+            if offer_run_on and ans in ("r", "run"):
+                _CAP["auto_rest"] = take
+                answer = "go"
+                _capture_say(
+                    "  RUNNING ON: the rest of this take will not be confirmed. "
+                    "Every move is still previewed, printed and recorded. "
+                    "Ctrl-C stops at the next checkpoint without moving the arm, "
+                    "and the next take asks again from its first move.")
+                break
+            print("  ?")
+
+    if take is not None:
+        take.confirmations.append({"prompt": prompt, "answer": answer,
+                                   "ros_time_ns": capture_node.now_ns(),
+                                   "auto": auto_by is not None,
+                                   "auto_by": auto_by})
+    return answer
+
+
+def teach_point(name, hold_s=None, still_mm=None, note=""):
+    """Record where the probe tip is NOW (world -> probe_end), averaged while
+    the arm is still, with the joint angles and the wrench.
+
+    The operator jogs the tool with the teach pendant, stops, and calls this.
+    It refuses if the arm moved more than CAPTURE_TEACH_STILL_MM while it was
+    averaging. The point is kept in taught_points, in the session and in
+    CAPTURE_ROOT/taught_<cell>_<mode>.json.
+    """
+    hold_s = CAPTURE_TEACH_HOLD_S if hold_s is None else float(hold_s)
+    still = (CAPTURE_TEACH_STILL_MM if still_mm is None else float(still_mm))/1000.0
+    xs, quat, last = [], None, None
+    t_end = time.monotonic() + hold_s
+    while time.monotonic() < t_end:
+        snap = live_pose.snapshot()
+        if snap is not None and snap[2] != last:
+            xs.append(snap[0])
+            quat = snap[1]
+            last = snap[2]
+        time.sleep(0.02)
+    if len(xs) < 3:
+        raise RuntimeError("no TF for probe_end while teaching %r -- is the robot "
+                           "driver publishing joint_states?" % name)
+    xs = np.array(xs)
+    spread = float(np.max(np.linalg.norm(xs - xs.mean(0), axis=1)))
+    if spread > still:
+        raise RuntimeError("the arm moved %.2f mm while teaching %r (limit %.2f mm): "
+                           "hold still and teach again" % (spread*1e3, name, still*1e3))
+    joints = capture_node.current_joints(max_age=2.0)
+    w = capture_node.recent_wrench(0.5)
+    entry = {"xyz": xs.mean(0).tolist(), "xyzw": list(quat),
+             "joints": joints, "spread_mm": spread*1e3,
+             "wrench_mean": w.mean(0).tolist() if w is not None else None,
+             "ros_time_ns": capture_node.now_ns(),
+             "wall": datetime.datetime.now().isoformat(timespec="seconds"),
+             "mode": CELL_MODE, "note": note}
+    taught_points[name] = entry
+    _save_taught()
+    capture_node.event({"event": "teach", "name": name, "point": entry})
+    take = _CAP.get("take")
+    if take is not None:
+        take.events.append({"event": "teach", "name": name, "point": entry})
+    _capture_say("  taught %-12s probe_end at (%.4f, %.4f, %.4f), still to %.2f mm%s"
+                 % (name, entry["xyz"][0], entry["xyz"][1], entry["xyz"][2],
+                    spread*1e3, "" if joints else " (no joint_states!)"))
+    return entry
+
+
+def forget_point(name):
+    taught_points.pop(name, None)
+    _save_taught()
+
+
+def list_taught():
+    """Every taught point, SAYING WHICH FRAME the numbers are in.
+
+    They are all probe-tip positions -- that is the only frame anything is
+    taught in -- but the Keyence's measurement point sits about 75 mm to the
+    side of the tip and the Azure further still, so a bare xyz here invites
+    exactly the wrong reading: that the laser was where these numbers say. The
+    scenarios do the conversion; the operator should not, and cannot if nothing
+    tells them which end of the tooling they are looking at.
+    """
+    if not taught_points:
+        print("  nothing taught yet. Jog the PROBE TIP onto the feature and "
+              "call teach_point('name').")
+        return []
+    print("  taught points -- %s in world, the PROBE TIP, not the Keyence or "
+          "the Azure:" % CAPTURE_TIP_FRAME)
+    for name, p in sorted(taught_points.items()):
+        print("  %-14s (%.4f, %.4f, %.4f)  %s %s" % (
+            name, p["xyz"][0], p["xyz"][1], p["xyz"][2], p.get("wall", ""),
+            p.get("note", "")))
+    return sorted(taught_points)
+
+
+def capture_status():
+    """One screen: session, work volume and where it came from, taught points,
+    recorder, robot program, light and laser."""
+    sess = _CAP.get("session")
+    print("  session: %s" % (sess["dir"] if sess else "none (capture_session())"))
+    print("  cell %s, mode %s" % (CELL_NAME, CELL_MODE))
+    try:
+        print(describe_work_volume())
+        found, real = manifest_file()
+        print("  manifest: %s" % (real or found))
+    except Exception as e:
+        print("  work volume: %s" % e)
+    take = _CAP.get("take")
+    print("  recording: %s" % (take.dir if take else "no"))
+    print("  robot program running: %s" % (capture_node.program_running,))
+    print("  digital outputs: %s" % ((capture_node.io or {}).get("digital_out"),))
+    print("  joint_states: %s" % ("live" if capture_node.current_joints() else "NOT ARRIVING"))
+    w = capture_node.recent_wrench(1.0)
+    print("  wrench (%s): %s" % (capture_node.wrench_topic,
+                                 "live" if w is not None else "none"))
+    print("  taught points: %s" % (", ".join(sorted(taught_points)) or "none"))
+    print("  auto-confirm: %s" % CAPTURE_AUTO_CONFIRM)
+    # Whether THIS take has been armed with `r`. Worth a line of its own: an
+    # operator who walked away and came back has no other way to tell whether
+    # the next move will stop and ask them.
+    if take is not None and _CAP.get("auto_rest") is take:
+        print("  running on: YES -- this take will not ask again (Ctrl-C stops "
+              "at the next checkpoint; the next take asks from its first move)")

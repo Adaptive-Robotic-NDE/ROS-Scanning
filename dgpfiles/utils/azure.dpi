@@ -1,0 +1,15 @@
+global cx, cy, fx, fy
+global x, y, z
+
+cx = 1026.55
+cy = 773.586
+fx = 973.347
+fy = 973.203
+
+pixel_x = 0
+pixel_y = 0
+depth = 0
+
+x = (pixel_x - cx) * depth / fx
+y = (pixel_y - cy) * depth / fy
+z = depth

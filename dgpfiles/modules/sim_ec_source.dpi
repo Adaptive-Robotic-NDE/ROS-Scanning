@@ -1,0 +1,560 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  sim_ec_source.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Simulated eddy-current source for testing the scan pipeline without
+#   hardware.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# Stand-in for the eddy-current instrument's analog outputs on a DAQ card.
+#
+# WHAT THIS IS. Two free-running float64 channels of volts, published in blocks
+# in timestamped transactions. That is ALL a real eddy-current instrument is
+# from the recording database's point of view: the instrument's X and Y outputs
+# wired into two analog inputs of a PXI card, which dgpython_nidaqmx.ai_voltage
+# turns into two channels. Nothing downstream can tell the difference --
+# ECTimestampedSource reads the same two channels out of the globalrev a pose
+# transaction produced, and neither it, nor the trace accumulator, nor the
+# impedance-plane conditioning, nor the projector knows or cares what put them
+# there.
+#
+# It is deliberately modelled on ai_voltage's publish loop rather than on
+# anything convenient:
+#
+#   * BOTH channels in ONE transaction. ai_voltage defines every channel's
+#     ndarray_ref inside a single `with recdb.start_transaction()`, and
+#     ECTimestampedSource._sample() pairs the two by reading them out of one
+#     globalrev. A simulator that published them in two transactions would
+#     let them land in different globalrevs, and the pairing would then be a
+#     race that happens to pass on an idle machine.
+#   * A BLOCK, not a sample. A buffered card returns SampsPerChan samples per
+#     read, so the reading correlated to a trigger crossing spans time and the
+#     probe moved during it. That is what EC_BLOCK_REDUCE ("mean"/"last"/
+#     "first") chooses between and what report_smear() measures, and a
+#     one-sample-per-transaction simulator would make both untestable.
+#   * The same metadata: axis0_scale in seconds, ampl_units 'V'. The trace
+#     accumulator reads the time axis off its input.
+#   * float64, because that is what ai_voltage writes.
+#
+# TWO SOURCES OF NUMBERS, AND THE CHANNELS DO NOT KNOW WHICH. Everything above
+# is about the SHAPE of what is published; what fills it is either of:
+#
+#   * a MODEL (pass model=), driven by the response table that ecsim generates
+#     and ec_plate_model.py reads. Real impedance-plane physics: a differential
+#     probe's double-lobed loop over a notch, the flaw-free lift-off/tilt
+#     trajectory, and tilt about the split line producing a signal of the same
+#     KIND as a flaw rather than merely noise on top of it. That last point is
+#     the whole reason the table exists.
+#   * the SYNTHETIC signal below, when there is no model. Gaussian bumps along
+#     an invented direction in the impedance plane.
+#
+# THE SYNTHETIC PATH IS NOT EDDY-CURRENT PHYSICS and has never claimed to be.
+# It stays because it needs no table, no HDF5 and no overnight generation run:
+# what breaks in this pipeline is mostly the ARCHITECTURE (a math function
+# wired onto a channel that does not exist yet, a trace bound to the wrong
+# pose), an architectural stand-in is what tests that, and it has to keep
+# working on a machine with nothing installed. Its numbers are synthetic and
+# must not be read as an instrument response. The model's numbers may be, with
+# the caveats ec_plate_model.py records -- chiefly that the probe's coil
+# geometry is a documented placeholder rather than a fit, so shapes are
+# meaningful and absolute amplitudes are not.
+#
+# The synthetic signal is not pure noise, though, and that is not decoration:
+#
+#   * it is POSITION-DEPENDENT, from a plan-view flaw map relative to
+#     scan_origin, so a completed scan produces a recognisable image. With
+#     identical traces everywhere, a projection that lands every trace in the
+#     wrong place and a projection that works look exactly the same.
+#   * lift-off and the flaw response lie along DIFFERENT directions in the raw
+#     impedance plane, offset from the axes. So null_here() has a real offset to
+#     remove, and set_rotation() has a real angle to find -- which makes the
+#     eddy-current setup procedure itself exercisable without an instrument.
+#
+# TO USE THE REAL INSTRUMENT, set EC_SOURCE = "hardware" in the config. This
+# module is not included then, and nothing else changes. To drive the
+# simulation from the response table instead of the synthetic signal, set
+# EC_TABLE and EC_PLATE; the config builds the model and passes it here.
+
+import math
+import threading
+import time
+import traceback
+
+import numpy as np
+import spatialnde2 as snde
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned. A .dpi's own imports
+# are LOCAL to that body -- see the module-import note in dpi_exports_test.py --
+# which is why math/threading/time/np/snde are imported above rather than
+# borrowed from whatever the config happened to import.
+global SimECSource
+
+
+class SimECSource(object):
+    """Two channels of synthetic eddy-current volts, free-running.
+
+    Constructed and started like the DAQ module it replaces; stop() ends the
+    thread. `position_fn` is the same callable the trigger uses and may return
+    None before TF has produced anything, which is treated as "the probe is
+    nowhere known" and produces the unflawed baseline rather than the origin.
+    """
+
+    #: Plan-view flaw map, in metres RELATIVE TO scan_origin -- the toolpath's
+    #: own footprint corner, which surface_path_scan.dpi sets at the start of
+    #: every scan. Relative, not absolute world coordinates, because a flaw
+    #: table in world coordinates is a property of one part on one bench and
+    #: would miss every other part. Same convention the simulated ultrasound
+    #: specimen uses.
+    #:
+    #: (dx, dy, radius, amplitude in volts). The radii are a few millimetres
+    #: because the regions the work cell actually scans are 24-90 mm across.
+    FLAWS = (
+        (0.008, 0.020, 0.0040, 0.85),
+        (0.020, 0.050, 0.0060, 0.55),
+        (0.012, 0.070, 0.0030, 1.10),
+    )
+
+    #: The null point: where the instrument sits over good material with the
+    #: probe down. Not (0, 0) on purpose -- an instrument is never nulled when
+    #: you find it, and null_here() exists to remove exactly this.
+    BASE = (1.20, -0.35)
+
+    #: Which way lift-off moves the spot in the RAW impedance plane, and which
+    #: way a flaw moves it. Both offset from the axes, and not parallel to each
+    #: other: that is the whole geometry the rotation setup procedure is for.
+    #: 74 degrees between them is in the range a real probe shows; it is not a
+    #: measurement of anything.
+    #:
+    #: THE ROTATION PARAMETER IS THIS ANGLE, NOT ITS NEGATIVE. ec_condition's
+    #: exec block computes theta = -rot_deg and rotates the data by theta, so a
+    #: feature sitting at +35 deg needs set_rotation(35) to land on horizontal --
+    #: the angle is quoted the way an instrument quotes it ("lift-off at 35
+    #: degrees"). ec_scan_wiring_test.py checks the sign.
+    LIFTOFF_DIR_DEG = 35.0
+    FLAW_DIR_DEG = 109.0
+
+    #: Peak-to-peak lift-off wander, volts. Stands in for surface finish and for
+    #: the millimetre-scale mesh error the probe rides over: the scan commands
+    #: the tip onto the MEASURED surface, so with no contact preload
+    #: (set_ec_preload() in the config) mesh error is lift-off 1:1.
+    LIFTOFF_V = 0.45
+    LIFTOFF_PERIOD_M = 0.018
+
+    #: Gaussian noise on each channel, volts rms.
+    NOISE_V = 0.004
+
+    def __init__(self, recdb, clock, real_path, imag_path, position_fn=None,
+                 sample_rate=1000.0, block_hz=50.0, seed=None, start=True,
+                 model=None, pose_fn=None):
+        self.recdb = recdb
+        self.clock = clock
+        self.real_path = real_path
+        self.imag_path = imag_path
+        self.position_fn = position_fn
+        # `model` is an ec_plate_model.ECPlateModel, or None for the synthetic
+        # signal. `pose_fn` returns ((x,y,z), (qx,qy,qz,qw), ...) -- the probe's
+        # ORIENTATION as well as its position, which the synthetic signal never
+        # needed and the model cannot do without: lift-off and both tilts come
+        # out of the orientation, and tilt is the dominant term.
+        self.model = model
+        self.pose_fn = pose_fn
+        if model is not None and pose_fn is None:
+            raise ValueError(
+                "a model needs pose_fn as well as position_fn: the response "
+                "table is indexed by probe ORIENTATION (lift-off and two tilt "
+                "axes) as much as by position, and tilt is the larger signal. "
+                "Driving a model from position alone would hold the probe "
+                "permanently square-on and hide exactly the effect the table "
+                "was generated to study.")
+        self.model_errors = 0
+        self.model_no_pose = 0
+        #: Blocks the recording database would not accept because something
+        #: newer had already been committed. A DROPPED SAMPLE, not a fault --
+        #: see publish_once(). Watch it: steady growth means TRANSACTION_LATENCY
+        #: is too small for this block rate, or this thread is being starved.
+        self.dropped_blocks = 0
+        self.last_drop = None
+        self.sample_rate = float(sample_rate)
+        self.block_hz = float(block_hz)
+        self.block_samples = max(1, int(round(self.sample_rate/self.block_hz)))
+        self.blocks = 0
+        self.errors = 0
+        self.last_error = None
+        self._rng = np.random.default_rng(seed)
+        self._quit = False
+
+        with self.recdb.start_transaction() as trans:
+            self.real_chan = trans.define_channel(self.real_path, "main")
+            self.imag_chan = trans.define_channel(self.imag_path, "main")
+
+        # START=FALSE EXISTS FOR A DETERMINISTIC CALLER, and it is not only a
+        # test convenience. publish_once() is already the hand-driven entry
+        # point, so a constructor that unconditionally starts a free-running
+        # thread means every such caller races it: between __init__ returning
+        # and stop() being called, the loop publishes an arbitrary number of
+        # blocks, each of which draws from self._rng. A SEEDED source is then
+        # not reproducible, because where the generator has got to depends on
+        # how busy the machine was.
+        #
+        # Measured 2026-10-10: sim_ec_model_test's synchronous test passed 24
+        # of 24 on an idle machine and failed 1 in 20 with the cores loaded,
+        # for exactly this reason.
+        self._thread = None
+        if start:
+            self.start()
+
+    def start(self):
+        """Run free, publishing a block every 1/block_hz. Idempotent."""
+        if self._thread is not None and self._thread.is_alive():
+            return self._thread
+        self._quit = False
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self._thread
+
+    # -- the signal --------------------------------------------------------
+
+    def current_position(self):
+        """Where the probe is, or None. Never raises: this runs on the
+        acquisition thread, and an exception there stops the instrument."""
+        if self.position_fn is None:
+            return None
+        try:
+            return self.position_fn()
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def acquisition_time(self):
+        """When the block being published was measured. -> measurement_time
+
+        THE TIMESTAMP IS THE CORRELATION KEY, and under
+        timed_transaction_manager it is what decides which pose a reading lines
+        up with. Letting it default makes it mean "when this thread got round
+        to opening a transaction" instead, which is the distinction that
+        manager exists to draw -- spatialnde2's own start_transaction() spells
+        this out and calls the default right for CONFIGURATION and wrong for
+        ACQUISITION. The channel definitions in __init__ are configuration and
+        rightly take the default; a block of volts is acquisition and does not.
+
+        FROM THE MANAGER'S OWN CLOCK, not a clock of our own. The two must not
+        drift against each other: the manager orders by this stamp and refuses
+        anything older than what it has already committed, so a producer
+        stamping from somewhere else would see its blocks refused for a reason
+        that has nothing to do with when they were measured. `clock` is the one
+        the config built the manager with; transmgr.get_current_time() is the
+        same thing reached the other way, and is on the base class so it works
+        under either manager.
+
+        Returns None when neither is reachable -- a bare recdb in a test --
+        and publish_once() then falls back to the unstamped call.
+        """
+        if self.clock is not None:
+            return self.clock.get_current_time()
+        transmgr = getattr(self.recdb, "transmgr", None)
+        if transmgr is None:
+            return None
+        try:
+            return transmgr.get_current_time()
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def current_pose(self):
+        """((x,y,z), (qx,qy,qz,qw)) or None. Never raises -- see
+        current_position(); this runs on the acquisition thread too."""
+        if self.pose_fn is None:
+            return None
+        try:
+            snap = self.pose_fn()
+        except Exception:                                  # noqa: BLE001
+            return None
+        if snap is None:
+            return None
+        try:
+            return (snap[0], snap[1])
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def _origin(self):
+        """scan_origin, if a scan has set one. See the note on FLAWS."""
+        o = globals().get("scan_origin")
+        if o is None:
+            return None
+        try:
+            return (float(o[0]), float(o[1]))
+        except Exception:                                  # noqa: BLE001
+            return None
+
+    def flaw_amplitude(self, pos):
+        """Flaw response at this probe position, in volts.
+
+        A smooth bump rather than a step: the probe's footprint is a couple of
+        millimetres, so a real instrument does not switch on at a flaw edge, and
+        a hard edge would make the resampling and the projection spot radius
+        look better behaved than they are.
+        """
+        origin = self._origin()
+        if pos is None or origin is None:
+            return 0.0
+        dx = float(pos[0]) - origin[0]
+        dy = float(pos[1]) - origin[1]
+        total = 0.0
+        for fx, fy, r, amp in self.FLAWS:
+            d2 = (dx - fx)**2 + (dy - fy)**2
+            total += amp*math.exp(-d2/(2.0*r*r))
+        return total
+
+    def liftoff_amplitude(self, pos):
+        """Lift-off at this probe position, in volts. Smooth in space, so it is
+        the same for two traces taken at the same place -- which is what makes
+        it lift-off rather than noise."""
+        if pos is None:
+            return 0.0
+        s = (float(pos[0]) + float(pos[1]))/self.LIFTOFF_PERIOD_M
+        return 0.5*self.LIFTOFF_V*math.sin(2.0*math.pi*s)
+
+    def synthesize(self, pos=None, n=None):
+        """One block of (X, Y) volts.
+
+        Returns two float64 arrays of length n. The impedance point is
+
+            BASE + liftoff*liftoff_direction + flaw*flaw_direction + noise
+
+        which is the arrangement the impedance-plane conditioning is FOR: null
+        removes BASE, the rotation turns liftoff_direction onto the horizontal
+        axis, and what is left vertically is the flaw.
+        """
+        if n is None:
+            n = self.block_samples
+
+        if self.model is not None:
+            pose = self.current_pose()
+            if pose is not None:
+                try:
+                    return self.model.volts(pose[0], pose[1], n=n)
+                except Exception:                          # noqa: BLE001
+                    # A model that raises must not stop the instrument. Count
+                    # it, record it, and fall through to the synthetic signal
+                    # for this block -- publishing SOMETHING keeps the
+                    # correlation and the trigger alive, and report() says how
+                    # often it happened. Formatted, not the object: an
+                    # exception object here would pin its traceback, and its
+                    # frame, and the active transaction in that frame, which
+                    # wedges every globalrev wait in the process.
+                    self.model_errors += 1
+                    self.last_error = traceback.format_exc()
+            else:
+                # No pose yet -- TF has produced nothing. Counted separately
+                # from a model that raised, because they want opposite
+                # responses: this one resolves itself as soon as the work cell
+                # comes up, and a nonzero count AFTER a scan means the model
+                # was never consulted at all. Falls through to the synthetic
+                # signal, which needs no pose.
+                self.model_no_pose += 1
+
+        if pos is None:
+            pos = self.current_position()
+
+        lo = self.liftoff_amplitude(pos)
+        fl = self.flaw_amplitude(pos)
+        la = math.radians(self.LIFTOFF_DIR_DEG)
+        fa = math.radians(self.FLAW_DIR_DEG)
+
+        x = self.BASE[0] + lo*math.cos(la) + fl*math.cos(fa)
+        y = self.BASE[1] + lo*math.sin(la) + fl*math.sin(fa)
+
+        xs = np.full(n, x, dtype=np.float64)
+        ys = np.full(n, y, dtype=np.float64)
+        if self.NOISE_V:
+            xs += self._rng.standard_normal(n)*self.NOISE_V
+            ys += self._rng.standard_normal(n)*self.NOISE_V
+        return xs, ys
+
+    # -- publishing --------------------------------------------------------
+
+    def _metadata(self):
+        md = snde.constructible_metadata()
+        md.AddMetaDatum(snde.metadatum("ande_array-axis0_scale",
+                                       1.0/self.sample_rate, "seconds"))
+        md.AddMetaDatum(snde.metadatum("ande_array-axis0_offset", 0.0, "seconds"))
+        md.AddMetaDatum(snde.metadatum("ande_array-axis0_units", "seconds"))
+        md.AddMetaDatum(snde.metadatum("ande_array-axis0_coord", "Time"))
+        md.AddMetaDatum(snde.metadatum("ande_array-ampl_units", "V"))
+        md.AddMetaDatum(snde.metadatum("ande_array-ampl_coord", "Voltage"))
+        md.AddMetaDatum(snde.metadatum("EC-simulated", 1))
+        # WHICH simulation, recorded on every block. A stored dataset whose
+        # traces came from the synthetic bumps and one whose traces came from
+        # the response table are not comparable, and nothing else in the file
+        # distinguishes them.
+        md.AddMetaDatum(snde.metadatum("EC-sim-source",
+                                       "table-model" if self.model is not None
+                                       else "synthetic"))
+        if self.model is not None:
+            md.AddMetaDatum(snde.metadatum(
+                "EC-sim-table",
+                str(self.model.table.path if self.model.table is not None else "")))
+            md.AddMetaDatum(snde.metadatum(
+                "EC-sim-table-stub",
+                1 if getattr(self.model.table, "is_stub", False) else 0))
+        return md
+
+    def publish_once(self, pos=None):
+        """Publish one block on both channels, in one transaction.
+
+        ONE transaction for the pair, exactly as ai_voltage does it: the
+        correlation reads both channels out of a single globalrev, so they have
+        to arrive together or the pairing is a race.
+
+        STAMPED AT MEASUREMENT, immediately after synthesising the block and
+        before anything else can delay us -- see acquisition_time().
+
+        A STAMP THE DATABASE REFUSES IS A DROPPED SAMPLE, not a fault, and not
+        a reason to stop. Something newer has already been committed, so this
+        block can no longer be put in order; the manager says so at the front
+        door precisely so the producer can decide, while it is still on the
+        stack. Counting it and leaving a GAP is the right answer -- shifting it
+        to a later timestamp would move a reading to a place the probe was not,
+        and raising would kill the acquisition thread and leave a scan running
+        against a dead instrument, which is the failure the real digitizer's
+        AcquisitionThreadCode() was fixed for. Returns None when it drops.
+        """
+        xs, ys = self.synthesize(pos=pos)
+        when = self.acquisition_time()
+        try:
+            opened = (self.recdb.start_transaction() if when is None
+                      else self.recdb.start_transaction(when))
+        except snde.snde_error as refused:
+            self.dropped_blocks += 1
+            # First line only: snde_error.what() appends a C++ backtrace, and a
+            # dropped sample is routine rather than a crash.
+            self.last_drop = str(refused).split("\n")[0]
+            if self.dropped_blocks <= 5 or self.dropped_blocks % 1000 == 0:
+                print("  simulated EC: block dropped (%d so far): %s"
+                      % (self.dropped_blocks, self.last_drop))
+            return None
+        with opened as trans:
+            rref = snde.create_ndarray_ref(trans, self.real_chan,
+                                           snde.SNDE_RTN_FLOAT64)
+            iref = snde.create_ndarray_ref(trans, self.imag_chan,
+                                           snde.SNDE_RTN_FLOAT64)
+        for ref, data in ((rref, xs), (iref, ys)):
+            ref.rec.metadata = self._metadata()
+            ref.rec.mark_metadata_done()
+            ref.allocate_storage(data.shape, True)
+            ref.data[:] = data
+            ref.rec.mark_data_ready()
+        self.blocks += 1
+        return xs, ys
+
+    def _loop(self):
+        # A free thread, not a module context: this publishes into the recording
+        # database and must not be serialised against the dgpy module that owns
+        # the prompt. Same as every other acquisition loop here.
+        from dataguzzler_python import context
+        context.InitFreeThread()
+        period = 1.0/self.block_hz
+        nxt = time.monotonic()
+        while not self._quit:
+            try:
+                self.publish_once()
+            except Exception:                              # noqa: BLE001
+                self.errors += 1
+                # Formatted, not the object: see triggered_acquisition.dpi.
+                self.last_error = traceback.format_exc()
+                # Do not spin on a persistent failure: a tight loop of failing
+                # transactions buries the real error in the log and starves the
+                # rest of the process.
+                time.sleep(0.2)
+            nxt += period
+            sleep = nxt - time.monotonic()
+            if sleep > 0.0:
+                time.sleep(sleep)
+            else:
+                # Behind schedule. Do not try to catch up by publishing a burst
+                # of blocks with near-identical timestamps -- under the timed
+                # transaction manager that reorders badly and the correlation
+                # then pairs a crossing with a block from the wrong instant.
+                nxt = time.monotonic()
+
+    def stop(self, timeout=5.0):
+        self._quit = True
+        if self._thread is not None:
+            self._thread.join(timeout)
+            self._thread = None
+
+    def report(self):
+        if self.model is not None:
+            return {"blocks": self.blocks, "errors": self.errors,
+                    "model_errors": self.model_errors,
+                    "model_no_pose": self.model_no_pose,
+                    "dropped_blocks": self.dropped_blocks,
+                    "last_drop": self.last_drop,
+                    "last_error": self.last_error,
+                    "sample_rate": self.sample_rate,
+                    "block_samples": self.block_samples,
+                    "block_hz": self.block_hz,
+                    "real_path": self.real_path, "imag_path": self.imag_path,
+                    "source": "table-model",
+                    "model": self.model.report()}
+        return {"blocks": self.blocks, "errors": self.errors,
+                "model_errors": self.model_errors,
+                "dropped_blocks": self.dropped_blocks,
+                "last_drop": self.last_drop,
+                "last_error": self.last_error,
+                "source": "synthetic",
+                "sample_rate": self.sample_rate,
+                "block_samples": self.block_samples,
+                "block_hz": self.block_hz,
+                "real_path": self.real_path, "imag_path": self.imag_path,
+                "scan_origin": self._origin(),
+                "null_point": self.BASE,
+                "liftoff_dir_deg": self.LIFTOFF_DIR_DEG,
+                "flaw_dir_deg": self.FLAW_DIR_DEG,
+                "rotation_to_flatten_liftoff_deg": self.LIFTOFF_DIR_DEG}

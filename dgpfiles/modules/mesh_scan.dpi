@@ -1,0 +1,1863 @@
+# ==============================================================================
+# SCENARIO B: EXISTING MESH IN, SCAN OUT
+# ==============================================================================
+# The plane scan defines its own geometry from three taught points. This does the
+# other thing: a mesh already describes the surface, Noether plans a toolpath over
+# it, and the scan follows that. Everything downstream is shared -- the same
+# triggered acquisition, the same trace list, the same projector -- because the
+# acquisition takes a ScanPath and knows nothing about where it came from.
+#
+# What is NOT shared is the rectangular volume. There is no grid here, so there
+# is no quick-look c-scan and no `assignmap`; the trace list and the projection
+# are the whole output. That is deliberate and is the reason the trace list
+# exists.
+
+# IMPORTED HERE RATHER THAN BORROWED FROM THE CONFIG. A .dpi is compiled as a
+# function body, so an `import` in one .dpi binds a LOCAL of that body and is
+# invisible to every other one -- only the including .dgp's own top-level imports
+# land in the shared globals(). A .dpi that leans on the includer's imports
+# carries a latent NameError: it works under every config that happens to import
+# the same names and raises deep inside a scan under one that does not. Import
+# what this file uses, here.
+import hashlib
+import math
+import os
+
+import numpy as np
+
+global mesh_scan_path
+mesh_scan_path = None
+global mesh_scan_x3d
+mesh_scan_x3d = None
+
+global _scan_work_dir
+def _scan_work_dir():
+    return SCAN_STORAGE_DIR if scan_storage_manager is not None else "/tmp"
+
+global mesh_projection_x3d
+def mesh_projection_x3d(mesh):
+    """Where to write the parameterized projection surface for `mesh`.
+
+    BESIDE THE MESH, which is the only place the name cannot collide. The
+    mesh itself lives in a per-run session directory; the shared work directory
+    does not, so deriving the .x3d name there from the mesh's BASENAME gives
+    every run of the pipeline the same filename and each one silently overwrites
+    the last. That is defect (1) of results16: run C's curved patch was written
+    over run B's flat plate at
+    /data/scandata/specimen_..._ecplan_roi_uv.x3d, the reuse test compared only
+    the string, and the process went on projecting onto run B's geometry 31 mm
+    away. Zero traces landed and every pass reported 100%.
+
+    Same convention as mesh_reconstruction.dpi's parameterize_mesh(): the mesh's
+    own path with the extension replaced by _uv.x3d. Two meshes in two session
+    directories therefore get two surfaces, and nothing has to remember to clean
+    up between runs.
+
+    THE FALLBACK IS STILL UNIQUE. A mesh may sit somewhere unwritable -- a
+    package's meshes/ directory, a read-only dataset -- and the parameterization
+    has to go somewhere. It goes in the work directory under a name carrying a
+    digest of the mesh's ABSOLUTE path, so it is still one surface per mesh and
+    the collision this function exists to remove cannot come back through the
+    fallback.
+    """
+    base = os.path.splitext(os.path.abspath(mesh))[0]
+    mesh_dir = os.path.dirname(base) or "."
+    if os.access(mesh_dir, os.W_OK):
+        return base + "_uv.x3d"
+    tag = hashlib.sha1(os.path.abspath(mesh).encode("utf-8")).hexdigest()[:10]
+    return os.path.join(_scan_work_dir(),
+                        "%s_%s_uv.x3d" % (os.path.basename(base), tag))
+
+global make_test_plate
+def make_test_plate(size=None, height=None, bow=None, divisions=None,
+                    origin=None, name="test_plate"):
+    """Write a bowed plate over the flat scan's ground, as PLY and X3D.
+
+    This is the regression specimen for the mesh path, and it is here for the
+    same reason ASCAN_SIM_DTYPE exists: to exercise a path end to end without
+    depending on hardware -- or in this case on a particular part being present,
+    positioned and reachable. A scan of the real specimen mesh cannot tell you
+    whether the mesh workflow works, because that mesh does not plan in this cell
+    at all (see CURVED_SPECIMEN_MESH).
+
+    Both formats, from one array. Noether loads meshes with
+    pcl::io::loadPolygonFile -- PLY, OBJ, STL, VTK, and NOT X3D -- while
+    spatialnde2's projector reads X3D and not PLY. Writing them separately is how
+    they stop being the same surface.
+    """
+    size = TEST_PLATE_SIZE if size is None else size
+    height = TEST_PLATE_HEIGHT if height is None else height
+    bow = TEST_PLATE_BOW if bow is None else bow
+    divisions = TEST_PLATE_DIVISIONS if divisions is None else divisions
+    origin = SCAN_ORIGIN if origin is None else origin
+
+    o = np.array([origin[0], origin[1], height], dtype=np.float64)
+    u = np.array([size, 0.0, 0.0])
+    v = np.array([0.0, size, 0.0])
+
+    ply = os.path.join(_scan_work_dir(), name + ".ply")
+    x3d = os.path.join(_scan_work_dir(), name + ".x3d")
+    write_plate_ply(ply, o, u, v, nu=divisions, nv=divisions, bow=bow, also_x3d=x3d)
+    print("  test plate: %.2f x %.2f m at z=%.3f, bow %.0f mm, %dx%d"
+          % (size, size, height, bow*1e3, divisions, divisions))
+    print("    mesh for the planner: %s" % ply)
+    print("    surface for the projector: %s" % x3d)
+    return ply, x3d
+
+global plan_mesh_path
+def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
+                   offset=None, orient=None, uv_method=None, x3d=None,
+                   estimate_normals=None, roll=None, source=None,
+                   specimen_kwargs=None, roll_reference=None,
+                   rotation_offset=None, max_tilt_deg=None, clearance=None,
+                   check_clearance=True, allow_contact_links=None,
+                   gate=None, gate_repair=None, roi=None, region=None,
+                   fixed_quat=None):
+    """Plan a toolpath over a mesh and prepare its projection surface.
+
+    Returns (ScanPath, x3d path). Both are also left in the globals
+    mesh_scan_path / mesh_scan_x3d, so a scan started afterwards from the prompt
+    does not have to replan -- planning a real mesh takes tens of seconds and the
+    result does not change.
+
+    Passing mesh=None asks obtain_specimen_mesh() for one, which is where the
+    four ways of getting a mesh -- on disk, synthesised, Azure, Keyence -- come
+    together. With SPECIMEN_SOURCE at its default "auto" that resolves to
+    NOETHER_MESH if it is set and the synthesised test plate otherwise, which is
+    exactly what this function did before the reconstruction stage existed.
+
+    source= forces one route for this call, e.g. plan_mesh_path(source="azure")
+    to go and measure the part first.
+
+    roi= is a region selection (roi_select.dpi), and it changes nothing about
+    the toolpath: it tells the MESH GATE which surface its roughness and tilt
+    numbers are about. Without one the gate measures the whole mesh, which on a
+    real reconstruction is the part plus the bench it is bolted to -- see
+    _gate_surface_mask() in noether_path.dpi for what that costs. roi=False says
+    "the whole mesh" deliberately.
+    """
+    global mesh_scan_path, mesh_scan_x3d
+
+    line_spacing = NOETHER_LINE_SPACING if line_spacing is None else line_spacing
+    z_offset = NOETHER_Z_OFFSET if z_offset is None else z_offset
+    snake = NOETHER_SNAKE if snake is None else snake
+    offset = NOETHER_MESH_OFFSET if offset is None else offset
+    orient = NOETHER_ORIENTATION if orient is None else orient
+    uv_method = NOETHER_UV_METHOD if uv_method is None else uv_method
+    roll = NOETHER_TOOL_ROLL if roll is None else roll
+    # The tool x direction the roll is taken from ("fixed" and "locked"). A
+    # config that does not name one keeps the +x every scan has used.
+    if roll_reference is None:
+        roll_reference = globals().get("NOETHER_ROLL_REFERENCE", (1.0, 0.0, 0.0))
+    # Which way the raster lines run. WITH NO OFFSET THE LINES RUN ALONG THE
+    # PART'S SECOND-LONGEST DIMENSION -- on a 304 x 153 mm plate that is along y
+    # -- and pi/2 turns them onto the longest, which is what ECAutomatedScan.dgp
+    # sets. At a zero offset the cutting planes are normal to the FIRST principal
+    # axis; at pi/2 they are normal to the second. noether_cut_axes() in
+    # noether_path.dpi transcribes the planner's own two lines of C++ and is what
+    # the gate and noether_cut_axis_test.py both use.
+    if rotation_offset is None:
+        rotation_offset = globals().get("NOETHER_ROTATION_OFFSET", 0.0)
+
+    if mesh is None:
+        mesh, obtained_x3d = obtain_specimen_mesh(source=source,
+                                                  **(specimen_kwargs or {}))
+        if x3d is None:
+            x3d = obtained_x3d
+    elif globals().get("_put_in_scene_if_there_is_one") is not None:
+        # A mesh handed in by name skips obtain_specimen_mesh(), and with it the
+        # one place that tells MoveIt what the part is. The scene is what makes
+        # the planner's own collision check mean anything, so it is not optional
+        # just because the caller already had a file: put the same mesh in.
+        _put_in_scene_if_there_is_one(mesh, None)
+    if estimate_normals is None:
+        # USE THE MESH'S OWN NORMALS WHENEVER IT HAS ANY, a reconstruction
+        # included. An estimated normal is the single largest source of nonsense
+        # in a Noether toolpath. A/B over a Poisson-reconstructed specimen mesh,
+        # the same 74100 poses at the production 0.3 mm line spacing:
+        #
+        #                                planner estimates   the mesh's own
+        #   poses pointing INTO the part       16.0%               0%
+        #   tilt p95 of the raw path           52.4 deg         20.9 deg
+        #   waypoints cropped by the 45 cap     7.0%              3.4%
+        #   travel left in contact             30.26 m          31.34 m
+        #   footprint coverage                  96.7%            98.1%
+        #   waypoints outside the measured
+        #     cable envelope                     5.87%            1.01%
+        #
+        # Poisson's normals come from the solved indicator field and are globally
+        # consistent by construction; PCL's NormalEstimationPCLMeshModifier is a
+        # local PCA with no orientation propagation at all, which is why
+        # orient_tool_away_from_surface() has anything to flip.
+        #
+        # A mesh with no normals still needs the planner's -- and without them
+        # PlaneSlicerRasterPlanner refuses outright, which the gate catches.
+        estimate_normals = not _mesh_has_vertex_normals(mesh)
+        print("  normals: %s"
+              % ("estimated by the planner (this mesh carries none)"
+                 if estimate_normals else "the mesh's own"))
+
+    # Is this mesh even in the work cell? A mesh authored about its own origin
+    # plans a toolpath in the floor, and a reconstruction that tracked the wrong
+    # frame lands a metre away and reconstructs cleanly while it does it. Both
+    # failure modes are silent: the first sign is an unreachable toolpath rather
+    # than anything about the mesh. The work volume is what "in the work cell"
+    # means, so it can be checked in one line before the planner is asked for
+    # anything.
+    _check_mesh_in_work_volume(mesh)
+
+    # WILL NOETHER GET A USABLE PATH OUT OF THIS AT ALL? Ask before the service
+    # is, because both ways this stage fails are invisible from here: the planner
+    # answers success=False and puts "Too many connecting vertices found between
+    # adjacent segments" in a log the caller never sees, or it dies on a NaN and
+    # the next plan blames a missing service. Two non-manifold edges -- 8 faces
+    # of 22899 -- are enough to make a Poisson reconstruction refuse at the
+    # production 0.3 mm line spacing while planning fine at most other spacings,
+    # so it is a lottery rather than a resolution limit; six NaN vertices in a
+    # smoothed ball-pivot mesh abort principal_axis_noether_srv outright.
+    #
+    # See mesh_plan_report() in noether_path.dpi for every threshold and what it
+    # was measured on; modules/mesh_plan_gate_test.py pins them to the real
+    # meshes. gate=False is for deliberately planning something known-bad.
+    # region= reaches the gate so that the roughness and tilt statistics measure
+    # the surface that will actually be scanned. Without it the gate falls back
+    # to EC_SCAN_REGION, which on a call that passed its own region is None -- so
+    # it would grade the whole mesh while the toolpath is cropped to part of it.
+    # See _gate_planning_mesh().
+    mesh = _gate_planning_mesh(mesh, line_spacing=line_spacing,
+                               estimate_normals=estimate_normals,
+                               gate=gate, repair=gate_repair,
+                               rotation_offset=rotation_offset, roi=roi,
+                               region=region)
+
+    print("planning %s (line spacing %.1f mm, z offset %+.3f m, rotation offset "
+          "%.3f rad)" % (mesh, line_spacing*1e3, z_offset, rotation_offset))
+    res = plan_noether_toolpath(mesh, line_spacing=line_spacing, z_offset=z_offset,
+                                snake=snake, estimate_normals=estimate_normals,
+                                rotation_offset=rotation_offset)
+    if not res.success:
+        raise RuntimeError("noether planning failed for %s -- check the service log "
+                           "(a mesh with no vertex normals needs estimate_normals=True)"
+                           % (mesh,))
+
+    if orient == "fixed" and fixed_quat is None:
+        # The orientation the arm is actually holding. Taken from live TF rather
+        # than written down, because it is a property of how the probe is mounted
+        # in this cell and it changes when the tooling does.
+        #
+        # A caller that knows the orientation it wants passes fixed_quat instead
+        # -- plan_ec_path() does, from ec_probe_rotation_reference(), so an
+        # axis-locked eddy-current path is the same path whatever the arm
+        # happened to be holding when it was planned.
+        t = ros.t
+        if t is None:
+            raise RuntimeError("no TF for probe_end; cannot take the fixed orientation")
+        r = t.transform.rotation
+        fixed_quat = (float(r.x), float(r.y), float(r.z), float(r.w))
+    elif orient != "fixed":
+        fixed_quat = None
+
+    if orient == "capped" and max_tilt_deg is None:
+        max_tilt_deg = globals().get("NOETHER_MAX_TILT_DEG", 35.0)
+    # THE ORIENTATION CONSTRAINT, and this is where the requirement that the
+    # probe stay normal to the surface stops being a thing that gets checked
+    # afterwards.
+    #
+    # orient="surface" takes the tool axis from the PLANNER'S pose, which is the
+    # mesh's normal as the planner read or re-estimated it, one waypoint at a
+    # time. orient="normal" takes it from the repaired mesh's own field, sampled
+    # at the waypoint. They express the same intent -- follow the surface -- and
+    # only the second one is true BY CONSTRUCTION and checkable afterwards, so a
+    # caller that asked for "surface" over a mesh held here gets "normal". That
+    # substitution makes tilt-relative-to-normal zero instead of capped, so
+    # waypoints do not have to be thrown away to keep the probe flat on the part.
+    #
+    # MESH_NORMAL_CONSTRAINT = False in a config leaves "surface" alone, which is
+    # how the two can be compared on one mesh.
+    surface = mesh if isinstance(mesh, str) else None
+    if (orient == "surface" and surface is not None
+            and globals().get("MESH_NORMAL_CONSTRAINT", True)):
+        orient = "normal"
+    path = scanpath_from_noether(res, offset=offset, orient=orient,
+                                 fixed_quat=fixed_quat, roll=roll,
+                                 roll_reference=roll_reference,
+                                 max_tilt_deg=max_tilt_deg, surface=surface)
+    # LET THE REPLY GO. The planner answers with one rosidl Pose object per
+    # waypoint and each costs 316 bytes of Python (measured, Iron); the eddy
+    # current path at a 0.30 mm line spacing is 911 511 of them, so holding the
+    # response through the rest of this function -- the parameterization, the
+    # clearance gate -- is 288 MB for data already copied into two numpy arrays.
+    res = None
+    print("  %s" % path.describe())
+    if orient in ("surface", "normal"):
+        if orient == "normal":
+            nr = path.normal_report or {}
+            # WHAT THIS LINE MAY AND MAY NOT CLAIM. It says where the axis came
+            # from, which is a fact about the construction. It may NOT say that
+            # nothing is flipped: that this code does not turn poses over is a
+            # statement about its policy, not a measurement of the path, and a
+            # mesh repair that has just replaced 23 backwards normals is exactly
+            # the run on which the two read differently. Whether anything is
+            # actually turned round is measured below, against the surface at each
+            # waypoint, by repair_tool_axis_to_surface(); nothing here pre-empts it.
+            print("  orientation: the tool axis IS the repaired surface normal, "
+                  "sampled from %s at every one of %d waypoints (%s; sampled at "
+                  "most %.3f mm off the surface). %d waypoint(s) sit on surface "
+                  "facing AWAY from world up, which is an unreachable region and "
+                  "is reported as one below rather than turned over."
+                  % (os.path.basename(str(surface)), len(path),
+                     "a height field" if nr.get("height_field")
+                     else "%.1f%% of it faces up" % (100.0*nr.get(
+                         "facing_up_fraction", 0.0),),
+                     nr.get("surface_distance_max_m", 0.0)*1e3,
+                     nr.get("facing_down", 0)))
+        else:
+            print("  orientation: %d of %d poses flipped so the probe faces the part"
+                  % (path.noether_flipped, len(path)))
+        # ROBUST BEFORE ANYTHING ELSE LOOKS AT IT. This is the backstop for a
+        # mesh whose normals are locally wrong, and it has to run here -- before
+        # the tilt cap decides what to throw away and before
+        # EC_AXIS_SMOOTHING_M averages what is left -- or both of those act on
+        # noise. See sanitize_tool_axis() for what it does and what it measured.
+        if globals().get("MESH_AXIS_SANITY", True) and roll == "locked":
+            # ASSERT, DO NOT REPAIR AGAIN, when the axis is already constrained to
+            # the repaired mesh normal. Two smoothers in series is how you get
+            # behaviour nobody can reason about; the division of labour is written
+            # down in sanitize_tool_axis()'s own docstring.
+            path = sanitize_tool_axis(
+                path, reference=roll_reference,
+                assert_only=path_is_normal_constrained(path))
+        # worst_roll_step_deg IS OVER THE WHOLE ARRAY, pass boundaries included,
+        # so it is not by itself evidence that the arm turns mid-sweep: on a real
+        # mesh it comes out the same order as that path's boundary steps.
+        # Labelled here for what it is; the within-pass figure, which is the one
+        # that means "stop and rotate", is below.
+        print("  tool roll: %s, worst orientation step between waypoints %.2f deg "
+              "(anywhere in the array, a pass boundary included)"
+              % (roll, path.worst_roll_step_deg))
+        # Roll and tilt SEPARATELY, because they cost different things: roll
+        # about the tool's own axis is wrist_3 and cable wrap, tilt is what the
+        # surface demands. A "locked" path reads 0 roll by construction.
+        path.roll_report = tool_roll_report(
+            path.quats, path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M),
+            reference=roll_reference)
+        # ALWAYS AS A DIRECTION. A roll reference may be a direction or a whole
+        # orientation -- an operator-set probe rotation arrives as the latter --
+        # and printing four quaternion components after "reference x =" names the
+        # wrong thing. This is that reference's own x axis either way.
+        _ref_x = quat_to_matrix(np.asarray(
+            roll_reference_quat(roll_reference), dtype=np.float64))[:, 0]
+        print("  rotation about the tool's own axis: %.2f deg across the path, "
+              "%.2f deg within one pass at most (reference x = %s); tilt from "
+              "vertical up to %.1f deg, mean %.1f"
+              % (path.roll_report["twist_range_deg"],
+                 path.roll_report["twist_in_pass_deg"],
+                 tuple(round(float(v), 6) for v in _ref_x),
+                 path.roll_report["tilt_max_deg"],
+                 path.roll_report["tilt_mean_deg"]))
+        # Within a pass and between passes SEPARATELY, and again over only the
+        # waypoints EC_MAX_TILT_DEG will leave behind -- because that is the
+        # path the arm flies. See tool_axis_continuity().
+        _cap = max_tilt_deg
+        if _cap is None:
+            _cap = globals().get("EC_MAX_TILT_DEG",
+                                 globals().get("NOETHER_MAX_TILT_DEG"))
+        path.axis_continuity = tool_axis_continuity(path, max_tilt_deg=_cap)
+        for _line in describe_tool_axis_continuity(path.axis_continuity):
+            print(_line)
+        # THE POSTCONDITION, AND THEN THE REACHABILITY -- in that order, because
+        # they are different questions and only the second one is about the arm.
+        #
+        #   angle(probe axis, SURFACE NORMAL)   must be 0. If it is not, the mesh
+        #                                       or the constraint is wrong and no
+        #                                       amount of dropping waypoints will
+        #                                       fix it.
+        #   angle(probe axis, VERTICAL)         may be anything the surface says.
+        #                                       Whether the arm can hold it is
+        #                                       EC_MAX_TILT_DEG's question, and the
+        #                                       answer is REPORTED -- what, where,
+        #                                       how much -- never silently dropped.
+        #
+        # AND THE TURNED-ROUND POSES, BEFORE EITHER, because the postcondition
+        # cannot see them: on a normal-constrained path it compares the axis with
+        # the same sampler that built it, so it reads 0.000 deg whatever happened.
+        # This one classifies each pose against the surface AT that waypoint,
+        # puts back the ones that can be put back, and DROPS the ones on surface
+        # facing away from the probe -- never turns one over, which would point
+        # the probe away from the part and push the holder into it.
+        #
+        # ONLY A NORMAL-CONSTRAINED PATH IS REPAIRED. orient="capped" leans the
+        # tool back on purpose and orient="surface" keeps the planner's own
+        # estimate; putting either back on the normal would quietly turn it into
+        # orient="normal" and, on a cylinder flank, undo the cap that is the only
+        # reason that path can be entered at all. Those modes get the measurement
+        # and no change.
+        if surface is not None:
+            if path_is_normal_constrained(path):
+                _fixed, _flips = repair_tool_axis_to_surface(
+                    path, surface, what="planned toolpath")
+                path = _fixed
+            else:
+                _flips = tool_axis_flip_report(path, surface)
+                for _line in describe_tool_axis_flips(_flips):
+                    print(_line)
+            path.axis_flips = _flips
+        if surface is not None and path_is_normal_constrained(path):
+            path.normal_postcondition = assert_probe_normal_to_surface(
+                path, surface, what="planned toolpath")
+        path.reachability = tool_reachability_report(path, _cap)
+        for _line in describe_tool_reachability(path.reachability):
+            print(_line)
+
+    if x3d is None:
+        # Beside the mesh, so two runs cannot write one file. The FULL path is
+        # printed, not the basename: the operator's only way to tell run C's
+        # surface from run B's is where it is, and results16's log shows the two
+        # runs reporting the identical name. See mesh_projection_x3d().
+        x3d = mesh_projection_x3d(mesh)
+        print("  parameterizing %s -> %s" % (os.path.basename(mesh), x3d))
+        mesh_uv_x3d(mesh, x3d, method=uv_method)
+        # AND CHECK IT HERE, where it was written and nothing has moved.
+        #
+        # The projector is built when the SCAN starts -- after the approach, the
+        # touchdown and the hardware null -- so a surface the loader will not
+        # take used to cost the whole setup, with the probe pressed into the
+        # part. Three runs went that way in two days. The file has existed since
+        # this line every time.
+        check_projection_surface(x3d)
+
+    acq = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    print("  %d of %d segments are scanning passes (>= %.0f mm); %.3f m of travel, "
+          "%d traces at a %.2f mm pitch"
+          % (len(acq), len(path.segments), PATH_MIN_SEGMENT_M*1e3,
+             sum(path.segment_length_m(s) for s in acq),
+             path.trace_count(_mesh_pitch(), acq), _mesh_pitch()*1e3))
+
+    # DOES THE WHOLE TOOL CLEAR THE PART? The toolpath places the eddy-current
+    # probe; the Keyence head, the Azure and its bracket come along on the same
+    # mounting plate and are 75-230 mm away from probe_end. Over a flat plate
+    # that costs nothing and over a curved one it is the difference between a
+    # scan and a collision: a path that places one sensor correctly can drive
+    # another on the same plate into the part.
+    #
+    # The probe's own contact is allowed by name, because contact is what this
+    # scan is FOR. Everything else on the tooling still has to clear.
+    if check_clearance and _clearance_available("this toolpath"):
+        if allow_contact_links is None:
+            allow_contact_links = TOOLING_CONTACT_LINKS
+        print("  contact is allowed for %s (this is a contact scan); every "
+              "other link on the tooling must clear the part"
+              % (", ".join(allow_contact_links) or "nothing",))
+        path, _clear = enforce_path_clearance(
+            path, mesh, limit=clearance, allow_links=allow_contact_links,
+            what="toolpath")
+        twist_within_limit(path)
+
+    # ARE THE TWO THINGS THIS FUNCTION RETURNS ABOUT THE SAME PART? Asked last,
+    # after the clearance gate has dropped whatever it is going to drop, and
+    # before anything moves. The toolpath and the projection surface come from
+    # one mesh here, so they agree by construction -- unless the .x3d was handed
+    # in by the caller, or the parameterization wrote somewhere a previous run
+    # had already written. Both of those are how results16 happened, and the
+    # consequence is an empty image with every pass at 100%. One bbox comparison
+    # at planning time costs nothing and refuses on disjoint.
+    #
+    # offset= because the surface is placed by the registration offset that the
+    # projector will put on the specimen pose channel, while the toolpath
+    # already has it baked in: comparing the raw file box against the path would
+    # make a correctly offset mesh look disjoint.
+    if x3d is not None:
+        check_projection_covers_path(x3d, path, what="toolpath", offset=offset)
+
+    mesh_scan_path = path
+    mesh_scan_x3d = x3d
+    return path, x3d
+
+global _mesh_has_vertex_normals
+def _mesh_has_vertex_normals(mesh):
+    """Does this file carry vertex normals? Header-only, so it costs nothing.
+
+    Deliberately not read_ply_mesh(): this is asked before the mesh is gated, on
+    a file that may be enormous or may not be a mesh at all, and the answer is
+    three lines of the header. A file that cannot be read this way is reported
+    as having none, which is the safe answer -- the planner then estimates.
+    """
+    if not isinstance(mesh, str) or not os.path.exists(mesh):
+        return False
+    if not mesh.lower().endswith(".ply"):
+        return False            # STL carries face normals, not vertex normals
+    try:
+        with open(mesh, "rb") as f:
+            hdr = b""
+            while b"end_header" not in hdr and len(hdr) < 65536:
+                line = f.readline()
+                if not line:
+                    break
+                hdr += line
+        txt = hdr.decode("ascii", "replace")
+        if "element vertex" not in txt:
+            return False
+        section = txt.split("element vertex")[1].split("element")[0]
+        return all((" %s\n" % c) in section or section.rstrip().endswith(" %s" % c)
+                   for c in ("nx", "ny", "nz"))
+    except Exception:
+        return False
+
+
+global _gate_planning_mesh
+def _gate_planning_mesh(mesh, line_spacing=None, estimate_normals=None,
+                        gate=None, repair=None, region=None,
+                        rotation_offset=None, roi=None):
+    """Refuse or repair a mesh before principal_axis_noether is asked for a path.
+
+    Everything the gate needs that is a property of THIS CELL rather than of the
+    mesh -- the measured work volume, the measured cable envelope, the tilt cap
+    the pipeline will crop to -- is collected here, so mesh_plan_report() stays a
+    pure function of a mesh and a few numbers and can be run on the host.
+
+    Returns the mesh to plan on: the original, or a repaired copy written beside
+    it. Raises MeshNotPlannable when nothing can be done, with every failed check
+    and its fix in the message.
+
+    NOETHER_MESH_GATE = False in a config turns it off; that is for planning
+    something deliberately known-bad, never for making a refusal go away.
+    """
+    gate = globals().get("NOETHER_MESH_GATE", True) if gate is None else gate
+    if not gate or not isinstance(mesh, str):
+        return mesh
+    fn = globals().get("mesh_plan_report")
+    if fn is None:              # noether_path.dpi not included: nothing to do
+        return mesh
+    repair = (globals().get("NOETHER_MESH_GATE_REPAIR", True)
+              if repair is None else repair)
+    kw = {"line_spacing": line_spacing,
+          "max_tilt_deg": globals().get("EC_MAX_TILT_DEG",
+                                        globals().get("NOETHER_MAX_TILT_DEG")),
+          "region": region if region is not None else globals().get("EC_SCAN_REGION"),
+          "estimate_normals": estimate_normals,
+          "rotation_offset": rotation_offset}
+    # WHICH SURFACE the roughness and tilt statistics measure. None keeps the
+    # WHOLE MESH -- what the gate has always reported, and still the default, so
+    # that nothing a caller already relies on changes underneath it. On a real
+    # reconstruction that mesh is the part AND the breadboard it is bolted to,
+    # and the statistic is the bench's; an ROI is what lets the gate see the
+    # part, and the gate says which it measured either way.
+    #
+    # DELIBERATELY NOT last_roi. An ROI drawn for an earlier scan is still
+    # sitting in that global, and a gate that quietly measured the wrong 40 cm2
+    # of bench reads like a good result. The selection belongs to one run, so the
+    # one place that knows that -- stage 2b of run_automated_scan() -- hands it
+    # on. From the prompt, say so: plan_ec_path(roi=last_roi).
+    #
+    # A REGION, THOUGH, IS NOT STALE: it was passed in for THIS call, and it is
+    # already the box the toolpath will be cropped to. Grading the whole mesh
+    # while planning over part of it produces a spurious refusal -- 40.9% of a 63
+    # mm cylinder leans past 45 degrees because most of a cylinder does, while
+    # the crown that is going to be scanned is nearly flat.
+    #
+    # roi=False is the deliberate "grade the whole mesh".
+    if roi is None and kw.get("region") is not None:
+        roi = "region"
+    if roi is not None:
+        kw["roi"] = roi
+    vol = None
+    try:
+        vol = work_volume()
+    except Exception:
+        vol = None
+    if vol is not None:
+        kw["work_volume"] = (vol[1], vol[2])
+    try:
+        kw["envelope"] = cable_envelope_model()
+    except Exception:
+        pass
+    # A repaired copy goes beside the mesh, named so it is obvious which it is
+    # and so a rerun overwrites rather than accumulating.
+    target = os.path.splitext(mesh)[0] + "_gated.ply" if repair else None
+    planning = require_plannable_mesh(mesh, repair_to=target, **kw)
+
+    # THE NORMALS, LAST: AFTER THE CROP AND AFTER THE TOPOLOGY.
+    #
+    # After the crop because the connected COMPONENT is the unit the requirement
+    # is stated in -- every connected region of the selection must come out a
+    # smooth continuous surface -- and before the crop the part and the bench it
+    # is bolted to are one component through the draped skirt. After the topology
+    # because a repair cannot fit a surface across a NaN vertex, and
+    # clean_mesh_for_planning() is what removes those.
+    #
+    # THE GATE'S OWN STATISTICS ARE MEASURED BEFORE THIS, deliberately: they grade
+    # the RECONSTRUCTION, which is what a reconstruction problem has to be
+    # diagnosed from, and they are the numbers mesh_plan_gate_test.py pins to the
+    # real meshes. The numbers to read for "is this surface smooth and
+    # continuous" are the repair's own, which describe_normal_repair() prints
+    # immediately below the gate's.
+    #
+    # MESH_REPAIR_NORMALS = False in a config turns it off. That is for showing
+    # what the repair was worth on a known mesh, never for making a plan happen.
+    if (globals().get("MESH_REPAIR_NORMALS", True)
+            and isinstance(planning, str)
+            and globals().get("repair_mesh_normals") is not None):
+        planning = repair_mesh_normals(planning).get("mesh") or planning
+    return planning
+
+
+global _check_mesh_in_work_volume
+def _check_mesh_in_work_volume(mesh, warn_fraction=0.5):
+    """Say how much of a mesh lies inside the work cell, before planning over it.
+
+    A warning rather than a refusal, and deliberately: a legitimate mesh can
+    overhang the box a little, and the reconstructions this is most useful for
+    are exactly the ones somebody is still debugging. What it must not do is
+    stay quiet when a mesh is somewhere else entirely.
+    """
+    volume = work_volume()
+    if volume is None:
+        return None
+    try:
+        verts = _mesh_vertices(mesh)
+    except Exception as e:
+        print("  (could not read %s to check it against the work volume: %s)"
+              % (os.path.basename(mesh), e))
+        return None
+    if not len(verts):
+        return None
+    inside = in_work_volume(verts)
+    frac = float(inside.mean())
+    lo = verts.min(axis=0)
+    hi = verts.max(axis=0)
+    if frac < warn_fraction:
+        _f, wlo, whi = volume
+        print("  WARNING: only %.0f%% of %s is inside the cell's work volume."
+              % (frac*100.0, os.path.basename(mesh)))
+        print("    mesh spans   x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f"
+              % (lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+        print("    work volume  x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f"
+              % (wlo[0], whi[0], wlo[1], whi[1], wlo[2], whi[2]))
+        print("    A mesh authored about its own origin, or reconstructed while "
+              "tracking the wrong frame, looks exactly like this.")
+    else:
+        print("  %.0f%% of the mesh is inside the cell's work volume" % (frac*100.0,))
+    return frac
+
+
+global _mesh_vertices
+def _mesh_vertices(path):
+    """(n,3) vertex positions from a binary or ascii PLY, or an STL.
+
+    Deliberately small and dependency-free: this runs to CHECK a mesh, and a
+    check that needs open3d to be importable is a check that gets skipped.
+    """
+    import re
+    import struct
+
+    low = path.lower()
+    if low.endswith(".stl"):
+        with open(path, "rb") as f:
+            head = f.read(80)
+            if head[:5].lower() == b"solid" and b"facet" in f.read(512):
+                f.seek(0)
+                vals = [float(v) for line in f
+                        for v in (line.split()[1:4]
+                                  if line.strip().lower().startswith(b"vertex")
+                                  else [])]
+                return np.asarray(vals, dtype=np.float64).reshape(-1, 3)
+            f.seek(80)
+            n = struct.unpack("<I", f.read(4))[0]
+            data = np.frombuffer(f.read(n*50), count=n,
+                                 dtype=np.dtype([("n", "<3f4"), ("v", "<9f4"),
+                                                 ("a", "<u2")]))
+            return data["v"].reshape(-1, 3).astype(np.float64)
+
+    with open(path, "rb") as f:
+        hdr = b""
+        while b"end_header" not in hdr:
+            line = f.readline()
+            if not line:
+                raise IOError("no PLY header in %s" % path)
+            hdr += line
+        txt = hdr.decode("ascii", "replace")
+        n = int(re.search(r"element vertex (\d+)", txt).group(1))
+        section = txt.split("element vertex")[1].split("element")[0]
+        props = re.findall(r"property (\w+) (\w+)", section)
+        if "format ascii" in txt:
+            vals = []
+            for _ in range(n):
+                vals.append([float(v) for v in f.readline().split()[:3]])
+            return np.asarray(vals, dtype=np.float64)
+        types = {"float": "<f4", "float32": "<f4", "double": "<f8",
+                 "uchar": "u1", "int": "<i4", "uint": "<u4",
+                 "short": "<i2", "ushort": "<u2"}
+        dt = [(name, types[t]) for t, name in props]
+        arr = np.frombuffer(f.read(np.dtype(dt).itemsize*n), dtype=dt, count=n)
+        return np.stack([arr["x"], arr["y"], arr["z"]], axis=1).astype(np.float64)
+
+
+global _quat_angle
+def _quat_angle(qa, qb):
+    """Angle between two (x,y,z,w) orientations, degrees."""
+    Ra = quat_to_matrix(qa)
+    Rb = quat_to_matrix(qb)
+    c = (np.trace(Ra.T @ Rb) - 1.0)/2.0
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+# ==============================================================================
+# THE TOOL AXIS: ROBUST BEFORE SMOOTH, AND MEASURED WHERE THE ARM FEELS IT
+# ==============================================================================
+# A Noether pose carries tool z along the mesh's normal at that waypoint, and on
+# a reconstruction those normals are measured, not designed. Where the
+# measurement is locally wrong the toolpath inherits it pose by pose, and the arm
+# obeys. Over a 20266-face Keyence reconstruction whose normals point up 99.6% of
+# the time, on a surface that is essentially flat:
+#
+#     tilt from vertical up to 89.7 deg, mean 3.4
+#     worst orientation step between waypoints 168.16 deg
+#     429 of 648 passes vary in orientation by up to 149.2 deg along their length
+#     1804 of 67672 waypoints dropped for exceeding EC_MAX_TILT_DEG
+#
+# The roll was locked and read 0.00 deg across the whole path, so none of that is
+# roll: it is TILT, inherited from per-face normals.
+#
+# NEITHER OF THE OTHER TWO STAGES IN THE PIPELINE CAN FIX THAT.
+#
+#   * the tilt cap (EC_MAX_TILT_DEG) DROPS waypoints, which loses coverage, and
+#     it runs after the fact. A normal that disagrees with its neighbours by 168
+#     degrees on locally flat ground is not a steep surface, it is noise, and
+#     throwing the waypoint away is paying coverage for a measurement error.
+#   * EC_AXIS_SMOOTHING_M averages the tool axis over 6 mm of travel
+#     (smooth_tool_axis() in noether_path.dpi) and still lets 55 degrees through.
+#     It is a BOX MEAN of unit vectors, and a mean has no defence against an
+#     outlier: four consecutive waypoints of one 35-point pass carried axes of
+#     (-0.99, -0.12, +0.02), (+0.99, +0.12, +0.01), (-0.99, -0.10, +0.08),
+#     (-0.99, -0.11, +0.00) -- near-horizontal, ALTERNATING IN SIGN -- between
+#     neighbours tilted 2.4 and 9.6 degrees. Averaging across that discontinuity
+#     produces an axis that describes nothing, and it drags the good neighbours
+#     with it.
+#
+# So the axis is made ROBUST first and averaged afterwards. sanitize_tool_axis()
+# replaces an axis that disagrees with a MEDIAN of its own neighbourhood, which
+# an outlier cannot move, and then bounds how fast the axis may turn per
+# millimetre of travel. Positions are never touched: the tip still goes exactly
+# where the mesh says, and coverage is not spent on a bad normal.
+#
+# WHAT IT DELIBERATELY DOES NOT DO is flatten real geometry. A window of six
+# millimetres, at a 0.45 mm waypoint spacing, is thirteen waypoints: a wrong run
+# of up to six is outvoted and repaired, and a run of seven or more is the
+# surface really turning -- a bench step, the draped skirt down the side of the
+# part -- which the median leaves alone for the tilt cap to drop. That split is
+# the whole design. Measured on two reconstructions of the same part, one cropped
+# to the part top and one still carrying the bench it is bolted to:
+#
+#                                          bench in the mesh        part top only
+#   tilt max, before / after                89.7 / 88.8 deg         83.4 / 2.0 deg
+#   worst step WITHIN a pass, before/after  178.1 / 2.6 deg         83.5 / 1.0 deg
+#   passes varying > 5 deg, before / after  423 / 362 of 471        5 / 0 of 204
+#
+# On the part alone the repair removes every one of the bad normals. With the
+# bench in the mesh what survives the repair is a real 28.4 mm step -- measured,
+# and not scannable by a contact probe. THE FIX FOR THAT IS THE ROI CROP, not
+# this; this is the backstop that keeps the churn down to what the mesh genuinely
+# says.
+
+
+global _rolling_median_dirs
+def _rolling_median_dirs(z, k):
+    """(n,3) unit directions replaced by a k-wide rolling component-wise median.
+
+    The estimator that an outlier cannot move. A component-wise median of unit
+    vectors is not itself a unit vector, so it is renormalised; over a
+    neighbourhood that mostly agrees, that is a direction within a fraction of a
+    degree of the true local axis, and over a neighbourhood with a minority of
+    garbage in it, it IGNORES the garbage instead of averaging it in.
+
+    The window is reflect-padded at the ends of the pass rather than shrunk, so
+    the first and last waypoints get a full-width estimate; a pass end is exactly
+    where an edge artefact lives and a half-width window there is half a defence.
+
+    Vectorised: one sliding_window_view and one np.median per pass. numpy 1.20
+    and later, which covers the cell's 1.23.
+    """
+    z = np.asarray(z, dtype=np.float64).reshape(-1, 3)
+    n = z.shape[0]
+    k = int(k)
+    if k % 2 == 0:
+        k -= 1
+    k = min(k, n if n % 2 else n - 1)
+    if k < 3 or n < 3:
+        return z.copy()
+    h = k//2
+    pad = np.vstack([z[1:h+1][::-1], z, z[max(n-h-1, 0):n-1][::-1]])
+    if pad.shape[0] != n + 2*h:         # a pass shorter than the window
+        return z.copy()
+    win = np.lib.stride_tricks.sliding_window_view(pad, k, axis=0)   # (n, 3, k)
+    m = np.median(win, axis=2)
+    norm = np.linalg.norm(m, axis=1, keepdims=True)
+    norm[norm < 1e-12] = 1.0
+    return m/norm
+
+
+global sanitize_tool_axis
+def sanitize_tool_axis(path, window_m=None, outlier_deg=None,
+                       max_turn_deg_per_mm=None, min_step_deg=None,
+                       split_deg=None, reference=None, verbose=True,
+                       assert_only=False):
+    """A copy of a LOCKED `path` whose tool axis is robust and continuous.
+
+    THE DIVISION OF LABOUR, written down once, here, because two independent
+    smoothers in series is how you get behaviour nobody can reason about.
+
+    This acts on the TOOLPATH AXES after the fact. The primary repair for bad
+    mesh normals is repair_mesh_normals() in noether_path.dpi, which acts on the
+    mesh itself: it fits a local surface to the POSITIONS over a geodesic
+    neighbourhood and never reads a normal at all. A median of the bad normals is
+    a better estimator than a mean of them; a fit to the positions does not
+    estimate them at all.
+
+    So on a path whose axis is already the repaired normal (orient="normal", and
+    `assert_only` is how that is passed in) the three stages divide like this:
+
+      stage 1, REPAIR       MEASURES ONLY. Its count must be ZERO, and a nonzero
+                            count is a FINDING -- it says the mesh repair did not
+                            hold and the reported axis disagrees with its own
+                            neighbourhood -- not a thing to fix quietly here.
+      stage 2, CUT AT A     STILL ACTS, and is not a repair at all: it is a
+      DISCONTINUITY         MOTION decision. A step that survives the mesh repair
+                            is real geometry (a bench lip, the top edge of a
+                            draped skirt), and ending the pass there so the arm
+                            lifts and re-approaches is the honest translation --
+                            where the tilt cap's answer to the same step is to
+                            throw the waypoints away. Costs no coverage.
+      stage 3, TURN-RATE    MEASURES ONLY. Clamping the axis TILTS THE PROBE OFF
+      BOUND                 THE SURFACE NORMAL, which is the one thing the
+                            constraint forbids, so on a constrained path it
+                            reports the excess and changes nothing. If a repaired
+                            mesh really turns faster than 10 deg/mm, that is the
+                            surface, and it is a reachability and speed question
+                            rather than a normals one.
+
+    With assert_only=False -- the default, and what an UNREPAIRED mesh gets -- all
+    three act. That path exists because a caller can plan on a mesh this cell did
+    not repair (MESH_REPAIR_NORMALS=False, a mesh handed in by hand,
+    orient="capped" for a non-contact sensor), and a backstop that only works
+    when the fix upstream ran is not a backstop.
+
+    smooth_tool_axis() in noether_path.dpi is the third smoother in this chain and
+    it DECLINES ENTIRELY on a constrained path; see its docstring for the 1.4
+    degrees a one-sided box mean would cost at the end of every pass.
+
+    Three stages, per pass, along arc length, with POSITIONS NEVER TOUCHED and
+    NOT ONE WAYPOINT DROPPED. The tip still goes exactly where the mesh says;
+    only which way the probe points changes, and only where the mesh cannot
+    support what it asked for.
+
+      1. REPAIR. The axis at each waypoint is compared with a median of its own
+         `window_m` of travel (_rolling_median_dirs()); anything more than
+         `outlier_deg` away is replaced by that median. This is what kills a
+         normal that disagrees with its neighbours, and unlike a mean it cannot
+         be fooled by one -- see the block above for the four alternating-sign
+         axes it was built for.
+
+      2. SPLIT AT A DISCONTINUITY. A step still over `split_deg` after the
+         repair is not noise and not a slope: it is the surface genuinely
+         turning inside one waypoint spacing -- the lip of the bench step, the
+         top edge of the draped skirt. THE PASS IS CUT THERE. That is the
+         honest translation of what the arm can do: it ends the pass, lifts,
+         and approaches the far side, instead of stopping mid-sweep and
+         rotating the wrist through 90 degrees with the probe on the part.
+         Cutting costs no coverage at all -- every waypoint is still in the
+         path -- where the tilt cap's answer to the same discontinuity is to
+         throw the waypoints away.
+
+         EXPECT THE BOUNDARY FIGURE IN THE REPORT TO RISE WHEN THIS FIRES, and
+         read it as the mechanism working rather than as a regression: a cut is
+         placed exactly at a big step, so the step is still in the numbers -- it
+         has moved from "inside a pass", where the arm stops mid-sweep with the
+         probe on the part, to "at a boundary", where it lifts and approaches. On
+         a reconstruction carrying a bench step, 190 cuts took the worst step
+         WITHIN a pass from 178.1 to 27.9 deg while the worst boundary step rose
+         from 116.7 to 165.7, and the number of actual scanning passes (over
+         PATH_MIN_SEGMENT_M) went from 471 to 473 -- most of the new pieces are
+         slivers, so the scan pays for two more approaches, not 190.
+
+      3. BOUND THE TURN RATE inside each resulting piece. The axis may turn at
+         most `max_turn_deg_per_mm` per millimetre of travel between
+         consecutive waypoints, and never less than `min_step_deg` at all (a
+         waypoint spacing of a micron -- Noether emits those -- must not mean a
+         bound of zero).
+
+         ONE SEQUENTIAL SWEEP, FORWARD, NOT AN ITERATION TO CONVERGENCE. Each
+         axis is clamped against one already settled and is never revisited, so
+         when the sweep ends every adjacent pair satisfies the bound -- exactly,
+         and provably, in a single pass over the piece.
+
+         An iterated PAIRWISE relaxation does NOT work here: it does not
+         terminate across a discontinuity the bound cannot express. Two
+         neighbours 154 degrees apart with a 1 degree budget between them make
+         each sweep undo the last -- 154.9 degrees still over the bound after
+         twelve sweeps on a real mesh, while quietly distorting the good axes
+         either side. Stage 2 is what removes that case, so stage 3 never meets
+         it.
+
+         A second, backward sweep would find nothing to do, since after a
+         successful forward sweep no pair is over the bound, so there is none.
+
+         The clamp is therefore one-directional, and the consequence is stated
+         rather than hidden: a correction accumulates DOWNSTREAM along the pass,
+         and the pass's first axis is taken on trust. Stage 1 is what protects
+         that first axis -- its median window is reflect-padded rather than
+         shrunk, so the waypoint at the start of a pass gets a full-width
+         estimate. A pass end is exactly where an edge artefact lives and a
+         half-width window there is half a defence.
+
+    A pass of two waypoints gets stages 2 and 3 only -- there is no
+    neighbourhood to take a median over, but there is still a step between them,
+    and a two-point sliver is exactly where the worst single step on a real path
+    lives.
+
+    ONLY FOR roll="locked". Every stage rebuilds the orientation from the tool
+    axis with locked_quats_from_axes(), which is the same construction
+    regularize_tool_roll(mode="locked") uses -- so for the eddy-current scan it
+    is exact, and for any other roll mode it would silently RE-LOCK a roll the
+    caller chose. Handed a path with another roll mode this returns it unchanged
+    and says so, the same way plan_ec_path() declines to average one.
+
+    Defaults come from the config, so a cell can retune them without editing
+    this file:
+
+      MESH_AXIS_SANITY              False turns the whole thing off (default on)
+      MESH_AXIS_WINDOW_M            the median window; falls back to
+                                    EC_AXIS_SMOOTHING_M, then 6 mm
+      MESH_AXIS_OUTLIER_DEG         disagreement that counts as noise (15 deg)
+      MESH_AXIS_SPLIT_DEG           a step this big is a discontinuity (20 deg)
+      MESH_AXIS_MAX_TURN_DEG_PER_MM the turn-rate bound (10 deg/mm)
+      MESH_AXIS_MIN_STEP_DEG        the floor under that bound (1 deg)
+
+    WHERE 15 DEGREES COMES FROM. It has to sit far enough above what a real
+    surface does that the repair can never touch geometry, and far enough below
+    the artefacts to catch them. Measured on a reconstructed part as the
+    distribution of exactly the quantity it thresholds -- each axis against a
+    6 mm median of its own pass:
+
+                                           p50    p95    p99   p99.9    max
+      the part and nothing else           0.025   0.11   0.17    0.33   83.6
+      the same part with the bench in it  0.076   3.55  28.66   85.56  173.1
+
+    The part's own surface disagrees with its own median by a THIRD of a degree
+    at the 99.9th percentile. 15 degrees is forty-five times that, and at that
+    threshold it repaired 5 waypoints of 41250 on the cropped mesh, every one of
+    them a genuine artefact; the same threshold catches 1.84% of the uncropped
+    one, which is the bench. There is a lot of room between 0.33 and 83.6; a
+    tighter value would repair more and is safe to try on a measured part, and a
+    looser one is not needed.
+
+    Leaves `path.axis_sanity` on the result: what it repaired, where it cut, what
+    it clamped, and the worst disagreement it saw.
+    """
+    if window_m is None:
+        window_m = globals().get("MESH_AXIS_WINDOW_M")
+    if window_m is None:
+        window_m = globals().get("EC_AXIS_SMOOTHING_M", 0.006)
+    window_m = float(window_m or 0.0)
+    if outlier_deg is None:
+        outlier_deg = float(globals().get("MESH_AXIS_OUTLIER_DEG", 15.0))
+    if max_turn_deg_per_mm is None:
+        max_turn_deg_per_mm = float(
+            globals().get("MESH_AXIS_MAX_TURN_DEG_PER_MM", 10.0))
+    if min_step_deg is None:
+        min_step_deg = float(globals().get("MESH_AXIS_MIN_STEP_DEG", 1.0))
+    if split_deg is None:
+        split_deg = float(globals().get("MESH_AXIS_SPLIT_DEG", 20.0))
+    if reference is None:
+        reference = getattr(path, "roll_reference",
+                            globals().get("NOETHER_ROLL_REFERENCE", (1.0, 0.0, 0.0)))
+
+    roll_mode = getattr(path, "roll_mode", None)
+    if roll_mode != "locked":
+        if verbose:
+            print("  NOT sanitising the tool axis: the roll is %r, and the "
+                  "repair re-locks it" % (roll_mode,))
+        return path
+    if window_m <= 0.0 and max_turn_deg_per_mm <= 0.0:
+        return path
+
+    pos = np.asarray(path.positions, dtype=np.float64)
+    q = np.asarray(path.quats, dtype=np.float64).reshape(-1, 4)
+    qn = np.linalg.norm(q, axis=1, keepdims=True)
+    qn[qn == 0.0] = 1.0
+    q = q/qn
+    x, y, zc, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    z = np.stack([2.0*(x*zc + y*w), 2.0*(y*zc - x*w), 1.0 - 2.0*(x*x + y*y)],
+                 axis=1)
+    out = z.copy()
+
+    repaired = 0
+    clamped = 0
+    worst_dev = 0.0
+    residual = 0.0
+    excess = 0.0
+    widths = []
+    splits = []
+    for a, b in path.segments:
+        n = b - a
+        if n < 2:
+            continue
+        seg = z[a:b].copy()
+        step = np.linalg.norm(np.diff(pos[a:b], axis=0), axis=1)
+
+        # --- 1. repair -------------------------------------------------------
+        if window_m > 0.0 and n >= 3:
+            moved = step[step > 0.0]
+            typical = float(np.median(moved)) if len(moved) else 0.0
+            # The window is named in METRES and the median is taken over a COUNT
+            # of waypoints, so the count comes from the pass's own typical step.
+            # Noether's spacing varies by orders of magnitude within one pass
+            # (0.00001 to 3.1 mm measured), which is why this is the median step
+            # and not the mean, and why the count is capped: a pass of dense
+            # microscopic steps must not turn into a 10 000-wide median.
+            k = 3 if typical <= 0.0 else int(round(window_m/typical))
+            k = max(3, min(k, 51))
+            widths.append(k)
+            med = _rolling_median_dirs(seg, k)
+            dev = np.degrees(np.arccos(np.clip(
+                np.einsum("ij,ij->i", seg, med), -1.0, 1.0)))
+            if len(dev):
+                worst_dev = max(worst_dev, float(dev.max()))
+            bad = dev > outlier_deg
+            if bad.any():
+                repaired += int(bad.sum())
+                if not assert_only:
+                    seg[bad] = med[bad]
+
+        # --- 2. cut where the axis is genuinely discontinuous ----------------
+        ang = np.degrees(np.arccos(np.clip(
+            np.einsum("ij,ij->i", seg[:-1], seg[1:]), -1.0, 1.0)))
+        cuts = (np.flatnonzero(ang > float(split_deg)) + 1
+                if split_deg > 0.0 else np.zeros(0, dtype=int))
+        splits.extend(int(a + c) for c in cuts)
+
+        # --- 3. bound the turn rate, inside each piece -----------------------
+        if max_turn_deg_per_mm > 0.0:
+            limit = np.maximum(min_step_deg, max_turn_deg_per_mm*step*1e3)
+            bounds = [0] + [int(c) for c in cuts] + [n]
+            for lo, hi in zip(bounds[:-1], bounds[1:]):
+                if hi - lo < 2:
+                    continue
+                piece = seg[lo:hi]
+                lim = limit[lo:hi-1]
+                if assert_only:
+                    # MEASURE THE EXCESS AND LEAVE THE AXIS ALONE. A clamp here
+                    # would tilt the probe off the repaired surface normal.
+                    a0 = np.degrees(np.arccos(np.clip(
+                        np.einsum("ij,ij->i", piece[:-1], piece[1:]), -1.0, 1.0)))
+                    over = a0 - lim
+                    clamped += int((over > 1e-12).sum())
+                    if len(over):
+                        excess = max(excess, float(over.max()))
+                    continue
+                # ONE SWEEP, FORWARD, AND THAT IS ENOUGH -- see the docstring.
+                # Each axis is clamped against one already settled and is not
+                # revisited, so every adjacent pair satisfies the bound when the
+                # sweep ends. `residual` below is the invariant check on that,
+                # and mesh_axis_sanity_test.py asserts it rather than trusting it.
+                for i in range(1, hi - lo):
+                    c = float(np.clip(np.dot(piece[i-1], piece[i]), -1.0, 1.0))
+                    th = math.acos(c)
+                    L = math.radians(lim[i-1])
+                    if th <= L + 1e-12:
+                        continue
+                    clamped += 1
+                    t = L/th
+                    s = math.sin(th)
+                    if s < 1e-12:
+                        continue
+                    v = (math.sin((1.0 - t)*th)*piece[i-1]
+                         + math.sin(t*th)*piece[i])
+                    nv = float(np.linalg.norm(v))
+                    if nv > 1e-12:
+                        piece[i] = v/nv
+                a2 = np.degrees(np.arccos(np.clip(
+                    np.einsum("ij,ij->i", piece[:-1], piece[1:]), -1.0, 1.0)))
+                residual = max(residual, float((a2 - lim).max()))
+
+        nv = np.linalg.norm(seg, axis=1, keepdims=True)
+        nv[nv < 1e-12] = 1.0
+        out[a:b] = seg/nv
+
+    # THE CUTS BECOME SEGMENT STARTS. Every waypoint is still in the path -- a
+    # cut only says that the pass ends here and the next one begins, which is
+    # what the acquisition already knows how to fly. A piece shorter than
+    # PATH_MIN_SEGMENT_M then reads as a link move rather than a scanning pass,
+    # which is the right answer for a two-waypoint sliver on the lip of a step.
+    starts = sorted(set(int(s) for s in path.segment_starts) | set(splits))
+    sane = ScanPath(pos.copy(), locked_quats_from_axes(out, reference),
+                    starts, source=path.source)
+    for attr in ("noether_flipped", "roll_mode", "roll_reference",
+                 "orient_mode", "max_tilt_deg", "segments_reversed",
+                 "axis_smoothing", "resampled", "roll_report",
+                 # WITHOUT THESE FOUR the path comes out of here having forgotten
+                 # that its axis is the repaired surface normal, and the next
+                 # stage averages it. Found by measuring: the same mesh read 0.99
+                 # deg off the normal through one route and 1.43 through the
+                 # other, and the difference was smooth_tool_axis() declining in
+                 # one and not the other.
+                 "normal_constrained", "normal_report", "normal_surface",
+                 "normal_offset"):
+        if hasattr(path, attr):
+            setattr(sane, attr, getattr(path, attr))
+    # RECOMPUTED, not carried: this is the number plan_mesh_path() prints as
+    # "worst orientation step between waypoints", and carrying the pre-repair
+    # value across would report the fault as though the fix had not run.
+    sane.worst_roll_step_deg = _worst_orientation_step(sane.quats)
+    sane.axis_sanity = {
+        "window_m": window_m, "outlier_deg": outlier_deg,
+        "split_deg": float(split_deg),
+        "max_turn_deg_per_mm": max_turn_deg_per_mm,
+        "min_step_deg": min_step_deg,
+        "median_width": int(np.median(widths)) if widths else 0,
+        "waypoints": int(len(out)),
+        "repaired": int(repaired), "clamped": int(clamped),
+        "split": int(len(splits)),
+        "passes_before": int(len(path.segments)),
+        "passes_after": int(len(sane.segments)),
+        "worst_disagreement_deg": float(worst_dev),
+        "assert_only": bool(assert_only),
+        "over_turn_bound_deg": float(max(excess, 0.0)),
+        "residual_over_bound_deg": float(max(residual, 0.0))}
+    if verbose and assert_only:
+        s = sane.axis_sanity
+        print("  tool-axis ASSERTION (the axis is already the repaired surface "
+              "normal, so this measures and does not change it): %d of %d "
+              "waypoints disagree with a %.1f mm median of their own pass by more "
+              "than %.0f deg (worst %.1f); %d step(s) turn faster than %.0f "
+              "deg/mm, by up to %.2f deg"
+              % (s["repaired"], s["waypoints"], window_m*1e3, outlier_deg,
+                 s["worst_disagreement_deg"], s["clamped"],
+                 max_turn_deg_per_mm, s["over_turn_bound_deg"]))
+        if s["repaired"]:
+            print("    FINDING: %d waypoint(s) whose axis came from the repaired "
+                  "mesh still disagree with a %.1f mm median of their own pass. "
+                  "There are two causes and the CUT COUNT below tells them apart: "
+                  "a pass that crosses a real step is CUT there, and this is that "
+                  "step counted from both sides of the cut (a mesh carrying a "
+                  "28.4 mm bench cliff inside one component reads about 1%% of "
+                  "its waypoints this way); a disagreement with no cut beside it "
+                  "means the mesh repair did not hold, and the mesh is what to "
+                  "look at. "
+                  "Either way EC_MAX_TILT_DEG is not the answer -- dropping these "
+                  "waypoints would delete coverage and change no axis."
+                  % (s["repaired"], window_m*1e3))
+    elif verbose:
+        s = sane.axis_sanity
+        print("  tool axis made robust before it is averaged: %d of %d "
+              "waypoints disagreed with a %.1f mm median of their own pass by "
+              "more than %.0f deg (worst %.1f) and were replaced; %d step(s) "
+              "clamped to %.0f deg/mm (median window %d waypoints)"
+              % (s["repaired"], s["waypoints"], window_m*1e3, outlier_deg,
+                 s["worst_disagreement_deg"], s["clamped"],
+                 max_turn_deg_per_mm, s["median_width"]))
+    if verbose:
+        s = sane.axis_sanity
+        if s["split"]:
+            print("    %d pass(es) CUT at a step still over %.0f deg after the "
+                  "repair -- the surface really turns there, so the pass ends "
+                  "and the next approaches the far side instead of the wrist "
+                  "rotating mid-sweep (%d passes -> %d; no waypoint dropped)"
+                  % (s["split"], split_deg, s["passes_before"], s["passes_after"]))
+        if s["residual_over_bound_deg"] > 1e-6:
+            # Cannot happen: one forward sweep settles every pair. Reported rather
+            # than asserted, because a planning stage must not die on its own
+            # invariant on the production system -- but it means this function is
+            # wrong.
+            print("    WARNING: %.3g deg still over the turn-rate bound. That is "
+                  "a fault in sanitize_tool_axis(), not in the mesh: the forward "
+                  "sweep is supposed to settle every pair."
+                  % (s["residual_over_bound_deg"],))
+    return sane
+
+
+global _direction_spread_deg
+def _direction_spread_deg(z):
+    """How far apart the two most different directions in `z` are, degrees.
+
+    The DIAMETER of the set, not the distance from its first member: measured
+    from the first member, one bad pose at the start of a pass reports the whole
+    pass as churning.
+
+    An exact diameter is every pair; this is the standard two-pass
+    approximation -- take the member furthest from the mean direction, then
+    measure everything against that one -- which is exact whenever the set is a
+    monotone sweep (a pass climbing a real slope: the case that matters) and
+    never overstates, since both passes measure real pairs.
+    """
+    z = np.asarray(z, dtype=np.float64).reshape(-1, 3)
+    if len(z) < 2:
+        return 0.0
+    m = z.mean(axis=0)
+    n = float(np.linalg.norm(m))
+    m = z[0] if n < 1e-12 else m/n
+    far = z[int(np.argmin(np.clip(z @ m, -1.0, 1.0)))]
+    return float(np.degrees(np.arccos(np.clip(z @ far, -1.0, 1.0))).max())
+
+
+global tool_axis_continuity
+def tool_axis_continuity(path, segments=None, max_tilt_deg=None, warn_deg=5.0,
+                         min_length_m=None):
+    """How much orientation the arm is asked for, measured where it feels it.
+
+    Three distinctions, because collapsing any of them makes a path read far
+    worse than it flies:
+
+      * WITHIN-PASS STEPS AND BOUNDARY STEPS SEPARATELY. A single largest step
+        over the whole quats array counts a pass boundary as a step between
+        waypoints, and they are not the same thing at all: a boundary is a lift,
+        a link move and an approach, while a step inside a pass is the arm
+        stopping mid-sweep and rotating. On a real path the two differ by tens of
+        degrees in either direction.
+      * SPREAD OVER THE PASS, not the angle from the pass's FIRST pose, which
+        reports a whole pass as varying because of one bad pose at its start.
+      * BOTH AGAIN OVER ONLY THE WAYPOINTS THAT SURVIVE `max_tilt_deg`, when it
+        is given. That is what the arm will see; the raw path includes
+        orientation that is about to be thrown away.
+
+    Returns a dict; describe_tool_axis_continuity() prints it.
+    """
+    if min_length_m is None:
+        min_length_m = globals().get("PATH_MIN_SEGMENT_M", 0.005)
+    if segments is None:
+        segments = path.acquiring_segments(min_length_m=min_length_m)
+    q = np.asarray(path.quats, dtype=np.float64).reshape(-1, 4)
+    qn = np.linalg.norm(q, axis=1, keepdims=True)
+    qn[qn == 0.0] = 1.0
+    q = q/qn
+    x, y, zc, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    z = np.stack([2.0*(x*zc + y*w), 2.0*(y*zc - x*w), 1.0 - 2.0*(x*x + y*y)],
+                 axis=1)
+    tilt = tool_tilt_deg(q)
+    keep = (tilt <= float(max_tilt_deg)) if max_tilt_deg is not None else None
+
+    pos = np.asarray(path.positions, dtype=np.float64).reshape(-1, 3)
+
+    def _measure(sel):
+        """(steps, turn rates, per-pass spreads) over the selected waypoints.
+
+        The RATE, deg per mm of travel, is the number with physical meaning. An
+        absolute step says nothing on its own because Noether's waypoint spacing
+        inside one pass spans four orders of magnitude (0.00001 to 3.1 mm
+        measured): 34 deg over a 7 mm step is the tool following a curve, and 34
+        deg over a 9 micron step is the arm standing still and rotating. The
+        absolute step alone cannot tell them apart.
+        """
+        steps, rates, lengths, spread = [], [], [], []
+        for a, b in segments:
+            idx = np.arange(a, b)
+            if sel is not None:
+                idx = idx[sel[a:b]]
+            if len(idx) < 2:
+                spread.append(0.0)
+                continue
+            zz = z[idx]
+            # Consecutive SURVIVING waypoints: when the cap drops a run out of
+            # the middle of a pass the acquisition drops the pass there too, so
+            # the pair either side of the gap is not a step the arm makes. It is
+            # counted anyway, and deliberately: over-reporting a discontinuity
+            # is the safe direction, and toolpath_segments splits on length, not
+            # on this.
+            c = np.clip(np.einsum("ij,ij->i", zz[:-1], zz[1:]), -1.0, 1.0)
+            ang = np.degrees(np.arccos(c))
+            steps.append(ang)
+            d = np.linalg.norm(np.diff(pos[idx], axis=0), axis=1)*1e3
+            lengths.append(d)
+            rates.append(ang/np.maximum(d, 1e-3))     # per mm, floored at 1 um
+            spread.append(_direction_spread_deg(zz))
+        steps = np.concatenate(steps) if steps else np.zeros(0)
+        rates = np.concatenate(rates) if rates else np.zeros(0)
+        lens = np.concatenate(lengths) if lengths else np.zeros(0)
+        return steps, rates, lens, np.asarray(spread, dtype=np.float64)
+
+    # BOUNDARIES OVER EVERY CONSECUTIVE SEGMENT, not just the scanning ones.
+    # `segments` is filtered to passes over PATH_MIN_SEGMENT_M, so consecutive
+    # entries of it are not adjacent in the array and the step between them is
+    # not a step at all. Measured that way the boundary figure comes out tens of
+    # degrees below the worst_roll_step_deg printed two lines above it, which
+    # makes the whole report look inconsistent.
+    allseg = list(path.segments)
+    boundary = []
+    for (_a, b), (c2, _d2) in zip(allseg[:-1], allseg[1:]):
+        if c2 != b:
+            continue
+        boundary.append(float(np.degrees(np.arccos(np.clip(
+            float(np.dot(z[b-1], z[c2])), -1.0, 1.0)))))
+    boundary = np.asarray(boundary, dtype=np.float64)
+
+    def _pack(steps, rates, lens, spread):
+        bad = np.flatnonzero(spread > float(warn_deg))
+        # The step that produced the worst RATE, carried so the line can print
+        # its denominator. Noether's spacing reaches a micron, and 1 deg over a
+        # micron is 1000 deg/mm -- an alarming number for a negligible motion, so
+        # the report says over what distance.
+        k = int(rates.argmax()) if len(rates) else -1
+        return {"passes": int(len(spread)),
+                "step_p99_deg": float(np.percentile(steps, 99)) if len(steps) else 0.0,
+                "step_max_deg": float(steps.max()) if len(steps) else 0.0,
+                "rate_p99_deg_per_mm": float(np.percentile(rates, 99)) if len(rates) else 0.0,
+                "rate_max_deg_per_mm": float(rates.max()) if len(rates) else 0.0,
+                "rate_max_over_mm": float(lens[k]) if k >= 0 else 0.0,
+                "spread_max_deg": float(spread.max()) if len(spread) else 0.0,
+                "passes_varying": int(len(bad)),
+                "worst_passes": [int(i) for i in bad[np.argsort(spread[bad])[::-1]][:8]]}
+
+    rep = {"warn_deg": float(warn_deg),
+           "tilt_max_deg": float(tilt.max()) if len(tilt) else 0.0,
+           "tilt_mean_deg": float(tilt.mean()) if len(tilt) else 0.0,
+           "boundaries": int(len(boundary)),
+           "boundary_p99_deg": float(np.percentile(boundary, 99)) if len(boundary) else 0.0,
+           "boundary_max_deg": float(boundary.max()) if len(boundary) else 0.0,
+           "whole": _pack(*_measure(None)), "capped": None,
+           "max_tilt_deg": None if max_tilt_deg is None else float(max_tilt_deg)}
+    if keep is not None:
+        rep["dropped_by_cap"] = int((~keep).sum())
+        rep["capped"] = _pack(*_measure(keep))
+    return rep
+
+
+global describe_tool_axis_continuity
+def describe_tool_axis_continuity(rep, indent="  "):
+    """The lines plan_mesh_path() prints from tool_axis_continuity()."""
+    out = []
+    for name, key in (("", "whole"), (" once EC_MAX_TILT_DEG has cropped it", "capped")):
+        d = rep.get(key)
+        if d is None:
+            continue
+        out.append("%sorientation along a pass%s: worst step between "
+                   "consecutive waypoints %.2f deg (p99 %.2f), worst turn rate "
+                   "%.1f deg/mm (over a %.4f mm step; p99 %.1f deg/mm)"
+                   % (indent, name, d["step_max_deg"], d["step_p99_deg"],
+                      d["rate_max_deg_per_mm"], d["rate_max_over_mm"],
+                      d["rate_p99_deg_per_mm"]))
+        if d["passes_varying"]:
+            # A SWEEP AND A ROTATION LOOK THE SAME IN THE SPREAD AND DIFFERENT IN
+            # THE RATE, so the rate is what this line says out loud. A pass that
+            # runs across a 60 mm crown legitimately turns the tool through 110
+            # degrees end to end, one degree per millimetre, and the arm follows
+            # it without stopping; a bad-normals fault shows the same spread at
+            # hundreds of degrees per millimetre. Reporting the spread alone
+            # makes the first read like the second, which is how a curved part
+            # gets "fixed" by flattening it.
+            bound = float(globals().get("MESH_AXIS_MAX_TURN_DEG_PER_MM", 10.0))
+            gradual = d["rate_max_deg_per_mm"] <= bound
+            out.append("%s  %d of %d pass(es) vary by up to %.1f deg along their "
+                       "own length (%s). %s"
+                       % (indent, d["passes_varying"], d["passes"],
+                          d["spread_max_deg"],
+                          ", ".join(str(i) for i in d["worst_passes"]),
+                          "At %.1f deg/mm that is the SURFACE TURNING, and the arm "
+                          "follows it without stopping -- a pass across a curved "
+                          "part is supposed to look like this."
+                          % (d["rate_max_deg_per_mm"],) if gradual else
+                          "At %.1f deg/mm, past the %.0f deg/mm this cell can "
+                          "follow, the arm stops and rotates mid-pass for that."
+                          % (d["rate_max_deg_per_mm"], bound)))
+        else:
+            out.append("%s  every one of %d pass(es) holds its orientation to "
+                       "within %.2f deg along its own length"
+                       % (indent, d["passes"], d["spread_max_deg"]))
+    out.append("%sacross each of %d pass boundaries (a lift and an approach, "
+               "NOT a mid-pass rotation): up to %.1f deg, p99 %.1f"
+               % (indent, rep["boundaries"], rep["boundary_max_deg"],
+                  rep["boundary_p99_deg"]))
+    return out
+
+
+# ==============================================================================
+# EC_MAX_TILT_DEG IS A REACHABILITY LIMIT, AND AN UNREACHABLE REGION IS REPORTED
+# ==============================================================================
+# The cap bounds tilt from VERTICAL and does nothing else. It is NOT the
+# pipeline's answer to bad normals: dropping every waypoint over the bound pays
+# coverage for a measurement error and leaves the survivors just as wrong. The
+# normals are repaired at the mesh (repair_mesh_normals()) and the tool axis is
+# constrained to the repaired normal (orient="normal"), which leaves the cap
+# exactly one job:
+#
+#   CAN THE ARM HOLD THIS POSE? A surface that stands at 60 degrees needs a tool
+#   axis at 60 degrees, and that is CORRECT -- the probe is normal to the
+#   surface, which is the whole requirement. What is in question is the ARM: the
+#   IK branch, the measured cable envelope (cable_envelope.dpi), and whether the
+#   Keyence body and the Azure bracket clear the part at that attitude
+#   (tooling_clearance.dpi). Those are properties of the work cell, not of the mesh.
+#
+# LOWERING THE CAP IS NOT A FIX FOR BAD NORMALS; repairing the normals is. A
+# region the cap excludes is REPORTED -- what it is, where it is, how much of the
+# scan it is -- instead of disappearing into a one-line waypoint count.
+
+
+global tool_reachability_report
+def tool_reachability_report(path, max_tilt_deg=None, min_points=2,
+                             up=(0.0, 0.0, 1.0), min_length_m=None):
+    """What a tilt-from-vertical limit would exclude, and where. -> dict
+
+    Measures; excludes nothing. The drop itself happens downstream in the scan
+    config (plan_ec_path()'s _crop_path_by_mask), and this is the report that used
+    to be missing when it did.
+
+    NOT A MEASURE OF NORMAL ERROR. A pose 60 degrees from vertical on a 60 degree
+    surface is right, and assert_probe_normal_to_surface() is the check that says
+    so. The two numbers moved in opposite directions when the normals were
+    repaired -- the tilt from vertical on a curved part goes UP, because the poses
+    now genuinely follow the surface -- so reading one as the other is exactly the
+    conflation this exists to end.
+
+    Returns, with None for max_tilt_deg meaning "nothing is excluded":
+      cap_deg, waypoints, excluded, excluded_fraction, tilt_max_deg,
+      tilt_p99_deg, excluded_tilt_min_deg, bbox (lo, hi of the excluded
+      positions), passes_touched, passes_lost, passes_split, travel_excluded_m,
+      travel_total_m, worst_pass and per_pass (a list of the worst offenders).
+    """
+    # globals().get, matching the guarded use at the top of this file: this
+    # constant is supplied by the CONFIG, not by any .dpi -- ECAutomatedScan.dgp
+    # says 0.005 and UTPlaneScan.dgp says 0.02 -- so a bare reference makes this
+    # function uncallable from a test harness, or from anything that has not
+    # loaded a config.
+    min_length_m = (globals().get("PATH_MIN_SEGMENT_M", 0.005)
+                    if min_length_m is None else float(min_length_m))
+    pos = np.asarray(path.positions, dtype=np.float64).reshape(-1, 3)
+    tilt = tool_tilt_deg(path.quats, up=up)
+    rep = {"cap_deg": None if max_tilt_deg is None else float(max_tilt_deg),
+           "waypoints": int(len(tilt)),
+           "tilt_max_deg": float(tilt.max()) if len(tilt) else 0.0,
+           "tilt_p99_deg": float(np.percentile(tilt, 99)) if len(tilt) else 0.0,
+           "tilt_mean_deg": float(tilt.mean()) if len(tilt) else 0.0,
+           "excluded": 0, "excluded_fraction": 0.0, "bbox": None,
+           "passes_touched": 0, "passes_lost": 0, "passes_split": 0,
+           "travel_excluded_m": 0.0, "travel_total_m": 0.0,
+           "excluded_tilt_min_deg": 0.0, "per_pass": [], "worst_pass": None,
+           "facing_away": int((tilt > 90.0).sum()) if len(tilt) else 0}
+    segs = [(a, b) for a, b in path.segments if b > a]
+    for a, b in segs:
+        if b - a > 1:
+            rep["travel_total_m"] += float(np.linalg.norm(
+                np.diff(pos[a:b], axis=0), axis=1).sum())
+    if max_tilt_deg is None or not len(tilt):
+        return rep
+    cap = float(max_tilt_deg)
+    over = tilt > cap
+    rep["excluded"] = int(over.sum())
+    rep["excluded_fraction"] = float(over.mean())
+    if not over.any():
+        return rep
+    rep["excluded_tilt_min_deg"] = float(tilt[over].min())
+    lo = pos[over].min(axis=0)
+    hi = pos[over].max(axis=0)
+    rep["bbox"] = (tuple(float(c) for c in lo), tuple(float(c) for c in hi))
+    per = []
+    for si, (a, b) in enumerate(segs):
+        m = over[a:b]
+        if not m.any():
+            continue
+        # What the crop would do to this pass: the surviving RUNS of waypoints,
+        # since a run shorter than min_points is dropped as well. A pass that
+        # loses its middle becomes two, which costs an extra approach; one whose
+        # every run is too short is lost outright.
+        runs, run = [], 0
+        for keep in list(~m) + [False]:
+            if keep:
+                run += 1
+                continue
+            if run:
+                runs.append(run)
+            run = 0
+        kept = [r for r in runs if r >= int(min_points)]
+        seg_travel = (float(np.linalg.norm(np.diff(pos[a:b], axis=0), axis=1).sum())
+                      if b - a > 1 else 0.0)
+        lost = seg_travel*float(m.mean())
+        rep["travel_excluded_m"] += lost
+        rep["passes_touched"] += 1
+        if not kept:
+            rep["passes_lost"] += 1
+        elif len(kept) > 1:
+            rep["passes_split"] += 1
+        per.append({"segment": si, "start": int(a), "waypoints": int(b - a),
+                    "excluded": int(m.sum()), "tilt_max_deg": float(tilt[a:b].max()),
+                    "pieces_kept": len(kept), "travel_excluded_m": lost,
+                    "long_enough": seg_travel >= min_length_m})
+    per.sort(key=lambda d: -d["excluded"])
+    rep["per_pass"] = per[:10]
+    rep["worst_pass"] = per[0] if per else None
+    return rep
+
+
+global describe_tool_reachability
+def describe_tool_reachability(rep, indent="  "):
+    """The reachability report, as the lines a scan log should carry."""
+    if rep is None:
+        return []
+    out = ["%stilt from VERTICAL (a reachability question, NOT a normal error): "
+           "up to %.1f deg, p99 %.1f, mean %.1f over %d waypoints"
+           % (indent, rep["tilt_max_deg"], rep["tilt_p99_deg"],
+              rep["tilt_mean_deg"], rep["waypoints"])]
+    if rep["cap_deg"] is None:
+        out.append("%s  no tilt limit is set, so nothing is excluded" % (indent,))
+        return out
+    if not rep["excluded"]:
+        out.append("%s  all of it is within the %.0f deg limit: NOTHING is "
+                   "excluded, and the whole planned surface is scannable"
+                   % (indent, rep["cap_deg"]))
+        return out
+    lo, hi = rep["bbox"]
+    out.append("%s  UNREACHABLE REGION: %d of %d waypoints (%.2f%%) lean %.1f to "
+               "%.1f deg, past the %.0f deg limit, and the scan config will "
+               "exclude them."
+               % (indent, rep["excluded"], rep["waypoints"],
+                  100.0*rep["excluded_fraction"], rep["excluded_tilt_min_deg"],
+                  rep["tilt_max_deg"], rep["cap_deg"]))
+    out.append("%s    WHERE  x %.3f..%.3f  y %.3f..%.3f  z %.3f..%.3f m"
+               % (indent, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]))
+    if rep.get("facing_away"):
+        out.append("%s    OF WHICH %d waypoint(s) sit on surface that faces AWAY "
+                   "from the probe (past 90 deg). A probe coming from above cannot "
+                   "touch those at any tilt, and they are NOT a sign error to be "
+                   "flipped -- flipping one points the probe at a surface facing "
+                   "the other way, which is a 180 deg tilt from the normal. Crop "
+                   "the region, or approach from another direction."
+                   % (indent, rep["facing_away"]))
+    out.append("%s    COST   %.3f m of %.3f m of travel, over %d pass(es): %d "
+               "lost outright, %d split in two (an extra approach each)"
+               % (indent, rep["travel_excluded_m"], rep["travel_total_m"],
+                  rep["passes_touched"], rep["passes_lost"], rep["passes_split"]))
+    w = rep["worst_pass"]
+    if w is not None:
+        out.append("%s    WORST  pass %d loses %d of %d waypoints (tilt up to "
+                   "%.1f deg) and keeps %d piece(s)"
+                   % (indent, w["segment"], w["excluded"], w["waypoints"],
+                      w["tilt_max_deg"], w["pieces_kept"]))
+    out.append("%s    THIS IS NOT A NORMALS PROBLEM. The probe is normal to the "
+               "surface at every one of those waypoints (the postcondition above "
+               "is the number). They are excluded because the ARM cannot hold "
+               "that attitude -- IK branch, cable envelope, the Keyence body and "
+               "Azure bracket clearing the part. Reaching them needs a different "
+               "approach direction or different tooling, NOT a different cap: "
+               "raising the cap asks for poses nobody has measured the cables at, "
+               "and lowering it deletes more surface." % (indent,))
+    return out
+
+
+
+global _mesh_pitch
+def _mesh_pitch():
+    """Trace pitch along a pass. Kept as the old name; see trace_pitch()."""
+    return trace_pitch()
+
+global mesh_path_feasibility
+def mesh_path_feasibility(path=None, sample=15, lifts=(0.0,), verbose=True):
+    """Can the arm actually enter and finish these passes? Ask before scanning.
+
+    Reproduces exactly what approach_row_start() does -- solve IK at the pass END
+    with collision checking, seed the START from that solution, and check both --
+    because that, and not "is this pose reachable", is what decides whether a pass
+    completes. On a real specimen mesh every pose can be individually reachable
+    while almost none of the passes are enterable, so the cheap test is the
+    misleading one.
+
+    Costs a couple of IK calls per sampled segment and moves nothing.
+    """
+    path = mesh_scan_path if path is None else path
+    if path is None:
+        raise RuntimeError("no toolpath planned yet -- call plan_mesh_path() first")
+
+    segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    lengths = [path.segment_length_m(s) for s in segs]
+    order = list(np.argsort(lengths)[::-1][:sample])
+    report = []
+    for lift in lifts:
+        ok_end = 0
+        ok_both = 0
+        for si in order:
+            start, end = segs[si]
+            p_end = path.positions[end-1] + np.array([0.0, 0.0, lift])
+            p_start = path.positions[start] + np.array([0.0, 0.0, lift])
+            q_end = ros.SolveIK(_pose_stamped(p_end, path.quats[end-1]))
+            if q_end is None:
+                continue
+            ok_end += 1
+            q_start = ros.SolveIK(_pose_stamped(p_start, path.quats[start]), seed=q_end)
+            if q_start is not None:
+                ok_both += 1
+        report.append({"lift_m": lift, "sampled": len(order),
+                       "valid_end": ok_end, "valid_both": ok_both})
+        if verbose:
+            print("  lift %+.3f m: %d/%d passes have a usable end configuration, "
+                  "%d/%d usable at both ends"
+                  % (lift, ok_end, len(order), ok_both, len(order)))
+    return report
+
+global _pose_msg
+def _pose_msg(xyz, quat_xyzw):
+    """A bare geometry_msgs/Pose, for filling a PoseArray."""
+    p = Pose()
+    p.position.x = float(xyz[0])
+    p.position.y = float(xyz[1])
+    p.position.z = float(xyz[2])
+    p.orientation.x = float(quat_xyzw[0])
+    p.orientation.y = float(quat_xyzw[1])
+    p.orientation.z = float(quat_xyzw[2])
+    p.orientation.w = float(quat_xyzw[3])
+    return p
+
+global _pose_stamped
+def _pose_stamped(xyz, quat_xyzw, frame="world"):
+    """The same pose, stamped -- which for IK is not optional.
+
+    SolveIK() falls back to the module's from_frame_rel when handed a bare Pose,
+    and this module was constructed as motion('ros', recdb, 'probe_end', 'world')
+    -- so an unstamped pose is interpreted in the PROBE's own frame. Every
+    solution then comes back empty and it reads exactly like an unreachable
+    toolpath: no pass solvable, over ground the flat scan raster covers without
+    trouble. The plane path does not hit this because scan_corners() builds its
+    poses from live TF, which arrives stamped 'world' already.
+    """
+    ps = PoseStamped()
+    ps.header.frame_id = frame
+    ps.pose = _pose_msg(xyz, quat_xyzw)
+    return ps
+
+global Scan2DMeshPath
+def Scan2DMeshPath(path=None, x3d=None, max_passes=None, force=False):
+    """Acquire along a planned toolpath. No grid, no rectangular volume.
+
+    The differences from Scan2DPlaneTriggered are exactly the ones the geometry
+    forces, and no others:
+
+      * no volume and no /ut_cscan, because there is no grid to index. The trace
+        list plus the projection is the output.
+      * every pose on the path carries its own orientation, so the probe follows
+        the surface rather than holding one attitude.
+      * a pass that will not plan is DROPPED and reported rather than aborting
+        the scan. Noether segments are ragged and some of them will not plan;
+        with a trace list a dropped pass costs coverage there and nothing
+        anywhere else, which is not true of a grid.
+    """
+    global scan_origin, mesh_scan_path, mesh_scan_x3d
+
+    path = mesh_scan_path if path is None else path
+    x3d = mesh_scan_x3d if x3d is None else x3d
+    if path is None:
+        raise RuntimeError("no toolpath planned yet -- call plan_mesh_path() first")
+    if getattr(ascan_source, "trigger_mode", "timer") not in ("position", "timestamped"):
+        raise RuntimeError("Scan2DMeshPath needs ASCAN_TRIGGER_MODE = 'position' or "
+                           "'timestamped'. There is no grid here to bin a free-running "
+                           "digitizer into, so the trigger IS the trace index.")
+
+    segs = path.acquiring_segments(min_length_m=PATH_MIN_SEGMENT_M)
+    if max_passes is not None:
+        segs = segs[:max_passes]
+    # No grid here, so nothing constrains the pitch: the requested step size
+    # is the step size.
+    pitch = set_trigger_pitch(SCAN_STEP_SIZE)
+
+    # The simulator's defect map is keyed on position relative to the scan
+    # origin, so give it the toolpath's own footprint corner.
+    #
+    # scan_origin is ONE cell-wide variable, written by whichever scan is
+    # running -- here, by plane_scan.dpi's three Scan2DPlane* (the grid's
+    # corner) and by surface_path_scan.dpi's run_surface_path_scan() (the same
+    # footprint corner as here). Readers are UTPlaneScan.dgp's
+    # probe_position_relative_to_scan() and the simulated specimen, and both
+    # want the CURRENT scan's origin, so the writer being whoever started last
+    # is the behaviour, not a collision. Allowlisted in dpi_exports_test.py.
+    scan_origin = (float(path.positions[:, 0].min()), float(path.positions[:, 1].min()))
+    origin_xy = scan_origin
+
+    _show_cscan_panel()
+    travel = sum(path.segment_length_m(s) for s in segs)
+    print("Mesh path scan: %d passes, %.3f m of travel, %d traces expected at %.2f mm"
+          % (len(segs), travel, path.trace_count(pitch, segs), pitch*1e3))
+
+    # The projection extent is the surface's own footprint, not a pass length:
+    # the parameterization spans the whole part, so that is what the pixel count
+    # has to resolve the spot against.
+    extent = float(max(path.positions[:, 0].ptp(), path.positions[:, 1].ptp()))
+    plan = plan_current_scan(path_length_m=travel, passes=len(segs),
+                             step_m=pitch, projection_extent_m=extent,
+                             force=force)
+
+    # THE PROBE IS MEANT TO TOUCH THE PART, so say so to the planner -- here,
+    # immediately before the passes, rather than at bring-up. plan_mesh_path()
+    # put the specimen in the planning scene (that is what makes MoveIt's own
+    # collision check mean anything), and with it there every pose of a CONTACT
+    # scan is in collision by construction. The pair goes in the scene's
+    # allowed-collision matrix; the Keyence head, the Azure and its bracket keep
+    # their protection, which is the whole point.
+    if globals().get("allow_specimen_contact") is not None:
+        try:
+            if SPECIMEN_SCENE_ID in planning_scene_objects():
+                allow_specimen_contact(TOOLING_CONTACT_LINKS)
+        except Exception as e:
+            print("  WARNING: could not declare the probe's contact with the "
+                  "specimen (%s). If the specimen is in the planning scene the "
+                  "passes will be refused as collisions; "
+                  "remove_specimen_from_scene() is the blunt way out." % (e,))
+
+    _prepare_trace_accum(path.trace_count(pitch, segs))
+
+    positions = np.array(path.positions, dtype=np.float64)
+    quats = np.array(path.quats, dtype=np.float64)
+
+    def _approach(idx, end_idx):
+        # Same reasoning as approach_row_start(): solve the far end first and
+        # seed the start from it, so the pass is entered in a configuration that
+        # can also finish it. Here it goes through MoveIt, so the move is
+        # collision checked rather than merely commanded.
+        start_pose = _pose_stamped(positions[idx], quats[idx])
+        end_pose = _pose_stamped(positions[end_idx], quats[end_idx])
+        q = ros.ApproachInConfiguration(start_pose, end_pose)
+        if q is not None:
+            return True
+        print("    no row-spanning configuration for this pass")
+        return False
+
+    def _sweep(start, end):
+        poses = PoseArray()
+        poses.header.frame_id = "world"
+        for k in range(start, end):
+            poses.poses.append(_pose_msg(positions[k], quats[k]))
+        # A row of waypoints: the looser IK threshold, or it truncates. See
+        # scan_plan.dpi's motion_kind().
+        r = (globals().get("cartesian_move") or ros.CartesianMove)(
+            poses, vel=raster_velocity(), acc=RASTER_ACCEL,
+            min_fraction=PATH_MIN_FRACTION)
+        return _move_outcome(r)
+
+    def _pose_at(seg, s_m, xy):
+        start, end = seg
+        s0 = path.s_m[start]
+        idx = int(np.searchsorted(path.s_m[start:end], s0 + s_m) + start)
+        idx = min(max(idx, start), end-1)
+        pos = positions[idx]
+        x, y = float(pos[0]), float(pos[1])
+        if xy is not None:
+            # The trigger's xy is measured and interpolated to the exact
+            # crossing, so it beats the commanded value. z and the orientation
+            # still come from the path -- the surface is what says how high the
+            # probe was and which way it was pointing.
+            x = float(xy[0]) + origin_xy[0]
+            y = float(xy[1]) + origin_xy[1]
+        return pose7_from_parts((x, y, float(pos[2])), tuple(quats[idx]))
+
+    def _setup():
+        # SHARED STATE, OWNED BY scan_accumulation.dpi -- which is where these
+        # four (with projector, below) are initialised and where a plane scan
+        # sets them. Writing them from here is deliberate and is not a name
+        # clash: they are the HANDLES on the math functions and the projection,
+        # and a mesh scan has to take the plane scan's down before it can build
+        # its own. Only one scan mode runs at a time, so whichever ran last owns
+        # the objects. Allowlisted in dpi_exports_test.py.
+        global cscan_gates, ndaccumulator, cscanfunction
+        # An earlier scan in this process may have left a gate chain, and a plane
+        # scan's volume accumulator reading /current_ascan with a c-scan reading
+        # the volume. Nothing here feeds that volume a grid, so every trace this
+        # scan stages would land in it at an index that means nothing.
+        #
+        # The gates go first and in their own transaction: teardown_gated_cscan
+        # opens one, and it has to RELEASE the gate parameter channels, not just
+        # delete the functions, or setup_gated_cscan below cannot define them
+        # again.
+        if cscan_gates is not None:
+            teardown_gated_cscan(recdb, cscan_gates)
+            cscan_gates = None
+
+        transact = recdb.start_transaction()
+        if cscanfunction is not None:
+            transact.delete_math_function(["/ut_cscan", "/ut_cscan_tof"], cscanfunction)
+            cscanfunction = None
+        if ndaccumulator is not None:
+            transact.delete_math_function(["/ut_scan_volume"], ndaccumulator)
+            ndaccumulator = None
+        transact.end_transaction().globalrev_wait().wait_complete()
+
+        if trace_accum is not None:
+            trace_accum.setup()
+            cscan_gates = setup_gated_cscan(recdb, trace_accum.traces_path, "/ut/gate",
+                                            CSCAN_GATES)
+        if projection_enabled() and x3d is not None:
+            # Same shared handle scan_accumulation.dpi's _setup_projection()
+            # builds for a plane scan, and on the same "/ut/proj" prefix --
+            # which is exactly why it must be the SAME name: a second
+            # SurfaceProjector on that prefix cannot be built, so reuse or
+            # teardown has to see the other mode's object. Allowlisted in
+            # dpi_exports_test.py.
+            global projector
+            radius, pixels = projection_settings(scan_plan)
+            # PATH AND CONTENTS, not the path alone. The same filename may hold
+            # a different surface -- see projection_surface_reusable().
+            reuse, why = projection_surface_reusable(projector, x3d)
+            if reuse:
+                # Same surface: empty the picture and reuse it. Rebuilding is not
+                # an option -- the channels x3d_load_geometry defines under the
+                # model tree cannot be handed back from Python, so a second
+                # SurfaceProjector on the same prefix fails. See restart().
+                # restart() re-instantiates the math function, so a changed spot
+                # radius or pixel count does take effect on the reused surface.
+                projector.radius = radius
+                projector.horizontal_pixels = pixels
+                projector.vertical_pixels = pixels
+                projector.restart()
+                print("  projection surface reused (image cleared): %s" % x3d)
+            else:
+                if projector is not None:
+                    projector.teardown()
+                    projector = None
+                    print("  rebuilding the projection surface -- %s" % (why,))
+                projector = SurfaceProjector(recdb, x3d, prefix="/ut/proj",
+                                             radius=radius,
+                                             horizontal_pixels=pixels,
+                                             vertical_pixels=pixels,
+                                             create_textured_part=PROJECTION_TEXTURED_PART,
+                                             offset=NOETHER_MESH_OFFSET)
+                print("  projection surface: %s" % x3d)
+            # BEFORE ANY TRACE IS STAGED: is that surface under this toolpath at
+            # all? Raises on disjoint. The passes have not started here -- this
+            # hook runs after the first reading, at the first touchdown -- so a
+            # refusal costs one pose and not a whole scan onto an empty image.
+            check_projection_covers_path(projector, path, what="toolpath")
+
+    def _progress(si, nseg, seg_report, elapsed):
+        if seg_report.get("skipped"):
+            print("  pass %d/%d: SKIPPED, %.3f m of coverage lost, %.1f s elapsed"
+                  % (si+1, nseg, seg_report["length_m"], elapsed))
+            return
+        L = seg_report["length_m"]
+        frac = seg_report.get("fraction")
+        print("  pass %d/%d: %d traces (expected %d), commanded %.3f m / observed "
+              "%.3f m (%.0f%%)%s, %.1f s elapsed"
+              % (si+1, nseg, seg_report["staged"], seg_report["expected"], L,
+                 seg_report["observed_m"],
+                 100.0*seg_report["observed_m"]/L if L else 0.0,
+                 "" if frac is None else ", planner %.0f%%" % (100.0*frac),
+                 elapsed))
+
+    # Hold move_group's IK in local mode for the scan: it starts global for
+    # interactive work, and a global solver may change arm branch mid-path and
+    # truncate a row. See motion_profile() in scan_plan.dpi.
+    _ik_hold = motion_profile("scan")
+    _ik_hold.__enter__()
+    try:
+        report = run_triggered_path_scan(path, ascan_source, pitch,
+                                         _approach, _sweep, _stage_ascan, _pose_at,
+                                         setup_after_first=_setup, segments=segs,
+                                         progress=_progress,
+                                         on_segment_failure="skip")
+    finally:
+        ascan_source.disarm()
+        ros.WaitUnPauseAcquisition()
+        _ik_hold.__exit__(None, None, None)
+
+    print("Mesh path scan complete: %d traces (%d expected), %.1f s, %.3f s/trace."
+          % (report["staged"], report["expected_traces"], report["elapsed"],
+             report["elapsed"]/max(report["staged"], 1)))
+    if report.get("skipped"):
+        lost = sum(s["length_m"] for s in report["skipped"])
+        print("  %d pass(es) dropped, %.3f m of planned coverage not acquired. "
+              "The traces that were taken are still correct -- each carries its "
+              "own pose -- but that ground was not scanned."
+              % (len(report["skipped"]), lost))
+    report_scan_outcome(report)
+    finish_projection()
+    return report

@@ -1,0 +1,158 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  surface_distance_fast.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Installs the compiled bounding-volume-hierarchy backend for signed
+#   point-to-surface distance.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# THE FAST BACKEND FOR SurfaceDistance.signed_distance()
+# ==============================================================================
+# tooling_clearance.dpi answers "how far is this point from the scanned surface,
+# and which side is it on" with a kD-tree over triangle centroids and a widening
+# candidate set. It is correct and it is slow: 30 to 90 microseconds per point
+# against the work cell's 198 422-triangle reconstruction, measured on the dev
+# host. A clearance gate asks that question tens of millions of times for one
+# toolpath, so that number is the difference between a gate that runs in seconds
+# and one that runs overnight.
+#
+# This include swaps in a bounding-volume-hierarchy kernel written in C++ and
+# loaded through ctypes: the same question, the same answer, the same sign
+# convention, 0.2 to 0.5 microseconds per point on eight cores. It replaces ONE
+# METHOD on the class tooling_clearance.dpi already built -- signed_distance --
+# so the class itself, its constructor, its normal-orientation rule and
+# reporting, describe(), distance(), triangle_radius, k0, every instance already
+# made and every isinstance() check are untouched. The numpy implementation
+# stays reachable as SurfaceDistance.signed_distance_numpy().
+#
+# IT IS NOT ONLY FASTER, IT IS MORE CORRECT, in two ways that are measured
+# rather than claimed:
+#
+#   * The numpy path stops widening its candidate set at max_k and can return a
+#     distance up to 0.19 mm LARGER than the true one -- about one random point
+#     in ten thousand against the work cell's reconstruction, always in the
+#     optimistic direction. The BVH matches brute force over every triangle
+#     exactly, on 300 000 points.
+#
+#   * exact_within / exact_each are accepted but NOT used to prune, because an
+#     unsigned cap can report a positive number for a point that is inside the
+#     surface. Measured on a flat plate: the numpy path returns +0.100 for a
+#     point 100 mm BELOW it when exact_within=0.05. Dropping the cap costs about
+#     4x on a far-point-heavy mix and removes that inversion; the gate can only
+#     become more conservative, never less. See signed_distance's docstring in
+#     surface_distance_fast.py for the full argument and the numbers.
+#
+# INCLUDE IT AFTER tooling_clearance.dpi and before anything that builds a
+# SurfaceDistance:
+#
+#     include(None, os.path.join(SCAN_MODULE_DIR, "tooling_clearance.dpi"))
+#     include(None, os.path.join(SCAN_MODULE_DIR, "surface_distance_fast.dpi"))
+#
+# That is the whole installation. It is a separate file on purpose: it edits no
+# line of tooling_clearance.dpi, so it cannot conflict with work in that file,
+# and leaving the include out is a complete, one-line uninstall.
+#
+# IF THE KERNEL CANNOT BE BUILT OR LOADED -- no compiler, a read-only cache, an
+# unfamiliar architecture -- this prints one line saying so and leaves the numpy
+# implementation exactly as it was. It never raises and never half-installs. Set
+# SURFACE_DISTANCE_FAST_REQUIRED = True in the config beforehand to turn that
+# into an error instead, which is what an acceptance test should do: "silently
+# fell back to the slow path" is otherwise indistinguishable from "was fast".
+#
+# WHAT THE KERNEL NEEDS: a C++17 compiler (g++ or clang++) on the machine, once.
+# It compiles surface_distance_kernel.cpp on first use into
+# ~/.cache/tari-surface-distance/, keyed by the source, the compiler and the
+# architecture, and reuses it forever after. Roughly one second. Nothing is
+# downloaded and nothing is installed. On a machine with no compiler, build the
+# .so elsewhere on the same architecture and point TARI_SURFACE_DISTANCE_LIB at
+# it. See the module docstring in surface_distance_fast.py for the rest.
+
+import os
+import sys
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned. SurfaceDistance is NOT
+# rebound here: install() replaces its signed_distance() method on the class
+# that tooling_clearance.dpi already made, so every function in that file, every
+# instance already built and every isinstance() check keeps working untouched.
+global surface_distance_backend
+
+_required = bool(globals().get("SURFACE_DISTANCE_FAST_REQUIRED", False))
+
+if "SurfaceDistance" not in globals():
+    raise NameError(
+        "surface_distance_fast.dpi has nothing to accelerate: include "
+        "modules/tooling_clearance.dpi first. (It defines SurfaceDistance; "
+        "this file only replaces its signed_distance().)")
+
+# dgpy's include() puts the .dpi's own FILE path on sys.path rather than its
+# directory, so a sibling module is not importable by name. SCAN_MODULE_DIR is
+# the directory the config already uses to find these files, which makes it the
+# honest answer rather than a guess.
+_moddir = globals().get("SCAN_MODULE_DIR")
+if _moddir and _moddir not in sys.path:
+    sys.path.insert(0, _moddir)
+
+surface_distance_backend = None
+try:
+    import surface_distance_fast as _sdf
+    surface_distance_backend = _sdf
+    _sdf.install(SurfaceDistance, required=_required)
+    if getattr(SurfaceDistance, "accelerated", False):
+        print("tooling clearance: %s" % (_sdf.status(),))
+    else:
+        raise RuntimeError(_sdf.status())
+except Exception as _e:
+    if _required:
+        raise
+    print("tooling clearance: signed_distance() is running on the NUMPY path "
+          "(%s: %s). Correct, but tens of microseconds per point -- a large "
+          "gate will take hours." % (type(_e).__name__, _e))

@@ -1,0 +1,556 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  robot_supervisor.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Pause, resume and abort a scan that is already flying.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# ROBOT SUPERVISOR: pause, abort and resume a measurement that is already flying
+# ==============================================================================
+# A scan is a long blocking call. `run_automated_scan()` occupies the dgpy
+# prompt for minutes, so by the time the operator can see that something is
+# wrong there is no prompt to type into. The only control they actually have is
+# the teach pendant, and stopping External Control there is what an operator who
+# does not like what the arm is doing will reach for.
+#
+# WITH NOTHING WATCHING, that stop is not treated as a stop. The UR logs
+# "Connection to reverse interface dropped", controller_stopper deactivates the
+# controllers, and MoveIt sits on the in-flight goal until its duration monitor
+# fires some 35 s later. Every row after that plans in full and has EXECUTION
+# refused by a scaled_joint_trajectory_controller answering "Can't accept new
+# action goals. Controller is not running." The sweep burns through the rest of
+# its rows against a dead controller and saves a mesh with gaps in it.
+#
+# That is the whole of what this module fixes: stopping the robot program is a
+# legitimate operator control, and the pipeline has to treat it as PAUSE rather
+# than as a run of failures.
+#
+# THREE WAYS IN, because the operator is not always at the prompt:
+#
+#   the pendant   stop External Control -> robot_program_running goes false ->
+#                 the scan pauses at the next checkpoint. Restart it and send
+#                 `resume` to carry on. This needs no terminal at all.
+#   a topic       /scan/command, std_msgs/String, one of pause|resume|abort.
+#                 Works while the dgpy prompt is blocked, from any terminal:
+#                     ros2 topic pub --once /scan/command std_msgs/msg/String "{data: resume}"
+#   the prompt    pause_scan() / resume_scan() / abort_scan(), for a second dgpy
+#                 connection or a script.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO: it never starts the robot program and
+# never resumes on its own when the program comes back. The operator stopped the
+# arm because they wanted it stopped; deciding to carry on is theirs. The
+# supervisor waits, says what it is waiting for, and does nothing until told.
+#
+# MoveIt's execution duration monitor is NOT the problem here and must not be
+# loosened to "fix" this. While the arm is actually moving the controller tracks
+# its planned duration to within a few milliseconds (10.55 s planned against
+# 10.556 s actual on a measured row), so a timeout after a stop is a correct
+# report of an arm that stopped moving part-way through a move. Raising the
+# allowance only delays the diagnosis.
+
+import threading
+import time
+
+global ScanAborted
+global ScanSupervisorUnavailable
+global scan_supervisor
+global supervisor_status
+global pause_scan
+global resume_scan
+global abort_scan
+global scan_checkpoint
+global wait_for_robot
+global supervised
+global SCAN_COMMAND_TOPIC
+global SCAN_PAUSE_TIMEOUT_S
+global SCAN_SUPERVISOR_ENABLED
+
+#: Where pause/resume/abort arrive from outside the blocked dgpy prompt.
+SCAN_COMMAND_TOPIC = "/scan/command"
+
+#: How long a pause may last before it becomes an abort, seconds. A paused scan
+#: holds the recorder open and the reconstruction accumulating, so it is not
+#: free to sit forever. None waits indefinitely.
+SCAN_PAUSE_TIMEOUT_S = 1800.0
+
+#: Set False to disable checkpointing entirely. Here so a simulation run that
+#: has no UR driver can turn the whole thing off, though the supervisor degrades
+#: to "always ready" on its own when the topics are absent -- see
+#: _RobotSupervisor.ready().
+SCAN_SUPERVISOR_ENABLED = True
+
+
+class ScanAborted(Exception):
+    """The operator abandoned this measurement. Unwind; do not move the arm."""
+    pass
+
+
+class ScanSupervisorUnavailable(Exception):
+    """rclpy, or the UR driver's status topics, are not there to watch."""
+    pass
+
+
+class _RobotSupervisor(object):
+    """Watches whether the arm can be commanded, and carries pause/abort state.
+
+    The two questions are separate and both matter:
+
+      is the ROBOT PROGRAM running?   /io_and_status_controller/robot_program_running
+      is the CONTROLLER active?       /controller_manager/list_controllers
+
+    The first goes false the moment External Control stops. The second is what
+    actually rejects a goal, and it lags the first because controller_stopper
+    has to notice and switch. A scan that checks only the program can still walk
+    into "Controller is not running"; one that checks only the controller waits
+    a second or two longer than it needs to. Check both.
+    """
+
+    #: Controllers whose absence stops a scan. The UR's scaled controller is the
+    #: one MoveIt executes through on hardware; simulation uses the plain one.
+    _WANTED = ("scaled_joint_trajectory_controller", "joint_trajectory_controller")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cv = threading.Condition(self._lock)
+        self._state = "running"          # running | paused | aborting
+        self._reason = ""
+        self._program = None             # None = never heard, True/False = heard
+        self._program_at = None
+        self._controllers = {}
+        self._controllers_at = None
+        self._node = None
+        self._executor = None
+        self._thread = None
+        self._quit = False
+        self._list_client = None
+        self._said = set()
+        self._last_try = 0.0
+        self._why_off = "not started yet"
+        self._ensure_node()
+
+    # -- the ROS side ---------------------------------------------------------
+
+    def watching(self):
+        """(bool, why). Is this thing actually looking at anything?
+
+        Worth asking out loud, because a supervisor that failed to start reports
+        ready() for everything and holds nothing up -- which looks exactly like a
+        healthy cell right up until the robot program stops and nobody notices.
+        """
+        if self._node is not None:
+            return True, ""
+        return False, self._why_off
+
+    def _ensure_node(self):
+        """Start the node, or say why not -- and be willing to try again later.
+
+        LAZY ON PURPOSE. rclpy is initialised by the `ros` motion module, and a
+        .dpi included before that runs hits "rclpy.init() has not been called,
+        cannot create node". Giving up at that point would leave the supervisor
+        answering "ready" to every question for the life of the process, so it
+        retries instead: one import and one guarded call every few seconds until
+        it works.
+        """
+        if self._node is not None:
+            return True
+        now = time.monotonic()
+        if now - self._last_try < 5.0:
+            return False
+        self._last_try = now
+        try:
+            import rclpy
+            from rclpy.node import Node
+            from rclpy.parameter import Parameter
+            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.qos import (QoSProfile, ReliabilityPolicy,
+                                   DurabilityPolicy, HistoryPolicy)
+            from std_msgs.msg import Bool, String
+        except Exception as e:
+            self._why_off = "rclpy is not importable (%s)" % (e,)
+            self._say_once("norclpy", "NOT WATCHING: %s. Nothing will notice if "
+                                      "the robot program stops." % self._why_off)
+            return False
+        if not rclpy.ok():
+            # Not an error yet: include order, and `ros` has not started. Say it
+            # once so a cell that never initialises rclpy is still visible.
+            self._why_off = ("rclpy is not initialised yet -- the motion module "
+                             "does that; this will keep retrying")
+            self._say_once("noinit", "not watching yet: %s" % self._why_off)
+            return False
+        try:
+            mode = globals().get("CELL_MODE", "sim")
+            self._node = Node("scan_supervisor", parameter_overrides=[
+                Parameter("use_sim_time", Parameter.Type.BOOL, mode == "sim")])
+            # robot_program_running is published ON CHANGE and latched, so a
+            # subscriber that joins late gets the last value only with
+            # TRANSIENT_LOCAL -- a 17-minute bag of a scan holds exactly one of
+            # these messages.
+            latched = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1,
+                                 reliability=ReliabilityPolicy.RELIABLE,
+                                 durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self._node.create_subscription(
+                Bool, "/io_and_status_controller/robot_program_running",
+                self._on_program, latched)
+            # ... and again with volatile QoS, because a driver that publishes
+            # volatile would never match the latched subscription at all and the
+            # supervisor would silently believe the program had never started.
+            self._node.create_subscription(
+                Bool, "/io_and_status_controller/robot_program_running",
+                self._on_program, 10)
+            self._node.create_subscription(
+                String, SCAN_COMMAND_TOPIC, self._on_command, 10)
+            try:
+                from controller_manager_msgs.srv import ListControllers
+                self._list_client = self._node.create_client(
+                    ListControllers, "/controller_manager/list_controllers")
+                self._ListControllers = ListControllers
+            except Exception:
+                self._list_client = None
+            self._executor = SingleThreadedExecutor()
+            self._executor.add_node(self._node)
+            self._thread = threading.Thread(target=self._spin,
+                                            name="scan_supervisor_spin",
+                                            daemon=True)
+            self._thread.start()
+            self._why_off = ""
+            self._say("watching %s and the trajectory controllers"
+                      % "/io_and_status_controller/robot_program_running")
+            return True
+        except Exception as e:
+            self._node = None
+            self._why_off = "the node could not be created (%s)" % (e,)
+            self._say_once("nonode", "NOT WATCHING: %s. It will keep retrying; "
+                                     "until it succeeds nothing will notice if "
+                                     "the robot program stops." % self._why_off)
+            return False
+
+    def stop(self):
+        """Let the spin thread out before rclpy is torn down under it.
+
+        Without this, shutting down prints "terminate called without an active
+        exception" from rclpy's C++ side as the context goes away beneath a
+        thread still inside spin_once -- alarming, and at dgpy exit it lands in
+        the middle of whatever else is unwinding.
+        """
+        self._quit = True
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(2.0)
+
+    def _spin(self):
+        poll = 0.0
+        while not self._quit:
+            try:
+                import rclpy
+                if not rclpy.ok():
+                    break
+            except Exception:
+                break
+            try:
+                self._executor.spin_once(timeout_sec=0.05)
+            except Exception:
+                time.sleep(0.1)
+            now = time.monotonic()
+            if now - poll > 2.0:
+                poll = now
+                try:
+                    self._poll_controllers()
+                except Exception:
+                    pass
+
+    def _on_program(self, msg):
+        with self._cv:
+            was = self._program
+            self._program = bool(msg.data)
+            self._program_at = time.monotonic()
+            if was is True and not self._program and self._state == "running":
+                # THE PENDANT CASE. Pause here rather than at the next
+                # checkpoint, so a sweep already inside a row stops asking for
+                # the rows after it.
+                self._state = "paused"
+                self._reason = ("the robot program stopped (External Control is "
+                                "no longer running on the pendant)")
+                self._say("PAUSED: %s" % self._reason)
+                self._say("  restart External Control, then: ros2 topic pub --once "
+                          "%s std_msgs/msg/String \"{data: resume}\"" % SCAN_COMMAND_TOPIC)
+                self._say("  or abandon this measurement with {data: abort}")
+            self._cv.notify_all()
+
+    def _on_command(self, msg):
+        want = (getattr(msg, "data", "") or "").strip().lower()
+        if want in ("pause", "resume", "abort"):
+            self._command(want, "the %s topic" % SCAN_COMMAND_TOPIC)
+        else:
+            self._say("ignoring %r on %s; expected pause, resume or abort"
+                      % (want, SCAN_COMMAND_TOPIC))
+
+    def _poll_controllers(self):
+        if self._list_client is None or not self._list_client.service_is_ready():
+            return
+        fut = self._list_client.call_async(self._ListControllers.Request())
+        # Spun by this same thread, so wait on the future rather than calling
+        # spin_until_future_complete, which would re-enter the executor.
+        end = time.monotonic() + 1.0
+        while not fut.done() and time.monotonic() < end:
+            time.sleep(0.01)
+        if not fut.done():
+            return
+        res = fut.result()
+        if res is None:
+            return
+        with self._cv:
+            self._controllers = dict((c.name, c.state) for c in res.controller)
+            self._controllers_at = time.monotonic()
+            self._cv.notify_all()
+
+    # -- what callers ask -----------------------------------------------------
+
+    def ready(self):
+        """(ok, reason). Unknown counts as ready, deliberately.
+
+        A simulation run has no UR driver and no controller_manager on these
+        names; a supervisor that blocked on silence would stop every sim scan
+        dead. Silence means "nothing to watch", not "not ready". Only a topic
+        that has spoken and said false, or a controller that is listed and not
+        active, holds a scan up.
+        """
+        self._ensure_node()
+        with self._cv:
+            if self._program is False:
+                return False, ("the robot program is not running -- start "
+                               "External Control on the pendant")
+            listed = [(n, s) for n, s in self._controllers.items()
+                      if n in self._WANTED]
+            if listed and not any(s == "active" for _n, s in listed):
+                return False, ("no trajectory controller is active (%s) -- the "
+                               "UR driver usually reactivates it a few seconds "
+                               "after the program restarts"
+                               % ", ".join("%s: %s" % ns for ns in listed))
+            return True, ""
+
+    def state(self):
+        with self._cv:
+            return self._state, self._reason
+
+    def _command(self, want, who):
+        with self._cv:
+            if want == "abort":
+                self._state = "aborting"
+                self._reason = "aborted from %s" % who
+                self._say("ABORT requested from %s; the measurement will stop at "
+                          "the next checkpoint without moving the arm" % who)
+            elif want == "pause":
+                if self._state == "running":
+                    self._state = "paused"
+                    self._reason = "paused from %s" % who
+                    self._say("PAUSED from %s" % who)
+            elif want == "resume":
+                if self._state == "paused":
+                    self._state = "running"
+                    self._reason = ""
+                    self._say("RESUMED from %s" % who)
+                elif self._state == "aborting":
+                    self._say("cannot resume: this measurement is aborting")
+            self._cv.notify_all()
+
+    def checkpoint(self, what="", timeout=None):
+        """Block while paused or while the arm cannot be commanded.
+
+        Called between rows and before anything that moves. Returns True when it
+        is safe to carry on, and raises ScanAborted when it is not going to be.
+        """
+        if not SCAN_SUPERVISOR_ENABLED:
+            return True
+        timeout = SCAN_PAUSE_TIMEOUT_S if timeout is None else timeout
+        began = time.monotonic()
+        told = False
+        while True:
+            with self._cv:
+                if self._state == "aborting":
+                    raise ScanAborted("%s: %s" % (what or "measurement",
+                                                  self._reason or "aborted"))
+                paused = self._state == "paused"
+            ok, why = self.ready()
+            if not paused and ok:
+                if told:
+                    self._say("continuing: %s" % (what or "the measurement"))
+                return True
+            if not told:
+                self._say("HOLDING before %s: %s"
+                          % (what or "the next step", self._reason or why))
+                told = True
+            if timeout is not None and time.monotonic() - began > timeout:
+                with self._cv:
+                    self._state = "aborting"
+                    self._reason = ("held for %.0f s with no resume (limit %.0f s)"
+                                    % (time.monotonic() - began, timeout))
+                raise ScanAborted("%s: %s" % (what or "measurement", self._reason))
+            with self._cv:
+                self._cv.wait(0.5)
+
+    def clear(self):
+        """Back to running, for the start of a new measurement."""
+        with self._cv:
+            self._state = "running"
+            self._reason = ""
+            self._said = set()
+            self._cv.notify_all()
+
+    def _say_once(self, key, text):
+        """Say it the first time and then stop: these run on a 5 s retry."""
+        with self._lock:
+            if key in self._said:
+                return
+            self._said.add(key)
+        self._say(text)
+
+    def _say(self, text):
+        # print() from a worker thread is swallowed in dgpy unless the thread
+        # has a context, so this goes out through the same path the rest of the
+        # pipeline uses when it can, and falls back to a plain print.
+        line = "  [supervisor] %s" % text
+        try:
+            say = globals().get("_capture_say")
+            if say is not None:
+                say(line)
+                return
+        except Exception:
+            pass
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass
+
+
+def supervisor_status():
+    """One line: what the supervisor thinks the arm and the scan are doing."""
+    sup = scan_supervisor
+    st, reason = sup.state()
+    ok, why = sup.ready()
+    watching, why_not = sup.watching()
+    with sup._cv:
+        prog = sup._program
+        ctrl = dict(sup._controllers)
+    prog_s = ("unknown -- nothing has published "
+              "/io_and_status_controller/robot_program_running"
+              if prog is None else ("running" if prog else "STOPPED"))
+    keep = dict((n, s) for n, s in ctrl.items() if n in _RobotSupervisor._WANTED)
+    out = ["watching: %s" % ("yes" if watching
+                             else "NO -- %s. A stopped robot program will NOT "
+                                  "pause a scan." % why_not),
+           "scan: %s%s" % (st, (" (%s)" % reason) if reason else ""),
+           "robot program: %s" % prog_s,
+           "controllers: %s" % (", ".join("%s=%s" % ns for ns in sorted(keep.items()))
+                                or "not listed"),
+           "commandable: %s" % ("yes" if ok else "NO -- %s" % why)]
+    print("  " + "\n  ".join(out))
+    return {"state": st, "reason": reason, "program": prog, "watching": watching,
+            "controllers": keep, "ready": ok}
+
+
+def pause_scan():
+    """Hold the running measurement at its next checkpoint."""
+    scan_supervisor._command("pause", "the dgpy prompt")
+
+
+def resume_scan():
+    """Carry on after a pause. Does nothing to an aborting measurement."""
+    scan_supervisor._command("resume", "the dgpy prompt")
+
+
+def abort_scan():
+    """Stop the measurement at its next checkpoint. Does not move the arm."""
+    scan_supervisor._command("abort", "the dgpy prompt")
+
+
+def scan_checkpoint(what="", timeout=None):
+    """Call between rows and before anything that moves.
+
+    Cheap when all is well (two lock acquisitions and no ROS traffic), so it is
+    fine to call it per row, per pass and per approach.
+    """
+    return scan_supervisor.checkpoint(what, timeout=timeout)
+
+
+def wait_for_robot(what="", timeout=None):
+    """Block until the arm can be commanded. Same thing; reads better up front."""
+    return scan_supervisor.checkpoint(what or "the arm being commandable",
+                                      timeout=timeout)
+
+
+class supervised(object):
+    """Wrap a whole measurement: clears stale state, checkpoints on entry.
+
+        with supervised("azure sweep"):
+            ...
+
+    An abort inside the block raises ScanAborted, which the caller is expected
+    to let propagate after it has stopped its recorder and its reconstruction.
+    """
+
+    def __init__(self, what, timeout=None):
+        self.what = what
+        self.timeout = timeout
+
+    def __enter__(self):
+        scan_supervisor.clear()
+        scan_supervisor.checkpoint("starting %s" % self.what, timeout=self.timeout)
+        return scan_supervisor
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is KeyboardInterrupt:
+            # Ctrl-C at the prompt is an abort, and saying so here means the
+            # unwind path is the same one a topic abort takes.
+            scan_supervisor._command("abort", "Ctrl-C")
+        return False
+
+
+scan_supervisor = _RobotSupervisor()

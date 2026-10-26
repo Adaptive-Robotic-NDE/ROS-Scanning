@@ -1,0 +1,491 @@
+# ==============================================================================
+# WHERE IS THE PART? -- YOLO, AND THE REGION EVERYTHING ELSE TAKES
+# ==============================================================================
+# The stage in front of the reconstruction stage. Every route into
+# obtain_specimen_mesh() takes a `region` -- (xmin, ymin, xmax, ymax) in world
+# metres -- which otherwise has to be typed by hand. This derives it from a YOLO
+# detection instead, which is the whole reason YOLO is in this cell.
+#
+# It is deliberately NOT a port of ClientScannerTest.dgp's yoloCrop(). That
+# function deprojects each of the four bbox corners at its own depth, then
+# branches through five cases depending on which of them came back valid,
+# because a corner of a bounding box usually lands just OFF the part and reads
+# the table, or reads nothing at all. Here the four corners are deprojected at
+# ONE depth -- the median over the box interior -- which is both simpler and
+# more robust for the flat-ish parts this cell scans, and has no cases at all.
+#
+# Two things are asked rather than written down, for the usual reason:
+#
+#   INTRINSICS. vision_pipeline.dpi carries `class Azure: cx = 1026.55, ...`,
+#   which is a 2048x1536 hardware camera. This cell's simulated Azure is
+#   640x480 with cx = 320.8, so every pixel deprojected through the written-down
+#   numbers lands roughly a metre out. camera_facts() reads camera_info.
+#
+#   DEPTH UNITS. The simulated camera's raw depth is 32FC1 METRES and the
+#   real one's 16UC1 MILLIMETRES, and depthCheck() in both older modules
+#   divides by 1000 unconditionally -- so in simulation it turns a 0.5 m
+#   standoff into 0.5 mm. The encoding says which, so read it.
+#
+# And the TOPICS are the work-cell manifest's (work_cell.dpi's sensor_topic), the
+# ones the bring-up gave yolo and the reconstruction. On hardware the depth
+# is depth_to_rgb, registered into the colour camera, because a detection's
+# pixels are colour pixels; the depth camera's own image is 640x576 and would
+# not line up. detection_region() refuses that mismatch outright.
+
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global camera_facts
+global yolo_enable
+global yolo_lifecycle_state
+global yolo_transition
+global release_yolo
+global ensure_yolo_active
+global yolo_detections
+global detection_region
+global yolo_region
+global YOLO_COLOR_TOPIC
+global YOLO_DEPTH_TOPIC
+global YOLO_INFO_TOPIC
+global YOLO_NS
+global YOLO_NODE
+global YOLO_ENABLE_SERVICE
+global YOLO_DETECTIONS_TOPIC
+
+
+#: What the INSTALLED yolo_ros actually offers, read off its source
+#: (yolo_ros/yolo_ros/yolo_node.py, tracking_node.py) and confirmed against a
+#: live graph. All of it sits under yolo.launch.py's `namespace`
+#: argument, which tari_bringup leaves at its default "yolo":
+#:
+#:   /yolo/enable          std_srvs/SetBool    yolo_node, created in
+#:                                             on_activate() and destroyed in
+#:                                             on_deactivate()
+#:   /yolo/detections      yolo_msgs/DetectionArray, a LIFECYCLE publisher, so
+#:                                             it is silent unless active
+#:   /yolo/tracking        yolo_msgs/DetectionArray from tracking_node, the
+#:                                             same detections plus track ids.
+#:                                             This is what ClientScannerTest
+#:                                             .dgp reads as
+#:                                             ros.tracked_detection.
+#:   /yolo/dbg_image        sensor_msgs/Image from debug_node
+#:   /yolo/set_classes      only for a model with set_classes (YOLOWorld,
+#:                                             YOLOE); this cell's
+#:                                             specimen_detector is plain YOLO,
+#:                                             so it does NOT exist.
+#:
+#: There is no /yolo/disable, and no parameter-set path: `enable` is declared
+#: as a parameter but read once in on_configure(), so setting it at runtime
+#: does nothing -- the service is the only live switch.
+YOLO_NS = "/yolo"
+YOLO_NODE = YOLO_NS + "/yolo_node"
+YOLO_ENABLE_SERVICE = YOLO_NS + "/enable"
+YOLO_DETECTIONS_TOPIC = YOLO_NS + "/detections"
+
+
+#: Session-wide overrides. None takes the work-cell manifest's Azure topics,
+#: which is what the bring-up pointed YOLO and the reconstruction at; each
+#: function also takes a per-call override. The detections come back stamped with
+#: the frame the image carried, so the frame is read off the detection rather
+#: than named here.
+YOLO_COLOR_TOPIC = None
+YOLO_DEPTH_TOPIC = None
+YOLO_INFO_TOPIC = None
+
+
+def _one_message(topic, msg_type, timeout=10.0, node_name="part_detection_probe"):
+    """The latest message on a topic, or None. Own node, destroyed on the way out."""
+    import rclpy
+    from rclpy.node import Node
+
+    got = []
+    node = Node(node_name)
+    try:
+        node.create_subscription(msg_type, topic, lambda m: got.append(m), 1)
+        deadline = time.monotonic() + timeout
+        while not got and time.monotonic() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.1)
+    finally:
+        node.destroy_node()
+    return got[-1] if got else None
+
+
+def camera_facts(info_topic=None, timeout=10.0):
+    """Intrinsics from camera_info: fx, fy, cx, cy, width, height, frame_id.
+
+    Asked, not written down. See the module header for what the written-down
+    ones cost.
+    """
+    from sensor_msgs.msg import CameraInfo
+
+    info_topic = (info_topic or YOLO_INFO_TOPIC
+                  or sensor_topic("azure", "camera_info", "/azure/camera_info"))
+    msg = _one_message(info_topic, CameraInfo, timeout=timeout,
+                       node_name="camera_info_probe")
+    if msg is None:
+        raise RuntimeError("no camera_info on %s in %.0f s" % (info_topic, timeout))
+    k = list(msg.k)
+    return {"fx": k[0], "fy": k[4], "cx": k[2], "cy": k[5],
+            "width": int(msg.width), "height": int(msg.height),
+            "frame_id": msg.header.frame_id}
+
+
+def yolo_lifecycle_state(node_name=YOLO_NODE, timeout=5.0):
+    """The yolo_node lifecycle state label, or None if it cannot be asked.
+
+    Worth asking before concluding anything about /yolo/enable: see
+    yolo_enable() for why.
+    """
+    import rclpy
+    from rclpy.node import Node
+    from lifecycle_msgs.srv import GetState
+
+    node = Node("yolo_state_probe")
+    try:
+        client = node.create_client(GetState, "%s/get_state" % (node_name,))
+        if not client.wait_for_service(timeout_sec=timeout):
+            return None
+        future = client.call_async(GetState.Request())
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+        res = future.result()
+        return res.current_state.label if res is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        node.destroy_node()
+
+
+def yolo_enable(on=True, service=YOLO_ENABLE_SERVICE, timeout=30.0):
+    """Switch the detector on or off.
+
+    yolo_node is a LIFECYCLE node and it creates this service in
+    on_activate(), destroying it again in on_deactivate() -- so the service
+    existing is the same question as the node being `active`, which is why the
+    failure below reports the lifecycle state rather than guessing.
+
+    Inference costs real CPU -- 646% of one core measured at ex-ur10e-1, the
+    largest single consumer in the cell -- so turn it off again when the region
+    has been taken. yolo_region() does.
+
+    The timeout is 30 s rather than 15 because tari_bringup holds the whole
+    yolo launch back by 30 s (a subscriber arriving while a Gazebo camera
+    initialises segfaults gzserver), and the model then loads before the node
+    activates. Asking too early is indistinguishable from asking for something
+    that does not exist: a short timeout reports "/yolo/enable does not exist"
+    while the bring-up log says "[yolo_node] Activated" and the service is up.
+    """
+    import rclpy
+    from rclpy.node import Node
+    from std_srvs.srv import SetBool
+
+    node = Node("yolo_enable_client")
+    try:
+        client = node.create_client(SetBool, service)
+        if not client.wait_for_service(timeout_sec=timeout):
+            state = yolo_lifecycle_state()
+            raise RuntimeError(
+                "no %s service after %.0f s. yolo_node is a lifecycle node and "
+                "only offers it while ACTIVE; it reports %r.%s\n"
+                "  check:  ros2 lifecycle get %s\n"
+                "          ros2 service list | grep ^/yolo\n"
+                "  and that yolo started at all -- it is skipped unless "
+                "`ultralytics` and `lap` import and the model file exists; "
+                "`ros2 run tari_bringup tari_cell_info` says which."
+                % (service, timeout, state or "nothing (no lifecycle service)",
+                   "" if state in (None, "active") else
+                   " A node stuck in `unconfigured` after activating usually "
+                   "means device= was not a torch device name.",
+                   YOLO_NODE))
+        future = client.call_async(SetBool.Request(data=bool(on)))
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+        res = future.result()
+        if res is None or not res.success:
+            raise RuntimeError("%s refused: %s"
+                               % (service, getattr(res, "message", "no answer")))
+        print("  yolo %s" % ("enabled" if on else "disabled"))
+        return res
+    finally:
+        node.destroy_node()
+
+
+def yolo_transition(label, node_name=YOLO_NODE, timeout=20.0):
+    """Drive yolo_node's lifecycle. Returns the state it ends in, or None.
+
+    `label` is "deactivate" or "activate". Never raises: this is used to give
+    resources back, and a scan must not fail because a detector would not let
+    go of them.
+    """
+    import rclpy
+    from rclpy.node import Node
+    from lifecycle_msgs.srv import ChangeState
+    from lifecycle_msgs.msg import Transition
+
+    ids = {"activate": Transition.TRANSITION_ACTIVATE,
+           "deactivate": Transition.TRANSITION_DEACTIVATE}
+    if label not in ids:
+        raise ValueError("transition must be one of %s" % (sorted(ids),))
+    node = Node("yolo_lifecycle_client")
+    try:
+        client = node.create_client(ChangeState, "%s/change_state" % (node_name,))
+        if not client.wait_for_service(timeout_sec=timeout):
+            return None
+        req = ChangeState.Request()
+        req.transition.id = ids[label]
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
+    except Exception as e:  # noqa: BLE001
+        print("  could not %s yolo_node: %s" % (label, e))
+        return None
+    finally:
+        node.destroy_node()
+    return yolo_lifecycle_state(node_name=node_name)
+
+
+def release_yolo(deactivate=True, quiet=False):
+    """Give the detector's CPU and memory back. NEVER RAISES.
+
+    The detection is over long before the scan is; everything after it -- two
+    reconstruction sweeps, a mesh filter, a Noether plan and the clearance gate
+    -- is the expensive half, and that is exactly when the work cell can least afford
+    a detector holding four to six cores and a loaded model. Measured at
+    ex-ur10e-1: yolo_node at 646% of one core, the largest single consumer in the
+    cell, and 400% still held after detection had finished.
+
+    Two levels, because they give back different things:
+
+      * `/yolo/enable false` stops inference. The node keeps its image
+        subscription and its loaded model, so every frame is still
+        deserialised and the model still occupies memory.
+      * DEACTIVATING the lifecycle node does the rest: yolo_node's
+        on_deactivate() runs `del self.yolo`, clears the CUDA cache and
+        destroys the image subscription. That is the release worth having: the
+        next stage can take dgpy to 8.4 GB and be OOM-killed without it.
+
+    It is reversible -- ensure_yolo_active() brings it back, reloading the
+    model -- so a second detection in the same session still works.
+    """
+    state = None
+    try:
+        yolo_enable(False, timeout=5.0)
+    except Exception as e:  # noqa: BLE001
+        if not quiet:
+            print("  yolo inference not switched off (%s)" % (e,))
+    if deactivate:
+        state = yolo_transition("deactivate")
+        if not quiet:
+            print("  yolo released: node is %s (model unloaded, image "
+                  "subscription dropped)" % (state or "not answering",))
+    return state
+
+
+def ensure_yolo_active(timeout=60.0):
+    """Bring yolo_node back to `active` if something released it. Returns the
+    state. The model is reloaded on activation, so this can take seconds."""
+    state = yolo_lifecycle_state()
+    if state == "active":
+        return state
+    if state == "inactive":
+        print("  yolo_node is inactive -- activating it (reloads the model)")
+        return yolo_transition("activate", timeout=timeout)
+    return state
+
+
+def yolo_detections(topic=None, timeout=15.0, min_score=0.0):
+    """(detections best-first, frame_id). Empty list if nothing is detected.
+
+    Returns the DetectionArray's own entries, so `.class_name`, `.score` and
+    `.bbox` are the fields to read.
+
+    The FRAME comes back alongside rather than attached to each detection,
+    because a rosidl message class defines __slots__ and silently accepts no
+    new attributes -- it raises AttributeError on assignment. It is the frame
+    the IMAGE was in, which is what a deprojection has to be transformed from:
+    `azure_gazebo_depth` in simulation, `rgb_camera_link` on hardware. Read from the
+    message rather than assumed, for the same reason the tracking frame is.
+
+    `topic` defaults to YOLO_DETECTIONS_TOPIC, yolo_node's own output. Pass
+    YOLO_NS + "/tracking" for tracking_node's version instead -- the same
+    detections with track ids attached, which is what ClientScannerTest.dgp
+    reads as ros.tracked_detection. Either works; the raw one is the default
+    because it needs one fewer node to be alive.
+    """
+    from yolo_msgs.msg import DetectionArray
+
+    topic = topic or YOLO_DETECTIONS_TOPIC
+    msg = _one_message(topic, DetectionArray, timeout=timeout,
+                       node_name="yolo_detection_probe")
+    if msg is None:
+        # Nothing arrived. The three reasons, in the order worth checking,
+        # because the difference is invisible from the topic alone: the
+        # detector is DISABLED (its publisher is a lifecycle publisher and
+        # drops everything while inference is off), the node is not `active`,
+        # or the colour camera is not publishing. Say which.
+        state = yolo_lifecycle_state()
+        print("  no DetectionArray on %s in %.0f s (yolo_node is %s)"
+              % (topic, timeout, state or "not answering its lifecycle service"))
+        return [], None
+    dets = [d for d in msg.detections if float(d.score) >= min_score]
+    dets.sort(key=lambda d: -float(d.score))
+    for d in dets:
+        print("  %s score %.3f, bbox %.0fx%.0f px at (%.0f, %.0f)"
+              % (d.class_name, d.score, d.bbox.size.x, d.bbox.size.y,
+                 d.bbox.center.position.x, d.bbox.center.position.y))
+    return dets, msg.header.frame_id
+
+
+def _depth_patch(topic, timeout=10.0):
+    """(depth array in METRES, frame_id) from a depth topic, whatever its units.
+
+    32FC1 is metres, 16UC1 is millimetres. Getting this wrong does not distort
+    the answer, it moves it by a factor of a thousand.
+    """
+    from sensor_msgs.msg import Image
+
+    msg = _one_message(topic, Image, timeout=timeout, node_name="depth_probe")
+    if msg is None:
+        raise RuntimeError("no depth image on %s in %.0f s" % (topic, timeout))
+    if msg.encoding.startswith("32FC"):
+        a = np.frombuffer(msg.data, dtype="<f4").reshape(msg.height, msg.width)
+        return a.astype(np.float64), msg.header.frame_id
+    if msg.encoding.startswith("16UC"):
+        a = np.frombuffer(msg.data, dtype="<u2").reshape(msg.height, msg.width)
+        return a.astype(np.float64)/1000.0, msg.header.frame_id
+    raise RuntimeError("cannot read depth encoding %r on %s"
+                       % (msg.encoding, topic))
+
+
+def detection_region(detection, pad=0.0, shrink=0.25, depth_topic=None,
+                     info_topic=None, frame=None, timeout=10.0):
+    """World-frame (xmin, ymin, xmax, ymax) for one YOLO detection.
+
+    The four bbox corners are deprojected at ONE depth -- the median of the
+    finite depths inside the middle `shrink` of the box -- and transformed into
+    world. Using the middle rather than the whole box matters: the edge of a
+    bounding box straddles the part boundary, so its depths are a mixture of the
+    part and whatever is behind it, and the median of that mixture is neither.
+
+    Returns (region, info). `info` carries the depth used, the surface height in
+    world z, and the corner points, because those are what tell you the answer
+    is sane before you fly a sweep on the strength of it.
+
+    `pad` widens the region in x and y. The reconstruction's own crop box has a
+    separate, larger pad -- this one is for the detector being tight on the part.
+    """
+    from geometry_msgs.msg import PointStamped
+    from tf2_geometry_msgs import do_transform_point
+    import rclpy
+
+    cam = camera_facts(info_topic, timeout=timeout)
+    depth_topic = (depth_topic or YOLO_DEPTH_TOPIC
+                   or sensor_topic("azure", "depth", "/azure/depth/image_raw"))
+    depth, depth_frame = _depth_patch(depth_topic, timeout=timeout)
+    frame = frame or depth_frame
+    if not frame:
+        raise RuntimeError("no frame to deproject from: the detection carried "
+                           "none and neither did the depth image")
+
+    cx_px = float(detection.bbox.center.position.x)
+    cy_px = float(detection.bbox.center.position.y)
+    hx = float(detection.bbox.size.x)/2.0
+    hy = float(detection.bbox.size.y)/2.0
+
+    if depth.shape != (cam["height"], cam["width"]):
+        raise RuntimeError(
+            "the depth image is %dx%d and camera_info says %dx%d, so the bbox "
+            "pixels cannot be deprojected through these intrinsics"
+            % (depth.shape[1], depth.shape[0], cam["width"], cam["height"]))
+
+    s = max(0.0, min(1.0, float(shrink)))
+    x0 = int(max(0, np.floor(cx_px - hx*s)))
+    x1 = int(min(cam["width"], np.ceil(cx_px + hx*s)))
+    y0 = int(max(0, np.floor(cy_px - hy*s)))
+    y1 = int(min(cam["height"], np.ceil(cy_px + hy*s)))
+    patch = depth[y0:y1, x0:x1]
+    finite = patch[np.isfinite(patch) & (patch > 0.0)]
+    if finite.size == 0:
+        raise RuntimeError(
+            "every depth pixel inside the detection is empty or non-finite, so "
+            "there is nothing to deproject. The camera sees the part (YOLO just "
+            "found it) but the depth stream does not -- check they are the same "
+            "sensor and that the part is inside the depth range.")
+    d = float(np.median(finite))
+
+    corners = [(cx_px - hx, cy_px - hy), (cx_px + hx, cy_px - hy),
+               (cx_px - hx, cy_px + hy), (cx_px + hx, cy_px + hy)]
+    t = ros._tf_buffer.lookup_transform("world", frame, rclpy.time.Time())
+    pts = []
+    for u, v in corners:
+        p = PointStamped()
+        p.header.frame_id = frame
+        p.point.x = (u - cam["cx"])*d/cam["fx"]
+        p.point.y = (v - cam["cy"])*d/cam["fy"]
+        p.point.z = d
+        w = do_transform_point(p, t)
+        pts.append((w.point.x, w.point.y, w.point.z))
+
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    zs = [p[2] for p in pts]
+    region = (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+    info = {"depth_m": d, "surface_z": float(np.mean(zs)), "frame": frame,
+            "corners_world": pts, "camera": cam,
+            "class_name": detection.class_name, "score": float(detection.score)}
+    print("  region x %.3f..%.3f  y %.3f..%.3f m  (%.0f x %.0f mm)"
+          % (region[0], region[2], region[1], region[3],
+             (region[2]-region[0])*1e3, (region[3]-region[1])*1e3))
+    print("    from %s at %.3f m, surface z %.3f, frame %s"
+          % (detection.class_name, d, info["surface_z"], frame))
+    return region, info
+
+
+def yolo_region(index=0, enable=True, disable_after=True, min_score=0.0,
+                pad=0.0, **kwargs):
+    """Detect, and hand back the region the reconstruction stage wants.
+
+    The autonomy entry point: one call replaces the four blocking input()
+    prompts in newKeyScan(). It is NOT a hard dependency of anything -- every
+    route into obtain_specimen_mesh() takes `region` as an argument, so a cell
+    whose detector cannot see its specimen sets it by hand and loses nothing but
+    the automation.
+
+    `enable`/`disable_after` bracket the detection so inference runs only while
+    it is wanted, which is where the 646% of one core measured at ex-ur10e-1
+    comes back from. Two consequences worth knowing:
+
+      * this works whether or not the bring-up started the detector enabled, so
+        a cell can set `service_config: {yolo: {enable: false}}` in its
+        manifest and idle at zero;
+      * it leaves the detector DISABLED afterwards. Anything else in the same
+        dgpy session that reads detections without enabling first --
+        ClientScannerTest.dgp's start() is the one such caller, and it reads
+        ros.tracked_detection straight away -- will then see nothing. Pass
+        disable_after=False when driving those by hand in the same session.
+    """
+    if enable:
+        # A previous stage may have RELEASED the detector (release_yolo), which
+        # deactivates the node and with it the enable service. Bring it back
+        # rather than reporting "no /yolo/enable service", which is what that
+        # looks like from here.
+        ensure_yolo_active()
+        yolo_enable(True)
+        # The detector runs on the images it receives after being enabled, and
+        # this cell's camera is slow. Ask for detections rather than sleeping a
+        # fixed time, but give the first one room to arrive.
+        time.sleep(2.0)
+    try:
+        dets, frame = yolo_detections(min_score=min_score)
+        if not dets:
+            raise RuntimeError(
+                "no detections. The model is trained on the cal plate's "
+                "proportions and does not recognise every specimen -- pass "
+                "region= by hand for one it cannot see.")
+        if index >= len(dets):
+            raise IndexError("asked for detection %d of %d" % (index, len(dets)))
+        kwargs.setdefault("frame", frame)
+        return detection_region(dets[index], pad=pad, **kwargs)
+    finally:
+        if enable and disable_after:
+            yolo_enable(False)

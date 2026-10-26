@@ -1,0 +1,670 @@
+# Two technician numbers in, a whole scan out.
+#
+# A technician setting up a UT scan thinks in STEP SIZE and VELOCITY, and expects
+# the instrument to work out the rest. On a traditional system it can, because
+# the digitizer, the encoder and the scanner bridge are one machine with one
+# known ceiling. Here they are not: the robot will happily sweep at whatever
+# velocity it is given, the digitizer will happily free-run at its PRF, and the
+# thing that actually falls over is the software pipeline in between -- which
+# says nothing when it does. Set a 0.5 mm step and the arm keeps moving at
+# 50 mm/s, the trace rate goes up ten-fold, and the staging queue grows until the
+# scan is producing traces it cannot record.
+#
+# So this module is the missing coupling. It takes the two numbers, works out
+# what the pipeline can sustain, and returns a plan that either fits or says why
+# it does not. Nothing here talks to ROS, to spatialnde2 or to the recording
+# database -- it is arithmetic over measured constants, which is what lets
+# scan_parameters_test.py check it with nothing launched.
+#
+# The measured constants are all in DEFAULT_LIMITS below, each with the
+# conditions it was measured under. They are the part that goes stale: re-measure
+# them when the pipeline
+# changes and the arithmetic follows. Every scan reports what it actually
+# achieved against what was planned (see check_scan_outcome), so drift is
+# visible rather than assumed.
+
+import math
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global ScanLimitError
+global DEFAULT_LIMITS
+global plan_scan
+global format_scan_plan
+global check_scan_outcome
+global auto_spot_radius
+global auto_projection_pixels
+global velocity_scaling_for
+global velocity_from_scaling
+
+
+class ScanLimitError(RuntimeError):
+    """A requested scan cannot be run as asked.
+
+    Raised rather than clamped. The distinction is the whole point of this
+    module: a velocity the pipeline can nearly keep up with is scaled down and
+    reported, but a request that is off by an order of magnitude, or that would
+    take four hours, or that would need more memory than there is, is a mistake
+    in the setup and quietly turning it into a different scan is the wrong
+    answer. Every message names the parameter to change.
+    """
+
+
+# Everything measured, and where it was measured. Read this before changing a
+# number in it.
+DEFAULT_LIMITS = {
+
+    # Sustained trace rate of the staging pipeline, per projection mode, in Hz.
+    #
+    # "live" is measured: a 30-pass timestamped mesh scan staged
+    # 61 traces per 6.1 s sweep -- 10 traces/s -- with the stager's queue sitting
+    # at a depth of 5 and draining, i.e. marginally behind. That is the ceiling
+    # with projection in the trace path.
+    #
+    # "deferred" and "off" share a per-trace path with no projection wait, and
+    # were measured together by deliberately over-driving one: a
+    # 4-pass scan asking for 50 traces/s achieved 21.7, with the stager's queue
+    # climbing to 175 and staying there. So ~22 -- and NOT the 50 that the
+    # one-wait transaction floor suggests. The floor counts the ordering window
+    # and no work at all, which is why planning against it is optimistic.
+    #
+    # None means "not measured for this mode; fall back to that floor, and accept
+    # that a scan planned against it may run behind". check_scan_outcome() says
+    # when one does.
+    "max_trace_rate_hz": {"live": 10.0, "deferred": 22.0, "off": 22.0},
+
+    # Serialised globalrev waits per staged trace. This is the hard floor: each
+    # wait costs one TRANSACTION_LATENCY, because that is the ordering window the
+    # timed transaction manager holds a transaction for before committing it.
+    #
+    #   1  _stage_ascan waits for the trace's own globalrev
+    #   +1 live projection with wait=True waits for another
+    #
+    # At the 0.02 s default that is 40 ms/trace live (25 Hz) and 20 ms/trace
+    # otherwise (50 Hz).
+    "waits_per_trace": {"live": 2, "deferred": 1, "off": 1},
+
+    # Sample-and-bin raster only (ASCAN_TRIGGER_MODE = "timer"). There the
+    # digitizer free-runs and _RowSampler keeps, for each grid column, the sample
+    # taken nearest it -- so the constraint is not the staging pipeline but the
+    # digitizer PRF: a column the sweep never sampled is filled from a neighbour
+    # and the c-scan is fabricated there. The config's own note puts ~5 A-scans
+    # per column at 50 Hz over a 60-column row and warns that dropping much below
+    # that starts producing empty columns; 3 is that bound with a little margin.
+    "raster_oversample": 3.0,
+
+    # Per-pass overhead: approach, plan, accelerate, decelerate. Independent of
+    # step size, so it dominates a fine scan's time budget as much as travel does.
+    #
+    # Measured twice, on unrelated runs, and they agree:
+    #   * 60x60 raster, 658.6 s / 60 rows = 11.0 s/row, of which 0.30 m at
+    #     ~50 mm/s is 6.0 s of travel -> 5.0 s of overhead
+    #   * 30-pass timestamped mesh scan, 329.7 s total, 9.0 m of travel at
+    #     ~50 mm/s = 180 s -> 150 s over 30 passes = 5.0 s/pass
+    "pass_overhead_s": 5.0,
+
+    # Refuse rather than clamp beyond this. A request 3x over the ceiling is a
+    # technician asking for a bit more than the machine has; 10x over is a
+    # misunderstanding about what the machine is, and silently running a scan ten
+    # times slower than asked is not a kindness.
+    "max_clamp_factor": 10.0,
+
+    # Refuse a scan longer than this without an explicit override. 1 h is about
+    # four times the longest scan this stack has actually completed.
+    "max_scan_time_s": 3600.0,
+
+    # Trace-list memory above which file-backed storage stops being optional.
+    # 1 GB, which a 0.5 mm step over the 0.31 m test plate reaches (1.2 GB).
+    "max_trace_memory_bytes": 1 << 30,
+
+    # HOW MANY TRACES THE PROJECTION KERNEL AVERAGES INTO ONE PIXEL.
+    #
+    # The splat falls off smoothly and reaches zero at its nominal radius, so a
+    # radius near half the sample spacing leaves the image a lattice of dots.
+    # Measured over the 5.08 mm pitch of a 60x60: 74.9% coverage of the scanned
+    # area at a 4 mm radius against 96.6% at 8 mm, with the same defect contrast
+    # either way.
+    #
+    # THAT MEASUREMENT WAS READ AS A MULTIPLE OF THE STEP (8/5.08 = 1.6) and the
+    # rule stayed "radius = 1.6 x step" for two years. It is wrong as soon as the
+    # two sample spacings differ, because it never sees the line spacing at all:
+    # an eddy-current scan at a 1.00 mm pitch and a 0.30 mm line spacing got the
+    # same 1.6 mm radius as a 1.00 mm square grid, which is 5.3x its line
+    # spacing, and averaged 26 traces into every pixel over a 3.2 mm disc. The
+    # notch response is 1-1.5 mm wide and the lift-off banding is 5-10 mm wide,
+    # so that kernel removed the signal and kept the artefact. Measured by
+    # reprojecting a real 59-pass scan: notch SNR 15.0 and 13.6 at 1.6 mm
+    # against 33.1 and 26.2 at the radius this rule now gives.
+    #
+    # WHAT THE 5.08 mm MEASUREMENT ACTUALLY FIXED is the number of samples the
+    # kernel reaches, which is an area: pi r^2 / (step x line_spacing). At 8 mm
+    # over a 5.08 mm square grid that is 7.8, and sqrt(8/pi) = 1.5958 against the
+    # 1.5748 that was fitted -- so "1.6 x step" IS "8 traces per spot" for a
+    # square grid, to 0.3%. Expressed that way it generalises to a rectangular
+    # sampling cell for free, and every square-grid scan keeps the radius it had.
+    #
+    # Raise it to average harder and blur more; lower it for a feature near the
+    # size of the sample spacing. A technician who wants a specific radius sets
+    # PROJECTION_SPOT_RADIUS and bypasses this entirely.
+    "traces_per_spot": 8.0,
+
+    # Parameterization pixels per projection spot DIAMETER. Below a couple of
+    # pixels across the splat cannot be drawn whatever its radius says: 512 px
+    # over 0.30 m is 1.7 px/mm, so a 1 mm spot is under 2 px.
+    #
+    # 8 is the number that reproduces both measured points. At the 5.08 mm step
+    # it asks for 512 -- the value the 96.6%-coverage image was actually made at
+    # -- and at a 0.5 mm step it asks for 2048, which is the "0.5 mm needs
+    # 2048+" the measurements led to. A manual choice giving under half of this
+    # is warned about rather than overridden.
+    "pixels_per_spot": 8.0,
+
+    # Parameterization is square and its cost is quadratic, so round up to one of
+    # these rather than to an arbitrary number.
+    "pixel_steps": (512, 1024, 2048, 4096),
+}
+
+
+def _rate_ceiling(projection_mode, transaction_latency_s, limits,
+                  trigger_mode="timestamped", digitizer_rate_hz=None):
+    """(rate_hz, what set it) -- the highest trace rate the pipeline sustains.
+
+    Two different machines depending on how acquisition is triggered, and the
+    difference is not a detail:
+
+      triggered / timestamped   every trace is staged, so the bound is the
+                                staging pipeline: a measured sustained rate where
+                                there is one, and the serialised-globalrev floor
+                                otherwise.
+
+      timer (sample and bin)    traces are not staged one per trigger; the
+                                digitizer free-runs and the sampler keeps the
+                                nearest hit per grid column. The bound is the
+                                PRF, because a column with no hit is FILLED FROM
+                                A NEIGHBOUR and the image is fabricated there.
+    """
+    if trigger_mode == "timer":
+        if not digitizer_rate_hz:
+            raise ValueError("timer mode needs the digitizer rate to plan against")
+        over = float(limits["raster_oversample"])
+        return (digitizer_rate_hz/over,
+                "%.0f Hz digitizer / %.1f samples per column"
+                % (digitizer_rate_hz, over))
+
+    waits = limits["waits_per_trace"].get(projection_mode, 1)
+    floor_rate = 1.0/(waits*transaction_latency_s) if transaction_latency_s > 0 else float("inf")
+    measured = limits["max_trace_rate_hz"].get(projection_mode)
+
+    if measured is not None and measured <= floor_rate:
+        return (float(measured),
+                "measured staging ceiling with projection %s" % projection_mode)
+    return (floor_rate,
+            "%d globalrev wait%s per trace at a %.0f ms ordering window"
+            % (waits, "" if waits == 1 else "s", transaction_latency_s*1e3))
+
+
+def auto_spot_radius(step_m, line_spacing_m=None, limits=None):
+    """Projection spot radius that averages traces_per_spot traces, in metres.
+
+    The sampling cell is step_m ALONG a pass by line_spacing_m ACROSS, and the
+    number of traces a disc of radius r reaches is pi r^2 / (step x spacing). So
+
+        r = sqrt(n x step x spacing / pi)
+
+    which is sqrt(n/pi) x spacing on a square grid -- 1.596 x at n = 8, the rule
+    this replaces, so nothing with equal spacings changes.
+
+    line_spacing_m None means "not known here", and the cell is then taken as
+    square at step_m: the old answer, for a caller that has not been given the
+    line spacing. That is a fallback and not a default -- a raster scan knows its
+    line spacing, and passing it is what stops the radius being set by the
+    coarser axis alone.
+    """
+    limits = DEFAULT_LIMITS if limits is None else limits
+    step_m = float(step_m)
+    spacing = step_m if line_spacing_m is None else float(line_spacing_m)
+    if not spacing > 0.0:
+        spacing = step_m
+    n = float(limits["traces_per_spot"])
+    return math.sqrt(n*step_m*spacing/math.pi)
+
+
+global traces_per_spot
+def traces_per_spot(spot_radius_m, step_m, line_spacing_m=None):
+    """How many traces a spot of this radius reaches, on this sampling grid.
+
+    The inverse of auto_spot_radius(), and the number worth printing: a radius
+    in millimetres is hard to judge against a feature size, and "26 traces
+    averaged into every pixel" is not.
+    """
+    spacing = step_m if line_spacing_m is None else float(line_spacing_m)
+    if not (spot_radius_m > 0.0 and step_m > 0.0 and spacing > 0.0):
+        return float("nan")
+    return math.pi*float(spot_radius_m)**2/(float(step_m)*spacing)
+
+
+def auto_projection_pixels(spot_radius_m, extent_m, limits=None):
+    """Parameterization pixels so one spot is a few pixels across.
+
+    extent_m is the physical size the parameterization spans -- for the
+    synthesised plane patch that is the scan area plus its margin, and for a mesh
+    it is the surface's own extent. Rounded up to the next standard size, because
+    the cost is quadratic and a number like 1730 buys nothing over 2048.
+    """
+    limits = DEFAULT_LIMITS if limits is None else limits
+    if not spot_radius_m > 0.0 or not extent_m > 0.0:
+        return limits["pixel_steps"][0]
+    want = float(limits["pixels_per_spot"])*extent_m/(2.0*spot_radius_m)
+    for px in limits["pixel_steps"]:
+        if px >= want:
+            return px
+    return limits["pixel_steps"][-1]
+
+
+def velocity_from_scaling(scaling, calibration):
+    """Probe speed a given MoveIt velocity scaling actually produces, m/s.
+
+    calibration is [(scaling, measured m/s), ...] ascending -- see
+    ROBOT_VELOCITY_CALIBRATION in the config for how it is measured. Linear
+    between the measured points, through the origin below the first, and FLAT
+    above the last, because that is what the measurement shows: the cell
+    saturates rather than continuing to speed up.
+    """
+    cal = sorted(calibration)
+    if not cal:
+        raise ValueError("no velocity calibration")
+    s = float(scaling)
+    if s <= cal[0][0]:
+        # Through the origin: a scaling of zero is a stationary arm, and this is
+        # the only defensible shape below the measured range. Extrapolation, and
+        # plan_scan says so.
+        return cal[0][1]*s/cal[0][0]
+    for (s0, v0), (s1, v1) in zip(cal, cal[1:]):
+        if s <= s1:
+            return v0 + (v1 - v0)*(s - s0)/(s1 - s0)
+    return cal[-1][1]
+
+
+def velocity_scaling_for(velocity_mps, calibration):
+    """MoveIt velocity SCALING that produces a given probe speed.
+
+    CartesianMove's vel is a fraction of the robot's JOINT limits, not a speed,
+    so a technician-facing number in m/s has to be converted -- and the
+    conversion is a property of this cell, not of this code. It is also NOT a
+    single constant: in the simulated cell the mapping is close to linear at
+    1.5 m/s full scale up to about 30 mm/s and then saturates hard, so one ratio
+    taken at 50 mm/s over-commands everything slower by half.
+
+    The inverse of velocity_from_scaling, therefore, over the measured table.
+    Returns the scaling clamped to the table's range; ask for more than the cell
+    can do and you get the most it can do, which plan_scan reports.
+    """
+    cal = sorted(calibration)
+    if not cal:
+        raise ValueError("no velocity calibration")
+    v = float(velocity_mps)
+    if v <= cal[0][1]:
+        return max(1e-4, cal[0][0]*v/cal[0][1])
+    for (s0, v0), (s1, v1) in zip(cal, cal[1:]):
+        if v <= v1:
+            return s0 + (s1 - s0)*(v - v0)/(v1 - v0)
+    return cal[-1][0]
+
+
+def plan_scan(step_m, velocity_mps, path_length_m, passes,
+              num_samples, sample_bytes,
+              trigger_mode="timestamped", projection_mode="live",
+              transaction_latency_s=0.02, digitizer_rate_hz=None,
+              velocity_calibration=((0.05, 0.05),),
+              spot_radius_m=None, projection_pixels=None,
+              projection_extent_m=None, line_spacing_m=None,
+              file_backed=False, limits=None, force=False):
+    """Work out what this scan actually costs, and whether it can be run.
+
+    step_m and velocity_mps are the two the technician sets. Everything else
+    describes the scan that is about to happen -- the geometry comes from the
+    ScanPath, the record length and sample size from the digitizer -- and is not
+    a knob.
+
+    Returns a dict. It always contains the arithmetic; "errors" is empty only if
+    the scan can be run as planned. plan_scan itself raises ScanLimitError for
+    those errors unless force=True, so a caller that wants to inspect and decide
+    passes force and reads the list.
+    """
+    limits = DEFAULT_LIMITS if limits is None else limits
+    step_m = float(step_m)
+    velocity_mps = float(velocity_mps)
+    path_length_m = float(path_length_m)
+    passes = int(passes)
+
+    if not step_m > 0.0:
+        raise ValueError("step size must be positive, not %r" % (step_m,))
+    if not velocity_mps > 0.0:
+        raise ValueError("velocity must be positive, not %r" % (velocity_mps,))
+
+    rate_hz, rate_reason = _rate_ceiling(projection_mode, transaction_latency_s,
+                                         limits, trigger_mode, digitizer_rate_hz)
+
+    # The coupling the config did not have: trace rate = velocity / step, so the
+    # rate ceiling IS a velocity ceiling once the step is chosen.
+    max_velocity = rate_hz*step_m
+    effective = min(velocity_mps, max_velocity)
+    clamped = effective < velocity_mps*(1.0 - 1e-9)
+
+    errors = []
+    warnings = []
+
+    over = velocity_mps/max_velocity if max_velocity > 0.0 else float("inf")
+    if over > float(limits["max_clamp_factor"]):
+        errors.append(
+            "requested %.1f mm/s is %.0fx the %.1f mm/s this pipeline can "
+            "sustain at a %.2f mm step (%s). Raise the step size, lower the "
+            "velocity, or set the projection mode to 'deferred'."
+            % (velocity_mps*1e3, over, max_velocity*1e3, step_m*1e3, rate_reason))
+
+    # What the arm will ACTUALLY do with that command, which is a separate
+    # question from what was asked for and is the one the trace rate depends on.
+    # Everything below is computed from the achieved speed, not the target,
+    # because a cell that runs 50% fast at low scalings produces 50% more traces
+    # per second than the plan would otherwise claim.
+    cal = sorted(velocity_calibration)
+    scaling = velocity_scaling_for(effective, cal)
+    achieved = velocity_from_scaling(scaling, cal)
+    if effective > cal[-1][1]*(1.0 + 1e-9):
+        warnings.append(
+            "the arm tops out at %.1f mm/s in this cell (measured), so %.1f mm/s "
+            "is not achievable; the scan will run at the slower speed."
+            % (cal[-1][1]*1e3, effective*1e3))
+    if effective < cal[0][1]*(1.0 - 1e-9):
+        warnings.append(
+            "%.1f mm/s is below the slowest speed this cell was calibrated at "
+            "(%.1f mm/s); the scaling is extrapolated through the origin and the "
+            "arm may run faster than asked. Watch the observed speed reported at "
+            "the end of the scan."
+            % (effective*1e3, cal[0][1]*1e3))
+    effective = achieved
+
+    # Trace count the way ScanPath.trace_count does it: one at the start of every
+    # pass, then one per step along it. Passes are counted separately because the
+    # +1 per pass is a real trace and matters on a many-pass fine scan.
+    per_pass = path_length_m/passes if passes else 0.0
+    traces = passes*(int(math.floor(per_pass/step_m)) + 1) if passes else 0
+
+    travel_s = path_length_m/effective if effective > 0.0 else float("inf")
+    overhead_s = passes*float(limits["pass_overhead_s"])
+    scan_time_s = travel_s + overhead_s
+
+    if scan_time_s > float(limits["max_scan_time_s"]):
+        errors.append(
+            "estimated scan time %s exceeds the %s limit. Raise the step size or "
+            "the line spacing, scan a smaller area, or pass force=True."
+            % (_hms(scan_time_s), _hms(float(limits["max_scan_time_s"]))))
+
+    trace_bytes = traces*num_samples*sample_bytes
+    pose_bytes = traces*7*4
+    memory_bytes = trace_bytes + pose_bytes
+
+    if memory_bytes > float(limits["max_trace_memory_bytes"]):
+        if file_backed:
+            warnings.append(
+                "%s of trace data -- file-backed, so this is disk rather than RAM."
+                % _bytes(memory_bytes))
+        else:
+            errors.append(
+                "%s of trace data with storage in memory. Set SCAN_STORAGE_DIR to "
+                "a directory on a real disk, or raise the step size."
+                % _bytes(memory_bytes))
+
+    if spot_radius_m is None:
+        spot_radius_m = auto_spot_radius(step_m, line_spacing_m, limits)
+        spot_auto = True
+    else:
+        spot_radius_m = float(spot_radius_m)
+        spot_auto = False
+        # JUDGED AGAINST THE SAMPLING CELL, not against the step. A radius under
+        # the step is fine when the lines are close together -- there are still
+        # several traces inside it -- and a radius over the step is not enough
+        # when they are far apart. The trace count is the thing that decides,
+        # and it is the thing to say.
+        got = traces_per_spot(spot_radius_m, step_m, line_spacing_m)
+        if got < 2.0:
+            warnings.append(
+                "a %.2f mm projection spot reaches %.1f trace(s) at a %.2f mm "
+                "step and a %.2f mm line spacing; under about 2 the image "
+                "breaks into a lattice of dots (74.9%% coverage measured at "
+                "1.6 traces against 96.6%% at 8). %.2f mm gives %.0f."
+                % (spot_radius_m*1e3, got, step_m*1e3,
+                   (line_spacing_m if line_spacing_m else step_m)*1e3,
+                   auto_spot_radius(step_m, line_spacing_m, limits)*1e3,
+                   float(limits["traces_per_spot"])))
+
+    extent = projection_extent_m if projection_extent_m else per_pass
+    if projection_pixels is None:
+        projection_pixels = auto_projection_pixels(spot_radius_m, extent, limits)
+        pixels_auto = True
+    else:
+        projection_pixels = int(projection_pixels)
+        pixels_auto = False
+        if extent > 0.0:
+            across = 2.0*spot_radius_m*projection_pixels/extent
+            if across < 0.5*float(limits["pixels_per_spot"]):
+                warnings.append(
+                    "a %.1f mm spot is %.1f pixels across at %d px over %.2f m; "
+                    "the projection cannot draw it. Use %d."
+                    % (spot_radius_m*1e3, across, projection_pixels, extent,
+                       auto_projection_pixels(spot_radius_m, extent, limits)))
+
+    plan = {
+        "step_m": step_m,
+        "requested_velocity_mps": velocity_mps,
+        "effective_velocity_mps": effective,
+        "velocity_clamped": clamped,
+        "velocity_scaling": scaling,
+        "max_velocity_mps": max_velocity,
+        "robot_max_velocity_mps": cal[-1][1],
+        "trace_rate_hz": effective/step_m if step_m > 0.0 else 0.0,
+        "max_trace_rate_hz": rate_hz,
+        "rate_limited_by": rate_reason,
+        "trigger_mode": trigger_mode,
+        "projection_mode": projection_mode,
+        "passes": passes,
+        "path_length_m": path_length_m,
+        "traces": traces,
+        "num_samples": int(num_samples),
+        "sample_bytes": int(sample_bytes),
+        "travel_s": travel_s,
+        "overhead_s": overhead_s,
+        "scan_time_s": scan_time_s,
+        "memory_bytes": memory_bytes,
+        "file_backed": bool(file_backed),
+        "spot_radius_m": spot_radius_m,
+        "spot_radius_auto": spot_auto,
+        "line_spacing_m": (float(line_spacing_m) if line_spacing_m else None),
+        "traces_per_spot": traces_per_spot(spot_radius_m, step_m, line_spacing_m),
+        "projection_pixels": int(projection_pixels),
+        "projection_pixels_auto": pixels_auto,
+        "projection_extent_m": extent,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+    if errors and not force:
+        raise ScanLimitError(
+            "this scan cannot be run as requested:\n    " + "\n    ".join(errors)
+            + "\n\n" + format_scan_plan(plan))
+    return plan
+
+
+def _hms(seconds):
+    if seconds != seconds or seconds == float("inf"):
+        return "forever"
+    if seconds < 90.0:
+        return "%.0f s" % seconds
+    if seconds < 5400.0:
+        return "%.1f min" % (seconds/60.0)
+    return "%.1f h" % (seconds/3600.0)
+
+
+def _bytes(n):
+    for unit, div in (("GB", 2**30), ("MB", 2**20), ("kB", 2**10)):
+        if n >= div:
+            return "%.2f %s" % (n/float(div), unit)
+    return "%d B" % n
+
+
+def format_scan_plan(plan):
+    """The summary printed before a scan starts.
+
+    Every derived number, with the arithmetic that produced it, so that a
+    2.6-hour scan is a decision rather than a surprise -- and so that a velocity
+    that was quietly scaled down says so with both numbers.
+    """
+    lines = []
+    lines.append("  scan plan")
+    lines.append("    step size          %.2f mm     (%d traces over %.3f m of travel, "
+                 "%d pass%s)"
+                 % (plan["step_m"]*1e3, plan["traces"], plan["path_length_m"],
+                    plan["passes"], "" if plan["passes"] == 1 else "es"))
+
+    if plan["velocity_clamped"]:
+        lines.append("    velocity           %.1f mm/s REQUESTED -> %.1f mm/s USED"
+                     % (plan["requested_velocity_mps"]*1e3,
+                        plan["effective_velocity_mps"]*1e3))
+        lines.append("                       scaled down to hold %.1f traces/s; the "
+                     "ceiling is %.1f traces/s"
+                     % (plan["trace_rate_hz"], plan["max_trace_rate_hz"]))
+        lines.append("                       (%s)" % plan["rate_limited_by"])
+    else:
+        lines.append("    velocity           %.1f mm/s     -> %.1f traces/s, against a "
+                     "%.1f traces/s ceiling"
+                     % (plan["effective_velocity_mps"]*1e3, plan["trace_rate_hz"],
+                        plan["max_trace_rate_hz"]))
+        lines.append("                       (%s)" % plan["rate_limited_by"])
+
+    lines.append("    estimated time     %s   (%s of travel + %s of per-pass overhead)"
+                 % (_hms(plan["scan_time_s"]), _hms(plan["travel_s"]),
+                    _hms(plan["overhead_s"])))
+    lines.append("    trace memory       %s     (%d x %d samples x %d bytes%s)"
+                 % (_bytes(plan["memory_bytes"]), plan["traces"],
+                    plan["num_samples"], plan["sample_bytes"],
+                    ", file-backed" if plan["file_backed"] else ", IN MEMORY"))
+    n = plan.get("traces_per_spot")
+    lines.append("    projection         %s, spot radius %.2f mm%s, %d px%s"
+                 % (plan["projection_mode"], plan["spot_radius_m"]*1e3,
+                    " (auto)" if plan["spot_radius_auto"] else "",
+                    plan["projection_pixels"],
+                    " (auto)" if plan["projection_pixels_auto"] else ""))
+    if n is not None and n == n:
+        # The radius alone does not say how much averaging it is: that depends
+        # on BOTH sample spacings, and it is the averaging that decides whether
+        # a feature the size of the sample spacing survives into the image.
+        lines.append("                       %.0f trace(s) averaged per pixel "
+                     "over a %.2f mm step x %.2f mm line spacing"
+                     % (n, plan["step_m"]*1e3,
+                        (plan.get("line_spacing_m") or plan["step_m"])*1e3))
+    lines.append("    robot velocity scaling %.4f" % plan["velocity_scaling"])
+
+    for w in plan["warnings"]:
+        lines.append("    WARNING: %s" % w)
+    for e in plan["errors"]:
+        lines.append("    ERROR:   %s" % e)
+    return "\n".join(lines)
+
+
+def check_scan_outcome(plan, report, limits=None):
+    """What the scan actually did, against what was planned.
+
+    This is the half that keeps the constants above honest. The plan is built
+    from numbers measured on other days on other hardware; the report is this
+    run. Three things are worth saying out loud:
+
+      * the stager's queue depth. It is the backpressure signal -- a queue that
+        grew and stayed grown means the pipeline was behind, whatever the
+        configured ceiling claims, and the ceiling should come down.
+      * the achieved trace rate, for the same reason from the other side.
+      * the observed probe speed against the requested one, which is the only
+        check there is on the velocity-scaling calibration in this cell.
+
+    Returns a list of lines; empty means everything matched.
+    """
+    limits = DEFAULT_LIMITS if limits is None else limits
+    out = []
+
+    elapsed = report.get("elapsed") or 0.0
+    staged = report.get("staged") or 0
+    if elapsed > 0.0 and staged:
+        achieved = staged/elapsed
+        out.append("  achieved %.1f traces/s over %s (planned %.1f traces/s, "
+                   "%d of %d traces)"
+                   % (achieved, _hms(elapsed), plan["trace_rate_hz"], staged,
+                      plan["traces"]))
+        if plan["scan_time_s"] > 0.0 and elapsed > 1.5*plan["scan_time_s"]:
+            out.append("  the scan took %.1fx the estimate -- the per-pass overhead "
+                       "or the velocity calibration in DEFAULT_LIMITS is wrong for "
+                       "this cell." % (elapsed/plan["scan_time_s"],))
+
+    depth = report.get("stager_max_queue_depth")
+    if depth is not None and depth > 0:
+        # A depth of a few is normal and drains. Sustained growth is not; a
+        # 30-pass reference scan peaks at 5.
+        if depth > 16:
+            out.append("  the staging queue reached %d: the pipeline ran BEHIND the "
+                       "trigger at %.1f traces/s. Lower the velocity or raise the "
+                       "step size; if this repeats, lower "
+                       "MAX_TRACE_RATE_HZ[%r] below %.1f."
+                       % (depth, plan["trace_rate_hz"], plan["projection_mode"],
+                          plan["trace_rate_hz"]))
+        else:
+            out.append("  staging queue peaked at %d (5 on the reference run)" % depth)
+
+    # Observed probe speed, per pass, from what the trigger saw the probe travel.
+    # This is the only check on velocity_scaling_for()'s calibration.
+    speeds = [seg["observed_m"]/seg["sweep_s"]
+              for seg in report.get("per_segment", [])
+              if seg.get("sweep_s") and seg.get("observed_m")]
+    if speeds:
+        mean = sum(speeds)/len(speeds)
+        out.append("  observed probe speed %.1f mm/s over %d pass%s (asked for %.1f)"
+                   % (mean*1e3, len(speeds), "" if len(speeds) == 1 else "es",
+                      plan["effective_velocity_mps"]*1e3))
+        ratio = mean/plan["effective_velocity_mps"] if plan["effective_velocity_mps"] else 0.0
+        if ratio and plan["velocity_scaling"] and (ratio > 1.15 or ratio < 0.85):
+            # TWO CAUSES, AND THIS LINE USED TO NAME ONLY ONE. The calibration
+            # table maps a scaling to a PEAK tool speed; what is measured here
+            # is the MEAN over a pass. They are the same number only on a path
+            # that holds its speed, and a surface-following toolpath does not:
+            # on 2026-10-16 mtc's own trajectory check reported a peak of
+            # 2.80 mm/s against the 2.5 asked for -- the calibration was right
+            # -- while the mean over the same trajectory was 1.09, because
+            # TOTG decelerates through every waypoint. This line said
+            # "ROBOT_VELOCITY_CALIBRATION is wrong here" and sent the next
+            # reader to re-measure a table that was fine.
+            #
+            # The discriminator is already printed, by mtc, once per pass, and
+            # it costs nothing to say where to look.
+            out.append("  that is %.2fx what was asked for. TWO THINGS DO "
+                       "THAT and they need different fixes:" % (ratio,))
+            out.append("    the calibration -- if mtc's 'Trajectory check' "
+                       "line for a pass reports a PEAK near %.1f mm/s, the "
+                       "table is fine; if it reports a peak near %.1f, the "
+                       "table is stale and the entry to add is (%.4f, %.4f)."
+                       % (plan["effective_velocity_mps"]*1e3, mean*1e3,
+                          plan["velocity_scaling"], mean))
+            out.append("    the trajectory  -- a peak at the commanded speed "
+                       "with a mean well under it is TOTG decelerating "
+                       "through the waypoints, not the arm running slow. The "
+                       "tool-axis turn rate and the waypoint spacing are what "
+                       "move it; the velocity scaling does not.")
+
+    late = report.get("late_transactions")
+    if late:
+        # max_lateness_secs is how much OLDER than its predecessor the worst
+        # out-of-order transaction was, not how far past the window it arrived.
+        # Compare it with the window: a lateness well under TRANSACTION_LATENCY
+        # means the producer was slow to submit, not that the window is too
+        # narrow for the spread of timestamps.
+        out.append("  %d late transaction(s) since startup, worst %.1f ms older than "
+                   "its predecessor -- committed, but those globalrev timestamps are "
+                   "out of order. Raise TRANSACTION_LATENCY if this grows."
+                   % (late, 1e3*(report.get("max_lateness_secs") or 0.0)))
+    return out

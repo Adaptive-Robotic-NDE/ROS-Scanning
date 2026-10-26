@@ -1,0 +1,2864 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  tooling_clearance.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Per-link clearance between the end-of-arm tooling and the scanned
+#   surface for a planned path.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# ==============================================================================
+# DOES THE WHOLE TOOL CLEAR THE PART? -- asked before anything flies
+# ==============================================================================
+# A scan stage places ONE sensor. The arm carries four things: the eddy-current
+# probe, the Keyence line profiler, the Azure Kinect and the bracket that holds
+# it. Put the sensor a stage cares about where that stage wants it and the other
+# three go wherever the geometry sends them.
+#
+# That is not hypothetical. A Keyence raster over a cylinder places
+# `lj_v7080_optical_frame` correctly inside its +/-23 mm window on every pass
+# while `probe_end` -- the tip of a 7.1 mm-radius barrel, 75 mm away on the same
+# mounting plate -- ends 0.7 to 4.5 mm from the cylinder's flank, which means the
+# probe body is commanded 5-6 mm INSIDE the part. Over a flat plate the same
+# geometry leaves 39 mm of clearance, so a flat calibration plate scans cleanly
+# and the fault never appears.
+#
+# MoveIt can catch this, and now does (tari_cpp_mtc checks collisions in the
+# raster stage), but only once the specimen is in the planning scene -- and only
+# as a yes/no at plan time, inside the planner, in the planner's units. This
+# module is the independent check: it answers "how many millimetres" for every
+# pose of a planned path, per LINK, before a single joint moves, and it does it
+# from the same URDF the planner uses rather than from a number written down
+# here.
+#
+# WHY IT IS SEPARATE FROM MOVEIT, deliberately:
+#
+#   * it runs on a ScanPath, at planning time, with no planning scene, no
+#     move_group and no robot -- so it works in a unit test and on a machine
+#     without ROS;
+#   * it reports a distance rather than a verdict, so a pass can be DROPPED for
+#     4 mm of clearance instead of the whole scan failing at pose 300 of 1400;
+#   * it is not fooled by a collision check that was switched off -- a planning
+#     stage with a default-constructed validity callback checks nothing and
+#     still reports success.
+#
+# Nothing here is specific to the eddy-current tooling. The geometry is read from
+# `robot_description`: every link rigidly attached to `tool0` through FIXED
+# joints, with its <collision> geometry, expressed in the `probe_end` frame. Bolt
+# something else on and this follows it.
+
+import os
+import math
+import time
+
+import numpy as np
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global robot_description_xml
+global tooling_envelope
+global clear_tooling_caches
+global ToolingEnvelope
+global SurfaceDistance
+global surface_distance
+global path_clearance
+global format_clearance_report
+global enforce_path_clearance
+global cap_path_tilt_for_clearance
+global TOOLING_ROOT_FRAME
+global TOOLING_RIGID_ROOT
+global TOOLING_SAMPLE_M
+global TOOLING_CLEARANCE_M
+global TOOLING_CLEARANCE_PAD_M
+global TOOLING_CONTACT_LINKS
+global TOOLING_TWIST_LIMIT_DEG
+global twist_within_limit
+global lead_in_clearance
+global closest_point_on_triangles
+global path_step_travel
+global sampled_path_clearance
+global TOOLING_GATE_RESOLUTION_M
+global TOOLING_GATE_SAMPLE_ABOVE
+global TOOLING_GATE_PROGRESS_ABOVE
+global TOOLING_GATE_PROGRESS_BLOCKS
+global TOOLING_GATE_MAX_ROUNDS
+global TOOLING_POSE_BLOCK
+global SURFACE_QUERY_BYTES
+global SURFACE_KERNEL_BYTES
+global SURFACE_QUERY_WORKERS
+global TOOLING_GATE_COARSE_M
+global TOOLING_GATE_PROGRESS_S
+
+
+# ------------------------------------------------------------------------------
+# The knobs, all overridable from a config.
+# ------------------------------------------------------------------------------
+
+#: The frame every path is expressed in -- the IK frame the moves are solved for.
+TOOLING_ROOT_FRAME = "probe_end"
+
+#: Where the rigid body that is "the tooling" starts. Everything reachable from
+#: here through FIXED joints moves with it and is checked.
+TOOLING_RIGID_ROOT = "tool0"
+
+#: How finely each link's collision geometry is sampled, metres. The check is a
+#: point-set against the specimen's triangles, so a coarser sampling can only
+#: OVERSTATE the clearance, and by at most about half the spacing. 4 mm with the
+#: 2 mm pad below is the trade this ships with; the pad covers the sampling.
+TOOLING_SAMPLE_M = 0.004
+
+#: Clearance a pose must leave between every tooling link and the surface being
+#: scanned, metres. 5 mm: the Keyence's own window is +/-23 mm, the profiler's
+#: noise about a fitted plane is 0.1 mm, and the rough mesh a raster is planned
+#: over is a 6 mm-voxel TSDF -- so a few millimetres is the resolution of the
+#: surface itself. Anything tighter than this is not a clearance, it is noise.
+TOOLING_CLEARANCE_M = 0.005
+
+#: Added to every measured distance as the cost of sampling, metres. See
+#: TOOLING_SAMPLE_M.
+TOOLING_CLEARANCE_PAD_M = 0.002
+
+#: How far the tool may turn about its own axis WITHIN one pass, degrees.
+#: UNMEASURED -- a placeholder, not a specification, and NOT THE CABLE LIMIT.
+#:
+#: The cable limit has been measured (capture_cable_envelope()) and it is not
+#: this quantity: it is a band in the ABSOLUTE wrist_3 joint angle, per tilt, and
+#: it lives in cable_envelope.dpi where install_cable_guard() enforces it on
+#: every motion. This number stays only as a PLANNING report -- a path that spins
+#: the tool inside one pass is badly planned whatever the cables allow -- and
+#: twist_within_limit() says so in as many words, because it warns rather than
+#: refusing.
+TOOLING_TWIST_LIMIT_DEG = 90.0
+
+#: The links the eddy-current scan touches the part WITH. Contact is the point of
+#: that scan, so these are reported and not refused -- but only when a caller
+#: names them, and it has to name them deliberately. Everything else on the
+#: tooling still has to clear.
+TOOLING_CONTACT_LINKS = ("ec_probe", "probe_holder")
+
+#: How much tooling travel the gate will step over between two MEASURED poses
+#: before it starts refining, metres. It is not a tolerance and nothing is
+#: rounded to it: it only sets how dense the first pass is. What bounds the
+#: answer is the 1-Lipschitz certificate in sampled_path_clearance() -- signed
+#: distance to a fixed surface changes by at most the distance the point moved --
+#: so a window is only left unmeasured once that certificate puts every pose
+#: inside it above the limit. 10 mm is about two eddy-current probe radii
+#: (ec_probe is a 7.1 mm-radius barrel), so the first pass already resolves the
+#: smallest thing on the tooling.
+TOOLING_GATE_RESOLUTION_M = 0.010
+
+#: Above this many poses the gate SAMPLES (with the certificate above) instead
+#: of measuring every pose. Below it, sampling would save nothing worth the
+#: extra reporting, and every existing caller and test stays on the exact path
+#: it was written against. A 0.30 mm eddy-current toolpath is 180 000 poses.
+TOOLING_GATE_SAMPLE_ABOVE = 2000
+
+#: How many refinement rounds the gate will run before it gives up and measures
+#: what is left exactly. A guard against a pathological path, not a tuning knob:
+#: each round at least halves every unresolved window, so a 180 000-pose path
+#: needs about 18 in the worst case.
+TOOLING_GATE_MAX_ROUNDS = 24
+
+#: Poses measured per block. The gate's working set is (poses x links x 3) and
+#: then (poses x links x k x 3) inside the distance query, so on a long path an
+#: unblocked check allocates tens of gigabytes -- it has reached 8.4 GB RSS and
+#: been OOM-killed. The answer does not depend on the block size; the peak
+#: memory does, and this makes it O(block) instead of O(path).
+TOOLING_POSE_BLOCK = 4096
+
+#: Working-set budget for one distance query, bytes -- a budget rather than a
+#: point count because what the query costs per point depends on the mesh. The
+#: barycentric test holds about 12 arrays of (points x candidates x 3) and 13 of
+#: (points x candidates), i.e. ~392 bytes per point per candidate, and the
+#: candidate count comes from the mesh (SurfaceDistance._starting_k: 88 on this
+#: cell's reconstruction, 12 on a coarse one). Fixing the point count instead
+#: would mean 211 MB per temporary on the dense mesh and 29 MB on the coarse
+#: one, for the same nominal setting. 256 MB is the same budget either way.
+SURFACE_QUERY_BYTES = 256 << 20
+
+#: Working set for ONE slab of the barycentric test, bytes. SURFACE_QUERY_BYTES
+#: bounds the whole query and therefore the peak memory; this bounds the slab
+#: the arithmetic actually runs on, and it is a CACHE size, not a memory budget.
+#:
+#: The test is memory-bandwidth bound, not arithmetic bound -- it holds about 20
+#: intermediates of (points x candidates x 3) float64 and touches each of them
+#: once. Measured on this cell's 198 422-triangle reconstruction at k = 59, with
+#: identical arithmetic and identical answers:
+#:
+#:      slab 70.8 MB   37.8 us/point       slab  5.8 MB    9.6 us/point
+#:      slab 15.7 MB   15.4 us/point       slab 0.36 MB    7.1 us/point
+#:
+#: 5.3x, entirely from whether the working set fits in L2/L3. Sizing the slab
+#: from SURFACE_QUERY_BYTES instead runs the arithmetic at ~70 MB and pays it.
+SURFACE_KERNEL_BYTES = 1 << 19
+
+#: How many threads the distance kernel may use. -1 (the default) means every
+#: core. Both halves of a query release the GIL -- scipy's KD-tree query takes
+#: its own `workers`, and numpy's ufuncs drop the GIL inside the barycentric
+#: slabs -- so this is THREADS, not processes: no fork out of a dgpy session
+#: holding the recording-database locks, no pickling of the mesh, and the answer
+#: is what one thread computes because the slabs are disjoint and nothing is
+#: reduced across them. Measured on 8 cores: 7.5 -> 2.5 us/point for the
+#: barycentric, 14.2 -> 4.3 for the tree query. Set it to 1 for serial
+#: behaviour.
+SURFACE_QUERY_WORKERS = -1
+
+#: How much tooling travel the FIRST pass of the sampled gate steps over,
+#: metres. Deliberately coarse: a window costs one measurement and buys
+#: certification of everything inside it, and what decides whether a window is
+#: ACCEPTED is the Lipschitz certificate (see sampled_path_clearance), never
+#: this number. Starting at TOOLING_GATE_RESOLUTION_M instead puts 39 800 of a
+#: 116 851-pose eddy-current path into round one before a single one of them has
+#: been looked at. A path that is genuinely tight everywhere converges to the
+#: same measured set either way -- it just gets there by refining down instead of
+#: by starting there.
+TOOLING_GATE_COARSE_M = 0.250
+
+#: Seconds between progress lines while the gate runs. The gate can take tens of
+#: minutes, and silence for that long is indistinguishable from a hang to an
+#: operator watching a cell. 0 turns the lines off.
+TOOLING_GATE_PROGRESS_S = 5.0
+
+#: Poses above which path_clearance() reports progress on its own.
+#:
+#: THIS USED TO BE DERIVED FROM THE BLOCK SIZE (4 x TOOLING_POSE_BLOCK = 16384
+#: poses), and the two thresholds were mutually exclusive: a path over
+#: TOOLING_GATE_SAMPLE_ABOVE (2000) poses never takes this path at all, and one
+#: under it can never reach 16384 -- so the exact gate was silent by
+#: construction, for every path that could possibly run it. On 2026-10-15 a
+#: 1749-pose eddy-current toolpath over a 24 x 18 mm region sat here for 231
+#: seconds with nothing printed, after a plan that had predicted 3.
+#:
+#: 120 poses is about 16 s at the 0.13 s/pose this cell measures, so anything
+#: that could be mistaken for a hang says something and anything quick stays
+#: quiet.
+TOOLING_GATE_PROGRESS_ABOVE = 120
+
+#: The fewest progress lines a reporting gate will manage to emit.
+#:
+#: Progress is reported per BLOCK, and a path shorter than TOOLING_POSE_BLOCK is
+#: one block -- so it ticks once, at zero, and says nothing again until it is
+#: finished. When progress is wanted the block is therefore divided down until
+#: there are at least this many of them. The block size cannot change the
+#: answer (see path_clearance), only the peak working set, and dividing it only
+#: ever lowers that.
+TOOLING_GATE_PROGRESS_BLOCKS = 20
+
+#: A failing window with no more than this many unmeasured poses inside it is
+#: measured out completely instead of bisected. Bisecting the last handful
+#: costs a round apiece and a round is a whole path_clearance() call.
+_GATE_MEASURE_ALL = 24
+
+#: The most marks refinement will drop into one window in one round. A guard
+#: against a window whose ends read as hugely clear while its middle is not:
+#: without it the predicted spacing could ask for thousands of poses at once.
+_GATE_MAX_INSERTS = 64
+
+
+_ENVELOPE_CACHE = {}
+_DESCRIPTION_CACHE = {}
+
+
+def clear_tooling_caches():
+    """Forget the parsed description and every envelope built from it.
+
+    The tooling changes when somebody rebuilds the description, and a dgpy
+    session outlives that.
+    """
+    _ENVELOPE_CACHE.clear()
+    _DESCRIPTION_CACHE.clear()
+
+
+# ------------------------------------------------------------------------------
+# Where the geometry comes from
+# ------------------------------------------------------------------------------
+
+def robot_description_xml(source=None, node="/robot_state_publisher",
+                          timeout=10.0):
+    """The URDF this work cell is running, as text.
+
+    In order: what the caller passed (XML text or a file), a
+    ROBOT_DESCRIPTION_XML global or TARI_ROBOT_DESCRIPTION_FILE in the
+    environment, then `robot_description` off /robot_state_publisher.
+
+    Read from the RUNNING node rather than rendered from xacro here, because the
+    arguments a cell was brought up with -- which tooling, which Azure bracket,
+    whether the Keyence is mounted, the per-cell calibrations -- decide what is
+    on the arm, and only the node that is up knows them. A test on the host
+    passes the xacro output in instead.
+    """
+    if source is not None:
+        if "<robot" in source[:4096]:
+            return source
+        with open(source) as handle:
+            return handle.read()
+    override = globals().get("ROBOT_DESCRIPTION_XML")
+    if override:
+        return override
+    path = os.environ.get("TARI_ROBOT_DESCRIPTION_FILE")
+    if path:
+        with open(path) as handle:
+            return handle.read()
+    if node in _DESCRIPTION_CACHE:
+        return _DESCRIPTION_CACHE[node]
+
+    import rclpy
+    from rclpy.node import Node
+    from rcl_interfaces.srv import GetParameters
+
+    client_node = Node("tooling_clearance_description")
+    try:
+        client = client_node.create_client(GetParameters,
+                                           node + "/get_parameters")
+        if not client.wait_for_service(timeout_sec=timeout):
+            raise RuntimeError(
+                "no %s/get_parameters, so there is no way to read the URDF this "
+                "cell is running. Bring up the description, or pass the xacro "
+                "output as source=." % (node,))
+        req = GetParameters.Request()
+        req.names = ["robot_description"]
+        future = client.call_async(req)
+        rclpy.spin_until_future_complete(client_node, future, timeout_sec=timeout)
+        res = future.result()
+        if res is None or not res.values or not res.values[0].string_value:
+            raise RuntimeError("%s has no robot_description parameter" % (node,))
+        xml = res.values[0].string_value
+    finally:
+        client_node.destroy_node()
+    _DESCRIPTION_CACHE[node] = xml
+    return xml
+
+
+def _rpy_matrix(rpy):
+    """URDF's fixed-axis roll-pitch-yaw as a rotation matrix."""
+    r, p, y = [float(v) for v in rpy]
+    cr, sr = math.cos(r), math.sin(r)
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+    return np.array([
+        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
+        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
+        [-sp,   cp*sr,            cp*cr]], dtype=np.float64)
+
+
+def _origin_transform(element):
+    """The 4x4 an <origin> names; identity when there is none."""
+    T = np.eye(4)
+    if element is None:
+        return T
+    origin = element.find("origin")
+    if origin is None:
+        return T
+    xyz = [float(v) for v in (origin.get("xyz") or "0 0 0").split()]
+    rpy = [float(v) for v in (origin.get("rpy") or "0 0 0").split()]
+    T[:3, :3] = _rpy_matrix(rpy)
+    T[:3, 3] = xyz
+    return T
+
+
+def _resolve_mesh_uri(uri):
+    """An absolute path for a URDF mesh filename.
+
+    file:// is what xacro leaves behind after $(find ...); package:// needs the
+    ament index, which is there in the container and not on the host, so a
+    TARI_MESH_PATH list of roots is honoured as well.
+    """
+    if uri.startswith("file://"):
+        return uri[len("file://"):]
+    if uri.startswith("package://"):
+        rest = uri[len("package://"):]
+        package, _, rel = rest.partition("/")
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            return os.path.join(get_package_share_directory(package), rel)
+        except Exception:
+            for root in (os.environ.get("TARI_MESH_PATH") or "").split(os.pathsep):
+                if not root:
+                    continue
+                candidate = os.path.join(root, package, rel)
+                if os.path.exists(candidate):
+                    return candidate
+            raise
+    return uri
+
+
+def _read_stl(path):
+    """(vertices, triangles) from an STL, binary or ASCII.
+
+    Every collision mesh on this tooling is a binary STL written by Blender's
+    exporter; the ASCII branch is here because one day one will not be.
+    """
+    with open(path, "rb") as _f:
+        data = _f.read()
+    if len(data) >= 84:
+        count = int(np.frombuffer(data, dtype="<u4", count=1, offset=80)[0])
+        if len(data) == 84 + 50*count and count > 0:
+            dt = np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)),
+                           ("attr", "<u2")])
+            rows = np.frombuffer(data, dtype=dt, count=count, offset=84)
+            verts = rows["v"].reshape(-1, 3).astype(np.float64)
+            tris = np.arange(3*count, dtype=np.int64).reshape(-1, 3)
+            return verts, tris
+    text = data.decode("ascii", "replace")
+    verts = []
+    for line in text.splitlines():
+        w = line.split()
+        if len(w) == 4 and w[0] == "vertex":
+            verts.append([float(w[1]), float(w[2]), float(w[3])])
+    if not verts or len(verts) % 3:
+        raise ValueError("%s is neither a binary nor an ASCII STL" % (path,))
+    verts = np.asarray(verts, dtype=np.float64)
+    return verts, np.arange(verts.shape[0], dtype=np.int64).reshape(-1, 3)
+
+
+def _read_dae(path):
+    """(vertices, triangles) from a COLLADA file, positions only.
+
+    Enough of COLLADA to get a collision hull out of it: every source of
+    POSITION data, its <unit meter=> scale, and the index lists of <triangles>
+    and <polylist> where the polygons are triangles. Materials, normals, UVs and
+    the scene graph are ignored -- the scene graph matters for a visual, and for
+    a collision hull the mesh is authored in the link's own frame.
+    """
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(path)
+    root = tree.getroot()
+    ns = {"c": root.tag.split("}")[0].strip("{")} if root.tag.startswith("{") else {}
+
+    def find(el, tag):
+        return el.findall("c:" + tag, ns) if ns else el.findall(tag)
+
+    scale = 1.0
+    for asset in find(root, "asset"):
+        for unit in find(asset, "unit"):
+            scale = float(unit.get("meter", 1.0))
+
+    verts = []
+    tris = []
+    for lib in find(root, "library_geometries"):
+        for geom in find(lib, "geometry"):
+            for mesh in find(geom, "mesh"):
+                sources = {}
+                for src in find(mesh, "source"):
+                    arrays = find(src, "float_array")
+                    if arrays:
+                        sources["#" + src.get("id")] = np.array(
+                            arrays[0].text.split(), dtype=np.float64)
+                position = None
+                for vert in find(mesh, "vertices"):
+                    for inp in find(vert, "input"):
+                        if inp.get("semantic") == "POSITION":
+                            position = sources.get(inp.get("source"))
+                if position is None:
+                    for key, arr in sources.items():
+                        if arr.size % 3 == 0:
+                            position = arr
+                            break
+                if position is None:
+                    continue
+                base = len(verts)
+                pts = position.reshape(-1, 3)*scale
+                verts.extend(pts.tolist())
+                for kind in ("triangles", "polylist"):
+                    for prim in find(mesh, kind):
+                        inputs = find(prim, "input")
+                        stride = max(int(i.get("offset", 0)) for i in inputs) + 1
+                        offset = 0
+                        for inp in inputs:
+                            if inp.get("semantic") == "VERTEX":
+                                offset = int(inp.get("offset", 0))
+                        ps = find(prim, "p")
+                        if not ps:
+                            continue
+                        idx = np.array(ps[0].text.split(), dtype=np.int64)
+                        idx = idx.reshape(-1, stride)[:, offset]
+                        if kind == "polylist":
+                            counts = find(prim, "vcount")
+                            if counts:
+                                sizes = np.array(counts[0].text.split(),
+                                                 dtype=np.int64)
+                                if (sizes != 3).any():
+                                    # Fan-triangulate anything else.
+                                    at = 0
+                                    for n in sizes:
+                                        for k in range(1, n - 1):
+                                            tris.append([base + idx[at],
+                                                         base + idx[at + k],
+                                                         base + idx[at + k + 1]])
+                                        at += int(n)
+                                    continue
+                        if idx.size >= 3:
+                            tri = idx[:(idx.size//3)*3].reshape(-1, 3) + base
+                            tris.extend(tri.tolist())
+    if not verts:
+        raise ValueError("%s has no COLLADA position data" % (path,))
+    verts = np.asarray(verts, dtype=np.float64)
+    if not tris:
+        # A point cloud is still a usable envelope: the vertices are the hull.
+        return verts, np.zeros((0, 3), dtype=np.int64)
+    return verts, np.asarray(tris, dtype=np.int64)
+
+
+def _read_mesh_file(path):
+    """(vertices, triangles) for any collision mesh format on this tooling."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".stl":
+        return _read_stl(path)
+    if ext == ".dae":
+        return _read_dae(path)
+    if ext == ".ply":
+        verts, _normals, tris = read_ply_mesh(path)
+        return verts, tris
+    raise ValueError("%s: no reader for %r collision geometry" % (path, ext))
+
+
+def _sample_triangles(verts, tris, spacing):
+    """Points covering a triangle set no farther apart than `spacing`.
+
+    The vertices always, plus a barycentric grid on every triangle bigger than
+    the spacing. A loop over triangles, which is fine: the largest collision mesh
+    on this tooling has 60 of them.
+    """
+    verts = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+    out = [verts]
+    if tris is None or len(tris) == 0:
+        return verts
+    for a, b, c in np.asarray(tris, dtype=np.int64):
+        pa, pb, pc = verts[a], verts[b], verts[c]
+        longest = max(np.linalg.norm(pb - pa), np.linalg.norm(pc - pb),
+                      np.linalg.norm(pa - pc))
+        n = int(math.ceil(longest/max(spacing, 1e-6)))
+        if n <= 1:
+            continue
+        i, j = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
+        keep = (i + j) <= n
+        u = i[keep]/float(n)
+        v = j[keep]/float(n)
+        out.append(pa + np.outer(u, pb - pa) + np.outer(v, pc - pa))
+    return np.unique(np.round(np.vstack(out), 6), axis=0)
+
+
+def _sample_box(size, spacing):
+    """Points on the surface of a box centred on the origin."""
+    sx, sy, sz = [float(v)/2.0 for v in size]
+    pts = []
+    for axis, half in enumerate((sx, sy, sz)):
+        u_axis, v_axis = [k for k in range(3) if k != axis]
+        halves = (sx, sy, sz)
+        nu = max(1, int(math.ceil(2*halves[u_axis]/max(spacing, 1e-6))))
+        nv = max(1, int(math.ceil(2*halves[v_axis]/max(spacing, 1e-6))))
+        u = np.linspace(-halves[u_axis], halves[u_axis], nu + 1)
+        v = np.linspace(-halves[v_axis], halves[v_axis], nv + 1)
+        uu, vv = np.meshgrid(u, v, indexing="ij")
+        for sign in (-1.0, 1.0):
+            block = np.zeros((uu.size, 3))
+            block[:, axis] = sign*half
+            block[:, u_axis] = uu.reshape(-1)
+            block[:, v_axis] = vv.reshape(-1)
+            pts.append(block)
+    return np.unique(np.round(np.vstack(pts), 6), axis=0)
+
+
+def _sample_cylinder(radius, length, spacing):
+    """Points on the surface of a z-axis cylinder centred on the origin."""
+    radius = float(radius)
+    length = float(length)
+    ntheta = max(6, int(math.ceil(2*math.pi*radius/max(spacing, 1e-6))))
+    nz = max(1, int(math.ceil(length/max(spacing, 1e-6))))
+    theta = np.linspace(0.0, 2*math.pi, ntheta, endpoint=False)
+    z = np.linspace(-length/2.0, length/2.0, nz + 1)
+    tt, zz = np.meshgrid(theta, z, indexing="ij")
+    side = np.column_stack([radius*np.cos(tt).reshape(-1),
+                            radius*np.sin(tt).reshape(-1), zz.reshape(-1)])
+    nr = max(1, int(math.ceil(radius/max(spacing, 1e-6))))
+    rr = np.linspace(0.0, radius, nr + 1)
+    tt2, rr2 = np.meshgrid(theta, rr, indexing="ij")
+    disc = np.column_stack([(rr2*np.cos(tt2)).reshape(-1),
+                            (rr2*np.sin(tt2)).reshape(-1),
+                            np.zeros(rr2.size)])
+    caps = [disc + [0.0, 0.0, length/2.0], disc - [0.0, 0.0, length/2.0]]
+    return np.unique(np.round(np.vstack([side] + caps), 6), axis=0)
+
+
+def _sample_sphere(radius, spacing):
+    """Points on a sphere, roughly evenly, by the Fibonacci construction."""
+    radius = float(radius)
+    n = max(12, int(math.ceil(4*math.pi*radius*radius
+                              / max(spacing*spacing, 1e-12))))
+    k = np.arange(n) + 0.5
+    phi = np.arccos(1.0 - 2.0*k/n)
+    theta = math.pi*(1.0 + 5.0**0.5)*k
+    return radius*np.column_stack([np.cos(theta)*np.sin(phi),
+                                   np.sin(theta)*np.sin(phi), np.cos(phi)])
+
+
+def _geometry_points(geometry, spacing):
+    """Surface points for one URDF <geometry>, in the geometry's own frame."""
+    mesh = geometry.find("mesh")
+    if mesh is not None:
+        path = _resolve_mesh_uri(mesh.get("filename"))
+        if not os.path.exists(path):
+            raise IOError(
+                "collision mesh %s does not exist. MoveIt drops a link's "
+                "collision geometry silently when this happens, so the arm "
+                "would plan as if the part of the tool were not there."
+                % (path,))
+        verts, tris = _read_mesh_file(path)
+        scale = mesh.get("scale")
+        if scale:
+            verts = verts*np.asarray([float(v) for v in scale.split()])
+        return _sample_triangles(verts, tris, spacing)
+    box = geometry.find("box")
+    if box is not None:
+        return _sample_box([float(v) for v in box.get("size").split()], spacing)
+    cylinder = geometry.find("cylinder")
+    if cylinder is not None:
+        return _sample_cylinder(cylinder.get("radius"), cylinder.get("length"),
+                                spacing)
+    sphere = geometry.find("sphere")
+    if sphere is not None:
+        return _sample_sphere(sphere.get("radius"), spacing)
+    return np.zeros((0, 3))
+
+
+class ToolingEnvelope(object):
+    """Every link bolted to the wrist, as points in the `probe_end` frame.
+
+    `links` is a list of dicts: name, points (N x 3), centre and radius of the
+    link's bounding sphere. The bounding spheres are what make the check cheap --
+    a link whose sphere is 38 mm clear of the surface needs no point-by-point
+    test, and over a flat plate that is every link, so the whole check costs
+    eight distance queries per pose.
+    """
+
+    def __init__(self, links, root, rigid_root, sample_m, source=""):
+        self.links = links
+        self.root = root
+        self.rigid_root = rigid_root
+        self.sample_m = sample_m
+        self.source = source
+        self.points = (np.vstack([l["points"] for l in links])
+                       if links else np.zeros((0, 3)))
+        if links:
+            self.centre = self.points.mean(axis=0)
+            self.radius = float(np.linalg.norm(
+                self.points - self.centre, axis=1).max())
+            #: The farthest sample point from the PATH FRAME (not from the point
+            #: cloud's centroid, which is what `radius` measures). It is the
+            #: lever arm a rotation of the path acts through, so it is what turns
+            #: "the path turned by theta here" into "the tooling moved by this
+            #: much" -- see path_step_travel().
+            self.reach = float(np.linalg.norm(self.points, axis=1).max())
+        else:
+            self.centre = np.zeros(3)
+            self.radius = 0.0
+            self.reach = 0.0
+
+    def __len__(self):
+        return self.points.shape[0]
+
+    def link_names(self):
+        return [l["name"] for l in self.links]
+
+    def describe(self):
+        return ("tooling envelope in %s: %d links, %d sample points at %.1f mm, "
+                "reach %.0f mm from %s" % (self.root, len(self.links),
+                                           len(self), self.sample_m*1e3,
+                                           self.radius*1e3, self.root))
+
+    def report(self):
+        """One line per link: how far it extends from the root frame."""
+        rows = []
+        for link in self.links:
+            d = np.linalg.norm(link["points"], axis=1)
+            rows.append("    %-22s %5d pts, %6.1f..%6.1f mm from %s"
+                        % (link["name"], link["points"].shape[0], d.min()*1e3,
+                           d.max()*1e3, self.root))
+        return "\n".join(rows)
+
+
+def _cluster_points(points, cluster_m):
+    """Bounding spheres over a grid of the link's own points.
+
+    One bounding sphere per link is not enough to keep this cheap. The Azure
+    body alone samples to 45 000 points and sits 94-227 mm from probe_end, so a
+    single sphere puts it "possibly within 50 mm" on any tilted pose and every
+    one of those points then gets measured. Grouping them on a grid gives a
+    two-level test -- link, then 20 mm block -- and only the blocks that could
+    actually be the closest thing are measured.
+    """
+    keys = np.floor(points/cluster_m).astype(np.int64)
+    _uniq, inverse = np.unique(keys, axis=0, return_inverse=True)
+    inverse = np.asarray(inverse).reshape(-1)
+    order = np.argsort(inverse, kind="stable")
+    sorted_inverse = inverse[order]
+    edges = np.searchsorted(sorted_inverse, np.arange(sorted_inverse[-1] + 2))
+    groups = [order[edges[i]:edges[i+1]] for i in range(len(edges) - 1)]
+    groups = [gi for gi in groups if gi.size]
+    centres = np.array([0.5*(points[gi].min(axis=0) + points[gi].max(axis=0))
+                        for gi in groups])
+    radii = np.array([float(np.linalg.norm(points[gi] - centres[k], axis=1).max())
+                      for k, gi in enumerate(groups)])
+    # The same grouping in CSR form. Level 3 of the check gathers the points of
+    # a few thousand (pose, cluster) pairs into ONE distance query, and doing
+    # that from a list of arrays costs more in np.concatenate than the query
+    # does; from a flat array plus offsets it is one _concat_ranges().
+    sizes = np.array([gi.size for gi in groups], dtype=np.int64)
+    start = np.zeros(sizes.size, dtype=np.int64)
+    if sizes.size:
+        start[1:] = np.cumsum(sizes)[:-1]
+    flat = (np.concatenate(groups) if groups
+            else np.zeros(0, dtype=np.int64)).astype(np.int64)
+    return {"cluster_indices": groups, "cluster_centres": centres,
+            "cluster_radii": radii, "cluster_order": flat,
+            "cluster_start": start, "cluster_size": sizes}
+
+
+def tooling_envelope(source=None, root=None, rigid_root=None, sample_m=None,
+                     exclude=(), cache=True, cluster_m=0.020):
+    """The tooling's collision geometry, in the `root` frame.
+
+    Walks the URDF's FIXED joints out from `rigid_root` (tool0) in both
+    directions, which is exactly the set of links that cannot move relative to
+    one another -- the wrist plate and everything bolted to it. A revolute joint
+    stops the walk, so the arm itself is never pulled in.
+
+    Every transform on that walk is a fixed joint origin, so this needs no joint
+    states, no TF and no robot: the answer is the same whatever the arm is doing.
+    That is the whole reason a planned path can be checked before it flies.
+    """
+    root = TOOLING_ROOT_FRAME if root is None else root
+    rigid_root = TOOLING_RIGID_ROOT if rigid_root is None else rigid_root
+    sample_m = TOOLING_SAMPLE_M if sample_m is None else sample_m
+
+    import xml.etree.ElementTree as ET
+    xml = robot_description_xml(source)
+    key = (hash(xml), root, rigid_root, round(sample_m, 6), tuple(exclude),
+           round(cluster_m, 6))
+    if cache and key in _ENVELOPE_CACHE:
+        return _ENVELOPE_CACHE[key]
+
+    robot = ET.fromstring(xml)
+    links = {l.get("name"): l for l in robot.findall("link")}
+    fixed = []
+    for joint in robot.findall("joint"):
+        if joint.get("type") != "fixed":
+            continue
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is None or child is None:
+            continue
+        fixed.append((parent.get("link"), child.get("link"),
+                      _origin_transform(joint)))
+
+    if rigid_root not in links:
+        raise ValueError(
+            "the description has no link %r, so there is no way to say what is "
+            "bolted to the wrist. Links: %s"
+            % (rigid_root, ", ".join(sorted(links))[:400]))
+
+    # Breadth-first over fixed joints, both ways, from the rigid root.
+    transforms = {rigid_root: np.eye(4)}
+    queue = [rigid_root]
+    while queue:
+        here = queue.pop(0)
+        for parent, child, T in fixed:
+            if parent == here and child not in transforms:
+                transforms[child] = transforms[here].dot(T)
+                queue.append(child)
+            elif child == here and parent not in transforms:
+                transforms[parent] = transforms[here].dot(np.linalg.inv(T))
+                queue.append(parent)
+
+    if root not in transforms:
+        raise ValueError(
+            "%r is not rigidly attached to %r through fixed joints, so a path "
+            "expressed in it cannot place the tooling. Rigid with %s: %s"
+            % (root, rigid_root, rigid_root, ", ".join(sorted(transforms))))
+    to_root = np.linalg.inv(transforms[root])
+
+    out = []
+    for name in sorted(transforms):
+        if name in exclude or name not in links:
+            continue
+        T = to_root.dot(transforms[name])
+        pts = []
+        for collision in links[name].findall("collision"):
+            geometry = collision.find("geometry")
+            if geometry is None:
+                continue
+            local = _geometry_points(geometry, sample_m)
+            if local.shape[0] == 0:
+                continue
+            G = T.dot(_origin_transform(collision))
+            pts.append(local.dot(G[:3, :3].T) + G[:3, 3])
+        if not pts:
+            continue
+        pts = np.vstack(pts)
+        centre = 0.5*(pts.min(axis=0) + pts.max(axis=0))
+        radius = float(np.linalg.norm(pts - centre, axis=1).max())
+        entry = {"name": name, "points": pts, "centre": centre,
+                 "radius": radius}
+        entry.update(_cluster_points(pts, cluster_m))
+        out.append(entry)
+
+    if not out:
+        raise RuntimeError(
+            "no link rigidly attached to %r has any <collision> geometry. Either "
+            "this description carries none, or its collision meshes are missing "
+            "from the install tree -- colcon --symlink-install links per file, so "
+            "a new mesh needs a rebuild." % (rigid_root,))
+    env = ToolingEnvelope(out, root, rigid_root, sample_m,
+                          source="robot_description")
+    if cache:
+        _ENVELOPE_CACHE[key] = env
+    return env
+
+
+# ------------------------------------------------------------------------------
+# Distance to the surface being scanned
+# ------------------------------------------------------------------------------
+
+def _unit_quat(q):
+    """A unit (x, y, z, w), normalised here rather than borrowed.
+
+    noether_path.dpi has `_unit_quats`, and this module cannot call it: a .dpi is
+    compiled as a function body, so only the names another .dpi declares `global`
+    are visible, and that one is private. The trap is that the tests exec every
+    .dpi into ONE namespace, where the private name IS visible -- so a caller
+    passes its unit tests and raises NameError the first time a sweep row needs
+    it at the cell, mid-raster. Three lines of numpy are cheaper than that
+    coupling.
+    """
+    v = np.asarray(q, dtype=np.float64).reshape(4)
+    n = float(np.linalg.norm(v))
+    return v if n == 0.0 else v/n
+
+
+def _quats_to_matrices(quats):
+    """(N, 3, 3) rotation matrices from (N, 4) (x, y, z, w), in one pass.
+
+    quat_to_matrix() one pose at a time builds a Python list of N small arrays
+    before np.stack copies it: about 200 bytes of object overhead per pose on
+    top of the 72 bytes of matrix, so 911 000 poses cost 190 MB of garbage to
+    produce 66 MB of answer. Same arithmetic, no list.
+    """
+    q = np.asarray(quats, dtype=np.float64).reshape(-1, 4)
+    nrm = np.linalg.norm(q, axis=1)
+    nrm = np.where(nrm == 0.0, 1.0, nrm)
+    x, y, z, w = (q/nrm[:, None]).T
+    R = np.empty((q.shape[0], 3, 3))
+    R[:, 0, 0] = 1 - 2*(y*y + z*z); R[:, 0, 1] = 2*(x*y - z*w); R[:, 0, 2] = 2*(x*z + y*w)
+    R[:, 1, 0] = 2*(x*y + z*w); R[:, 1, 1] = 1 - 2*(x*x + z*z); R[:, 1, 2] = 2*(y*z - x*w)
+    R[:, 2, 0] = 2*(x*z - y*w); R[:, 2, 1] = 2*(y*z + x*w); R[:, 2, 2] = 1 - 2*(x*x + y*y)
+    # A zero quaternion is not a rotation; quat_to_matrix() returns identity for
+    # it and so does this, so an unstaged pose does not become a reflection.
+    R[np.linalg.norm(np.asarray(quats, dtype=np.float64).reshape(-1, 4), axis=1) == 0.0] = np.eye(3)
+    return R
+
+
+_KERNEL_POOLS = {}
+
+
+def _kernel_workers(workers=None):
+    """How many threads a distance query may use, clamped to the machine."""
+    cores = os.cpu_count() or 1
+    n = SURFACE_QUERY_WORKERS if workers is None else workers
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = -1
+    if n <= 0:
+        n = cores
+    return max(1, min(n, cores))
+
+
+def _kernel_pool(n):
+    """A REUSED thread pool of `n` threads, or None for serial.
+
+    Reused because a query is issued thousands of times along a path and
+    creating a pool per query costs more than the query. Threads, not
+    processes: see SURFACE_QUERY_WORKERS. If this environment will not give us
+    threads at all -- and a dgpy session is an odd environment -- the caller
+    falls back to running the slabs in this thread, which is slower and
+    identical.
+    """
+    if n <= 1:
+        return None
+    pool = _KERNEL_POOLS.get(n)
+    if pool is None:
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = ThreadPoolExecutor(max_workers=n,
+                                      thread_name_prefix="clearance")
+        except Exception:
+            pool = False
+        _KERNEL_POOLS[n] = pool
+    return pool or None
+
+
+def _concat_ranges(starts, sizes):
+    """The concatenation of range(starts[i], starts[i]+sizes[i]), vectorised.
+
+    Level 3 of the clearance check gathers the points of a few hundred to a few
+    thousand (pose, cluster) pairs into ONE distance query. Doing that with a
+    Python list comprehension over np.arange costs more than the query it
+    feeds.
+    """
+    starts = np.asarray(starts, dtype=np.int64).reshape(-1)
+    sizes = np.asarray(sizes, dtype=np.int64).reshape(-1)
+    total = int(sizes.sum())
+    if total == 0:
+        return np.zeros(0, dtype=np.int64)
+    ends = np.cumsum(sizes)
+    offset = np.zeros(sizes.size, dtype=np.int64)
+    offset[1:] = ends[:-1]
+    return np.repeat(starts - offset, sizes) + np.arange(total, dtype=np.int64)
+
+
+def closest_point_on_triangles(p, a, b, c):
+    """Closest point to `p` on each triangle (a, b, c), all broadcast (..., 3).
+
+    The barycentric-region algorithm (Ericson, Real-Time Collision Detection),
+    written branchlessly so it runs over a million (point, triangle) pairs at a
+    time. Exact -- not a plane projection, which is wrong for any point whose
+    foot falls outside the triangle, and on a coarse mesh most of them do.
+    """
+    ab = b - a
+    ac = c - a
+    ap = p - a
+    d1 = np.einsum("...i,...i->...", ab, ap)
+    d2 = np.einsum("...i,...i->...", ac, ap)
+    bp = p - b
+    d3 = np.einsum("...i,...i->...", ab, bp)
+    d4 = np.einsum("...i,...i->...", ac, bp)
+    cp = p - c
+    d5 = np.einsum("...i,...i->...", ab, cp)
+    d6 = np.einsum("...i,...i->...", ac, cp)
+
+    va = d3*d6 - d5*d4
+    vb = d5*d2 - d1*d6
+    vc = d1*d4 - d3*d2
+    denom = va + vb + vc
+    safe = np.where(np.abs(denom) < 1e-30, 1.0, denom)
+    v = vb/safe
+    w = vc/safe
+    q = a + ab*v[..., None] + ac*w[..., None]
+
+    # Edge regions, then vertex regions: the later np.where wins, which is the
+    # priority the algorithm needs.
+    def edge(p0, d, t):
+        t = np.clip(t, 0.0, 1.0)
+        return p0 + d*t[..., None]
+
+    mask = (vc <= 0) & (d1 >= 0) & (d3 <= 0)
+    q = np.where(mask[..., None], edge(a, ab, d1/np.where(d1 - d3 == 0, 1.0, d1 - d3)), q)
+    mask = (vb <= 0) & (d2 >= 0) & (d6 <= 0)
+    q = np.where(mask[..., None], edge(a, ac, d2/np.where(d2 - d6 == 0, 1.0, d2 - d6)), q)
+    mask = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0)
+    denom_bc = (d4 - d3) + (d5 - d6)
+    q = np.where(mask[..., None],
+                 edge(b, c - b, (d4 - d3)/np.where(denom_bc == 0, 1.0, denom_bc)), q)
+    q = np.where(((d1 <= 0) & (d2 <= 0))[..., None], a, q)
+    q = np.where(((d3 >= 0) & (d4 <= d3))[..., None], b, q)
+    q = np.where(((d6 >= 0) & (d5 <= d6))[..., None], c, q)
+    return q
+
+
+class SurfaceDistance(object):
+    """Signed distance from arbitrary points to a triangulated surface.
+
+    SIGNED, and that is the whole point of using this rather than a nearest
+    neighbour search over the mesh's vertices. An unsigned distance cannot tell
+    "4 mm above the flank" from "4 mm inside the part", and the fault this module
+    exists to catch is exactly the second one: an eddy-current probe commanded
+    5-6 mm inside a cylinder reads as a healthy few millimetres to every unsigned
+    distance in the pipeline.
+
+    The sign comes from the closest triangle's own normal, because a scanned
+    surface is an OPEN sheet -- a top-half rough mesh, a reconstruction patch --
+    and an inside/outside test needs a closed one. The normals are oriented once,
+    on construction, so that the majority of them point along `outward` (world
+    +z for a part lying on a bench, which is also the side the tool approaches
+    from). A surface whose normals disagree with that by more than a third says
+    so rather than silently inverting every sign.
+    """
+
+    def __init__(self, vertices, triangles, outward=(0.0, 0.0, 1.0),
+                 name="surface"):
+        self.name = name
+        v = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+        t = np.asarray(triangles, dtype=np.int64).reshape(-1, 3)
+        if t.shape[0] == 0:
+            raise ValueError("%s has no triangles to measure against" % (name,))
+        self.a = v[t[:, 0]]
+        self.b = v[t[:, 1]]
+        self.c = v[t[:, 2]]
+        n = np.cross(self.b - self.a, self.c - self.a)
+        area = np.linalg.norm(n, axis=1)
+        keep = area > 1e-14
+        self.a, self.b, self.c = self.a[keep], self.b[keep], self.c[keep]
+        n = n[keep]/area[keep, None]
+        w = area[keep]
+        out = np.asarray(outward, dtype=np.float64)
+        out = out/np.linalg.norm(out)
+        agree = n.dot(out)
+        flip = agree < 0.0
+        share = float(np.minimum(flip.mean(), 1.0 - flip.mean()))
+        #: The fraction of faces that disagree with their neighbours about
+        #: which way is out, AS MEASURED -- before the repair below.
+        self.normal_disagreement = share
+        if flip.mean() > 0.5:
+            n = -n
+            flip = ~flip
+            agree = -agree
+
+        # THE SIGN OF A HEIGHT FIELD COMES FROM THE FIELD, NOT FROM ONE FACE.
+        #
+        # The sign of every clearance number is the nearest triangle's own
+        # normal, which is right for a closed solid and wrong for a surface
+        # that is single-valued along `outward`: there, every face points the
+        # same way by construction, so a face that does not is simply broken,
+        # and the only thing it can do is invert the answer for every point
+        # nearest to it.
+        #
+        # 2026-10-09, on a reconstructed plate whose whole z extent was 2 mm
+        # and 99.5% of whose normals pointed up:
+        #
+        #     worst clearance -141.8 mm (limit 5.0 mm)
+        #     lj_v7080_frame  -141.8 mm   <-- under the limit
+        #     outer_shell     -123.1 mm   <-- under the limit
+        #
+        # Nothing can be 141 mm inside a 2 mm plate. Those links were 141 mm
+        # ABOVE it, nearest to one of the few faces still wound the wrong way.
+        # It cost 376 of 2925 waypoints, whole passes skipped, 101 passes split
+        # into 136, and 17.1% of the path -- and because each split is a lift
+        # and an approach in the middle of a pass, it is also where that run's
+        # stop-start toolpath came from.
+        #
+        # So where the surface IS a height field -- area-weighted, because a
+        # sliver must not get a vote proportional to a facet -- the minority
+        # are turned to agree with it. A closed part disagrees about half the
+        # time (its underside legitimately faces down), falls far outside the
+        # threshold, and is not touched: this repairs open sheets, which is the
+        # only case where "every face points the same way" is a fact about the
+        # geometry rather than an assumption about it.
+        # AGREEING IS NOT THE SAME AS NOT DISAGREEING, and the difference is a
+        # whole class of surface. A half cylinder standing on its axis has
+        # every normal PERPENDICULAR to `outward`: none of them disagrees, and
+        # it is still not a height field along that axis -- n.out is ~0, its
+        # sign is floating-point noise, and "repairing" the ones that land
+        # negative turns a random half of the surface inside out. So the test
+        # is the area that positively agrees, not the area that fails to
+        # object.
+        tot = float(w.sum()) if w.size else 0.0
+        agree_area = (float(w[agree > HEIGHT_FIELD_MIN_COS].sum()/tot)
+                      if tot > 0 else 0.0)
+        disagree_area = (float(w[flip].sum()/tot)
+                         if tot > 0 and flip.any() else 0.0)
+        self.outward_agreement_area = agree_area
+        self.outward_disagreement_area = disagree_area
+        self.height_field = bool(agree_area >= HEIGHT_FIELD_MIN_AGREE_AREA
+                                 and disagree_area
+                                 < HEIGHT_FIELD_MAX_DISAGREEMENT)
+        self.sign_faces_corrected = 0
+        if self.height_field and flip.any():
+            n = n.copy()
+            n[flip] = -n[flip]
+            self.sign_faces_corrected = int(flip.sum())
+        self.normals = n
+        self.centroids = (self.a + self.b + self.c)/3.0
+        self.triangle_radius = float(np.linalg.norm(
+            np.stack([self.a, self.b, self.c]) - self.centroids, axis=2).max())
+        self.vertices = v
+        self.triangles = t
+        #: The triangle table AFTER degenerate faces were dropped, so it lines
+        #: up with a/b/c. `triangles` above is the file's own and does not.
+        self.tri_idx = t[keep]
+        self._build_rim()
+        #: The surface's own axis-aligned box. Not used to bound a distance --
+        #: it would be a true lower bound, and a large one on a tool held above
+        #: a part, but a bound on DISTANCE says nothing about which side, and
+        #: that is the whole difficulty (see _settle_far). It is kept because it
+        #: is what `outward_max` is read off, and because any caller asking
+        #: "where is this surface" wants it.
+        self.lo = np.minimum(np.minimum(self.a.min(axis=0), self.b.min(axis=0)),
+                             self.c.min(axis=0))
+        self.hi = np.maximum(np.maximum(self.a.max(axis=0), self.b.max(axis=0)),
+                             self.c.max(axis=0))
+        #: The unit `outward` the normals were oriented to, and how far the
+        #: surface itself reaches along it. A point beyond that is above EVERY
+        #: triangle in the outward direction, which is the only cheap evidence
+        #: this class has that a point is on the outside rather than the inside
+        #: -- see _settle_far.
+        self.outward_unit = out
+        self.outward_max = float(np.maximum(
+            np.maximum(self.a.dot(out), self.b.dot(out)), self.c.dot(out)).max())
+        try:
+            from scipy.spatial import cKDTree
+            self._tree = cKDTree(self.centroids)
+        except Exception:
+            self._tree = None
+        self.k0 = self._starting_k()
+
+    def _starting_k(self, floor=12, ceiling=160):
+        """How many candidate triangles to fetch on the FIRST try.
+
+        signed_distance() keeps widening until a triangle outside the candidate
+        set cannot win, which is when the farthest candidate centroid is more
+        than one largest-triangle-radius beyond the best distance found. On a
+        dense mesh 12 candidates never satisfy that: a 646 000-triangle
+        reconstruction with 0.19 mm between centroids and a largest radius of
+        0.99 mm puts the 12th centroid 0.4 mm away, so the test fires for every
+        point and every query runs three times over -- at k = 12, 48 and finally
+        192, which is 20x the work of getting it right once, and enough to cost
+        the gate 0.1 s per pose.
+
+        Centroids of a surface mesh lie on a sheet, so the k-th nearest is about
+        spacing*sqrt(k/pi) away; inverting that for spacing*sqrt(k/pi) > radius
+        gives the k below. It is a starting point, not a promise -- the widening
+        loop still decides when the answer is final.
+        """
+        if self._tree is None or self.centroids.shape[0] < floor:
+            return floor
+        sample = self.centroids[::max(1, self.centroids.shape[0]//4096)]
+        near = self._tree.query(sample, k=2)[0][:, 1]
+        spacing = float(np.median(near))
+        if not spacing > 0.0:
+            return floor
+        k = int(math.ceil(math.pi*(self.triangle_radius/spacing)**2)) + 4
+        return int(min(max(k, floor), ceiling))
+
+    def describe(self):
+        return ("%s: %d triangles, %.1f mm largest, %.0f%% of normals point the "
+                "other way, %d candidates per query"
+                % (self.name, self.a.shape[0], self.triangle_radius*1e3,
+                   self.normal_disagreement*100.0, self.k0))
+
+    def _candidates(self, points, k, workers=None, upper=None):
+        if self._tree is not None:
+            k = min(k, self.centroids.shape[0])
+            # The query runs on every core: scipy does it on one by default and
+            # every other core in this machine is idle while it does. Older
+            # scipy spells the argument n_jobs. `workers` is threaded down from
+            # the caller so that a query issued from inside an already-parallel
+            # slab does not oversubscribe the machine.
+            nw = _kernel_workers(workers)
+            ub = np.inf if upper is None else float(upper)
+            try:
+                dist, idx = self._tree.query(points, k=k, workers=nw,
+                                             distance_upper_bound=ub)
+            except TypeError:
+                try:
+                    dist, idx = self._tree.query(points, k=k, n_jobs=nw,
+                                                 distance_upper_bound=ub)
+                except TypeError:
+                    dist, idx = self._tree.query(points, k=k,
+                                                 distance_upper_bound=ub)
+            if k == 1:
+                dist = dist[:, None]
+                idx = idx[:, None]
+            return dist, idx
+        # No scipy: brute force over centroids in chunks. Slower, same answer.
+        k = min(k, self.centroids.shape[0])
+        idx = np.empty((points.shape[0], k), dtype=np.int64)
+        dist = np.empty((points.shape[0], k))
+        step = max(1, int(4e6//max(self.centroids.shape[0], 1)))
+        for start in range(0, points.shape[0], step):
+            block = points[start:start + step]
+            d = np.linalg.norm(block[:, None, :] - self.centroids[None, :, :],
+                               axis=2)
+            order = np.argpartition(d, k - 1, axis=1)[:, :k]
+            rows = np.arange(block.shape[0])[:, None]
+            take = np.argsort(d[rows, order], axis=1)
+            order = order[rows, take]
+            idx[start:start + step] = order
+            dist[start:start + step] = d[rows, order]
+        return dist, idx
+
+    def _settle_far(self, pts, far, workers, bands=4):
+        """Points the caller has already said it does not care about, found
+        without measuring any of them.
+
+        THIS IS WHERE THE TIME GOES. A KD-tree over triangle centroids answers
+        "which centroid is nearest" by descending to a leaf and then unwinding
+        every node whose box is within the best distance found. For a point
+        170 mm off a 300 mm-wide part -- which is where most of this tooling
+        spends its life, median 168 mm measured over the real envelope -- that
+        ball covers the whole mesh, nothing prunes, and the query degenerates to
+        a scan of all 198 422 centroids: 15.2 us a point, and the gate is 80%
+        tree time.
+
+        But the caller has already said (via `exact_within` / `exact_each`) how
+        close it still cares about. Asking the tree the BOUNDED question
+        instead -- "is any centroid within far + one triangle radius?" -- prunes
+        on the way down and answers in 0.13 us a point, 117x faster, because it
+        never has to find the nearest one. A point with no centroid inside that
+        radius is farther than `far` from every triangle, which is exactly what
+        the caller said it would accept as a bound.
+
+        `far` varies per point, so the points are split into `bands` by it and
+        each band asked its own bounded question; a band's bound is the largest
+        `far` in it, so every point in it is settled soundly or not at all.
+
+        Returns (settled mask, lower bound for the settled points).
+        """
+        n = pts.shape[0]
+        settled = np.zeros(n, dtype=bool)
+        value = np.zeros(n)
+        r = self.triangle_radius
+        # ONLY POINTS ON THE OUTWARD SIDE MAY BE SETTLED, and this is the line
+        # that makes the whole early-out defensible rather than merely fast.
+        #
+        # "No triangle within X" is a statement about DISTANCE. It is equally
+        # true of a point X above the part and a point X below it, and this
+        # class's sign convention -- the closest triangle's own normal, because
+        # a scanned surface is an open sheet -- is not reliable at that range:
+        # off the edge of the sheet the nearest triangle is a boundary one and
+        # its normal says whatever the local tilt says. Reporting a settled
+        # point as POSITIVELY clear therefore needs evidence, and the one piece
+        # of evidence available for free is that the point lies beyond the whole
+        # surface along `outward` -- the direction the normals were oriented to
+        # and the direction the tool approaches from. Everything else is
+        # measured, which costs more and cannot be wrong.
+        #
+        # Residual assumption, and it is the one to check if this is ever wrong:
+        # `outward` really is the side the tool is on. It is oriented on
+        # construction so the majority of normals agree with it, and
+        # normal_disagreement says how large the minority is; a surface that
+        # cannot be oriented this way says so there rather than here.
+        usable = np.isfinite(far) & (pts.dot(self.outward_unit)
+                                     > self.outward_max)
+        if not usable.any() or self._tree is None:
+            return settled, value
+        idx_all = np.nonzero(usable)[0]
+        f = far[idx_all]
+        if bands > 1 and f.size > 64 and float(f.max() - f.min()) > 1e-9:
+            edges = np.unique(np.quantile(f, np.linspace(0.0, 1.0, bands + 1)))
+            which = np.clip(np.searchsorted(edges, f, side="left") - 1,
+                            0, edges.size - 2)
+            groups = [idx_all[which == b] for b in range(edges.size - 1)]
+        else:
+            groups = [idx_all]
+        for gi in groups:
+            if gi.size == 0:
+                continue
+            ub = float(far[gi].max()) + r
+            if not np.isfinite(ub):
+                continue
+            near = self._candidates(pts[gi], 1, workers=workers, upper=ub)[0]
+            miss = ~np.isfinite(near[:, 0])
+            if not miss.any():
+                continue
+            hit = gi[miss]
+            settled[hit] = True
+            # The tree said "no centroid within ub", so the surface is more than
+            # ub - one triangle radius away. That is the bound, and it is
+            # DELIBERATELY NOT TIGHTENED with anything else (the distance to the
+            # surface's bounding box is a true lower bound too, and is often
+            # much larger here) -- see the note on the sign in signed_distance.
+            # A settled point is reported on the OUTWARD side, and the less
+            # weight that assumption has to carry the better.
+            value[hit] = ub - r
+        return settled, value
+
+    def _best_candidate(self, pts, idx, workers):
+        """Reduce a candidate set to its winner, in cache-resident slabs.
+
+        Returns (distance to the nearest candidate triangle, which triangle,
+        signed side). The arithmetic is closest_point_on_triangles() and nothing
+        else; what this adds is the two things that decide what it costs:
+
+          * the slab. The barycentric test holds ~20 intermediates of
+            (points x candidates x 3) and reads each once, so it runs at the
+            speed of whichever cache the slab fits in -- 5.3x between a 70 MB
+            slab and a 0.36 MB one for identical work. SURFACE_KERNEL_BYTES.
+          * the threads. Slabs are disjoint and write disjoint output, and
+            numpy drops the GIL inside the ufuncs, so this is a 3x on 8 cores
+            for free and the answer does not depend on how the slabs fell.
+        """
+        n = pts.shape[0]
+        k = max(int(idx.shape[1]), 1)
+        dbest = np.empty(n)
+        tbest = np.empty(n, dtype=np.int64)
+        side = np.empty(n)
+        slab = max(64, int(SURFACE_KERNEL_BYTES//(24*k)))
+        spans = [(st, min(st + slab, n)) for st in range(0, n, slab)]
+
+        def run(span):
+            lo, hi = span
+            p = pts[lo:hi, None, :]
+            ii = idx[lo:hi]
+            q = closest_point_on_triangles(p, self.a[ii], self.b[ii], self.c[ii])
+            delta = p - q
+            # Squared distance: same argmin, same ordering, one temporary fewer
+            # and no per-element abs() -- and the square root is taken once per
+            # point instead of once per candidate.
+            d2 = np.einsum("ijk,ijk->ij", delta, delta)
+            best = np.argmin(d2, axis=1)
+            rows = np.arange(hi - lo)
+            tri = ii[rows, best]
+            dbest[lo:hi] = np.sqrt(d2[rows, best])
+            tbest[lo:hi] = tri
+            side[lo:hi] = np.einsum("ij,ij->i", delta[rows, best],
+                                    self.normals[tri])
+
+        pool = _kernel_pool(workers) if len(spans) > 1 else None
+        if pool is None:
+            for span in spans:
+                run(span)
+        else:
+            list(pool.map(run, spans))
+        return dbest, tbest, side
+
+    def _signed_distance_impl(self, points, k=None, max_k=None, block=None,
+                              exact_within=None, exact_each=None, workers=None):
+        """Signed distance for each point; negative means inside the part.
+
+        Exact for the triangles it considers, and it keeps widening the candidate
+        set until widening cannot change the answer: a triangle whose centroid is
+        farther than (best distance + the largest triangle's radius) cannot
+        contain a closer point. So this is not "approximately the nearest
+        triangle", it is the nearest triangle.
+
+        BLOCKED, because the working set is (points x k) index and distance
+        arrays and then a (points x k x 3) closest-point array for every
+        intermediate in the barycentric test -- around 20 of them. At k=12 that
+        is ~2.5 kB per point and it grows eightfold as k widens to 192, so ten
+        million points is not a big query, it is 25+ GB. The block size changes
+        nothing about the answer; it bounds the peak.
+
+        `exact_within` is the distance beyond which the caller will accept a
+        lower bound instead of a measurement -- see below.
+
+        WHAT `exact_within` ASSUMES: a point it settles is reported with a
+        POSITIVE sign. The bound is on the
+        unsigned distance -- "no triangle is within this far" -- and that is
+        true of a point far inside the part as well as far outside it, so
+        settling asserts that a point more than `exact_within` from the surface
+        is on the outward side of it. Nothing in the query establishes that.
+        Callers must only relax to a distance at which they can vouch for the
+        sign themselves; path_clearance() can, and says how. Two things reduce
+        the weight that assumption carries: the threshold is clamped to be
+        positive below (at or under zero the caller is hunting for penetration
+        and nothing may be settled), and once a triangle has actually been
+        looked at, its own normal vetoes settling a point it calls inside. `exact_each` is the
+        same thing PER POINT, broadcast against `points`, and it exists because
+        the clearance check batches thousands of poses into one query and each
+        pose has its own running minimum to beat. It is a pure RELAXATION: an
+        implementation that ignores it and measures everything exactly is still
+        correct, only slower. When it is given it replaces `exact_within`.
+
+        `workers` is how many threads to use; None means SURFACE_QUERY_WORKERS.
+
+        THE ORDER OF THE TWO TESTS IS THE WHOLE COST. The floor test below needs
+        only the distance to the NEAREST centroid, which a k=1 tree query
+        answers for 2.2 us a point. The barycentric test costs 7-45. So the floor
+        test is asked FIRST, and the barycentric only ever sees the points whose
+        answer it decides; the other order runs the barycentric over every point
+        and throws most of the answers away for the floor bound.
+        """
+        k = int(self.k0 if k is None else k)
+        max_k = int(max(k, 192) if max_k is None else max_k)
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        n = points.shape[0]
+        if n == 0:
+            return np.zeros(0)
+        far_scalar = np.inf if exact_within is None else float(exact_within)
+        if exact_each is None:
+            far = None if not np.isfinite(far_scalar) else np.full(n, far_scalar)
+        else:
+            far = np.broadcast_to(
+                np.asarray(exact_each, dtype=np.float64).reshape(-1),
+                (n,)).astype(np.float64, copy=True)
+        if far is not None:
+            # A NON-POSITIVE THRESHOLD IS NOT A RELAXATION, IT IS A DEMAND.
+            # "Beyond this distance a lower bound will do" only means anything
+            # for a positive distance: at zero or below, the caller is hunting
+            # for penetration and every point could be the one. Left unclamped
+            # the early-out reads "is the nearest centroid farther than -10 mm"
+            # -- true of every point in the world -- and settles the entire
+            # query at its bound. That is exactly what a contact scan produces:
+            # path_clearance() passes the running minimum, the probe is 12 mm
+            # inside the part by design, and the links that must NOT touch would
+            # then never be measured at all. The cylinder case in
+            # tooling_clearance_test.py covers it.
+            far = np.where(far > 0.0, far, np.inf)
+            if not np.isfinite(far).any():
+                far = None
+        # The outer block only bounds how many points are held at once; the
+        # per-k blocking below is what bounds the query itself.
+        if block is None:
+            block = 500000
+        if block > 0 and n > block:
+            out = np.empty(n)
+            for start in range(0, n, block):
+                sl = slice(start, start + block)
+                # THE KERNEL, not the entry point: signed_distance() applies
+                # the rim rule on top, and applying it per block and then again
+                # to the whole makes the answer depend on the block size. That
+                # is exactly what the "outer block size does not change the
+                # answer" check is for, and it caught this.
+                out[sl] = self._signed_distance_impl(
+                    points[sl], k=k, max_k=max_k, block=0,
+                    exact_within=exact_within,
+                    exact_each=None if far is None else far[sl],
+                    workers=workers)
+            return out
+
+        nworkers = _kernel_workers(workers)
+        signed = np.full(n, np.inf)
+        todo = np.arange(n)
+        # The floor test is worth its own tree query only while it is settling a
+        # useful share of the points; on a query that is entirely up against the
+        # surface it settles none and the extra pass is 30% overhead. Measure it
+        # on the first slab and stop asking if it is not paying.
+        prepass = far is not None
+        seen = 0
+        hits = 0
+        while todo.size:
+            # RE-BLOCK AT EVERY k. The widening loop multiplies k by four, and
+            # the working set is proportional to (points x k), so a block sized
+            # for the first k is sixteen times too big by the third pass: on a
+            # 211 000-triangle mesh that reaches 4.6 GB for 933 poses, straight
+            # through a budget meant to cap it at 256 MB.
+            #
+            # 64 BYTES A CANDIDATE, NOT 392. The 392 counts the barycentric
+            # test's ~20 intermediates of (points x k x 3); those live in
+            # cache-sized slabs of their own inside _best_candidate and do not
+            # set this size. What is left here is the candidate distance
+            # and index arrays -- one float64 and one int64 each, with headroom
+            # -- so the same budget buys a block six times larger, and a
+            # KD-tree query costs less per point when it is handed 20 000 of
+            # them than when it is handed 3 000. Measured over the real tooling:
+            # 10.2 ms a pose at 392 bytes, 8.9 at 64, and 8.9 again at 32 for
+            # another 84 MB of peak, which is why it is 64 and not 32.
+            chunk = max(1024, SURFACE_QUERY_BYTES//(64*max(k, 1)))
+            nxt = []
+            for start in range(0, todo.size, chunk):
+                sub = todo[start:start + chunk]
+                if prepass:
+                    # A POINT THAT IS SIMPLY FAR AWAY NEVER CONVERGES, and most
+                    # of the tooling is far away. For a point 20 mm off a flat
+                    # sheet every candidate centroid is about 20 mm away, so the
+                    # widening test fires no matter how wide the candidate set
+                    # gets -- it would take 1500 of them to separate. The caller
+                    # says how far it still cares about being exact; beyond that
+                    # a lower bound is accepted and reported as the lower bound
+                    # it is. Asked first, and asked as a BOUNDED question, this
+                    # costs 0.13 us a point instead of 15 -- see _settle_far.
+                    settled, bound_value = self._settle_far(
+                        points[sub], far[sub], nworkers)
+                    seen += sub.size
+                    hits += int(settled.sum())
+                    if settled.any():
+                        signed[sub[settled]] = bound_value[settled]
+                        sub = sub[~settled]
+                    if seen >= 4096 and hits < 0.05*seen:
+                        prepass = False
+                    if sub.size == 0:
+                        continue
+                pts = points[sub]
+                # UNBOUNDED, unlike the prepass, and deliberately. A bounded
+                # query only prunes when there is nothing inside the bound, and
+                # every point that got this far has something inside it -- that
+                # is why the prepass did not settle it. Measured on the real
+                # tooling, bounding this query bought 0.2 us a point on the
+                # points it could not help and cost more than that in rebuilding
+                # the (points x k) index array around the empty slots it left.
+                dist, idx = self._candidates(pts, k, workers=nworkers)
+                dbest, tri, side = self._best_candidate(pts, idx, nworkers)
+                value = np.where(side < 0.0, -dbest, dbest)
+                signed[sub] = value
+                # Points where a triangle outside the candidate set could still
+                # win: its centroid would have to be nearer than the farthest
+                # one we looked at, plus the largest triangle's own radius.
+                more = dist[:, -1] < dbest + self.triangle_radius
+                if far is not None:
+                    # The same floor bound the prepass uses, for the points it
+                    # did not look at (it is off, or this is a widening round).
+                    #
+                    # It REPLACES the candidate answer wherever that answer is
+                    # not yet proved, because an unproved candidate answer is an
+                    # upper bound -- the nearest of the triangles we happened to
+                    # look at -- and reporting an upper bound as a clearance is
+                    # the one direction this module may never err in. Where the
+                    # answer IS proved (nothing outside the candidate set can
+                    # beat it) it is the truth and it stands.
+                    floor = dist[:, 0] - self.triangle_radius
+                    # `& (side >= 0)`: here, unlike in the prepass, we have
+                    # actually looked at a triangle and it says which side of it
+                    # the point is on. A point the nearest candidate calls
+                    # INSIDE is never settled, whatever its distance -- being
+                    # deep inside is the one answer this module must not round
+                    # off, and it costs nothing to keep it.
+                    settled = (floor >= far[sub]) & (side >= 0.0)
+                    if settled.any():
+                        at = sub[settled]
+                        signed[at] = np.where(~more[settled], value[settled],
+                                              floor[settled])
+                        more = more & ~settled
+                if more.any():
+                    nxt.append(sub[more])
+                del dist, idx, dbest, tri, side, value
+            if k >= max_k or k >= self.centroids.shape[0] or not nxt:
+                break
+            todo = np.concatenate(nxt)
+            k = min(max_k, k*4)
+            prepass = False
+        return signed
+
+    def _build_rim(self):
+        """The mesh's boundary edges: the ones used by exactly one triangle.
+
+        A closed body has none and everything below is a no-op on it.
+        """
+        t = self.tri_idx
+        if t.size == 0:
+            self.rim_a = np.zeros((0, 3)); self.rim_b = np.zeros((0, 3))
+            self.n_boundary_edges = 0
+            return
+        e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]], axis=0)
+        e = np.sort(e, axis=1)
+        uniq, counts = np.unique(e, axis=0, return_counts=True)
+        bnd = uniq[counts == 1]
+        self.rim_a = self.vertices[bnd[:, 0]] if bnd.size else np.zeros((0, 3))
+        self.rim_b = self.vertices[bnd[:, 1]] if bnd.size else np.zeros((0, 3))
+        self.n_boundary_edges = int(bnd.shape[0])
+
+    def _rim_distance(self, points):
+        """Distance from each point to the nearest boundary EDGE segment."""
+        if self.n_boundary_edges == 0:
+            return np.full(points.shape[0], np.inf)
+        out = np.empty(points.shape[0])
+        ab = self.rim_b - self.rim_a
+        denom = np.einsum("ij,ij->i", ab, ab)
+        denom[denom < 1e-24] = 1e-24
+        # One point at a time over the rim, which is short: a 76 x 66 mm patch
+        # has a few hundred boundary edges and this is only ever asked about
+        # the handful of points that came back negative.
+        for i in range(points.shape[0]):
+            ap = points[i] - self.rim_a
+            tpar = np.clip(np.einsum("ij,ij->i", ap, ab)/denom, 0.0, 1.0)
+            closest = self.rim_a + tpar[:, None]*ab
+            out[i] = np.sqrt(np.min(np.einsum("ij,ij->i",
+                                              points[i] - closest,
+                                              points[i] - closest)))
+        return out
+
+    def signed_distance(self, points, **kwargs):
+        """Signed distance, with the sign of an OPEN mesh taken honestly.
+
+        BEYOND THE EDGE OF A SHEET THERE IS NO INSIDE, and this is where the
+        2026-10-09 clearance numbers came from. The planning mesh that day was
+        a measured patch 76 x 66 mm across and 1.1 mm thick. The Keyence frame
+        rides about 73 mm off the probe axis, so near the ends of a raster it
+        sat OUTSIDE that patch's footprint and below its plane -- and the sign
+        of a signed distance comes from the nearest triangle, which there is
+        one on the rim, with its normal pointing up. Below a rim triangle reads
+        as inside the part:
+
+            worst clearance -141.8 mm (limit 5.0 mm)
+            lj_v7080_frame  -141.8 mm   <-- under the limit
+            outer_shell     -123.1 mm   <-- under the limit
+
+        on a plate one millimetre thick, with every face correctly wound.
+        Measured again 2026-10-10 against the same saved mesh: a point 100 mm
+        beyond the rim and 100 mm below it reads -142.4 mm, and the mesh has
+        zero inconsistently wound faces.
+
+        What it cost: 376 of 2925 waypoints dropped, whole passes skipped, 101
+        passes split into 136, 17.1% of the path given up -- and since each
+        mid-pass split is a lift and an approach, it is also where that run's
+        stop-start motion came from.
+
+        So: where the nearest point on the mesh lies on a BOUNDARY edge, the
+        query point is off the end of the sheet and no triangle there can say
+        which side of the part it is on. The magnitude is kept, because a tool
+        near the rim is still near something; only the claim to be inside is
+        dropped. A closed mesh has no boundary edges and nothing here applies
+        to it.
+        """
+        d = self._signed_distance_impl(points, **kwargs)
+        if self.n_boundary_edges == 0:
+            return d
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        neg = np.where(d < 0.0)[0]
+        if neg.size == 0:
+            return d
+        rim = self._rim_distance(pts[neg])
+        # The nearest point on the mesh is ON the rim exactly when the distance
+        # to the rim equals the distance to the surface. A tolerance, because
+        # both are floating point and the rim distance is computed a different
+        # way from the surface distance.
+        off_the_end = rim <= np.abs(d[neg])*(1.0 + 1e-9) + 1e-9
+        if off_the_end.any():
+            d = d.copy()
+            d[neg[off_the_end]] = np.abs(d[neg[off_the_end]])
+        return d
+
+    def distance(self, points, **kwargs):
+        """Unsigned distance -- for a report that does not care which side."""
+        return np.abs(self.signed_distance(points, **kwargs))
+
+
+def surface_distance(mesh, outward=(0.0, 0.0, 1.0)):
+    """A SurfaceDistance for a mesh file, a (vertices, triangles) pair, or one
+    that is already built."""
+    if isinstance(mesh, SurfaceDistance):
+        return mesh
+    if isinstance(mesh, str):
+        verts, _normals, tris = read_ply_mesh(mesh)
+        return SurfaceDistance(verts, tris, outward=outward,
+                               name=os.path.basename(mesh))
+    verts, tris = mesh
+    return SurfaceDistance(verts, tris, outward=outward)
+
+
+# ------------------------------------------------------------------------------
+# The check itself
+# ------------------------------------------------------------------------------
+
+def path_clearance(path, mesh, envelope=None, segments=None, pad=None,
+                   allow_links=(), outward=(0.0, 0.0, 1.0), sample_m=None,
+                   description=None, interest_m=0.050, stride=1,
+                   indices=None, fill="interp", block=None,
+                   measure_allowed=True, progress=None):
+    """How close the whole tool comes to the surface, at every pose of `path`.
+
+    Returns a dict:
+        min_m           the worst clearance anywhere on the path
+        clearance       (N,) the worst clearance at each waypoint, metres
+        link            (N,) which link was closest there
+        per_pass        one row per segment: index, waypoints, min, mean, where
+        per_link        {link: worst clearance that link reached}
+        exact           (N,) True where the number is measured rather than a
+                        bounding-sphere lower bound
+        allowed         the links excluded from `min_m` by allow_links
+        envelope        the ToolingEnvelope used
+
+    Clearance is SIGNED: negative means that link is inside the part. `pad` is
+    subtracted from every measurement as the cost of sampling the tooling at a
+    finite spacing, so the number reported is the pessimistic one.
+
+    HOW IT STAYS AFFORDABLE. The honest question is "the minimum distance
+    between 120 000 tooling points and 6 000 triangles, at each of 400 poses",
+    which is 3 x 10^8 point-triangle tests done naively. Three levels of
+    bounding sphere cut it to a few million: the link, then a 20 mm block of the
+    link, then the points. A sphere whose nearest possible approach already
+    exceeds the running minimum cannot improve it, so it is never opened. Above
+    `interest_m` the answer stops being interesting -- a link 80 mm clear is
+    clear -- so anything beyond that is left as its lower bound and marked
+    inexact rather than measured. The reported minimum is unaffected: a bound is
+    only accepted where it is already larger than a measured value.
+
+    `stride` samples every nth pose, for a quick look on a very long path. The
+    poses in between are then not checked at all, so a strided report is a
+    reconnaissance and never the thing a flight decision is made on.
+    `indices` names the poses to measure outright, which is how
+    sampled_path_clearance() drives this: it chooses them from the path's own
+    geometry and certifies the rest. `fill="none"` then leaves the unmeasured
+    poses as NaN instead of interpolating, because interpolation between two
+    measurements is a guess and the certificate is not.
+
+    `block` is how many poses are measured at a time. It does not change the
+    answer; it bounds the peak memory, which otherwise grows with the length of
+    the path: 4 625 MB for 933 poses of an eddy-current toolpath unblocked
+    against 415 MB for the same poses in blocks.
+
+    `measure_allowed=False` stops at the bounding spheres for the links the
+    caller declared contact for. They cannot fail the gate -- that is what
+    declaring them means -- and on the eddy-current tooling they are 2 842 of
+    the ~3 000 points measured per pose, so this is most of the cost of a check
+    whose answer they cannot change. Their reported numbers become lower bounds;
+    sampled_path_clearance() measures them properly at a sample of poses so the
+    report still says how hard the probe is pressing.
+    """
+    pad = TOOLING_CLEARANCE_PAD_M if pad is None else pad
+    surface = surface_distance(mesh, outward=outward)
+    env = (tooling_envelope(source=description, sample_m=sample_m)
+           if envelope is None else envelope)
+
+    positions = np.asarray(path.positions, dtype=np.float64).reshape(-1, 3)
+    quats = np.asarray(path.quats, dtype=np.float64).reshape(-1, 4)
+    n = positions.shape[0]
+    clearance = np.full(n, np.inf)
+    # The same thing measured over the links that are NOT allowed to touch. Kept
+    # separately rather than filtered afterwards by "which link was closest",
+    # because a pose where the probe is 5 mm INSIDE the part (allowed) and the
+    # Keyence head is 3 mm outside it (not allowed) has the probe as its closest
+    # link and must still be refused.
+    allow = set(allow_links or ())
+    gate = np.full(n, np.inf)
+    exact = np.zeros(n, dtype=bool)
+    closest = [""]*n
+    gate_link = [""]*n
+    per_link = {}
+
+    if indices is not None:
+        checked = np.unique(np.asarray(indices, dtype=np.int64))
+        checked = checked[(checked >= 0) & (checked < n)]
+    else:
+        checked = np.arange(0, n, max(1, int(stride)))
+
+    centres = np.array([l["centre"] for l in env.links])
+    radii = np.array([l["radius"] for l in env.links])
+    keepable = np.array([l["name"] not in allow for l in env.links])
+    block = int(TOOLING_POSE_BLOCK if block is None else block)
+    if block <= 0:
+        block = max(1, checked.size)
+
+    # MEASURED IN BLOCKS. Everything below is per-pose and independent between
+    # poses, so the block size cannot change the answer -- only the peak
+    # working set, which is what ran this out of memory on a long path.
+    if progress is None:
+        progress = checked.size > TOOLING_GATE_PROGRESS_ABOVE
+    if progress and checked.size > TOOLING_GATE_PROGRESS_BLOCKS:
+        # Enough blocks to tick between. See TOOLING_GATE_PROGRESS_BLOCKS.
+        block = max(1, min(block, int(checked.size
+                                      // TOOLING_GATE_PROGRESS_BLOCKS)))
+    tick = _gate_progress(checked.size) if progress else None
+    for start in range(0, checked.size, block):
+        sel = checked[start:start + block]
+        if tick is not None:
+            tick(start)
+        R = _quats_to_matrices(quats[sel])
+
+        # Level 1: one sphere per link, every pose in the block in one call.
+        world = np.einsum("nij,kj->nki", R, centres) + positions[sel][:, None, :]
+        # exact_within: a link sphere 300 mm clear does not need its distance to
+        # the nearest triangle resolved to the micron, and resolving it is what
+        # made the query widen its candidate set five times over for nothing.
+        # The bound it returns instead is a true lower bound, which is all any
+        # of the three levels here ever uses a bound for.
+        bound = (surface.signed_distance(
+            world.reshape(-1, 3),
+            exact_within=interest_m + float(radii.max())
+        ).reshape(sel.size, len(env.links)) - radii[None, :])
+        del world
+
+        # Closest links first, so the running minimum is tight before the big
+        # ones are considered at all.
+        for k in np.argsort(bound.min(axis=0)):
+            link = env.links[int(k)]
+            allowed_link = link["name"] in allow
+            worst = per_link.get(link["name"], np.inf)
+            # A LINK IS OPENED AGAINST ITS OWN RUNNING MINIMUM. For a link the
+            # gate depends on that is `gate`, not `clearance` -- and the
+            # difference is not cosmetic. `clearance` is the minimum over EVERY
+            # link including the ones allowed to touch, so on a contact scan the
+            # probe's own -2 mm would become the cap, every other link would be
+            # skipped as "no better than that" and gated on its bounding-sphere
+            # lower bound instead of a measurement. Those bounds are tens of
+            # millimetres slack on a link 200 mm long, so poses that are
+            # genuinely 40 mm clear would be dropped BECAUSE the probe is in
+            # contact -- which is the one thing that scan is supposed to do.
+            running = clearance[sel] if allowed_link else gate[sel]
+            cap = np.minimum(running, interest_m)
+            rows = np.nonzero(bound[:, k] <= cap)[0]
+            # THE BEST LOWER BOUND KNOWN FOR THIS LINK AT EACH POSE. It starts
+            # as the one-sphere level-1 bound and each level that runs replaces
+            # it with something tighter; where a level did not run, the previous
+            # level's bound stands. Every pose ends with a real number for every
+            # link, which is what the running minima below are then taken over.
+            low = bound[:, k].copy()
+            measured_here = np.zeros(sel.size, dtype=bool)
+            if allowed_link and not measure_allowed:
+                # Bounds only for a link that cannot fail the gate. It still
+                # gets its level-1/2 lower bound, which is all `clearance` and
+                # the running cap need; what is skipped is the point-by-point
+                # measurement, and on the eddy-current path the two contact
+                # links are 2842 of the ~3000 points measured per pose.
+                rows = np.zeros(0, dtype=np.int64)
+            if rows.size:
+                # Level 2: the link's own 20 mm blocks, for those poses.
+                cc = link["cluster_centres"]
+                cr = link["cluster_radii"]
+                cw = (np.einsum("nij,kj->nki", R[rows], cc)
+                      + positions[sel[rows]][:, None, :])
+                # EXACTNESS PER CLUSTER, not one threshold for the widest of
+                # them. A block is opened when `cbound <= here`, and cbound is
+                # this query's answer minus the block's own radius, so what has
+                # to be exact is everything below `interest_m + cr` FOR THAT
+                # BLOCK -- a block settled above its own threshold is
+                # guaranteed not to open, which is the only thing this level
+                # decides. A single `interest_m + cr.max()` instead demands the
+                # widest block's exactness of every block, and since the bounded
+                # query below costs what it is allowed to skip, that is most of
+                # the cost of this level for none of its answer.
+                cbound = (surface.signed_distance(
+                    cw.reshape(-1, 3),
+                    exact_each=np.broadcast_to(
+                        interest_m + cr[None, :],
+                        (rows.size, cc.shape[0])).reshape(-1)
+                ).reshape(rows.size, cc.shape[0]) - cr[None, :])
+                del cw
+
+                # Level 3: the points in the blocks that could still matter.
+                #
+                # BATCHED ACROSS POSES, which is the difference between this
+                # gate finishing in a minute and finishing in a day. One pose's
+                # opened blocks are a few hundred points; issued one pose at a
+                # time that is 1.4 MILLION numpy calls over an eddy-current
+                # path, each one paying a KD-tree entry, a cross-thread dispatch
+                # and twenty small-array allocations to do 500 points of work.
+                # Measured at 37 us/point that way against 3 us/point when the
+                # same points arrive in one array.
+                #
+                # It is not an approximation and it is not a reordering of the
+                # answer: `here` below (the running minimum a pose's link is
+                # measured against) depends only on values set by OTHER links,
+                # never by another pose, because each pose appears once in
+                # `rows`. So every pose's `here` is known before the batch, and
+                # the batched result is the same number the loop produced.
+                here = cap[rows]
+                mask = cbound <= here[:, None]
+                # A block that stayed shut is not a hole in the answer: its own
+                # lower bound still constrains this link at this pose, and it is
+                # a far tighter constraint than level 1's single sphere. So the
+                # link's bound at a pose is the smallest of (what the opened
+                # blocks measured) and (what the shut blocks bound), and THAT is
+                # compared against level 1 and the larger kept -- every one of
+                # them is a lower bound on the same quantity, so the largest is
+                # the one to believe.
+                shut_low = np.where(mask, np.inf, cbound).min(axis=1)
+                dmin = np.full(rows.size, np.inf)
+                pair_row, pair_cl = np.nonzero(mask)
+                if pair_row.size:
+                    cstart = link["cluster_start"]
+                    csize = link["cluster_size"]
+                    corder = link["cluster_order"]
+                    lpts = link["points"]
+                    sizes = csize[pair_cl]
+                    ends = np.cumsum(sizes)
+                    total = int(ends[-1])
+                    # One batch holds (points x 3) of local and world points and
+                    # a gathered (points x 3 x 3) of rotations -- 120 bytes a
+                    # point -- on top of whatever the query itself holds, which
+                    # SURFACE_QUERY_BYTES already bounds. A 512th of that budget
+                    # is 64 MB of gather per batch and keeps the whole level
+                    # under a tenth of a gigabyte however long the path is.
+                    budget = max(4096, int(SURFACE_QUERY_BYTES)//512)
+                    cuts = np.searchsorted(
+                        ends, np.arange(1, total//budget + 1)*budget)
+                    edges = np.unique(np.concatenate(
+                        ([0], cuts, [sizes.size]))).astype(np.int64)
+                    for e in range(edges.size - 1):
+                        lo, hi = int(edges[e]), int(edges[e + 1])
+                        if hi <= lo:
+                            continue
+                        sz = sizes[lo:hi]
+                        pidx = corder[_concat_ranges(cstart[pair_cl[lo:hi]], sz)]
+                        rrep = np.repeat(pair_row[lo:hi], sz)
+                        world = (np.einsum("nij,nj->ni", R[rows[rrep]],
+                                           lpts[pidx])
+                                 + positions[sel[rows[rrep]]])
+                        # EXACT ONLY WHERE IT COULD MATTER, per point. This
+                        # link's number is used for one thing: is it below the
+                        # running minimum for ITS pose? A sample point whose
+                        # lower bound is already above that cannot change the
+                        # answer, so it is left as its bound -- and on the
+                        # eddy-current probe, whose barrel runs 68 mm up from a
+                        # tip that is on the surface, that is nearly all of
+                        # them. `exact_each` carries each pose's own running
+                        # minimum into the batch, so batching costs no exactness
+                        # anywhere; a scalar would have had to use the loosest
+                        # pose's and measure the rest for nothing.
+                        # here + pad, not here: `pad` is subtracted from the
+                        # answer below, so a point only stops mattering once its
+                        # distance is above the running minimum PLUS the pad it
+                        # is about to lose. Asking for exactness to `here` alone
+                        # would let a bound land exactly on `here`, become
+                        # `here - pad` after the pad, and ratchet the running
+                        # minimum down by one pad for every link that looked.
+                        #
+                        # THE SIGN THIS RELAXATION ASSUMES IS VOUCHED FOR BY THE
+                        # SAMPLING, not by the query. A link's points are a
+                        # sample of a CLOSED collision hull at TOOLING_SAMPLE_M,
+                        # so the hull cannot put a point inside the part without
+                        # crossing the surface, and the crossing carries sample
+                        # points within half a spacing of it. Those are close to
+                        # the surface, so they are never settled -- they are
+                        # measured, they come back negative or near zero, and it
+                        # is the MINIMUM over the link that this level reports.
+                        # An interior point mis-signed as clear can therefore
+                        # not raise the link's number above the crossing, and
+                        # TOOLING_CLEARANCE_PAD_M is the half-spacing that
+                        # covers the crossing itself. Section 8e of
+                        # tooling_clearance_test.py drives whole links into a
+                        # plate and a cylinder and checks exactly this.
+                        d = surface.signed_distance(
+                            world, exact_each=here[rrep] + pad)
+                        del world
+                        # rrep is non-decreasing (np.nonzero walks the mask row
+                        # by row), so the per-pose minimum is one reduceat.
+                        cut = np.concatenate(
+                            ([0], np.nonzero(np.diff(rrep))[0] + 1))
+                        got = np.minimum.reduceat(d, cut)
+                        at = rrep[cut]
+                        dmin[at] = np.minimum(dmin[at], got)
+                # LEVELS 2 AND 3 REPLACE LEVEL 1'S BOUND FOR THIS LINK.
+                # All three are lower bounds on the same quantity, so the
+                # largest looks like the one to keep -- and that is wrong,
+                # because level 1's is the only one that leans on the signed
+                # distance being 1-Lipschitz over a 112 mm sphere. It is not:
+                # the sign comes from the closest triangle's normal (see
+                # SurfaceDistance) and it flips across the EDGE of an open
+                # sheet, so a link hanging off the side of the part can have a
+                # bounding-sphere centre reading +156 mm while its own sample
+                # points read -125. Taking the max there lets a +48 mm sphere
+                # bound overrule a -199 mm measurement, and the pose is kept.
+                # What the tool actually touches is measured, not inferred.
+                #
+                # Both of them lean on that 1-Lipschitz assumption too, but
+                # over a 20 mm block rather than a 112 mm link, which is where
+                # a scanned sheet actually is smooth. So once level 2 has run,
+                # its bound is the one to keep -- and where level 3 measured
+                # points on top of it, the measurement is. Level 1's sphere is
+                # only ever the answer for a link level 2 never looked at, and
+                # it is folded in for exactly those (see `low`'s initial value
+                # and the comment there): that is the hole this closes, and it
+                # is a different hole from the one above.
+                got = np.isfinite(dmin)
+                low[rows] = np.where(got, np.minimum(dmin, shut_low), shut_low)
+                measured_here[rows] = got
+            per_link[link["name"]] = min(per_link.get(link["name"], np.inf),
+                                         float(low.min()) - pad)
+            # The running minima the NEXT link is opened against. Updated from
+            # `low`, so a link that was never opened at a pose still tightens
+            # them by whatever its bounding sphere is worth.
+            vals = low - pad
+            take = vals < clearance[sel]
+            if take.any():
+                bp = sel[take]
+                clearance[bp] = vals[take]
+                exact[bp] = measured_here[take]
+                for i in bp:
+                    closest[int(i)] = link["name"]
+            if not allowed_link:
+                take = vals < gate[sel]
+                if take.any():
+                    bp = sel[take]
+                    gate[bp] = vals[take]
+                    for i in bp:
+                        gate_link[int(i)] = link["name"]
+
+        # EVERY LINK NOW CONSTRAINS EVERY POSE, measured or not, so there is
+        # nothing left to patch up here: the loop above folded each link's best
+        # lower bound into `clearance` and `gate` whether it was opened or not.
+        #
+        # Folding in only the MEASURED links, and reaching for the level-1
+        # bounds afterwards for poses where nothing was measured, is sound while
+        # the running minimum is below `interest_m`, because a link is skipped
+        # only when its own bound is already above that minimum. It is NOT sound
+        # above it: once every link is clear by more than interest_m the cap
+        # that decides what gets opened is interest_m itself, and a link whose
+        # bound is 50.1 mm is then skipped while a link measured at 200 mm sets
+        # the pose's number. On a real reconstruction that over-reports a pose
+        # by around 0.07 mm -- 55.95 mm against a truth of 55.88.
+        # Cosmetic in a report; NOT cosmetic in sampled_path_clearance(),
+        # which turns each measured clearance into a certified window of that
+        # many millimetres of tooling travel -- an over-reported clearance there
+        # is an uncertified pose flown as if it had been checked.
+        del bound, R
+
+    # Un-checked poses. "interp" is the old behaviour and is a GUESS, kept for
+    # the reconnaissance `stride` was written for; "none" leaves them NaN, which
+    # is what sampled_path_clearance() wants because it replaces them with a
+    # bound it can defend.
+    if checked.size < n:
+        if fill == "none":
+            keep_mask = np.zeros(n, dtype=bool)
+            keep_mask[checked] = True
+            clearance = np.where(keep_mask, clearance, np.nan)
+            gate = np.where(keep_mask, gate, np.nan)
+        else:
+            clearance = np.interp(np.arange(n), checked, clearance[checked])
+            gate = np.interp(np.arange(n), checked, gate[checked])
+            for i in range(n):
+                j = int(checked[np.argmin(np.abs(checked - i))])
+                if not closest[i]:
+                    closest[i] = closest[j]
+                if not gate_link[i]:
+                    gate_link[i] = gate_link[j]
+    if not allow:
+        gate = clearance
+        gate_link = closest
+
+    segs = list(segments if segments is not None else path.segments)
+    per_pass = []
+    for si, (a, b) in enumerate(segs):
+        if b <= a:
+            continue
+        vals = gate[a:b]
+        if not np.isfinite(vals).any():
+            continue
+        j = int(np.nanargmin(vals))
+        per_pass.append({"pass": si, "start": a, "end": b, "n": int(b - a),
+                         "min_m": float(np.nanmin(vals)),
+                         "mean_m": float(np.nanmean(vals)),
+                         "at": a + j, "link": gate_link[a + j]})
+
+    return {"min_m": float(np.nanmin(gate)),
+            "min_any_m": float(np.nanmin(clearance)),
+            "clearance": gate,
+            "clearance_any": clearance,
+            "exact": exact,
+            "link": gate_link,
+            "link_any": closest,
+            "per_pass": per_pass,
+            "per_link": per_link,
+            "allowed": sorted(allow),
+            "pad_m": pad,
+            "stride": int(max(1, stride)),
+            "checked": checked,
+            "envelope": env,
+            "surface": surface}
+
+
+def _hms(seconds):
+    """h:mm:ss for a progress line."""
+    seconds = int(max(0.0, seconds))
+    return "%d:%02d:%02d" % (seconds//3600, (seconds % 3600)//60, seconds % 60)
+
+
+def _gate_progress(total, what="poses", every=None):
+    """A one-line progress report, at most every TOOLING_GATE_PROGRESS_S.
+
+    The gate can spend tens of minutes inside the distance kernel, and a silent
+    process with a robot that has not moved is indistinguishable from a hang --
+    so it says something while it works. Returns a callable; call it with the
+    count done so far.
+    """
+    every = TOOLING_GATE_PROGRESS_S if every is None else float(every)
+    state = {"t0": time.time(), "last": 0.0, "done": 0}
+
+    def tick(done=None, note="", force=False):
+        if done is not None:
+            state["done"] = int(done)
+        now = time.time()
+        if every <= 0:
+            return
+        if state["done"] <= 0 and not force:
+            # Nothing has happened yet, so there is nothing to say and no rate
+            # to estimate from. The first line lands one interval in.
+            state["last"] = state["last"] or now
+            return
+        if not force and now - state["last"] < every:
+            return
+        state["last"] = now
+        elapsed = now - state["t0"]
+        d = state["done"]
+        rate = d/elapsed if elapsed > 0.0 else 0.0
+        left = (total - d)/rate if rate > 0.0 and total > d else 0.0
+        line = ("gate: %d/%d %s, %s elapsed, ~%s left%s"
+                % (d, total, what, _hms(elapsed), _hms(left), note))
+        # THROUGH progress.dpi WHEN IT IS LOADED, and not only for the
+        # timestamp. A bare print() from a dgpy acquisition thread can be
+        # SWALLOWED -- that is a documented trap in this codebase -- and a
+        # swallowed progress line puts the gate straight back to being a silent
+        # process nobody can distinguish from a hang. progress_say() routes to
+        # the capture session's own sink when there is one, so the line also
+        # survives into the session log rather than only onto a terminal.
+        say = globals().get("progress_say")
+        if callable(say):
+            try:
+                say(line)
+                return
+            except Exception:
+                pass            # never let a progress line kill the gate
+        print("    " + line)
+    return tick
+
+
+def path_step_travel(path, envelope):
+    """(N-1,) upper bound on how far ANY point of the tooling moves between
+    consecutive poses of `path`. Metres.
+
+    A pose is a rigid transform (R, t) of the tooling. Between pose i and i+1 a
+    point p fixed in the tool frame moves by
+
+        |R2 p + t2 - R1 p - t1|  <=  |t2 - t1| + |(R2 - R1) p|
+                                 <=  |t2 - t1| + 2 sin(theta/2) |p|
+                                 <=  |t2 - t1| + theta * reach
+
+    where theta is the angle between the two orientations and `reach` is the
+    farthest sample point from the path frame. Every step is an inequality in
+    the safe direction, and nothing here is sampled or fitted, so the result is
+    an upper bound on the true motion and never an estimate of it.
+
+    This is the quantity the sampled gate is built on: signed distance to a
+    fixed surface is 1-Lipschitz, so a pose that is X clear cannot be less than
+    X - (travel) clear one step later, whatever the surface looks like in
+    between.
+    """
+    pos = np.asarray(path.positions, dtype=np.float64).reshape(-1, 3)
+    quats = np.asarray(path.quats, dtype=np.float64).reshape(-1, 4)
+    if pos.shape[0] < 2:
+        return np.zeros(0)
+    move = np.linalg.norm(np.diff(pos, axis=0), axis=1)
+    q = quats/np.where(np.linalg.norm(quats, axis=1) == 0.0, 1.0,
+                       np.linalg.norm(quats, axis=1))[:, None]
+    dot = np.abs(np.einsum("ij,ij->i", q[:-1], q[1:]))
+    theta = 2.0*np.arccos(np.clip(dot, -1.0, 1.0))
+    return move + theta*float(getattr(envelope, "reach", 0.0))
+
+
+def sampled_path_clearance(path, mesh, limit=None, envelope=None, pad=None,
+                           allow_links=(), outward=(0.0, 0.0, 1.0),
+                           sample_m=None, description=None, interest_m=0.050,
+                           resolution_m=None, max_rounds=None, segments=None,
+                           report=True, block=None, report_poses=192):
+    """path_clearance() over a SAMPLE of the poses, with every pose it did not
+    measure certified rather than guessed.
+
+    WHY. The eddy-current toolpath at the 0.30 mm line spacing this cell scans
+    at is 180 000 poses after cropping, and was 911 000 before (the gate used to
+    run on the raw Noether path, ahead of every crop). Measuring each one takes
+    hours. Sampling every nth pose and hoping is not an option either: the fault
+    this module exists to catch is a 7.1 mm probe barrel 5 mm inside a part, and
+    a stride of ten over a 1 mm pitch steps across it.
+
+    WHAT IS GUARANTEED. Clearance along the path is 1-Lipschitz in tooling
+    motion -- see path_step_travel() -- so two MEASURED poses j < k bound every
+    pose m between them from below:
+
+        clearance(m) >= max( c(j) - travel(j..m), c(k) - travel(m..k) )
+
+    A window is accepted only when that bound is at or above `limit` for every
+    pose inside it. Any window where it is not gets its worst interior pose
+    measured and is reconsidered, which halves it at worst. So the gate ends
+    with every pose of the path either MEASURED outright or holding a lower
+    bound that is at or above the limit -- there is no pose about which nothing
+    is known, and a violation cannot hide between samples. What sampling buys is
+    that flat, far-from-the-part stretches are certified in one step while the
+    poses near the limit are all measured.
+
+    `resolution_m` only sets how dense the first pass is (default
+    TOOLING_GATE_RESOLUTION_M): the certificate, not this number, decides what
+    is accepted.
+
+    Returns the same report as path_clearance(), plus:
+        checked         the pose indices measured
+        certified       (N,) True where the value is a bound, not a measurement
+        rounds          refinement rounds used
+        blind_span_m    the largest tooling travel left unmeasured inside an
+                        accepted window -- how far apart two measurements ever
+                        were where nothing was measured between them
+        exhausted       windows the rounds limit stopped before they resolved
+                        (0 is what a healthy run reports)
+    """
+    limit = TOOLING_CLEARANCE_M if limit is None else float(limit)
+    resolution_m = (TOOLING_GATE_RESOLUTION_M if resolution_m is None
+                    else float(resolution_m))
+    max_rounds = (TOOLING_GATE_MAX_ROUNDS if max_rounds is None
+                  else int(max_rounds))
+    pad = TOOLING_CLEARANCE_PAD_M if pad is None else pad
+    surface = surface_distance(mesh, outward=outward)
+    env = (tooling_envelope(source=description, sample_m=sample_m)
+           if envelope is None else envelope)
+    n = len(path)
+    segs = list(segments if segments is not None else path.segments)
+    if not segs:
+        segs = [(0, n)]
+
+    coarse_m = max(float(TOOLING_GATE_COARSE_M), resolution_m)
+    travel = path_step_travel(path, env)
+    # Cumulative tooling travel, so the distance between any two poses of one
+    # segment is one subtraction. Reset at every segment boundary: consecutive
+    # poses in DIFFERENT passes are separated by a lift, a transit and a
+    # descent, and the gate certifies poses, not the moves between them
+    # (lead_in_clearance() is what checks those).
+    cum = np.zeros(n)
+    for a, b in segs:
+        if b - a > 1:
+            cum[a+1:b] = np.cumsum(travel[a:b-1])
+            cum[a+1:b] += cum[a]
+        # a pose that starts a segment carries its own origin
+    seg_of = np.full(n, -1, dtype=np.int64)
+    for si, (a, b) in enumerate(segs):
+        seg_of[a:b] = si
+
+    # THE FIRST PASS IS DELIBERATELY COARSE: the two ends of every segment,
+    # then every pose at which the tooling has travelled another
+    # TOOLING_GATE_COARSE_M. What a measurement buys is not a pose, it is the
+    # certification of every pose within (clearance - limit) of travel of it,
+    # and on a path that is 25 mm clear that is a 20 mm window -- so starting at
+    # `resolution_m` (10 mm) measures twice as many poses as the certificate can
+    # use before a single one of them has been looked at. Starting coarse and
+    # refining where the certificate actually fails measures the poses the
+    # answer depends on and no others. `resolution_m` is now the FLOOR on how
+    # finely refinement will place new marks, not the first pass's spacing.
+    want = set()
+    for a_, b_ in segs:
+        if b_ <= a_:
+            continue
+        want.add(int(a_))
+        want.add(int(b_ - 1))
+        if b_ - a_ > 2:
+            marks = np.arange(cum[a_], cum[b_-1], coarse_m)[1:]
+            if marks.size:
+                want.update(int(i) for i in
+                            (a_ + np.searchsorted(cum[a_:b_], marks)).clip(a_, b_-1))
+    idx = np.array(sorted(want), dtype=np.int64)
+
+    gate = np.full(n, np.nan)
+    gate_link = [""]*n
+    clear_any = np.full(n, np.nan)
+    clear_link = [""]*n
+    per_link = {}
+    measured = np.zeros(n, dtype=bool)
+    exact = np.zeros(n, dtype=bool)
+    rounds = 0
+    exhausted = 0
+    rep = None
+    tick = _gate_progress(n) if report else (lambda *a, **k: None)
+    poses_all = np.arange(n)
+
+    while idx.size:
+        rounds += 1
+        rep = path_clearance(path, surface, envelope=env, segments=segs,
+                             pad=pad, allow_links=allow_links, outward=outward,
+                             interest_m=interest_m, indices=idx, fill="none",
+                             block=block, measure_allowed=False,
+                             progress=False)
+        gate[idx] = rep["clearance"][idx]
+        clear_any[idx] = rep["clearance_any"][idx]
+        for i in idx:
+            gate_link[int(i)] = rep["link"][int(i)]
+            clear_link[int(i)] = rep["link_any"][int(i)]
+        exact[idx] |= rep["exact"][idx]
+        measured[idx] = True
+        for name, value in rep["per_link"].items():
+            per_link[name] = min(per_link.get(name, np.inf), value)
+
+        # CERTIFY EVERY WINDOW AT ONCE. One pass of searchsorted finds, for
+        # every unmeasured pose, the measured pose before it and after it; the
+        # Lipschitz bound is then two subtractions over the whole path. Walking
+        # the windows in Python instead cost a second a round by the time there
+        # were 40 000 of them, which is the same order as the measuring.
+        done = np.nonzero(measured)[0]
+        prev_at = np.searchsorted(done, poses_all, side="right") - 1
+        next_at = np.searchsorted(done, poses_all, side="left")
+        have = (prev_at >= 0) & (next_at < done.size)
+        j = done[np.clip(prev_at, 0, done.size - 1)]
+        k = done[np.clip(next_at, 0, done.size - 1)]
+        have &= (seg_of[j] == seg_of) & (seg_of[k] == seg_of)
+        bnd = np.where(have,
+                       np.maximum(gate[j] - (cum - cum[j]),
+                                  gate[k] - (cum[k] - cum)),
+                       -np.inf)
+        interior = have & ~measured
+        failing = np.nonzero(interior & (bnd < limit))[0]
+        tick(int(n - failing.size))
+        if failing.size == 0:
+            break
+        if rounds >= max_rounds:
+            # Count the WINDOWS left, not the poses, so the number means the
+            # same thing it always did.
+            exhausted = int(np.unique(prev_at[failing]).size)
+            break
+
+        # REFINE ONLY WHERE THE BOUND COULD DIP, and refine by as much as the
+        # measurements already in hand say is needed. A window whose ends are
+        # both 30 mm clear against a 5 mm limit can carry 25 mm of travel either
+        # side of any new measurement, so marks go in at that spacing -- one
+        # round, not the five that halving the window one pose at a time would
+        # take. The prediction can be wrong (the surface is free to rise in the
+        # middle); when it is, the certificate fails again and the next round
+        # refines what is left. Only the certificate decides what is accepted.
+        nxt = set()
+        order = np.argsort(prev_at[failing], kind="stable")
+        fs = failing[order]
+        wid = prev_at[fs]
+        cuts = np.concatenate(([0], np.nonzero(np.diff(wid))[0] + 1,
+                               [fs.size]))
+        for w in range(cuts.size - 1):
+            part = fs[cuts[w]:cuts[w+1]]
+            lo = int(done[wid[cuts[w]]])
+            hi = int(done[min(wid[cuts[w]] + 1, done.size - 1)])
+            # Always the worst interior pose: that alone at least halves the
+            # window, which is what bounds the number of rounds.
+            nxt.add(int(part[np.argmin(bnd[part])]))
+            inside = hi - lo - 1
+            if inside <= 0:
+                continue
+            if inside <= _GATE_MEASURE_ALL:
+                # A window this small cannot be cheaper to bisect than to
+                # finish, and finishing it takes it out of the round count.
+                nxt.update(int(i) for i in range(lo + 1, hi))
+                continue
+            slack = min(gate[lo], gate[hi]) - limit
+            step = max(1.6*slack, resolution_m)
+            marks = np.arange(cum[lo] + step, cum[hi], step)
+            if marks.size > _GATE_MAX_INSERTS:
+                marks = marks[np.unique(np.linspace(
+                    0, marks.size - 1, _GATE_MAX_INSERTS).astype(int))]
+            if marks.size:
+                nxt.update(int(i) for i in
+                           (lo + np.searchsorted(cum[lo:hi], marks)).clip(lo + 1,
+                                                                         hi - 1))
+        nxt = set(i for i in nxt if not measured[i])
+        if not nxt:
+            exhausted = int(np.unique(prev_at[failing]).size)
+            break
+        idx = np.array(sorted(nxt), dtype=np.int64)
+
+    # Fill the unmeasured poses with the bound that accepted them. It is a lower
+    # bound on the truth, so a pose kept by it is genuinely clear; it is never
+    # an interpolation.
+    blind = 0.0
+    done = np.nonzero(measured)[0]
+    if done.size:
+        prev_at = np.searchsorted(done, poses_all, side="right") - 1
+        next_at = np.searchsorted(done, poses_all, side="left")
+        have = (prev_at >= 0) & (next_at < done.size)
+        j = done[np.clip(prev_at, 0, done.size - 1)]
+        k = done[np.clip(next_at, 0, done.size - 1)]
+        have &= (seg_of[j] == seg_of) & (seg_of[k] == seg_of) & ~measured
+        if have.any():
+            fill_at = np.nonzero(have)[0]
+            jj, kk = j[fill_at], k[fill_at]
+            gate[fill_at] = np.maximum(gate[jj] - (cum[fill_at] - cum[jj]),
+                                       gate[kk] - (cum[kk] - cum[fill_at]))
+            clear_any[fill_at] = np.maximum(
+                clear_any[jj] - (cum[fill_at] - cum[jj]),
+                clear_any[kk] - (cum[kk] - cum[fill_at]))
+            for at, ja, ka in zip(fill_at, jj, kk):
+                gate_link[int(at)] = gate_link[int(ja)] or gate_link[int(ka)]
+                clear_link[int(at)] = clear_link[int(ja)] or clear_link[int(ka)]
+            blind = float((cum[kk] - cum[jj]).max())
+    # A segment of one pose, or a pose no window covered, keeps its own
+    # measurement; anything still NaN was never reachable and is reported as
+    # such rather than silently read as clear.
+    stuck = np.isnan(gate)
+    if stuck.any():
+        gate[stuck] = -np.inf
+        clear_any[stuck] = -np.inf
+
+    # The links that are ALLOWED to touch were bounded, not measured, because
+    # they cannot fail the gate and they are most of the work. Their numbers are
+    # still what a technician reads to see how hard the probe is pressing, so
+    # measure them properly at a bounded sample of the poses and say so.
+    allowed_sample = 0
+    if allow_links and done.size:
+        take = done if done.size <= report_poses else done[
+            np.unique(np.linspace(0, done.size - 1, report_poses).astype(int))]
+        allowed_sample = int(take.size)
+        arep = path_clearance(path, surface, envelope=env, segments=segs,
+                              pad=pad, allow_links=(), outward=outward,
+                              interest_m=interest_m, indices=take, fill="none",
+                              block=block, progress=False)
+        for name in allow_links:
+            if name in arep["per_link"]:
+                per_link[name] = arep["per_link"][name]
+        clear_any[take] = np.minimum(clear_any[take], arep["clearance"][take])
+
+    per_pass = []
+    for si, (a, b) in enumerate(segs):
+        if b <= a:
+            continue
+        vals = gate[a:b]
+        j = int(np.argmin(vals))
+        per_pass.append({"pass": si, "start": a, "end": b, "n": int(b - a),
+                         "min_m": float(vals.min()), "mean_m": float(vals.mean()),
+                         "at": a + j, "link": gate_link[a + j]})
+
+    out = {"min_m": float(gate.min()), "min_any_m": float(clear_any.min()),
+           "clearance": gate, "clearance_any": clear_any, "exact": exact,
+           "link": gate_link, "link_any": clear_link, "per_pass": per_pass,
+           "per_link": per_link, "allowed": sorted(set(allow_links or ())),
+           "pad_m": pad, "stride": 1, "checked": done,
+           "certified": ~measured, "rounds": rounds,
+           "blind_span_m": blind, "exhausted": exhausted,
+           "allowed_sample": allowed_sample,
+           "resolution_m": resolution_m, "limit_m": limit,
+           "envelope": env, "surface": (rep or {}).get("surface", surface)}
+    if report:
+        print("    sampled: %d of %d poses measured (%.2f%%) in %d round(s); "
+              "every other pose is bounded below by its neighbours and clears "
+              "%.1f mm. Widest unmeasured gap %.1f mm of tooling travel."
+              % (done.size, n, 100.0*done.size/max(n, 1), rounds, limit*1e3,
+                 blind*1e3))
+        if allowed_sample:
+            print("    the contact links (%s) cannot fail the gate, so they are "
+                  "bounded along the path and MEASURED at %d poses -- their "
+                  "numbers below are from that sample"
+                  % (", ".join(allow_links), allowed_sample))
+        if exhausted:
+            print("    WARNING: %d window(s) hit the %d-round limit and are NOT "
+                  "certified. Raise TOOLING_GATE_MAX_ROUNDS or check every pose."
+                  % (exhausted, max_rounds))
+    return out
+
+
+def format_clearance_report(report, limit=None, per_pass=True,
+                            max_passes=20):
+    """The clearance report as text, in millimetres."""
+    limit = TOOLING_CLEARANCE_M if limit is None else limit
+    env = report["envelope"]
+    lines = ["  tooling clearance against %s" % (report["surface"].name,),
+             "    %s" % (env.describe(),),
+             "    worst clearance %+.1f mm (limit %.1f mm, %.1f mm of it "
+             "sampling pad)" % (report["min_m"]*1e3, limit*1e3,
+                                report["pad_m"]*1e3)]
+    for name in sorted(report["per_link"], key=lambda k: report["per_link"][k]):
+        flag = ""
+        if name in report["allowed"]:
+            flag = "   (contact allowed)"
+        elif report["per_link"][name] < limit:
+            flag = "   <-- under the limit"
+        lines.append("    %-22s %+7.1f mm%s"
+                     % (name, report["per_link"][name]*1e3, flag))
+    if per_pass:
+        rows = report["per_pass"]
+        # One line per pass is a useful report for a 6-pass sweep and an
+        # unreadable one for a 7832-pass eddy-current path. Print the worst
+        # `max_passes` and say how many were left out; the full list is in the
+        # returned report either way.
+        shown = rows
+        if max_passes and len(rows) > max_passes:
+            shown = sorted(sorted(rows, key=lambda r: r["min_m"])[:max_passes],
+                           key=lambda r: r["pass"])
+        for row in shown:
+            lines.append("    pass %4d: %5d poses, min %+7.1f mm (%s at %d), "
+                         "mean %+7.1f mm"
+                         % (row["pass"], row["n"], row["min_m"]*1e3,
+                            row["link"], row["at"], row["mean_m"]*1e3))
+        if len(shown) < len(rows):
+            lines.append("    (the %d worst of %d passes; the rest are clearer)"
+                         % (len(shown), len(rows)))
+    return "\n".join(lines)
+
+
+#: Area fraction of faces that may disagree with `outward` before a surface
+#: stops being treated as a height field. A reconstructed patch comes in under
+#: a percent; a closed body comes in near a half, because half of it genuinely
+#: faces away. Nothing real sits between.
+HEIGHT_FIELD_MAX_DISAGREEMENT = 0.10
+
+#: A face counts as agreeing with `outward` when its normal is within ~84
+#: degrees of it. Anything closer to perpendicular carries no information
+#: about which side is out.
+HEIGHT_FIELD_MIN_COS = 0.1
+
+#: And this much of the AREA has to agree before the surface is treated as a
+#: height field at all. A measured patch comes in at 1.0; a half cylinder
+#: standing on its axis comes in near 0, a closed box near a sixth.
+HEIGHT_FIELD_MIN_AGREE_AREA = 0.90
+
+
+#: Below this half-thickness a mesh is an open sheet, not a solid, and
+#: _say_impossible_penetration() has nothing to say about it.
+MIN_SOLID_HALF_THICKNESS_M = 1.0e-4
+
+#: How far past the geometric bound a penetration has to be before it is
+#: called impossible rather than merely deep.
+IMPOSSIBLE_PENETRATION_FACTOR = 5.0
+
+
+def _mesh_max_interior_depth(mesh):
+    """The deepest a point can be INSIDE this mesh, in metres.
+
+    Half the smallest bounding-box extent, which bounds the inradius of any
+    body: a point deeper than that would admit a ball of that radius, and a
+    body containing such a ball is at least twice that wide in every direction.
+    Non-convex bodies are only shallower. Returns None if the mesh has no
+    usable vertices.
+    """
+    if all(hasattr(mesh, k) for k in ("a", "b", "c")):
+        # A SurfaceDistance keeps the triangle corners, not a vertex table.
+        try:
+            v = np.concatenate([np.asarray(mesh.a, dtype=np.float64),
+                                np.asarray(mesh.b, dtype=np.float64),
+                                np.asarray(mesh.c, dtype=np.float64)], axis=0)
+        except Exception:
+            return None
+    else:
+        v = getattr(mesh, "vertices", None)
+        if v is None and isinstance(mesh, dict):
+            v = mesh.get("vertices")
+        try:
+            v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+        except Exception:
+            return None
+    if v.size == 0:
+        return None
+    extent = v.max(axis=0) - v.min(axis=0)
+    return 0.5*float(extent.min())
+
+
+def _say_impossible_penetration(rep, mesh, what):
+    """Say so when a 'collision' is deeper than the part is thick.
+
+    2026-10-09. The clearance check reported
+
+        worst clearance -141.8 mm
+        lj_v7080_frame  -141.8 mm   <-- under the limit
+        outer_shell     -123.1 mm   <-- under the limit
+
+    against a planning mesh whose whole z extent was 2 mm. Nothing can be 141
+    mm inside a 2 mm plate. The sign came from the nearest triangle's normal
+    and a handful of this mesh's normals pointed the wrong way -- the cleaner
+    had already said so, "57 face(s) REWOUND ... and 1 TURNED UP on a height
+    field (99.5% of its normals point up)" -- so points far ABOVE the surface
+    read as far inside it.
+
+    What it cost: 376 of 2925 waypoints dropped, whole passes SKIPPED, 101
+    passes split into 136, and 17.1% of the path given up, which is where the
+    scan's "super weird" fragmented toolpath came from -- every split is a lift
+    and an approach in the middle of a pass.
+
+    This only SAYS so. It does not flip the sign, and deliberately: on a mesh
+    that is a surface shell rather than a solid, "below the surface" is
+    genuinely inside the part, and a bound taken from the shell's own thickness
+    would turn a real collision into a clear pose. Naming it is safe; guessing
+    is not.
+    """
+    depth = _mesh_max_interior_depth(mesh)
+    if depth is None or not np.isfinite(depth):
+        return
+    # AN OPEN SHEET HAS NO THICKNESS AND SO NO BOUND. A planning surface that
+    # is one layer of triangles has a minimum extent of nearly zero, which
+    # would make every real collision "impossible" and this message fire on
+    # every genuine catch. Where the bound is vacuous, say nothing: the only
+    # guard there is the normal repair, and a false alarm here would teach the
+    # operator to ignore a true one.
+    if depth < MIN_SOLID_HALF_THICKNESS_M:
+        return
+    c = np.asarray(rep.get("clearance"))
+    if c.size == 0:
+        return
+    # A MARGIN, because the bound is an upper bound on a non-convex body and a
+    # pose a little past it is arithmetic, not a sign error. Five times past it
+    # is not arithmetic. The 2026-10-09 case was 141 times past.
+    impossible = -IMPOSSIBLE_PENETRATION_FACTOR*depth
+    worst = float(np.min(c))
+    if worst >= impossible:
+        return
+    n_bad = int((c < impossible).sum())
+    links = rep.get("per_link") or {}
+    named = sorted((v, k) for k, v in links.items() if v < impossible)
+    print("    ** IMPOSSIBLE PENETRATION: %d of %d pose(s) of the %s report "
+          "the tooling further inside this surface than the surface is thick. "
+          "The worst is %+.1f mm; nothing can be more than %.1f mm inside it "
+          "(half its smallest extent). That is the SIGN being wrong, not the "
+          "distance. The usual cause is a point off the END of an open sheet, "
+          "which SurfaceDistance.signed_distance() already corrects for; a "
+          "face still wound the wrong way will do it too. Either way the "
+          "magnitude is the real distance."
+          % (n_bad, int(c.size), what, worst*1e3, depth*1e3))
+    if named:
+        print("       the links it names: %s"
+              % (", ".join("%s %+.1f mm" % (k, v*1e3) for v, k in named[:4]),))
+    print("       Those poses are being dropped and the passes through them "
+          "split, so this is paid for in coverage and in a fragmented "
+          "toolpath, not in a refusal. Check the planning mesh's winding, and "
+          "whether its boundary edges were found (%d here) -- a surface whose "
+          "rim is not known has no outside beyond it."
+          % (getattr(mesh, "n_boundary_edges", -1),))
+
+
+def enforce_path_clearance(path, mesh, limit=None, envelope=None, pad=None,
+                           allow_links=(), outward=(0.0, 0.0, 1.0),
+                           sample_m=None, what="path", min_points=4,
+                           report=True, refuse_all=True, description=None,
+                           sample=None, resolution_m=None):
+    """Drop every waypoint whose tooling does not clear the surface.
+
+    Returns (path, report). The path is the one that is safe to fly; the report
+    is path_clearance()'s, plus `dropped`, `kept` and `coverage_lost` so the
+    caller can say what the check cost.
+
+    DROPS RATHER THAN REFUSES, for the same reason the work-volume crop does: a
+    raster over a curved part legitimately cannot reach the steep flanks with a
+    tool this wide, and losing those passes is a measurement with a hole in it,
+    which is a result. Flying them is a collision, which is not. If nothing
+    survives, that is an error and it says so.
+    """
+    limit = TOOLING_CLEARANCE_M if limit is None else limit
+    # SAMPLE on a long path, measure every pose on a short one. `sample=None`
+    # decides by length, so nothing that was already fast changes at all and
+    # every existing caller keeps the exact numbers it was written against; a
+    # 180 000-pose eddy-current toolpath, which cannot be measured pose by pose
+    # in an afternoon, gets the certified sampler. See sampled_path_clearance()
+    # for what it guarantees -- it is not "every nth pose and hope".
+    if sample is None:
+        sample = len(path) > TOOLING_GATE_SAMPLE_ABOVE
+    if sample:
+        rep = sampled_path_clearance(
+            path, mesh, limit=limit, envelope=envelope, pad=pad,
+            allow_links=allow_links, outward=outward, sample_m=sample_m,
+            description=description, resolution_m=resolution_m, report=report)
+    else:
+        rep = path_clearance(path, mesh, envelope=envelope, pad=pad,
+                             allow_links=allow_links, outward=outward,
+                             sample_m=sample_m, description=description)
+    if report:
+        print(format_clearance_report(rep, limit=limit))
+
+    # rep["clearance"] already EXCLUDES the links the caller declared contact
+    # for, so this is one comparison and there is nothing to patch up
+    # afterwards. See path_clearance() for why that is not the same as
+    # forgiving a waypoint whose closest link happened to be an allowed one.
+    keep = rep["clearance"] >= limit
+    _say_impossible_penetration(rep, mesh, what)
+    total = float(sum(path.segment_length_m(s) for s in path.segments))
+    if keep.all():
+        rep.update({"dropped": 0, "kept": int(keep.sum()),
+                    "coverage_lost": 0.0, "passes_before": len(path.segments),
+                    "passes_after": len(path.segments), "path": path})
+        if report:
+            print("    every pose clears by at least %.1f mm; nothing dropped"
+                  % (limit*1e3,))
+        return path, rep
+    if not keep.any() and refuse_all:
+        raise RuntimeError(
+            "no pose of the %s clears the tooling by %.1f mm -- the worst is "
+            "%+.1f mm (%s). This surface cannot be scanned with this tool held "
+            "this way: follow the surface (orient='capped'), or scan it with a "
+            "narrower tool."
+            % (what, limit*1e3, rep["min_m"]*1e3,
+               min(rep["per_link"], key=lambda k: rep["per_link"][k])))
+
+    # mesh_reconstruction.dpi owns the crop -- the work-volume crop, the region
+    # of interest, the tilt limit and this one all split segments the same way,
+    # and two copies of that would drift. It is resolved HERE rather than at
+    # include time because .dpi files share one namespace and the include order
+    # is the config's business; a config that forgot it would otherwise find out
+    # with a bare NameError at the moment the gate was about to save it.
+    crop = globals().get("_crop_path_by_mask")
+    if crop is None:
+        raise RuntimeError(
+            "enforce_path_clearance() needs _crop_path_by_mask() from "
+            "mesh_reconstruction.dpi, which this config has not included. The "
+            "%s has poses whose tooling is inside %.1f mm of the surface (worst "
+            "%+.1f mm) and they cannot be dropped, so nothing here is safe to "
+            "fly: add modules/mesh_reconstruction.dpi to the config."
+            % (what, limit*1e3, rep["min_m"]*1e3))
+    cropped = crop(path, keep, what, min_points,
+                   "inside %.1f mm of the surface" % (limit*1e3))
+    kept_length = float(sum(cropped.segment_length_m(s)
+                            for s in cropped.segments))
+    lost = 0.0 if total <= 0 else 1.0 - kept_length/total
+    rep.update({"dropped": int((~keep).sum()), "kept": int(keep.sum()),
+                "coverage_lost": lost, "passes_before": len(path.segments),
+                "passes_after": len(cropped.segments), "path": cropped})
+    if report:
+        print("    coverage given up to keep the tool clear: %.1f%% of the "
+              "path (%.3f m of %.3f m), %d of %d passes remain"
+              % (lost*100.0, total - kept_length, total,
+                 len(cropped.segments), len(path.segments)))
+    return cropped, rep
+
+
+def cap_path_tilt_for_clearance(path, mesh, limits_deg=(0.0, 15.0, 30.0, 45.0),
+                                limit=None, envelope=None, roll="fixed",
+                                reference=None, report=True,
+                                **kwargs):
+    """Try a ladder of tilt caps and keep the one that covers the most.
+
+    A curved part has no single right answer: holding the tool vertical puts the
+    far side of the tooling into the flank, and following the normal all the way
+    tilts it past what the arm can enter. So measure -- cap the tilt at each of
+    `limits_deg`, check the clearance, and keep whichever cap leaves the most
+    path flyable. Returns (path, report, chosen_deg).
+
+    `path` must be a surface-following path (orient="surface"), because a capped
+    path is built by REDUCING its tilt; there is nothing to cap on a path that
+    was planned with one fixed orientation.
+    """
+    limit = TOOLING_CLEARANCE_M if limit is None else limit
+    # THE ROLL REFERENCE IS THE PATH'S OWN TRAVEL DIRECTION, not world +x.
+    # This used to default to roll="path", which took the tool's x from each
+    # pose's tangent and -- until the sign-continuity guard was ungated in
+    # noether_path.dpi -- flipped 180 degrees at every serpentine turn.
+    # "fixed" is the better answer, but ONLY with the right reference: the
+    # Keyence is a LINE sensor whose line lies along tool y, so a world +x
+    # reference on a raster whose rows run along world y lays the line ALONG
+    # each pass instead of across it, and the sweep covers 12% of the plate
+    # while reporting success. _flat_tool_quat() is the same length-weighted
+    # mean travel direction the Keyence stage uses, with the sign folded out so
+    # a serpentine does not cancel. Looked up by name because a .dpi is not a
+    # module; without it, say so and keep the old behaviour rather than
+    # silently using a reference that is wrong for a line sensor.
+    if reference is None:
+        flat = globals().get("_flat_tool_quat")
+        if callable(flat):
+            reference = flat(path)
+        else:
+            if report:
+                print("    _flat_tool_quat is not loaded, so the roll reference "
+                      "cannot be taken from the path; falling back to "
+                      'roll="path"')
+            roll, reference = "path", (1.0, 0.0, 0.0)
+    env = envelope if envelope is not None else tooling_envelope(
+        source=kwargs.pop("description", None))
+    surface = surface_distance(mesh, outward=kwargs.pop("outward",
+                                                        (0.0, 0.0, 1.0)))
+    best = None
+    for cap in limits_deg:
+        trial = ScanPath(np.array(path.positions, copy=True),
+                         cap_tool_tilt(path.quats, cap),
+                         list(path.segment_starts),
+                         source="%s +tilt cap %.0f deg" % (path.source, cap))
+        rep = path_clearance(trial, surface, envelope=env, **kwargs)
+        keep = rep["clearance"] >= limit
+        flyable = float(keep.mean())
+        if report:
+            print("    tilt cap %5.1f deg: worst %+7.1f mm, %.0f%% of poses "
+                  "clear" % (cap, rep["min_m"]*1e3, flyable*100.0))
+        if best is None or flyable > best[0]:
+            best = (flyable, cap, trial, rep)
+    flyable, cap, trial, rep = best
+    if report:
+        print("    keeping the %.1f deg cap (%.0f%% of poses clear)"
+              % (cap, flyable*100.0))
+    return trial, rep, cap
+
+
+def twist_within_limit(path, segments=None, limit_deg=None,
+                       reference=(1.0, 0.0, 0.0), report=True):
+    """How much this path turns the tool about its own axis. REPORTING ONLY.
+
+    THIS IS NOT THE CABLE LIMIT AND MUST NEVER AGAIN STAND IN FOR ONE. It
+    measures CARTESIAN TOOL TWIST -- how far the tool frame rotates about its
+    own z along the path -- against TOOLING_TWIST_LIMIT_DEG, a number whose own
+    comment calls it a placeholder, and it warns and returns rather than
+    refusing anything.
+
+    THE REAL LIMIT IS THE WRIST_3 BAND, and it lives somewhere else:
+
+        the model      dgpfiles/modules/cable_envelope.dpi
+                       -- measured per tilt by capture_cable_envelope(), in
+                          ABSOLUTE wrist_3 joint angle
+        enforced by    install_cable_guard(), on for the whole
+                       ECAutomatedScan.dgp session, and _check_wrist3() inside
+                       the capture tool
+
+    The difference is not pedantic. Tool twist is a property of a path and says
+    nothing about where the joint starts: a path with 0 degrees of twist flown
+    from a wrist_3 of -113 degrees passes this check and wraps the loom. And
+    the cable band is not symmetric, not centred on zero, and different at
+    every tilt -- 270 degrees of travel
+    untilted, 75 at a -40 degree x tilt -- none of which a single twist number
+    can express.
+
+    What this is still good for is what it was written for: a path that spins
+    the tool inside one pass is a badly planned path whatever the cables allow,
+    and roll='locked' is usually the answer. Keep it as a planning report.
+
+    Returns (ok, report).
+    """
+    limit_deg = TOOLING_TWIST_LIMIT_DEG if limit_deg is None else limit_deg
+    segs = list(segments if segments is not None else path.segments)
+    rep = tool_roll_report(path.quats, segs, reference=reference)
+    ok = rep["twist_in_pass_deg"] <= float(limit_deg)
+    if report:
+        print("    tool rotation about its own axis: %.1f deg within one pass, "
+              "%.1f deg across the path (planning report against %.0f deg, an "
+              "UNMEASURED placeholder -- NOT the cable limit)"
+              % (rep["twist_in_pass_deg"], rep["twist_range_deg"],
+                 float(limit_deg)))
+        if not ok:
+            print("    WARNING: this path spins the tool a long way inside one "
+                  "pass. Plan with roll='locked'.")
+        print("    The cable limit is the wrist_3 band (cable_envelope.dpi), "
+              "enforced on every motion by install_cable_guard(). This line "
+              "does not check it and never did.")
+    return ok, rep
+
+
+def lead_in_clearance(start, end, mesh, envelope=None, limit=None, steps=24,
+                      allow_links=(), pad=None, outward=(0.0, 0.0, 1.0)):
+    """Check the straight move INTO a pass, which nobody plans and nobody sees.
+
+    `computeCartesianPath` silently prepends a lead-in from wherever the arm is
+    to waypoint 0 and still reports "100.0% of N waypoints": a 105.6 mm row
+    entered from the wrong place has been measured at 171.4 mm of travel,
+    30.3 mm off the requested polyline. So a row entered from the wrong place
+    does not fail -- it sweeps
+    the part on the way in and reports success. `_fly_scanpath()` makes that
+    worse on purpose, because it continues when the approach fails rather than
+    abandoning the sweep, which is right for coverage and wrong for the part.
+
+    This is the missing question: does the TOOLING clear the surface along that
+    straight line? Positions interpolate linearly and orientations by slerp,
+    which is what the Cartesian interpolator does between two poses.
+
+    start and end are (xyz, quat) pairs. Returns (ok, report).
+    """
+    limit = TOOLING_CLEARANCE_M if limit is None else limit
+    p0 = np.asarray(start[0], dtype=np.float64).reshape(3)
+    p1 = np.asarray(end[0], dtype=np.float64).reshape(3)
+    q0 = _unit_quat(start[1])
+    q1 = _unit_quat(end[1])
+    if float(np.dot(q0, q1)) < 0.0:
+        q1 = -q1
+    dot = float(np.clip(np.dot(q0, q1), -1.0, 1.0))
+    theta = math.acos(dot)
+    positions = []
+    quats = []
+    for t in np.linspace(0.0, 1.0, max(2, int(steps))):
+        positions.append(p0 + t*(p1 - p0))
+        if theta < 1e-6:
+            quats.append(q0)
+        else:
+            quats.append((math.sin((1.0 - t)*theta)*q0
+                          + math.sin(t*theta)*q1)/math.sin(theta))
+    line = ScanPath(np.array(positions), np.array(quats), [0],
+                    source="lead-in")
+    rep = path_clearance(line, mesh, envelope=envelope, pad=pad,
+                         allow_links=allow_links, outward=outward)
+    ok = rep["min_m"] >= limit
+    print("    lead-in %.0f mm: tooling clears by %+.1f mm at worst (%s)%s"
+          % (float(np.linalg.norm(p1 - p0))*1e3, rep["min_m"]*1e3,
+             min(rep["per_link"], key=lambda k: rep["per_link"][k]),
+             "" if ok else "  <-- REFUSED, the limit is %.1f mm" % (limit*1e3,)))
+    return ok, rep

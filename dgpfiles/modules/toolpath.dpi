@@ -1,0 +1,94 @@
+import numpy as np
+from geometry_msgs.msg import PoseArray, Pose, Quaternion
+
+global generate_fixed_axis_toolpath
+def generate_fixed_axis_toolpath(fixed_axis_noether_client, filepath, line_spacing=0.02, z_offset=0.05, distance_threshold=0.1, direction=[1.0, 0.0, 0.0], origin=[0.0, 0.0, 0.0], lock_z=True):
+    print(f"Requesting Fixed Axis toolpath from Noether for {filepath}...")
+    try:
+        res = fixed_axis_noether_client.sendRequest('FixedAxisNoetherPlanner', {
+            'mesh_filename': filepath,
+            'line_spacing': line_spacing,
+            'z_offset': z_offset,
+            'distance_threshold': distance_threshold,
+            'direction': direction,
+            'origin': origin
+        })
+        if not res.success:
+            print("Noether failed to generate toolpath.")
+            return generate_dummy_toolpath()
+        return res.noether_pose_array
+    except Exception as e:
+        print(f"Error calling Noether: {e}")
+        return generate_dummy_toolpath()
+
+global generate_surface_following_toolpath
+def generate_surface_following_toolpath(noether_client, filepath, line_spacing=0.02, z_offset=0.05, distance_threshold=0.1):
+    print(f"Requesting Surface Following toolpath from Noether for {filepath}...")
+    try:
+        res = noether_client.sendRequest('PrincipalAxisNoetherPlanner', {
+            'mesh_filename': filepath,
+            'line_spacing': line_spacing,
+            'z_offset': z_offset,
+            'distance_threshold': distance_threshold
+        })
+        if not res.success:
+            print("Noether failed to generate toolpath.")
+            return None
+        return res.noether_pose_array
+    except Exception as e:
+        print(f"Error calling Noether: {e}")
+        return generate_dummy_toolpath()
+
+def generate_dummy_toolpath():
+    print("Falling back to dummy raster path...")
+    pa = PoseArray()
+    for y in np.linspace(-0.1, 0.1, 10):
+        for x in np.linspace(-0.1, 0.1, 10):
+            p = Pose()
+            p.position.x = 0.972 + (x * 0.01)
+            p.position.y = -0.321 + (y * 0.01)
+            p.position.z = 0.983
+            p.orientation.x = 0.0
+            p.orientation.w = 1.0
+            pa.poses.append(p)
+    return pa
+
+
+# ---------------------------------------------------------------------------
+# Structured toolpaths
+#
+# The functions above return a bare PoseArray, which is all the Noether services
+# used to provide. They now also return segment_start_indices -- the raster-line
+# boundaries that flattening ToolPaths into one PoseArray otherwise destroys.
+# Prefer these wrappers: a ScanPath carries the boundaries and the arc length
+# that position-triggered acquisition needs, and falls back to inferring the
+# boundaries when the response has none (an older service, or a path from
+# somewhere else entirely).
+
+global scanpath_from_noether_response
+def scanpath_from_noether_response(res):
+    """Wrap a Noether service response as a ScanPath. Requires that
+    modules/toolpath_segments.dpi has already been included."""
+    if res is None or not getattr(res, "success", False):
+        return None
+    indices = list(getattr(res, "segment_start_indices", []) or [])
+    if not indices:
+        print("toolpath: service reported no segment structure; inferring boundaries")
+    return scanpath_from_pose_array(res.noether_pose_array, indices)
+
+
+global generate_surface_following_scanpath
+def generate_surface_following_scanpath(noether_client, filepath, line_spacing=0.02,
+                                        z_offset=0.05, distance_threshold=0.1, snake=True):
+    """Surface-following toolpath over a mesh, as a ScanPath."""
+    res = noether_client.sendRequest('PrincipalAxisNoetherPlanner', {
+        'mesh_filename': filepath,
+        'line_spacing': line_spacing,
+        'z_offset': z_offset,
+        'distance_threshold': distance_threshold,
+        'snake': snake,
+    })
+    sp = scanpath_from_noether_response(res)
+    if sp is not None:
+        print("toolpath: %s" % sp.describe())
+    return sp

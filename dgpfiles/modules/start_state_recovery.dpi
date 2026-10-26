@@ -1,0 +1,262 @@
+#########################################################################
+# AdaptiveNDE Project                                                   #
+# ROS-Scanning Package                                                  #
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    #
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       #
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  start_state_recovery.dpi
+# Authors: Tyler Lesthaeghe
+# Created: 2026-09-29
+# Description:
+#   Backs a contact probe off the specimen when the arm has been left in a state
+#   the motion planner refuses, so the next run can start without hand jogging.
+# Derived From:
+#
+#########################################################################
+# Revision Log
+#
+# 2026-09-29:  Initial Commit
+#
+#########################################################################
+# Development Notes
+#
+#
+#########################################################################
+# Recovering from an arm left touching the part.
+#
+# THE SITUATION THIS EXISTS FOR. A contact scan ends with the probe on the
+# specimen and lifts it off as its last act. Anything that stops the scan
+# BETWEEN those two -- an exception, a killed process, a power-cycled
+# workstation -- leaves the tip on the part. The planner then refuses every goal,
+# because it validates the START state before it plans anything, and a probe
+# resting on a modelled specimen is a collision. The refusal arrives at the first
+# move of the NEXT run, which is usually a move to a named pose that has nothing
+# to do with the part:
+#
+#     the arm would not move to 'over_table': MoveIt refused it
+#
+# Nothing in that says the arm is touching something, and the only way out was to
+# jog the arm off the part by hand before the pipeline could be used again.
+#
+# THE ONE MOTION THAT IS SAFE FROM HERE, and the reason this is a recovery rather
+# than a workaround: backing the probe straight off along its OWN axis. The tool
+# axis is normal to the surface the probe was placed on, so retreating along it
+# moves directly away from the part and nothing else on the tooling sweeps
+# anywhere new. It cannot reach past the taught envelope, because it only ever
+# reduces how far into the work the tool is. A joint move, or a rise in world z
+# from a tilted surface, has neither property.
+#
+# WHAT IT DOES NOT DO. It does not turn collision checking off, and it does not
+# change the allowed-collision matrix: /check_state_validity already accepts
+# "these links are expected to be touching" and reports every pair that is
+# actually in contact, so an undeclared collision somewhere else on the arm still
+# reads as a fault and still refuses to move. It also does not retry forever --
+# one retreat, then it reports.
+
+# A .dpi is compiled as a function body, so anything the including config needs
+# to see has to be declared global before it is assigned.
+global start_state_validity
+global describe_start_state
+global recover_contact_start_state
+global START_STATE_RETREAT_M
+
+#: How far to back off, when the caller has no contact settings to say.
+#: One approach height is what a pass entry uses, so it is known to be clear of
+#: the part and known to be plannable.
+START_STATE_RETREAT_M = 0.05
+
+
+def start_state_validity(contact_links=None, timeout=10.0):
+    """Is the arm where it is now a state the planner will plan FROM?
+
+    -> (verdict, why). `verdict` is True, False or None, and None -- the service
+    did not answer -- is not the same as False and is not permission to move: an
+    unverifiable state is one nobody has checked.
+
+    With `contact_links` empty this is the PLANNER'S OWN VIEW: the service
+    already applies the allowed-collision matrix, so what it calls invalid is
+    what move_group will refuse to plan from.
+
+    Naming `contact_links` asks a different and weaker question -- "is anything
+    OTHER than these touching" -- and the difference between the two answers is
+    what identifies a probe left resting on the part.
+    """
+    node = globals().get("capture_node")
+    ros_mod = globals().get("ros")
+    if node is None or ros_mod is None:
+        return (None, "no capture node and no motion module, so the arm's "
+                      "configuration cannot be read")
+    q = node.current_joints()
+    if q is None:
+        return (None, "no /joint_states in the last second, so the arm's "
+                      "configuration is unknown -- is the controller running?")
+    try:
+        verdict = ros_mod.CheckStateValidity(
+            list(q), allow_contact_links=list(contact_links or []),
+            timeout=timeout)
+    except Exception as e:                                       # noqa: BLE001
+        return (None, "/check_state_validity raised: %s" % (e,))
+    if verdict is True:
+        return (True, "the planner accepts the arm's current state")
+    if verdict is None:
+        return (None, "/check_state_validity did not answer within %.0f s"
+                % (timeout,))
+    return (False, "the planner reports the arm's current state as in collision")
+
+
+def describe_start_state():
+    """One line on whether the arm can be planned from. Moves nothing."""
+    verdict, why = start_state_validity()
+    if verdict is True:
+        return "  start state: OK -- %s" % (why,)
+    if verdict is None:
+        return "  start state: UNKNOWN -- %s" % (why,)
+    links = list(globals().get("TOOLING_CONTACT_LINKS", []))
+    lenient, _ = start_state_validity(contact_links=links)
+    if lenient is True:
+        return ("  start state: THE PROBE IS ON THE PART -- every goal will be "
+                "refused until it is backed off. recover_contact_start_state() "
+                "does that along the tool axis; a scan calls it for you.")
+    return ("  start state: IN COLLISION, and not at the contact links -- %s. "
+            "Something other than the probe is touching, so backing off is not "
+            "the fix. Ask the planner what: ros2 service call "
+            "/check_state_validity moveit_msgs/srv/GetStateValidity "
+            "\"{group_name: ur_manipulator}\"" % (why,))
+
+
+def recover_contact_start_state(contact=None, positions=None, contact_links=None,
+                                retreat_m=None, quiet=False):
+    """Back the probe off the part if that is why the planner is refusing.
+
+    -> {"needed", "recovered", "why", "retreat_m"}. `needed` is False when the
+    state was already fine, which is the normal case and is why this is cheap
+    enough to call before every run.
+
+    `contact` is surface_path_scan.dpi's contact_motion() dict; the retreat is
+    flown with its axis speed and acceleration, the same way a pass entry lifts
+    off. Without one, START_STATE_RETREAT_M at the same settings.
+
+    ONLY EVER ALONG THE TOOL AXIS, AND ONLY AWAY FROM THE SURFACE -- see the note
+    at the top of this file. A state that is invalid for any OTHER reason is
+    reported and left exactly as it is: backing off would not fix it, and moving
+    the arm on a guess about why the planner is unhappy is the wrong instinct
+    next to real hardware.
+    """
+    links = list(contact_links if contact_links is not None
+                 else globals().get("TOOLING_CONTACT_LINKS", []))
+
+    verdict, why = start_state_validity()
+    if verdict is True:
+        return {"needed": False, "recovered": True, "why": why, "retreat_m": 0.0}
+    if verdict is None:
+        if not quiet:
+            print("  start state could not be checked (%s), so nothing was "
+                  "backed off. A move refused from here may be this rather than "
+                  "the goal." % (why,))
+        return {"needed": None, "recovered": False, "why": why, "retreat_m": 0.0}
+
+    # Invalid. Is it ONLY the links that are allowed to touch the part?
+    lenient, lenient_why = start_state_validity(contact_links=links)
+    if lenient is not True:
+        if not quiet:
+            print("  START STATE IN COLLISION, and not only at the links that "
+                  "may touch the part (%s)." % (", ".join(links) or "none",))
+            print("    Backing off along the tool axis is not the fix: something "
+                  "other than the probe is in collision, so nothing was moved. "
+                  "Ask the planner what is touching:")
+            print("      ros2 service call /check_state_validity "
+                  "moveit_msgs/srv/GetStateValidity "
+                  "\"{group_name: ur_manipulator}\"")
+        return {"needed": True, "recovered": False,
+                "why": lenient_why if lenient is False else why,
+                "retreat_m": 0.0}
+
+    # The probe is resting on the part and nothing else is touching. This is the
+    # recoverable case.
+    height = float(retreat_m if retreat_m is not None
+                   else (contact["approach_m"] if contact
+                         else START_STATE_RETREAT_M))
+    if not quiet:
+        print("  the probe is resting on the part, which is why the planner is "
+              "refusing every goal.")
+        print("    backing off %.0f mm along the tool axis -- straight away from "
+              "the surface, which is the one move available from here"
+              % (height*1e3,))
+
+    lift = globals().get("contact_lift")
+    retract = globals().get("contact_retract")
+    if lift is None:
+        return {"needed": True, "recovered": False,
+                "why": "contact_lift() is not available, so the retreat cannot "
+                       "be flown; include surface_path_scan.dpi",
+                "retreat_m": 0.0}
+    settings = contact if contact else _default_contact()
+    # With the toolpath in hand, retract knows how far clear the probe already is
+    # and lifts only the remainder -- so a second attempt does not walk the arm
+    # up and out of reach. Without it, one approach height from wherever it is.
+    if positions is not None and retract is not None:
+        moved = retract(settings, positions=positions)
+    else:
+        moved = lift(settings, height)
+    if not moved:
+        return {"needed": True, "recovered": False,
+                "why": "the retreat along the tool axis was itself refused; the "
+                       "arm has to be jogged off the part by hand",
+                "retreat_m": 0.0}
+
+    verdict, why = start_state_validity()
+    if verdict is True:
+        if not quiet:
+            print("    start state is valid again; the run can continue")
+        return {"needed": True, "recovered": True, "why": why,
+                "retreat_m": height}
+    if not quiet:
+        print("    STILL REFUSED after backing off %.0f mm (%s). Do not raise "
+              "this and try again -- find out what is touching first."
+              % (height*1e3, why))
+    return {"needed": True, "recovered": False, "why": why, "retreat_m": height}
+
+
+def _default_contact():
+    """Contact settings for a retreat when the caller passed none.
+
+    Deliberately the near-part speeds: this runs when something has already gone
+    wrong, with the tool against the specimen.
+    """
+    maker = globals().get("contact_motion")
+    if maker is not None:
+        return maker(near_speed_mps=globals().get("NEAR_PART_SPEED", 0.01),
+                     links=list(globals().get("TOOLING_CONTACT_LINKS", [])))
+    return {"approach_m": START_STATE_RETREAT_M,
+            "near_scaling": 0.05, "axis_scaling": 0.05, "accel": 0.05}
