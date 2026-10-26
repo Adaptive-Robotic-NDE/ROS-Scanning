@@ -406,7 +406,7 @@ def test_the_cable_aware_roll_search():
     # there is almost always SOME roll that satisfies it, and the band check
     # usually costs nothing. What genuinely cannot be flown is a direction where
     # the arm has only one configuration available and that one lies in the dead
-    # zone. The stub below makes the +y half of the cell behave that way.
+    # zone. The stub below makes the +y half of the work cell behave that way.
     ns["wrist3_band"] = fake_band
 
 

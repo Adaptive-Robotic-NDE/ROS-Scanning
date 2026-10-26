@@ -136,7 +136,7 @@ def capture_azure_sweeps(region=None, lighting=None, variants=("pipeline", "tilt
                 else float(SPECIMEN_SWEEP_CAMERA_HEIGHT))
         # Through globals(), not as a bare name: a .dpi is a function body, so
         # a constant another .dpi forgot to declare `global` is simply absent
-        # here and raises NameError at the cell before the scenario can start.
+        # here and raises NameError on the production system before the scenario can start.
         rungs = tuple(float(v) for v in (globals().get("AZURE_PAN_HEIGHTS")
                                          or (0.50, 0.45, 0.40, 0.35, 0.30)))
         # A pan sweep holds its SLANT RANGE constant by construction, so a

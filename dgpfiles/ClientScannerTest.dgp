@@ -90,7 +90,7 @@ eddie_current_probe_mesh = os.path.join(tari_ur_description_pkg, 'meshes', 'ecPr
 global ros
 # depthCheck() below reads ros.depth_image at YOLO's colour pixels, so
 # motion must subscribe to the depth registered into the colour camera. Which
-# topic that is comes from the cell manifest, the one the bring-up used;
+# topic that is comes from the work-cell manifest, the one the bring-up used;
 # motion subscribes to nothing unless told to.
 try:
     from tari_bringup.cells import load_cell

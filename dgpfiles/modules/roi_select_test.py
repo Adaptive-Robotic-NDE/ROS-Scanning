@@ -349,8 +349,8 @@ def test_front_surface():
     check("one tilted surface is NOT speckled by its own depth gradient",
           int(kept.sum()) > 0.97*n2, "kept %d of %d" % (kept.sum(), n2))
 
-    # np.ptp(a), not a.ptp(): the method was removed in numpy 2.0, and this
-    # has to run on the cell's 22.04 numpy as well as on a current one.
+    # np.ptp(a), not a.ptp(): the method was removed in numpy 2.0, and this has to
+    # run on the production system's 22.04 numpy as well as on a current one.
     stale = G.front_surface_mask(tilt, tilt_depth, whole, cell=6.0,
                                  tol=0.02*float(np.ptp(tilt_depth)))
     check("a fixed-fraction tolerance speckles it, which is why it is not used",
@@ -725,7 +725,7 @@ def test_footprint():
     check("...and its shape and heights together into a few thousand",
           len(json.dumps(enc)) < 4000, "%d" % (len(json.dumps(enc)),))
 
-    # A RECTANGLE'S FOOTPRINT IS THAT RECTANGLE, to the cell. It is built
+    # A RECTANGLE'S FOOTPRINT IS THAT RECTANGLE, to the work cell. It is built
     # directly rather than by handing footprint() two corners: two points make
     # the point-spacing fill measure the DIAGONAL as the spacing and grow the
     # region by half of it, which turned an 18 x 60 mm region into 80 x 122 mm.

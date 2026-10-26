@@ -13,7 +13,7 @@ def run_point_by_point_scan(ros, projection_manager, pose_array, capture_callbac
     num_poses = len(pose_array.poses)
     print(f"Starting scan of {num_poses} points...")
     
-    # Move to start position first before clearing accumulators (per AGENTS.md rule)
+    # Move to start position first before clearing accumulators
     start_pose = pose_array.poses[0]
     print("Moving to start position...")
     ros.Move(start_pose, 0.2, 0.2)

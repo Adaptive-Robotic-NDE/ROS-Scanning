@@ -80,7 +80,8 @@
 # WHY IT IS SEPARATE FROM MOVEIT, deliberately:
 #
 #   * it runs on a ScanPath, at planning time, with no planning scene, no
-#     move_group and no robot -- so it works in a unit test and on the host;
+#     move_group and no robot -- so it works in a unit test and on a machine
+#     without ROS;
 #   * it reports a distance rather than a verdict, so a pass can be DROPPED for
 #     4 mm of clearance instead of the whole scan failing at pose 300 of 1400;
 #   * it is not fooled by a collision check that was switched off -- a planning
@@ -320,7 +321,7 @@ def clear_tooling_caches():
 
 def robot_description_xml(source=None, node="/robot_state_publisher",
                           timeout=10.0):
-    """The URDF this cell is running, as text.
+    """The URDF this work cell is running, as text.
 
     In order: what the caller passed (XML text or a file), a
     ROBOT_DESCRIPTION_XML global or TARI_ROBOT_DESCRIPTION_FILE in the
@@ -1845,8 +1846,8 @@ def path_clearance(path, mesh, envelope=None, segments=None, pad=None,
                 # gate finishing in a minute and finishing in a day. One pose's
                 # opened blocks are a few hundred points; issued one pose at a
                 # time that is 1.4 MILLION numpy calls over an eddy-current
-                # path, each one paying a KD-tree entry, a thread hand-off and
-                # twenty small-array allocations to do 500 points of work.
+                # path, each one paying a KD-tree entry, a cross-thread dispatch
+                # and twenty small-array allocations to do 500 points of work.
                 # Measured at 37 us/point that way against 3 us/point when the
                 # same points arrive in one array.
                 #

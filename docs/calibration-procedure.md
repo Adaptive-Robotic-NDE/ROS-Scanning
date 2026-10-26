@@ -5,7 +5,7 @@ arm, how to measure it, how to get the answer into the robot description as
 **files you copy**, and — the part that matters most — how to check in three
 minutes that nothing has drifted.
 
-Run it at the cell. Everything below is typed at the `dgpy>` prompt of
+Run it on the production system. Everything below is typed at the `dgpy>` prompt of
 `ECAutomatedScan.dgp` except where it says shell.
 
 ---
@@ -110,7 +110,7 @@ from the arm.** Everything below exists for when it fails.
 
 ---
 
-## 2. What you need at the cell
+## 2. What you need on the production system
 
 Two artifacts, both made here. Both live in `ROS-Scanning/docs/calibration/`.
 
@@ -285,7 +285,7 @@ camera on the arm is.
 | `<CAPTURE_ROOT>/cell_override/ex-ur10e-1.sensor_calibration.json` | the record — both sensors, full report, conditioning, pose set. The source of truth. |
 | `<CAPTURE_ROOT>/cell_override/sensor_calibration.urdf.xacro` | **the drop-in.** Regenerated in full from the record every time, so it always carries both sensors. |
 
-`CAPTURE_ROOT` is `/data/scandata/capture` on the cell PC. The printout gives
+`CAPTURE_ROOT` is `/data/scandata/capture` on the controlling computer. The printout gives
 the real paths — copy what it prints.
 
 ### What the drop-in contains
@@ -328,7 +328,7 @@ real position of is a camera it will drive through something.
 ```
   DEPLOY IT -- copy one file, rebuild one package, restart ROS
     cp /data/scandata/capture/cell_override/sensor_calibration.urdf.xacro \
-       ~/ros_ws/src/tari_site/tari_cell_ex_ur10e_1/urdf/
+       ~/ros_ws/src/<site package>/tari_cell_ex_ur10e_1/urdf/
     colcon build --packages-select tari_cell_ex_ur10e_1
     restart the bring-up, then:  check_calibration_applied()
 ```
@@ -344,7 +344,7 @@ restart the bring-up. (With a `--symlink-install` workspace the build is a
 no-op, because the installed file *is* the source file. It takes a second
 either way — run it.)
 
-The cell's `urdf/environment.urdf.xacro` already includes
+The work cell's `urdf/environment.urdf.xacro` already includes
 `sensor_calibration.urdf.xacro`, and the file already exists with identity
 values, so **deploying is a copy and never an edit**. That is deliberate: an
 edit is the step that gets skipped at 6 pm at a cell.
@@ -390,10 +390,10 @@ If it fails it says so and tells you what to check:
            correction joint mounting_plate <- azure_mount_cal   off by 17.967 mm, 63.159 mrad
            probe_end -> rgb_camera_link             off by 16.377 mm, 63.159 mrad
            The file did not reach the description in force. Was it copied into
-           the cell's tari_site package, rebuilt, and the bring-up restarted?
+           the work cell's site package, rebuilt, and the bring-up restarted?
 ```
 
-### Two files in `tari_site` that are NOT this
+### Two files in the site package that are NOT this
 
 * **`tari_cell_ex_ur10e_1/etc/calibration.yaml`** is the **UR arm's kinematic
   calibration** from the robot vendor — joint origins to eleven decimal places,
@@ -452,8 +452,8 @@ where the correction is non-zero.
 
 ### The failure both solvers are built around
 
-The translation of a hand-eye solve only enters through `(R_A − I) t_X`, and
-`(R_A − I)` is **singular**: it annihilates the axis of `R_A`, and its other two
+The translation of a hand-eye solve only enters through `(R_A − Id) t_X`, and
+`(R_A − Id)` (Id: the identity) is **singular**: it annihilates the axis of `R_A`, and its other two
 singular values are `2·sin(θ/2)`. So a pose set that barely rotates, or rotates
 about only one axis, determines the offset barely or not at all — **and fits the
 data perfectly while doing it**, because a wrong offset in the null direction is
@@ -482,7 +482,7 @@ naturally produces.
 
 ### The cable envelope is a hard bound
 
-This cell cannot do textbook rotations: the end-of-arm loom binds. The measured
+This work cell cannot do textbook rotations: the end-of-arm loom binds. The measured
 envelope on record (`cable_envelope.dpi`) allows tool tilts no further than
 ±40° about world x and ±20° about world y, with a wrist_3 band **270° wide
 untilted and 75° wide at x −40°**.
@@ -604,7 +604,7 @@ What each kind of failure costs, per pose:
 | no route reaches it (refused, failed, no IK, cable band) | **that pose.** The reason is printed and named in the take |
 | the profiles are silent, or come back a constant | **that pose.** Same |
 | the operator skips it at the prompt | **that pose** — a skip is a skip, not a retry |
-| **the monitor stops the arm** (overspeed, overforce) | **the rest of the flying.** What was collected is still solved and saved, then the stop is re-raised — go and look at the cell |
+| **the monitor stops the arm** (overspeed, overforce) | **the rest of the flying.** What was collected is still solved and saved, then the stop is re-raised — go and look on the production system |
 | the operator aborts (`q`) | **the rest of the flying.** Same: you still get the calibration |
 
 The retry is a *joint* move and not the same Cartesian request again, because
@@ -644,7 +644,7 @@ solve_azure_from_take("/data/.../azure_poses")
 ```
 
 It applies the *same* guards as the live run — it is the same function, minus
-the moving — so a set it accepts is a set the cell would have accepted. An npz
+the moving — so a set it accepts is a set the work cell would have accepted. An npz
 that `dgpfiles/utils/cal_extract.py` lifts out of a bag has the same shape
 and loads the same way, which is how takes from before this existed are
 recovered.
@@ -683,7 +683,7 @@ Full calibration from cold: **about two hours.** The routine check: three minute
 | `docs/calibration/make_board.py`, `tari_calibration_board_20mm_letter.pdf` | the checkerboard, and the script that makes it |
 | `docs/calibration/make_artifact.py`, `tari_calibration_artifact.stl` | the stepped artifact, and the script that makes it |
 | `dgpfiles/modules/calibration.dpi` | the operator's module: poses, motion, capture, detection, reporting, the drop-in file |
-| `dgpfiles/modules/calibration_solve.py` | the arithmetic. numpy only, no cv2, no ROS — runs on the host |
+| `dgpfiles/modules/calibration_solve.py` | the arithmetic. numpy only, no cv2, no ROS — runs anywhere numpy does |
 | `dgpfiles/modules/calibration_test.py` | the arithmetic, host-runnable: `python3 calibration_test.py` |
 | `dgpfiles/modules/calibration_resilience_test.py` | what a run does when a pose will not fly, host-runnable |
 | `tari_ur_description/urdf/azure_bracket.urdf.xacro`, `lj_v7080_macro.xacro` | the correction joints, identity by default |
@@ -706,7 +706,7 @@ than hand-edit the STL or the PDF.
 | `check_calibration_poses(poses)` | judge a pose set before flying it |
 | `calibrate_azure()` / `calibrate_keyence()` | solve, record, write the drop-in |
 | `solve_azure_from_take(p)` / `solve_keyence_from_take(p)` | **re-solve a take that was collected but not solved. No arm** |
-| `deploy_calibration()` | copy the drop-in into `tari_site` |
+| `deploy_calibration()` | copy the drop-in into the site package |
 | `check_calibration_applied()` | did the file take? reads TF |
 | `verify_calibration()` | are the two sensors right? flies the arm |
 | `describe_calibration()` / `load_calibration()` | what is on record |

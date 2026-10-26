@@ -59,10 +59,10 @@
 # tooling_clearance.dpi answers "how far is this point from the scanned surface,
 # and which side is it on" with a kD-tree over triangle centroids and a widening
 # candidate set. It is correct and it is slow: 30 to 90 microseconds per point
-# against the cell's 198 422-triangle reconstruction, measured on the dev host.
-# A clearance gate asks that question tens of millions of times for one toolpath,
-# so that number is the difference between a gate that runs in seconds and one
-# that runs overnight.
+# against the work cell's 198 422-triangle reconstruction, measured on the dev
+# host. A clearance gate asks that question tens of millions of times for one
+# toolpath, so that number is the difference between a gate that runs in seconds
+# and one that runs overnight.
 #
 # This include swaps in a bounding-volume-hierarchy kernel written in C++ and
 # loaded through ctypes: the same question, the same answer, the same sign
@@ -78,7 +78,7 @@
 #
 #   * The numpy path stops widening its candidate set at max_k and can return a
 #     distance up to 0.19 mm LARGER than the true one -- about one random point
-#     in ten thousand against the cell's reconstruction, always in the
+#     in ten thousand against the work cell's reconstruction, always in the
 #     optimistic direction. The BVH matches brute force over every triangle
 #     exactly, on 300 000 points.
 #

@@ -60,10 +60,10 @@ grabbing and the checkerboard finding; everything that turns observations into
 a transform, and everything that decides whether the observations deserved to
 be turned into one, is here. Three reasons that split is worth the extra file:
 
-  * it can be tested on the host, where there is no cv2 and no rclpy
+  * it can be tested where there is no cv2 and no rclpy
     (calibration_test.py),
-  * the cell runs whatever OpenCV Ubuntu 22.04 ships, and a hand-eye solver
-    that lives in numpy cannot be broken by an OpenCV API change,
+  * the production system runs whatever OpenCV Ubuntu 22.04 ships, and a hand-eye
+    solver that lives in numpy cannot be broken by an OpenCV API change,
   * the part that is easy to get silently wrong is the arithmetic, and code
     that needs a robot to run is code nobody tests.
 
@@ -236,8 +236,8 @@ def so3_log(R):
         return np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0],
                          R[1, 0] - R[0, 1]])/2.0
     if abs(theta - math.pi) < 1e-6:
-        # Near pi the antisymmetric part vanishes; take the axis from R + I,
-        # whose columns are all parallel to it, and pick the biggest.
+        # Near pi the antisymmetric part vanishes; take the axis from R +
+        # identity, whose columns are all parallel to it, and pick the biggest.
         A = (R + np.eye(3))/2.0
         k = int(np.argmax(np.diag(A)))
         axis = A[:, k]
@@ -471,7 +471,7 @@ def _rotation_park_martin(kept):
 
 
 def _translation_ls(kept, R_X):
-    """t_X from (R_A - I) t_X = R_X t_B - t_A, stacked and least-squared."""
+    """t_X from (R_A - Id) t_X = R_X t_B - t_A, stacked and least-squared."""
     rows, rhs = [], []
     for A, B in kept:
         rows.append(A[:3, :3] - np.eye(3))
@@ -1000,7 +1000,7 @@ def plane_agreement(points_a, points_b, at=None, name_a="A", name_b="B"):
 #                          it have extent in TWO directions, or is the plane
 #                          about to be invented?
 #
-# Both are pure geometry over numpy arrays, so both are tested on the host
+# Both are pure geometry over numpy arrays, so both are tested with no ROS
 # against synthetic data that is deliberately good and deliberately bad --
 # calibration_test.py, test_profile_* and test_plane_support_*.
 
@@ -1009,7 +1009,7 @@ def plane_agreement(points_a, points_b, at=None, name_a="A", name_b="B"):
 #:
 #: PICKED FROM THE HEAD, NOT FROM ZERO. The LJ-V7080's z repeatability is
 #: 0.5 um, so 0.5 um is the smallest scatter physics allows even on a perfect
-#: surface; the best this cell has actually measured within a profile is 7 um
+#: surface; the best this work cell has actually measured within a profile is 7 um
 #: on a sprayed flat and 24 um on bare metal. 1 um is twice the head's own
 #: repeatability floor and seven times below the best real measurement, so an
 #: excellent profile passes with a factor of seven in hand and a repeated
@@ -1775,8 +1775,8 @@ def solve_surface_fit(G, P, artifact, X0, W0, max_iter=30, ball_margin=None,
         #
         # Without the line search, whether that happens depends on the LAPACK
         # build to the last bit: the same inputs converge on one numpy and
-        # diverge on another, and the host, the container and the cell all run
-        # different versions. surface_fit_recovery() pushes the answer off by
+        # diverge on another, and the host, the container and the work cell all
+        # run different versions. surface_fit_recovery() pushes the answer off by
         # design, so it drives the fit into this deliberately and then scores a
         # determined direction 0.0.
         #
@@ -1920,7 +1920,7 @@ def solve_surface_fit(G, P, artifact, X0, W0, max_iter=30, ball_margin=None,
 # overwrite. So the description gains ONE new joint per sensor, identity by
 # default, and the calibration sets that joint. It is the same shape as
 # keyence_ref_dist_cal -- a spec the shared description owns and a correction
-# the cell owns -- widened from one number to six.
+# the work cell owns -- widened from one number to six.
 #
 # THE CHAIN, and the side the correction goes on. In the deployed description:
 #
@@ -2025,7 +2025,7 @@ def surface_fit_recovery(G, P, artifact, X, W, probe=None, fix_W=False,
 
 
 def describe_surface_fit_recovery(rec):
-    """The recovery check as text, for the operator standing at the cell."""
+    """The recovery check as text, for the operator standing at the work cell."""
     L = ["RECOVERY (push the answer off by %.0f mm / %.0f mrad and re-solve; "
          "1.00 means the data pulls it all back)" % (rec["probe_mm"],
                                                      rec["probe_mrad"])]

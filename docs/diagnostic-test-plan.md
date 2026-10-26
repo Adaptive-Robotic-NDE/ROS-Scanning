@@ -6,8 +6,8 @@ are independent: run any subset in any order, and skip the rest without
 breaking anything.
 
 Nothing in this document requires a code change. The code is on
-`ROS-Scanning_staging@main`, `tari_ros_staging@iron` and
-`dgpython-ros2motion_staging@iron`. Everything new defaults to the behaviour the
+the `main` branch of ROS-Scanning, and the `iron` branches of tari_ros and
+dgpython-ros2motion. Everything new defaults to the behaviour the
 cell already flew, so **a run that touches none of these knobs is the run you
 did last time.**
 
@@ -33,7 +33,7 @@ cd ~/ros_ws && colcon build --symlink-install --packages-select tari_cpp_mtc tar
 to reach both nodes and ROS reads it at launch. `tari_toppra` is new and loaded
 by nothing; building it only makes it importable.
 
-### 0.2 Bring up the cell
+### 0.2 Bring up the work cell
 
 ```bash
 source /opt/ros/iron/setup.bash && source ~/ros_ws/install/setup.bash
@@ -115,7 +115,7 @@ From the `dgpy>` startup banner:
 ```
 
 **Record** the ceiling factor and the tool-speed line. If the second says
-`COMMANDED IN M/S`, a previous session left the solver on and tests 4–9 are not
+`COMMANDED IN M/S`, an earlier run left the solver on and tests 4–9 are not
 comparable to earlier runs.
 
 ## 3. Where the 1327 mm lead-in comes from — free, on the first Cartesian move
@@ -596,7 +596,7 @@ varies more than the part does — the image is largely a picture of mesh error.
 
 ---
 
-## 13. Not at the cell: the arc-length timing backend
+## 13. Not on the production system: the arc-length timing backend
 
 `tari_toppra` is built and loaded by **nothing**. It times a Cartesian path by
 TCP arc length so that commanding m/s becomes a constant bound. Measured

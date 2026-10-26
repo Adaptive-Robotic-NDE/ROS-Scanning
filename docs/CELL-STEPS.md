@@ -12,7 +12,7 @@ backwards is the useful order:
 | 3 | the ROI, the gauge, the toolpath normals, the cable guard |
 | 0-2 | the Azure depth correction, and its verification |
 
-If you are going to the cell once, **do Part 4.** It subsumes Part 3's run steps.
+If you are going to the work cell once, **do Part 4.** It subsumes Part 3's run steps.
 
 **The three things this procedure exists to hold in place.** The Azure reads every surface
 12.45 mm too far (8 measurements over 4 days, sd 0.68 mm), and a bring-up adapter subtracts
@@ -23,12 +23,12 @@ disagrees with the Keyence by more than 2 mm.
 
 # Part 0 — deploy (once, ~15 min)
 
-### 0.1 Copy to the cell
+### 0.1 Copy to the work cell
 
 | from | to |
 |---|---|
 | `ROS-Scanning/` | `~/Desktop/tyler_test9_ws/ROS-Scanning/` |
-| `ros_ws/src/tari_site/` | `~/Desktop/tyler_test9_ws/src/tari_site/` |
+| `ros_ws/src/<site package>/` | `~/Desktop/tyler_test9_ws/src/<site package>/` |
 | `ros_ws/src/tari_ros/tari_bringup/` | `~/Desktop/tyler_test9_ws/src/tari_ros/tari_bringup/` |
 | `ros_ws/src/tari_ros/tari_ur_description/` | `~/Desktop/tyler_test9_ws/src/tari_ros/tari_ur_description/` |
 | `ros_ws/src/tari_ros/tari_pc_reconstruction/` | `~/Desktop/tyler_test9_ws/src/tari_ros/tari_pc_reconstruction/` |
@@ -297,7 +297,7 @@ not a fault.
 | from | to |
 |---|---|
 | `ROS-Scanning/` | `~/Desktop/tyler_test9_ws/ROS-Scanning/` |
-| `ros_ws/src/tari_site/` | `~/Desktop/tyler_test9_ws/src/tari_site/` |
+| `ros_ws/src/<site package>/` | `~/Desktop/tyler_test9_ws/src/<site package>/` |
 
 ```bash
 cd ~/Desktop/tyler_test9_ws && colcon build --symlink-install --packages-select tari_cell_configs
@@ -374,7 +374,7 @@ PULL THOSE FACES IN in the manifest's motion_volume block and run this again.
 - **`in collision`** — the box reaches into something the model knows about. Pull that face in.
 - **`unknown`** — the validity service did not answer. Not permission; find out why first.
 
-Edit `ros_ws/src/tari_site/tari_cell_configs/config/cells/ex-ur10e-1.yaml`, rebuild
+Edit `tari_cell_configs/config/cells/ex-ur10e-1.yaml` in the site package, rebuild
 `tari_cell_configs`, restart dgpy, run it again. `check_motion_volume(samples=5)` gives a
 finer grid once the coarse one is clean.
 
@@ -389,10 +389,10 @@ though it does not fail.
 
 ### Two things this check does NOT cover
 
-1. **Anything in the cell that is not in the URDF.** This is the planner's collision model
+1. **Anything in the work cell that is not in the URDF.** This is the planner's collision model
    and nothing else. The standing assumption is that the environment is properly modelled —
    if there is a fixture, a cable tray or a bench stop that the model does not carry, this
-   will call the space free and the arm will be allowed to try it. **Walk the cell and look
+   will call the space free and the arm will be allowed to try it. **Walk the work cell and look
    along each widened face before the first real run.**
 2. **Orientations other than tool-down.** It checks the orientation every sweep and raster
    uses. A box the arm can reach with the tool pointing sideways is not the box this is
@@ -496,7 +496,7 @@ mysteries:
 capture_cable_envelope(full_circle=True)
 ```
 at more tilts is what closes both. It is ~40 minutes and it is the single highest-value
-thing left that only the cell can do.
+thing left that only the work cell can do.
 
 ## What to send back
 

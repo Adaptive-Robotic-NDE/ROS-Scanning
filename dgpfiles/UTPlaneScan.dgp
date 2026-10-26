@@ -118,7 +118,7 @@ live_pose = ros.live_pose
 
 # Distance between traces ALONG a pass, in metres. The primary control.
 #
-# 5 mm is a round number close to the 5.08 mm every measurement in the handoffs
+# 5 mm is a round number close to the 5.08 mm every earlier measurement
 # was taken at (that was 0.30/59, inherited from the plane scan's 60-column grid
 # -- an arbitrary constant that meant nothing at all for a mesh scan).
 SCAN_STEP_SIZE = 0.005
@@ -135,7 +135,7 @@ SCAN_VELOCITY = 0.050
 # (scaling, measured m/s) pairs.
 #
 # CartesianMove's vel is a fraction of the robot's JOINT limits; what a
-# technician sets is a speed. The conversion is a property of the cell, and it
+# technician sets is a speed. The conversion is a property of the work cell, and it
 # is NOT one constant. Measured over a bowed plate, two passes each,
 # pass-to-pass agreement about 1%:
 #
@@ -147,13 +147,13 @@ SCAN_VELOCITY = 0.050
 #     0.0500    52.9 mm/s         1.06 m/s
 #
 # So it is linear at about 1.55 m/s full scale up to ~30 mm/s and then saturates
-# near 53 mm/s: past a scaling of about 0.035 the cell simply will not go
+# near 53 mm/s: past a scaling of about 0.035 the robot simply will not go
 # faster. Taking the single ratio at 0.05 -- the one number the old constant was
 # built from -- over-commands everything slower by half, which is exactly what
 # happened: a scan asking for 10 mm/s ran at 15.6 and its staging queue grew to
 # 39 because it was producing 50% more traces per second than planned.
 #
-# Two consequences worth knowing at the panel: this cell cannot sweep faster
+# Two consequences worth knowing at the panel: this robot cannot sweep faster
 # than ~53 mm/s, and below 7.9 mm/s the mapping is extrapolated rather than
 # measured (the plan says so). Every scan reports observed against requested and
 # prints the table entry to add if they disagree -- that is how this list grows.
@@ -277,7 +277,7 @@ ASCAN_RATE_HZ = 50.0
 #               position, so how many A-scans land in a column depends on how
 #               fast the arm happened to be moving, and _RowSampler has to bin
 #               them to the nearest column afterwards. This is the default
-#               because every measurement in the handoff was taken against it.
+#               because every earlier measurement was taken against it.
 #
 #   "position"  fire once per ASCAN_TRIGGER_PITCH of probe travel, which is what
 #               a position trigger box does (see scan-trigger-box/). Trigger k is
@@ -362,7 +362,7 @@ ASCAN_TRIGGER_PITCH = None
 # SCAN_STEP_SIZE and SCAN_LINE_SPACING over the scanned area", which is what the
 # technician controls are for: over the default 0.30 m square, a 5 mm step and a
 # 10 mm line spacing give 61 x 31. Set them to numbers to pin the grid instead --
-# 60/60 reproduces the historic geometry every cross-check in the handoffs was
+# 60/60 reproduces the historic geometry every earlier cross-check was
 # measured against, at a 5.08 mm pitch in both axes.
 #
 # For a rectangular scan the column pitch and the trigger pitch are the same
@@ -378,16 +378,16 @@ SCAN_N = None   # points along the v axis
 SCAN_ORIGIN = (0.75, -0.35)
 # Where scans are written. A literal path is one machine's home and nobody
 # else's, so resolve the same way the capture tool does: what the site says,
-# then the mount the cell actually has, then this account's own home.
+# then the mount the work cell actually has, then this account's own home.
 SCAN_STORAGE_DIR = (os.environ.get("TARI_SCANDATA")
                     or os.environ.get("SCANDATA_ROOT")
                     or ("/data/scandata" if os.path.isdir("/data/scandata")
                         else os.path.expanduser("~/scandata")))
 
-# WHICH CELL THIS CONFIG IS RUNNING IN, and in which mode. The cell manifest
-# under tari_bringup already describes the robot, the sensors and the topics;
-# naming it here lets this config read the rest of that description instead of
-# repeating it. What it reads today is the WORK VOLUME -- the box parts are
+# WHICH WORK CELL THIS CONFIG IS RUNNING IN, and in which mode. The work-cell
+# manifest under tari_bringup already describes the robot, the sensors and the
+# topics; naming it here lets this config read the rest of that description instead
+# of repeating it. What it reads today is the WORK VOLUME -- the box parts are
 # placed inside, which every reconstruction crops to. See modules/work_cell.dpi.
 CELL_NAME = "ex-ur10e-1"
 CELL_MODE = "sim"
@@ -442,7 +442,7 @@ RASTER_MIN_FRACTION = 1.0
 #
 # The mesh is interpreted in WORLD coordinates -- principal_axis_noether_srv
 # loads it with pcl and emits the vertex positions as poses directly, subtracting
-# z_offset. So the file has to be positioned in the cell already, and a mesh
+# z_offset. So the file has to be positioned in the work cell already, and a mesh
 # authored about its own origin will plan a toolpath in the floor.
 #
 # None means "use the synthesised test plate", which is the default because it is
@@ -508,7 +508,7 @@ KEYENCE_BACKEND = "pc"
 #   * the COLOUR filter is the eddy-current green tape, (0.0, 0.55, 0.44) at
 #     0.15, and would delete an untaped part entirely;
 #   * the VERTEX filter is a plane in world z. There is no cell-wide value for
-#     it: the cut height is a property of the specimen, not of the cell.
+#     it: the cut height is a property of the specimen, not of the work cell.
 #     0.98 is right for this test plate (top 1.03) and
 #     deletes the calibration plate (top 0.948) in its entirety. Nor can it be
 #     derived -- this cell's bench is an optical breadboard that reconstructs
@@ -521,13 +521,13 @@ KEYENCE_BACKEND = "pc"
 #     of it against a 0.09 m^2 plate here) -- so it deletes the specimen, keeps
 #     the table, and reports success.
 #
-# What crops is the cell's WORK VOLUME, declared once in the cell manifest and
-# applied by every reconstruction before a vertex exists. See work_cell.dpi.
+# What crops is the work cell's WORK VOLUME, declared once in the work-cell manifest
+# and applied by every reconstruction before a vertex exists. See work_cell.dpi.
 # clean_mesh() remains for a caller who knows their specimen and wants one of
 # the three deliberately: obtain_specimen_mesh(clean=True, cutoff=<world z>).
 #
 # What this does NOT solve, and nothing here does yet: separating a thin part
-# from the surface it rests on. The work volume bounds the cell, not the part,
+# from the surface it rests on. The work volume bounds the work cell, not the part,
 # so a reconstruction of a part on a bench contains some bench.
 SPECIMEN_CLEAN_MESH = False
 
@@ -548,7 +548,7 @@ TEST_PLATE_DIVISIONS = 61
 #     off: 10/10 at every standoff), so reach is not what stops it;
 #   * what fails is collision, and not with the specimen -- the planning scene
 #     has no world objects at all. It is the ARM against `robot_environment`,
-#     the cell enclosure mesh, in every branch that reaches those poses;
+#     the work-cell enclosure mesh, in every branch that reaches those poses;
 #   * shifting the mesh in y does nothing (0/15 segments usable at dy = 0.15,
 #     0.30, 0.40). Lifting it 0.30 m in z gives 11/15. So it is height, and
 #     0.30 m is far more standoff than a scan has;
@@ -581,9 +581,9 @@ NOETHER_MESH_OFFSET = (0.0, 0.0, 0.0)
 
 # "surface" follows the mesh normals; "fixed" holds one orientation for the whole
 # path. Surface-following is the point of the exercise, but a specimen whose
-# normals swing further than the wrist can follow inside the cell leaves "fixed"
-# as the only thing that runs -- and for a mild curve with a standoff transducer
-# it is a legitimate choice, not a fallback.
+# normals swing further than the wrist can follow inside the work cell leaves
+# "fixed" as the only thing that runs -- and for a mild curve with a standoff
+# transducer it is a legitimate choice, not a fallback.
 NOETHER_ORIENTATION = "surface"
 
 # Where the roll about the tool's own axis comes from. NOT cosmetic.
@@ -1050,13 +1050,13 @@ else:
 # functions and classes and run nothing, so they are grouped rather than
 # scattered back through the file.
 
-# First, because everything that crops anything asks it where the cell is.
+# First, because everything that crops anything asks it where the work cell is.
 include(None, os.path.join(SCAN_MODULE_DIR, "work_cell.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "digitizer.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
 
-# THE CELL'S MEASURED SPEED CURVE REPLACES THE ONE ABOVE, when the manifest has
+# THE WORK CELL'S MEASURED SPEED CURVE REPLACES THE ONE ABOVE, when the manifest has
 # one for this mode. After scan_plan.dpi because that is what consumes it, and
 # before anything plans. The config's own value stays as
 # ROBOT_VELOCITY_CALIBRATION_CONFIG.

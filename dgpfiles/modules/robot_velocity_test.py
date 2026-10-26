@@ -371,8 +371,8 @@ print("")
 print("the saturating top of the curve is preserved")
 
 # The existing table saturates: 0.0472 -> 35 mm/s but 0.0529 -> 50. Above the
-# last row velocity_from_scaling() is FLAT by design (the cell stops speeding
-# up), and velocity_scaling_for() must not extrapolate past it.
+# last row velocity_from_scaling() is FLAT by design (the work cell stops
+# speeding up), and velocity_scaling_for() must not extrapolate past it.
 out = table_from_rungs(clean)
 top_s, top_v = out["table"][-1]
 check(abs(velocity_from_scaling(top_s*2.0, out["table"]) - top_v) < 1e-12,

@@ -149,7 +149,7 @@ def _capture_root_default():
 
 # -- settings: override from the prompt with globals()['CAPTURE_X'] = value ----
 for _k, _v in (
-        # Where sessions go: a mount if the cell has one, so it survives a
+        # Where sessions go: a mount if the work cell has one, so it survives a
         # container restart, and outside every repository either way.
         ("CAPTURE_ROOT", _capture_root_default()),
         # Confirm every motion at the prompt. True answers yes by itself and is

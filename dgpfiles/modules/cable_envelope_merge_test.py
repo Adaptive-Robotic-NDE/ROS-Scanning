@@ -283,7 +283,7 @@ def test_a_step_the_sweeps_disagree_on_is_dropped_rather_than_guessed():
 
 
 def test_the_manifest_block_carries_the_merge():
-    """The manifest is what travels to the cell; the sweep files do not."""
+    """The manifest is what travels to the work cell; the sweep files do not."""
     merged = _merge(*_sources())
     block = NS["cable_envelope_manifest_block"](model=merged, mode="hardware")
     assert "merged_from: [\"later\", \"earlier\"]" in block, block

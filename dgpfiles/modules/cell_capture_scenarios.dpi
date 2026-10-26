@@ -744,7 +744,7 @@ def _velocity_manifest_target():
 
 
 def velocity_manifest_block(result, mode=None):
-    """The `robot_velocity:` YAML for the cell manifest, ready to paste.
+    """The `robot_velocity:` YAML for the work-cell manifest, ready to paste.
 
     Carries `span_m` because the curve is path-length dependent -- a move much
     shorter than the span it was measured over never reaches the speed the table
@@ -875,10 +875,10 @@ def describe_velocity_table(result):
     for s, v, why in result.get("dropped") or []:
         lines.append("      (dropped scaling %.4f at %.1f mm/s: %s)" % (s, v*1e3, why))
     lines.append("")
-    # THE MANIFEST, NOT A CONFIG. The manifest travels with the cell; a config
-    # constant has to be transcribed by every machine that runs the cell, and a
+    # THE MANIFEST, NOT A CONFIG. The manifest travels with the work cell; a config
+    # constant has to be transcribed by every machine that runs the work cell, and a
     # transcription is eventually not made -- the pipeline then converts through a
-    # curve measured somewhere else. That has already cost a scan.
+    # curve measured somewhere else.
     lines.append("  PUT THIS IN THE CELL MANIFEST, under robot_velocity, and the")
     lines.append("  pipeline will load it by itself (%s):"
                  % (_velocity_manifest_target(),))
@@ -919,7 +919,7 @@ def capture_robot_velocity(speeds_mm_s=(5.0, 10.0, 20.0, 30.0, 40.0, 50.0),
                            length_mm=300.0, position=None, repeats=2,
                            joint_scalings=(0.010, 0.015, 0.020, 0.030),
                            joint_deg=20.0, quat=(0.0, 0.0, 0.0, 1.0)):
-    """SCENARIO 9. The cell's own speed curve, measured instead of assumed.
+    """SCENARIO 9. The work cell's own speed curve, measured instead of assumed.
 
     Flies a straight horizontal line in FREE SPACE at a ladder of commanded
     speeds, records what MoveIt scaling each one actually produced and what tip

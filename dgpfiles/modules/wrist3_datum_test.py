@@ -31,7 +31,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-#: The cell's own measurement, as capture_cable_envelope() wrote it.
+#: The work cell's own measurement, as capture_cable_envelope() wrote it.
 #: The workspace root, found from this file rather than hardcoded: these
 #: suites run from a checkout that may live anywhere.
 WORKSPACE = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
@@ -115,7 +115,7 @@ def test_the_datum_survives_a_save_and_reload():
 
 
 def test_the_datum_reaches_the_cell_manifest():
-    """The manifest is what travels to the cell; the capture file does not."""
+    """The manifest is what travels to the work cell; the capture file does not."""
     env = _env()
     block = NS["cable_envelope_manifest_block"](model=env, mode="hardware")
     assert "wrist3_start_deg" in block, (
@@ -127,7 +127,7 @@ def test_the_datum_reaches_the_cell_manifest():
 
 
 def test_the_real_measurement_from_this_cell_carries_it():
-    """Against the file the cell actually wrote, not a fixture.
+    """Against the file the work cell actually wrote, not a fixture.
 
     This is what makes the change worth anything: the datum was already being
     measured and written out, on every row, and was thrown away on load.

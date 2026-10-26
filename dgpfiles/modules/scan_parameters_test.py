@@ -122,7 +122,7 @@ def test_far_over_the_ceiling_is_an_error():
 def test_the_measured_reference_scan_comes_back():
     print("=== the measured 5.5 min reference scan comes back out ===")
     # 30 passes of 0.31 m at 50.8 mm/s, plus 5 s/pass of overhead, which measures
-    # 329.7 s on the cell.
+    # 329.7 s on the production system.
     p = plan_scan(step_m=0.00508, velocity_mps=0.0508, force=True, **PLATE)
     close("estimated scan time within 10%% of the measured 329.7 s",
           p["scan_time_s"], 329.7, 33.0)
@@ -312,7 +312,7 @@ def test_velocity_scaling_is_a_measured_curve():
               velocity_scaling_for(v, CAL), s, 1e-9)
     # Why a table and not one ratio: a single ratio taken at the top of the range
     # over-commands everything slower. A constant scaling of 0.0100 is meant to be
-    # 10 mm/s, and this cell runs it at 15.6 mm/s.
+    # 10 mm/s, and this work cell runs it at 15.6 mm/s.
     close("a single-constant scaling of 0.0100 for 10 mm/s", 0.010, 0.010, 0.0)
     close("...which this cell really runs at", velocity_from_scaling(0.010, CAL)*1e3,
           15.6, 1e-9)

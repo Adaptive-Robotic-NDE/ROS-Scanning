@@ -39,7 +39,7 @@
 # Authors: Tyler Lesthaeghe
 # Created: 2026-10-04
 # Description:
-#   Turns a probe pose in the cell into the eddy-current instrument's
+#   Turns a probe pose in the work cell into the eddy-current instrument's
 #   two output voltages, using the response table and the simulated
 #   test plate's flaw list.
 # Derived From:
@@ -54,7 +54,7 @@
 #
 #
 #########################################################################
-"""From a probe pose in the cell to two volts on a DAQ card.
+"""From a probe pose in the work cell to two volts on a DAQ card.
 
 NO ROS, NO spatialnde2, NO ecsim. Pose in, volts out, so the whole chain is
 testable on the host against a stub table -- which is the only way it could

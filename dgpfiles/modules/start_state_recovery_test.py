@@ -106,7 +106,7 @@ class FakeNode(object):
 
 
 def _load(**injected):
-    """The .dpi in its own namespace, with the cell's names stubbed in.
+    """The .dpi in its own namespace, with the work cell's names stubbed in.
 
     The module reads the cell through globals().get(), and a .dpi exec'd with one
     dict for globals and locals puts its own definitions in that same dict -- so

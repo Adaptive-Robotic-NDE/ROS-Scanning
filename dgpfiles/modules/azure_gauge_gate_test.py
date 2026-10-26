@@ -443,8 +443,8 @@ def main():
 
     print("\n9. EVERY EXISTING CALLER STILL FITS THE SIGNATURE")
     # A new parameter with no default, or a renamed one, would break these at
-    # the cell rather than here. cell_capture_pipeline.dpi's scenario 8 and the
-    # unattended roi_select=False path are the two that matter.
+    # the work cell rather than here. cell_capture_pipeline.dpi's scenario 8 and
+    # the unattended roi_select=False path are the two that matter.
     dgp_tree = ast.parse(src, filename="ECAutomatedScan.dgp")
     sig = [f for f in ast.walk(dgp_tree)
            if isinstance(f, ast.FunctionDef) and f.name == "run_automated_scan"][0]

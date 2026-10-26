@@ -153,7 +153,7 @@ def obtain_specimen_mesh(source=None, region=None, clean=None, cutoff=None,
             # Only reconstructions. A mesh put on disk deliberately is not this
             # function's to filter, and the test plate is analytic.
             #
-            # OFF by default (SPECIMEN_CLEAN_MESH). What crops is the cell's
+            # OFF by default (SPECIMEN_CLEAN_MESH). What crops is the work cell's
             # work volume, applied by the reconstruction itself before there is a
             # vertex to filter. `cutoff` is here so a caller who knows their own
             # specimen can still ask for a world-z cutoff plane deliberately; with no
@@ -248,7 +248,7 @@ def reconstruct_specimen(source="azure", region=None, name="specimen",
             # range sideways, so what is left to choose is how high to fly, and
             # that is the arm's business rather than the camera's. None derives
             # it from the work volume's ceiling: as near to straight down as the
-            # tool can be without leaving the cell's declared box.
+            # tool can be without leaving the work cell's declared box.
             if globals().get("SPECIMEN_SWEEP_CAMERA_HEIGHT") is not None:
                 sweep_kwargs.setdefault(
                     "height", float(SPECIMEN_SWEEP_CAMERA_HEIGHT))
@@ -318,7 +318,7 @@ def reconstruct_specimen(source="azure", region=None, name="specimen",
         # 15.6 mm/s.
         #
         # None, so _reconstruct() converts it, from THIS raster's own kinematics
-        # where IK can be had and from the cell-wide velocity curve where it
+        # where IK can be had and from the work-cell-wide velocity curve where it
         # cannot (path_motion_scaling). Converting here instead and handing down
         # a scaling would SKIP the path-aware conversion entirely for this
         # sensor -- _reconstruct() only converts when vel is None.

@@ -441,7 +441,7 @@ def test_plane_agreement_reproduces_the_failure_it_exists_to_catch():
 # which reads as "the Azure is badly out" and says nothing about the Azure.
 # These tests pin BOTH directions, because a check that refuses a constant by
 # refusing everything is not a check: an excellent real profile (7 um RMS, the
-# best this cell has measured) has to pass.
+# best this work cell has measured) has to pass.
 
 #: The head's measured within-profile noise on this cell: 7 um on a sprayed
 #: flat, 24 um on bare metal. 800 columns over the 31 mm line, 0.5 um quantum.
@@ -468,7 +468,7 @@ def _profile_grab(z0=0.0, noise=_KEY_NOISE_SPRAYED, tilt_deg=0.0, n_profiles=60,
 
 
 def test_profile_a_real_noisy_flat_passes():
-    """THE OVER-REJECTION HALF. 7 um RMS is the best this cell has ever measured
+    """THE OVER-REJECTION HALF. 7 um RMS is the best this work cell has ever measured
     within a profile; if the check cannot tell that from a constant it is not a
     check, it is a way of refusing to calibrate."""
     for noise in (_KEY_NOISE_SPRAYED, _KEY_NOISE_BARE):
@@ -1434,9 +1434,9 @@ def test_the_artifacts_range_spread_fits_inside_the_heads_window():
 # ------------------------------------------------------------------------------
 # The drop-in file: solve -> write -> read back -> the same transform
 # ------------------------------------------------------------------------------
-# THE ONLY QUESTION THAT MATTERS is whether the numbers written into the cell's
-# xacro make the deployed chain publish the transform that was solved. These
-# tests stand in for the chain with two arbitrary transforms -- A, the
+# THE ONLY QUESTION THAT MATTERS is whether the numbers written into the work
+# cell's xacro make the deployed chain publish the transform that was solved.
+# These tests stand in for the chain with two arbitrary transforms -- A, the
 # correction's parent link to probe_end, and B, the correction's child link to
 # the sensor -- both of which calibration.dpi reads from live TF. Neither is
 # small, neither is axis-aligned, and B carries a large rotation, because that

@@ -510,7 +510,7 @@ def _imports_of(tree_body):
 
 
 def _dgp_files():
-    """The real configs. _agentctl_*.dgp are the control-port wrappers the agent
+    """The real configs. _agentctl_*.dgp are the control-port wrappers that
     tooling writes next to a config; they are copies and must not be counted."""
     return [f for f in sorted(glob.glob(os.path.join(os.path.dirname(HERE), "*.dgp")))
             if not os.path.basename(f).startswith("_agentctl")]

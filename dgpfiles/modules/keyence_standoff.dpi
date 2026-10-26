@@ -139,9 +139,10 @@
 #
 # ------------------------------------------------------------------------------
 # NO TOUCH-OFF. Nothing in this file may require one: a contact touch-off is how
-# the cell is CALIBRATED, and it is not part of the automated pipeline. Layer 1
-# uses the planned geometry, layer 2 and layer 3 use the sensor's own returns. A
-# touch-off can be handed in as `surface=` when one exists, and that is all.
+# the work cell is CALIBRATED, and it is not part of the automated pipeline.
+# Layer 1 uses the planned geometry, layer 2 and layer 3 use the sensor's own
+# returns. A touch-off can be handed in as `surface=` when one exists, and that
+# is all.
 #
 # ------------------------------------------------------------------------------
 # THE GEOMETRY, WRITTEN DOWN ONCE
@@ -180,8 +181,9 @@
 #
 # ------------------------------------------------------------------------------
 # Numpy only. No ROS for anything but the live subscription, no open3d, no
-# service: a guard that needs the cell up is a guard that cannot refuse before
-# the cell is up. Python 3.10 -- the work cell runs ROS natively on Ubuntu
+# service: a guard that needs the work cell up is a guard that cannot refuse
+# before the work cell is up. Python 3.10 -- the production system runs ROS
+# natively on Ubuntu
 # 22.04 and has no container to hide a newer interpreter in.
 
 import os
@@ -281,9 +283,9 @@ KEYENCE_MESH_BIAS_LIMIT_M = 0.010
 #: CURVED ACROSS THE LINE rather than flat, metres.
 #:
 #: 3 mm. A flat plate measures 0.3-1.9 mm of p5..p95 spread in simulation and
-#: 0.10 mm on a sprayed flat at the cell, so 3 mm is well clear of a flat surface
-#: and well under what a real curve gives: a 131 x 65 x 67 mm cylinder spans tens
-#: of millimetres across the same 31 mm line.
+#: 0.10 mm on a sprayed flat on the production system, so 3 mm is well clear of a
+#: flat surface and well under what a real curve gives: a 131 x 65 x 67 mm
+#: cylinder spans tens of millimetres across the same 31 mm line.
 #:
 #: What it gates is the INFERENCE, not the measurement -- see the note in
 #: keyence_range_report() where the bias is computed. Over this, "the median
@@ -558,13 +560,13 @@ def _tri_grid(verts, tris, cell):
     hi = np.maximum(np.maximum(verts[tris[:, 0]], verts[tris[:, 1]]),
                     verts[tris[:, 2]])
     x0, y0 = float(lo[:, 0].min()), float(lo[:, 1].min())
-    # A CAP ON THE GRID, not on the candidates. The cell above is sized from the
-    # MEDIAN face, and a reconstructed mesh is not uniform: ball pivoting leaves
+    # A CAP ON THE GRID, not on the candidates. The grid cell above is sized from
+    # the MEDIAN face, and a reconstructed mesh is not uniform: ball pivoting leaves
     # slivers and Poisson leaves a few faces spanning a hole, so one triangle
     # can cover the whole grid and the (cell, triangle) list can blow up while
-    # the median says everything is fine. Widening the cell until the list fits
-    # keeps the answer exactly right -- a coarser grid means more candidates per
-    # ray, never a missed one -- where clipping a triangle's span would lose
+    # the median says everything is fine. Widening the grid cell until the list
+    # fits keeps the answer exactly right -- a coarser grid means more candidates
+    # per ray, never a missed one -- where clipping a triangle's span would lose
     # surface and silently under-report the standoff.
     for _round in range(12):
         nx = max(1, int(math.ceil((float(hi[:, 0].max()) - x0)/cell)) + 1)
@@ -625,20 +627,21 @@ def _ray_first_hit(origins, dirs, geom, search=None, progress_what=None):
     v0 = verts[tris[:, 0]]
     e1 = verts[tris[:, 1]] - v0
     e2 = verts[tris[:, 2]] - v0
-    # THE CELL IS SIZED FOR THE TRIANGLES, NOT FOR THE RAY. Sizing it to 2*search
-    # makes the ray's footprint fit in one cell, which is true and useless: it
-    # also makes the whole mesh one bucket, so every ray is tested against every
-    # face, and cost then grows with mesh size. Sizing the grid to the faces
-    # instead -- about sqrt(n) cells a side, never finer than a face -- holds a
-    # 4600-pose raster to a fraction of a second against both a 31k-face TSDF
-    # mesh and a 199k-face Poisson mesh, so the bigger mesh is not the slower one.
+    # THE GRID CELL IS SIZED FOR THE TRIANGLES, NOT FOR THE RAY. Sizing it to
+    # 2*search makes the ray's footprint fit in one cell, which is true and
+    # useless: it also makes the whole mesh one bucket, so every ray is tested
+    # against every face, and cost then grows with mesh size. Sizing the grid to
+    # the faces instead -- about sqrt(n) cells a side, never finer than a face --
+    # holds a 4600-pose raster to a fraction of a second against both a 31k-face
+    # TSDF mesh and a 199k-face Poisson mesh, so the bigger mesh is not the
+    # slower one.
     #
     # A near-vertical ray still covers exactly one cell, because its footprint
     # comes from its own direction below, not from `search`.
     span = np.linalg.norm(np.maximum(np.abs(e1), np.abs(e2)), axis=1)
-    # max - min written out: ndarray.ptp() was removed in numpy 2 and the host
-    # is on it while the cell is not, so the one spelling that works on both is
-    # the arithmetic.
+    # max - min written out: ndarray.ptp() was removed in numpy 2 and the
+    # development machine is on it while the production system is not, so the one
+    # spelling that works on both is the arithmetic.
     extent = max(float(verts[:, 0].max() - verts[:, 0].min()),
                  float(verts[:, 1].max() - verts[:, 1].min()), 1e-6)
     cell = max(float(np.median(span))*2.0, extent/max(math.sqrt(len(tris)), 1.0),

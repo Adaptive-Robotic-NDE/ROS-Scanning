@@ -905,7 +905,7 @@ def _wound_consistently(path, quiet=False):
         # It comes back WORSE than it went in -- 26 inconsistent edges became
         # 104, with 208 conflicts while propagating -- which says the flips it
         # needs conflict with each other and no consistent assignment exists.
-        # Removing the overlapping faces removes that frustration. See
+        # Removing the overlapping faces removes those conflicts. See
         # overlapping_faces() for what is and is not claimed about why.
         #
         # Ordered this way round deliberately: rewinding removes nothing and is

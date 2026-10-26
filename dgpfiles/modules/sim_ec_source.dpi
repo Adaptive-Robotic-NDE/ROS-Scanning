@@ -155,7 +155,7 @@ class SimECSource(object):
     #: specimen uses.
     #:
     #: (dx, dy, radius, amplitude in volts). The radii are a few millimetres
-    #: because the regions the cell actually scans are 24-90 mm across.
+    #: because the regions the work cell actually scans are 24-90 mm across.
     FLAWS = (
         (0.008, 0.020, 0.0040, 0.85),
         (0.020, 0.050, 0.0060, 0.55),
@@ -393,9 +393,9 @@ class SimECSource(object):
             else:
                 # No pose yet -- TF has produced nothing. Counted separately
                 # from a model that raised, because they want opposite
-                # responses: this one resolves itself as soon as the cell comes
-                # up, and a nonzero count AFTER a scan means the model was
-                # never consulted at all. Falls through to the synthetic
+                # responses: this one resolves itself as soon as the work cell
+                # comes up, and a nonzero count AFTER a scan means the model
+                # was never consulted at all. Falls through to the synthetic
                 # signal, which needs no pose.
                 self.model_no_pose += 1
 

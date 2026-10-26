@@ -107,7 +107,7 @@ AZURE_PARTS = ("keyence", "roi_spray", "specimen_azure.ply")
 #: 0.7 mm and the rough mesh is the one that is wrong.
 PLATE_TOP_Z = 0.9402
 
-#: Where the plate is, roughly, in the cell.
+#: Where the plate is, roughly, in the work cell.
 PLATE_X = (0.775, 0.858)
 PLATE_Y = (-0.111, 0.145)
 

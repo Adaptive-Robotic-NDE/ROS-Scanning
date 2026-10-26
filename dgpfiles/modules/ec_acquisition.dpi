@@ -9,7 +9,7 @@
 #   * It requires stopping. A scan that stops at every point is slower than the
 #     part deserves and the stops are most of the time.
 #   * Nothing ties the samples to WHERE the probe was. "The latest block at the
-#     moment I asked" is systematically old by the acquisition-to-globalrev
+#     moment of the request" is systematically old by the acquisition-to-globalrev
 #     latency, and on a serpentine that bias reverses every pass -- so it shows
 #     up as a zipper between adjacent rows, not as a harmless offset.
 #
@@ -61,10 +61,10 @@ import spatialnde2 as snde
 # a NameError on `ec_condition_function` several hundred lines later.
 #
 # A bare ModuleNotFoundError reads as "a dependency is missing from the outside
-# world", which invites the wrong fix. The package is IN THIS WORKSPACE, at
-# spatialnde2-ec-functions/, it builds on the host in about a minute, and it is
-# installed in the container; what it is not is installed on every host by
-# default. Say that here, where the failure happens.
+# world", which invites the wrong fix. The package lives at
+# spatialnde2-ec-functions/ in the same source tree, builds in about a minute,
+# and is not installed on every machine by default. Say that here, where the
+# failure happens.
 try:
     from spatialnde2_ec_functions import ec_condition_function
 except ImportError as _ec_import_error:
@@ -999,7 +999,7 @@ scan_projection_status = ec_projection_status
 
 
 def project_ec_traces(first=0, count=None, component=None, quiet=False):
-    """Replay THIS SESSION's eddy-current trace list through the projector.
+    """Replay THIS PROCESS's eddy-current trace list through the projector.
 
     The eddy-current counterpart of project_traces() (scan_plan.dpi), and the
     deferred half of PROJECTION_MODE for this instrument. It exists because the
@@ -1213,7 +1213,7 @@ def run_ec_path_scan(path, x3d, source, cond=None, prefix="/ec",
         """
         global ec_trace_accum, ec_staging_chan
         if ec_trace_accum is not None:
-            # A second scan in one session, or the accumulator is sized for the
+            # A second scan in one process, or the accumulator is sized for the
             # previous toolpath's trace count. Teardown first: its accumulator
             # reads the staging channel, and a math function must go before its
             # input can be handed back.

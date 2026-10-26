@@ -11,7 +11,7 @@ the `ECAutomatedScan.dgp` prompt.
 - Recorder: `ros2 run tari_bringup record` (`ros_ws/src/tari_ros/tari_bringup/tari_bringup/record.py`).
   The capture tool starts and stops it; it also summarises, expands and replays takes offline.
 
-## Before leaving for the cell
+## Before leaving for the work cell
 
 1. **Deploy by replacing, not merging**: copy `ros_ws/src` and `ROS-Scanning` over as whole
    trees, then do the clean build in `ec-automated-scan-first-run.md` section 0. Then check
@@ -29,7 +29,7 @@ the `ECAutomatedScan.dgp` prompt.
    it starts and refused on hardware if it will not fit above `CAPTURE_RESERVE_GB` (5 GB);
    a running take closes its bag and stops itself if free space falls below the reserve.
 
-## At the cell: the command sequence
+## On the production system: the command sequence
 
 Three terminals.
 
@@ -172,7 +172,7 @@ motion ceiling; testing the whole tooling against the crop top instead collapsed
 
 Files:
 - `<session>/work_volume_hardware.yaml`: the block to paste into
-  `ros_ws/src/tari_site/tari_cell_configs/config/cells/ex-ur10e-1.yaml`;
+  `tari_cell_configs/config/cells/ex-ur10e-1.yaml` in the site package;
 - `~/scandata/capture/cell_override/ex-ur10e-1.work_volume.json`: the measured box. Every
   dgpy session that loads the capture tool uses it at once: it regenerates
   `cell_override/ex-ur10e-1.yaml` from the real manifest with only the box replaced, and puts
@@ -208,8 +208,8 @@ along each axis; a tilt outside them is refused rather than extrapolated. The mo
 `modules/cable_envelope.dpi`.
 
 The result is saved to `~/scandata/capture/cable_limits_<cell>_<mode>.json`, and the test prints
-a `cable_envelope:` block to paste into the cell manifest — **do that**, because the JSON is
-only on the machine that ran the test while the manifest travels with the cell and is what a
+a `cable_envelope:` block to paste into the work-cell manifest — **do that**, because the JSON is
+only on the machine that ran the test while the manifest travels with the work cell and is what a
 fresh dgpy session reads.
 
 From then on **every motion that would turn wrist 3 outside the band for its tilt is refused**
@@ -274,7 +274,7 @@ up **along the tool axis**. Never past the taught points. Tilts turn the probe a
 about the travel direction (`tilt_axis="travel"`) or across it (`"across"`); the probe's roll
 stays as taught. 10 mm/s. A wrench change over `CAPTURE_CONTACT_FORCE_LIMIT` (60 N) stops the
 arm. `ec=True` also arms `ec_source` and writes `ec_<tilt>.npz` per pass — untested, there is
-no DAQ off the cell.
+no DAQ off the work cell.
 
 ### 8 — Full pipeline
 
@@ -289,7 +289,7 @@ The take is **always** closed and kept, with `scenario.json` saying what happene
 |---|---|---|
 | `... Nothing moved.` (work volume, cable envelope, clearance, "cannot follow up-across-down") | refused before moving | read the reason; re-teach the point, or jog the arm nearer with the pendant, then run the scenario again |
 | `... did not complete (planner reached N%)` | MoveIt could not plan or finish the move | the arm stopped where it was; run the scenario again (a new take); if it repeats, jog nearer or re-teach |
-| `STOPPED (overspeed ...)` / `force change ...` | the monitor stopped the arm; on hardware the UR program is **paused** | check the cell, press play on the pendant, run the scenario again. Later moves of that kind are already slowed by the measured ratio |
+| `STOPPED (overspeed ...)` / `force change ...` | the monitor stopped the arm; on hardware the UR program is **paused** | check the work cell, press play on the pendant, run the scenario again. Later moves of that kind are already slowed by the measured ratio |
 | `... The cables allow A..B deg at tilt (...) ... Nothing moved.` in scenario 4, 5 (raster) or 8 | the pipeline's own first move goes to its home configuration, `home_joints` in `mesh_reconstruction.dpi`, with **wrist 3 at 0°** — about 166° from where the arm works, and below the 31.3° the cable test confirmed as slack | nothing moved; the take is kept. Do not widen the band to get past it, and do not reach for the branch 360° away — the cable wraps, so +200° and −160° are the same tool orientation and opposite cable states. The pipeline has to use a home with wrist 3 near the working angle (reported as a pipeline fix) |
 | `the robot program is not running` | External Control is paused/stopped (after jogging) | press play on the pendant |
 | `not enough disk for ...` | the estimate does not fit above the reserve | free space, or run fewer variants |
@@ -346,14 +346,14 @@ ros2 run tari_bringup record replay  <take> --start-nodes    # re-run the live r
 `replay` plays the expanded bag with `--clock` and makes the recorded reconstruction calls when
 the bag clock reaches their recorded times, writing outputs to `<take>/replay/`. With
 `--start-nodes` it starts `industrial_reconstruction` / `tari_pc_reconstruction` itself with
-`use_sim_time`. **Nothing else may serve those services**: run it with the cell (and the
+`use_sim_time`. **Nothing else may serve those services**: run it with the work cell (and the
 simulator) stopped.
 
 ### What replay has been proven to reproduce
 
-The claim the rest of this document rests on is that a bag brought back from the cell is
+The claim the rest of this document rests on is that a bag brought back from the work cell is
 enough to re-run the reconstruction elsewhere. It has been tested by replaying a take
-recorded in simulation with the cell and the simulator down and comparing the replayed mesh
+recorded in simulation with the work cell and the simulator down and comparing the replayed mesh
 against the one the live run produced.
 
 **The Azure dome into `industrial_reconstruction`** (89 s of sweep, 15 MB bag, 455 MB
@@ -426,7 +426,7 @@ anywhere below the work-volume top when a scenario knows no geometry.
    IK along the Cartesian path (or FK along a joint move) and takes the largest scaling at
    which no checked point of the tooling (the probe tip and the Keyence head,
    `lj_v7080_frame`) can exceed
-   0.8× (Cartesian) or 0.85× (joint) the class limit. The cell's velocity calibration can only
+   0.8× (Cartesian) or 0.85× (joint) the class limit. The work cell's velocity calibration can only
    make it slower.
 2. **During — a stop.** The probe tip's speed is measured from TF, timed by TF's own stamps,
    over ≥ 0.1 s. Above 1.25× the limit (`CAPTURE_OVERSPEED_FACTOR`) the arm is stopped: on

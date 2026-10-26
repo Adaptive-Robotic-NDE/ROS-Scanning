@@ -14,7 +14,7 @@
 # what the pipeline can sustain, and returns a plan that either fits or says why
 # it does not. Nothing here talks to ROS, to spatialnde2 or to the recording
 # database -- it is arithmetic over measured constants, which is what lets
-# scan_parameters_test.py check it on the host with no cell running.
+# scan_parameters_test.py check it with nothing launched.
 #
 # The measured constants are all in DEFAULT_LIMITS below, each with the
 # conditions it was measured under. They are the part that goes stale: re-measure

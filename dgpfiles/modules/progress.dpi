@@ -73,11 +73,11 @@
 # WHAT THE OUTPUT LOOKS LIKE, AND WHY IT LOOKS LIKE THAT
 # ------------------------------------------------------------------------------
 # PLAIN APPENDED LINES. No spinner, no carriage return, no ANSI, no in-place
-# redraw. The cell runs the pipeline under `script`, and the resulting typescript
-# is read afterwards as a file -- one that is already unreadable in places
-# because something else in the stack emits escape sequences. Anything that
-# looks good live and terrible in a log file is the wrong trade here: the log is
-# how a run gets diagnosed the next day.
+# redraw. The production system runs the pipeline under `script`, and the
+# resulting typescript is read afterwards as a file -- one that is already
+# unreadable in places because something else in the stack emits escape
+# sequences. Anything that looks good live and terrible in a log file is the
+# wrong trade here: the log is how a run gets diagnosed the next day.
 #
 # EVERY LINE CARRIES A WALL CLOCK. A typescript has no timestamps of its own, so
 # "when did this stage actually start" is otherwise unanswerable. It is also the

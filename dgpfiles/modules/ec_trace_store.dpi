@@ -90,7 +90,7 @@
 #     the write must still stop the scan.
 #
 # The arithmetic, the file format and the reading are in ec_trace_store.py, so
-# they are testable on the host with no snde, no ROS and no robot. This file is
+# they are testable with no snde, no ROS and no robot. This file is
 # the wiring: the recording database on one side and the projector on the other.
 
 import os
@@ -111,7 +111,7 @@ global ec_replay_report
 global list_ec_runs
 global ec_trace_store_module
 
-#: The directory this session's most recent eddy-current scan wrote its passes
+#: The directory this process's most recent eddy-current scan wrote its passes
 #: to. None until a scan has started one. Printed in the scan report so the
 #: operator does not have to go looking for it.
 ec_run_dir = None

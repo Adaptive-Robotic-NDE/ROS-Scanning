@@ -114,9 +114,9 @@ import threading
 import numpy as np
 
 #: Schema names. Duplicated from ecsim's schema module rather than imported,
-#: because ecsim is not installed in the container and will not be: this
-#: reader must work with h5py alone. ec_response_table_test.py checks these
-#: against ecsim's own constants whenever ecsim IS importable, so the
+#: because ecsim is not installed on the production system and will not be:
+#: this reader must work with h5py alone. ec_response_table_test.py checks
+#: these against ecsim's own constants whenever ecsim IS importable, so the
 #: duplication cannot drift silently.
 RESPONSE_PATH = "/response"
 WRITTEN_PATH = "/written"

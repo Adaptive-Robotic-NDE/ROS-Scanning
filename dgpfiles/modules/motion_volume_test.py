@@ -80,8 +80,8 @@ What is checked here, on the HOST with numpy and no ROS:
     have no IK solution. Failing on that is crying wolf;
   * UNKNOWN IS NOT OK -- a service that did not answer is not permission to widen
     a box the arm will be allowed to fly through;
-  * a clean report says what it does NOT cover, which is anything in the cell that
-    is not in the URDF.
+  * a clean report says what it does NOT cover, which is anything in the work
+    cell that is not in the URDF.
 
 The sampling and the service calls are not testable without a cell; the reporting
 is, and the reporting is what an operator acts on.

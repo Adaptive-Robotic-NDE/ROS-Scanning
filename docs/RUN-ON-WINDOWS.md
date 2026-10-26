@@ -181,7 +181,7 @@ usable either way, and the choice is recorded in the file.
 
 It prints a measured seconds-per-pose and an ETA after the first few poses and
 **asks before committing to the rest**. That estimate is the real one for your
-machine; treat any number I have quoted as indicative only.
+machine; treat any number quoted here as indicative only.
 
 **If it is interrupted** — power cut, closed window, Ctrl-C — just run the same
 command again. It reads back what is already written and does only the rest.

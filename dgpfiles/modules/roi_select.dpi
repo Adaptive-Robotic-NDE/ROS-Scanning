@@ -173,7 +173,7 @@
 #   Ctrl+drag    DESELECT with whichever tool is active
 #   Shift+drag   add instead of replace
 #   Ctrl+A / Ctrl+D / Ctrl+I / Ctrl+Z   all / clear / invert / undo
-#   T F S I R    top, front, side, isometric, refit
+#   T,F,S,I,R    top, front, side, isometric, refit
 #   Enter        Accept        Esc   Cancel
 #
 # Middle and right drag always move the camera whatever tool is active, so
@@ -184,7 +184,7 @@
 # is nearest the camera -- so a box drawn over the part does not also take its
 # underside or the bench straight behind it. It is plain numpy, not a z-buffer
 # read or vtkHardwareSelector, because those are the first things to misbehave
-# on the software GL stack the cell is driven through over VNC.
+# on the software GL stack the production system is driven through over VNC.
 #
 # ------------------------------------------------------------------------------
 # DEPENDENCIES
@@ -227,7 +227,7 @@ ROI_SELECT_ENABLED = bool(globals().get("ROI_SELECT", True))
 #: How long the operator gets before the child is killed. Generous on purpose:
 #: this blocks a scan that has already flown a sweep, and an operator who walks
 #: away mid-selection should find the window still there. The timeout exists so
-#: a wedged child cannot hold the cell forever, not to hurry anybody.
+#: a wedged child cannot hold the work cell forever, not to hurry anybody.
 global ROI_SELECT_TIMEOUT
 ROI_SELECT_TIMEOUT = 3600.0
 

@@ -206,11 +206,11 @@ class _NoFlag(object):
     ask live TF whether the head arrived rather than assume it did."""
 
 
-#: The cell's motion envelope for the harness: generous, so a test that narrows
-#: `envelope` to steer VERTEX SELECTION does not also forbid probe_end from
-#: going where the gauge puts it.
+#: The work cell's motion envelope for the harness: generous, so a test that
+#: narrows `envelope` to steer VERTEX SELECTION does not also forbid probe_end
+#: from going where the gauge puts it.
 #:
-#: AT THE CELL THESE ARE ONE BOX -- capture_envelope() feeds both
+#: ON THE PRODUCTION SYSTEM THESE ARE ONE BOX -- capture_envelope() feeds both
 #: gauge_sample_points() and _check_envelope(). The harness splits them because
 #: probe_end sits 75 mm to the side of the point the sensor measures (T_PS), so
 #: a box drawn tightly round the sampled vertices is not a box probe_end fits
@@ -885,7 +885,8 @@ def test_the_samples_are_spread_over_the_mesh_and_lie_on_it():
     check("spread over most of a 200 mm mesh", min(d) > 0.08,
           "%.3f m apart at the closest" % min(d))
     # The 2-D cross product written out: np.cross on 2-vectors was removed in
-    # numpy 2 and the host is on it while the cell is on 1.23.
+    # numpy 2, which development machines have and the production system (1.23)
+    # does not.
     u, v = P[1, :2] - P[0, :2], P[2, :2] - P[0, :2]
     area = abs(float(u[0]*v[1] - u[1]*v[0]))
     check("and not collinear, so a tilt is measurable in both directions",
@@ -1088,7 +1089,7 @@ def test_a_pose_that_cannot_be_flown_costs_that_point_and_not_the_run():
 
 @_checked
 def test_a_monitor_stop_is_not_swallowed():
-    """CaptureStopped means a human has to look at the cell. It goes straight
+    """CaptureStopped means a human has to look at the work cell. It goes straight
     up, and the partial result is still printed and kept."""
     ns = fresh()
     cell = Cell(ns, truth=0.9218, delta=BIAS_M, stop_at=2)
@@ -1771,7 +1772,7 @@ def test_the_speed_limit_is_converted_and_not_handed_through():
     check("it is the pipeline's near-the-part acceleration",
           all(abs(c["acc"] - 0.05) < 1e-12 for c in cell.cartesian),
           str(sorted(set(c["acc"] for c in cell.cartesian))))
-    # With no path-aware bound, the cell-wide curve decides.
+    # With no path-aware bound, the work-cell-wide curve decides.
     ns2 = fresh()
     c2 = Cell(ns2, truth=0.9218, delta=BIAS_M)
     ns2["path_motion_scaling"] = lambda poses, v, quiet=True: None

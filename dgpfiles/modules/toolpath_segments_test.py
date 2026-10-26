@@ -6,7 +6,7 @@ import types
 import numpy as np
 
 # Resolve the .dpi next to THIS file, never by absolute path: the suite has to
-# run from any checkout, including the cell PC.
+# run from any checkout, including the controlling computer.
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 if HERE not in sys.path:

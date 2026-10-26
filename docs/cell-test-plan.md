@@ -1,6 +1,6 @@
 # Cell test plan — run the pipeline end to end
 
-A run sheet for a cell visit whose objective is `run_automated_scan()` through
+A run sheet for a site visit whose objective is `run_automated_scan()` through
 all five stages on the real arm.
 
 Stage 2 — the Azure reconstruction that produces the rough planning surface — is
@@ -183,7 +183,7 @@ reached.
 
 **Do not let a broken Azure cost you stages 5 and 6.** They have not run on
 hardware either, and they do not need the Azure: they need *a mesh*, and any
-earlier Keyence reconstruction of a real specimen will serve. The cell PC keeps
+earlier Keyence reconstruction of a real specimen will serve. The controlling computer keeps
 them under `/data/scandata/<timestamp>/specimen_keyence_poisson.ply`.
 
 ```python

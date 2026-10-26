@@ -57,7 +57,7 @@ PLATE_Y = 0.120
 PLATE_Z = 0.012
 TOP_CELL = 0.002          # tessellation of the scanned face
 
-# Where the plate sits in the cell. The top face lands at this z. Overridable
+# Where the plate sits in the work cell. The top face lands at this z. Overridable
 # with --place / --yaw-deg, because where the plate sits is a decision about
 # this bench and not a property of the plate.
 PLACE_XYZ = (0.850, -0.200, 0.950)

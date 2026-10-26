@@ -138,7 +138,7 @@ def _checked(fn):
 
 
 # ==============================================================================
-# The geometry, and the cable envelope, loaded the way the cell loads them
+# The geometry, and the cable envelope, loaded the way the work cell loads them
 # ==============================================================================
 
 def _load(name, ns):
@@ -180,12 +180,12 @@ resample_segments = NS["resample_segments"]
 CableEnvelope = NS["CableEnvelope"]
 CableRefused = NS["CableRefused"]
 
-#: THE CELL'S OWN MEASUREMENT, from the untilted row of the cable-envelope file
-#: capture_cable_envelope() wrote for ex-ur10e-1 (home_quat = identity, the same
-#: datum as NOETHER_ROLL_REFERENCE): wrist_3 sat at 166.09 deg and the cables
-#: allowed 16.09..301.09 deg there. So the rotations this cell can hold with the
-#: probe vertical are -150.00..+135.00 deg, and the +/-40 deg tilt rows tighten
-#: that further.
+#: THE WORK CELL'S OWN MEASUREMENT, from the untilted row of the cable-envelope
+#: file capture_cable_envelope() wrote for ex-ur10e-1 (home_quat = identity, the
+#: same datum as NOETHER_ROLL_REFERENCE): wrist_3 sat at 166.09 deg and the cables
+#: allowed 16.09..301.09 deg there. So the rotations this work cell can hold with
+#: the probe vertical are -150.00..+135.00 deg, and the +/-40 deg tilt rows
+#: tighten that further.
 WRIST3_DATUM_DEG = 166.09270167005653
 UNTILTED_LO_DEG = 16.092701670056524
 UNTILTED_HI_DEG = 301.09270167005656
@@ -215,7 +215,7 @@ def envelope():
 
 
 def no_envelope():
-    """Put the module back to "this cell has never been measured"."""
+    """Put the module back to "this work cell has never been measured"."""
     NS["_CABLE"][0] = None
     NS["_CABLE_LOOKED"][0] = True
     del NS["_CABLE_WARNED"][:]

@@ -422,7 +422,7 @@ def test_the_verdict_follows_the_executing_nodes_mode():
     print("\n1. the same move, the same solver, the same band: only the "
           "executor's mode differs")
 
-    # transit: move_group global, mtc_hub_node local -- the cell's wiring.
+    # transit: move_group global, mtc_hub_node local -- the work cell's wiring.
     ros = Ros()
     guard, ns = guarded(ros)
     res, text = run(lambda: guard.CartesianMove([POSE, POSE]))
@@ -555,7 +555,7 @@ def test_the_ik_mode_is_restored():
           "%s %s" % (ros.set_calls, ros.solve_modes))
 
     # The mode change TOOK EFFECT and then the reply failed. Relying on
-    # SetIKMode's return value here would leave the cell in the guard's mode,
+    # SetIKMode's return value here would leave the work cell in the guard's mode,
     # which is why the mode is read before the switch rather than after it.
     ros = Ros(set_raises_after=True)
     guard, _ns = guarded(ros)
@@ -797,7 +797,7 @@ def _run_ik_target_checks():
 
     # local_only=True IS FOR A PREDICTION, and a prediction must not be made in a
     # mode the executing node is not in. It never asks global, even when local has
-    # no answer: "I do not know" refuses nothing, while a global branch refuses a
+    # no answer: an unknown answer refuses nothing, while a global branch refuses a
     # move the executor would have flown.
     ros3 = Ros(answers={"local": None, "global": joints(GLOBAL_DEG)})
     _g3, ns3 = guarded(ros3)

@@ -52,7 +52,7 @@
 #
 #
 #########################################################################
-"""The pan sweep's geometry, on the host, with no ROS and no robot.
+"""The pan sweep's geometry, with no ROS and no robot.
 
 WHY A PAN SWEEP. A dome sweep buys its standoff with height alone, and the
 height NFOV_UNBINNED needs over this bench -- camera 1.4548, probe_end 1.3795,

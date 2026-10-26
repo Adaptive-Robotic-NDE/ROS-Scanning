@@ -1,4 +1,4 @@
-# Cell visit, Tuesday 2026-10-06
+# Site visit, Tuesday 2026-10-06
 
 Written 2026-10-05 from `results19` — the first run that went start to finish and
 produced a readable image. Everything here follows from measurements on that
@@ -27,7 +27,7 @@ Four code changes landed. All of them are on `main` in `ROS-Scanning` and in
 |---|---|---|
 | Projection spot radius now follows **both** sample spacings | it only ever saw the trace pitch, so a 0.30 mm line spacing still got a 1.6 mm radius — 26 traces averaged into every pixel | the plan prints `8 trace(s) averaged per pixel`, and the radius drops from 1.60 mm to 0.87 mm at a 1.00 × 0.30 mm grid |
 | Pinched vertices are repaired before the surface is loaded | the 14:51 scan died in `x3d_load_geometry` **after** the probe was on the part and the instrument nulled | either nothing, or one line saying a face was removed |
-| `mtc_node` drains its goal threads before shutting down | it segfaulted on the way out three times in one session | a clean exit when you stop the cell |
+| `mtc_node` drains its goal threads before shutting down | it segfaulted on the way out three times running | a clean exit when you stop the work cell |
 | The preload ceiling note records that 1–2 mm is the intended operating point | so nobody "fixes" it back | nothing; it is a comment |
 | `r` at a capture prompt runs the rest of that take without asking | a tilt × rotation matrix is ~50 prompts and by pass two you are confirming the same descent for the ninth time | a new key in the prompt — see below |
 | `capture_contact()` declares specimen contact for its own take | the probe is pressed into a collision object, so moves made *from* the part were refused at 14–86% | a `contact with 'specimen' is now ALLOWED` line at the start of each take, `now refused` at the end |
@@ -63,7 +63,7 @@ its trace pitch changes, and that change is the fix.
 
 ---
 
-## 1. Bring the cell up (~15 min)
+## 1. Bring the work cell up (~15 min)
 
 ### 1.1 Update the workspace
 
@@ -78,8 +78,8 @@ cd ~/tari && ./tari.bash --layer site
 ```
 
 Expect it to report the repositories it fast-forwarded. If any says
-`cannot be fast-forwarded ... it has diverged from origin`, **stop and send me
-the line** — it means there is a local commit on the cell that I do not have.
+`cannot be fast-forwarded ... it has diverged from origin`, **stop and record
+the line** — it means there is a local commit on the production system that exists nowhere else.
 
 Watch for these two lines near the end:
 
@@ -93,7 +93,7 @@ link spatialnde2's C++ ABI, and an extra left in place across a spatialnde2
 rebuild does not fail to import — it segfaults when the EC math runs.
 
 If the verify phase fails, it will print `dgpy_install.sh --check` output naming
-the package and the state. Send me that.
+the package and the state. Record that.
 
 ### 1.2 Source and launch
 
@@ -192,7 +192,7 @@ axis` at 86%, `off contact_a` at 14%, and `over contact_a: lift off` reporting a
 100% plan that then moved 1.0 mm of the 10 it was commanded. All three read as
 planner faults; all three were the planner correctly refusing to interpolate out
 of a start state it had been told was illegal. If you see one of those again,
-it is **not** this, and I want to know.
+it is **not** this, and it should be reported.
 
 A declaration you made by hand is left alone and not withdrawn.
 `capture_contact(..., declare_contact=False)` keeps every protection, for the
@@ -233,9 +233,9 @@ recording 01_contact -> /data/scandata/capture/2026-10-06_..._hardware/01_contac
 **Write down which take directory went with which speed and direction**, or just
 note the order — the timestamps are in order anyway.
 
-### 2.5 Read the answer on the cell
+### 2.5 Read the answer on the production system
 
-Save this as `/tmp/lag.py` on the cell:
+Save this as `/tmp/lag.py` on the production system:
 
 ```python
 import numpy as np, glob, os, sys, json
@@ -299,7 +299,7 @@ python3 /tmp/lag.py
 **Write down the three latencies.**
 
 - **All three within ~0.02 s of each other** → it is a fixed time lag. That is
-  correctable in software and I will do it: the correction is to shift each
+  correctable in software: the correction is to shift each
   trace's position back along its own travel direction by `latency × speed`.
 - **Latency falls as speed rises** (separation roughly constant in mm) → it is a
   geometric offset after all and the fix is a tooling calibration, not a
@@ -322,7 +322,7 @@ than the trace pitch alone. When you run a scan, the plan prints:
 ```
 
 **Check that second line.** If it says a number much larger than 8, the line
-spacing did not reach the planner and I want to know.
+spacing did not reach the planner, which is a fault to report.
 
 Measured on your `results19` data, reprojected offline:
 
@@ -380,7 +380,7 @@ reconstruct_rough()
 reconstruct_rough(region=(xmin, ymin, xmax, ymax))
 ```
 
-(metres, world frame, in that order — the order has cost us 696 mm before.)
+(metres, world frame, in that order — a wrong order has produced a 696 mm error before.)
 
 ### 4.2 Fly the same patch twice, rows 90° apart
 
@@ -399,11 +399,11 @@ as arguments.
 choosing the axis for you, which it otherwise does on cable grounds.
 
 If the second one refuses on cable or reach grounds, say so and stop; that is
-itself the answer to "can we do this", and I will plan around it.
+itself the answer to "can we do this", and the plan has to work around it.
 
 ### 4.3 Compare them
 
-Save as `/tmp/ripple.py` on the cell:
+Save as `/tmp/ripple.py` on the production system:
 
 ```python
 import numpy as np, sys
@@ -467,8 +467,8 @@ python3 /tmp/ripple.py <path printed by a> <path printed by b>
 
 - **The dominant ripple axis swaps between the two meshes** → it is an artefact
   of the Keyence sweep, and the fix is to combine the two scans (or to stop
-  following per-vertex normals on a part we know is flat). This is the outcome I
-  expect.
+  following per-vertex normals on a part we know is flat). This is the
+  expected outcome.
 - **The ripple stays on the same axis in both** → it is 20 µm of real relief on a
   surface-ground 7075 block, which would be surprising and worth knowing, and the
   answer is to keep the mesh and live with a 1° normal wobble.
@@ -542,7 +542,7 @@ print("peak-to-peak %.3f V" % np.ptp(z["impedance"].imag))
 The probe is spring-loaded and conforms to the surface anyway, so following
 1.2° of mesh ripple with the commanded tool axis buys nothing and costs ~0.9 V.
 Planning over a *flattened* mesh would remove that. We do not have a one-line
-switch for it yet — tell me what section 4 says and I will add one, because the
+switch for it yet — report what section 4 says and one can be added, because the
 right form of it depends on whether the ripple is real.
 
 ### 5.3 If it does show a response, fly it

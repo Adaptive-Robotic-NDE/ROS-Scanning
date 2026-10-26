@@ -93,7 +93,7 @@ TILT_PERP_OHMS_PER_DEG2 = 0.02
 
 #: Residual imbalance, ohms: what the probe reads over good material square
 #: on. A real differential probe does not cancel to nothing, and if this were
-#: zero then lift-off alone would move the spot nowhere and the cell's
+#: zero then lift-off alone would move the spot nowhere and the work cell's
 #: conditioning procedure would have no lift-off direction to find.
 COMMON_OHMS = 2.2
 
@@ -105,7 +105,7 @@ COMMON_OHMS = 2.2
 LIFTOFF_DECAY_M = 0.0004
 
 #: Phase of the flaw response and of the lift-off/tilt trajectory, radians.
-#: DIFFERENT, and that difference is the point: it is the angle the cell's
+#: DIFFERENT, and that difference is the point: it is the angle the work cell's
 #: conditioning procedure rotates onto an axis, so a stub where they coincided
 #: would make set_rotation() untestable.
 FLAW_PHASE_RAD = math.radians(109.0)

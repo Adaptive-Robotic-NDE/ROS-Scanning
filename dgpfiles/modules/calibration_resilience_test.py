@@ -149,10 +149,11 @@ class CableRefused(RuntimeError):
 # ------------------------------------------------------------------------------
 
 #: A BARE GROUND FLAT, which is what CAL_ARTIFACT = "flat" and an empty
-#: CAL_BALL_CENTRES give -- the artifact the cell actually calibrates against.
-#: It matters here and not only for realism: calibrate_keyence() derives the
-#: artifact's starting pose from a PLANE FIT, whose in-plane rotation is
-#: arbitrary, and a plate with balls on it cannot be started that way.
+#: CAL_BALL_CENTRES give -- the artifact the work cell actually calibrates
+#: against. It matters here and not only for realism: calibrate_keyence()
+#: derives the artifact's starting pose from a PLANE FIT, whose in-plane
+#: rotation is arbitrary, and a plate with balls on it cannot be started that
+#: way.
 ARTIFACT = cs.PlateArtifact(np.zeros((0, 3)), 0.0127, (0.13, 0.10),
                             "bare flat")
 
@@ -312,7 +313,8 @@ def _ns(cell, x0_error=None):
         "CAL_MOVE_ROUTES": 2, "CAPTURE_ROOT": cell.tmpdir,
         "CELL_NAME": "nowhere", "CELL_MODE": "sim",
         "_CAL": {},
-        # -- the cell --------------------------------------------------------
+        # -- the work cell
+        # --------------------------------------------------------
         "_cal_geom": lambda: cs,
         "_cal_say": lambda m: said.append(str(m)),
         "cal_artifact": lambda kind=None: ARTIFACT,
@@ -719,7 +721,7 @@ def test_a_dataset_with_no_recorded_standoff_recovers_it_from_the_label():
 
 
 def test_the_failure_message_names_the_offline_entry_point():
-    """The operator is at the cell reading a traceback, not a docstring."""
+    """The operator is at the work cell reading a traceback, not a docstring."""
     with _tmp() as d:
         cell = Cell(d)
         ns = _ns(cell)
@@ -804,7 +806,7 @@ def test_the_run_says_how_many_poses_the_answer_came_from():
 # ------------------------------------------------------------------------------
 
 def _candidate_poses(distances, tilts):
-    """_cal_candidate_poses() with the cell replaced by nothing at all."""
+    """_cal_candidate_poses() with the work cell replaced by nothing at all."""
     src = open(os.path.join(HERE, "calibration.dpi")).read()
     fn = next(n for n in ast.parse(src).body
               if isinstance(n, ast.FunctionDef)

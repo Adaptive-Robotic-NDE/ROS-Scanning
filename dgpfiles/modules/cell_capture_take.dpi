@@ -318,7 +318,7 @@ def start_take(scenario, sets=("core",), expect_s=120.0, specimen=None, lighting
     # EVERY ARGUMENT IS A STRING OR THE TAKE NEVER STARTS, and this says which
     # one is not. subprocess raises "expected str, bytes or os.PathLike object,
     # not list" from inside fork_exec with no clue which of the thirty
-    # arguments it means, and it raises it at the cell with the arm live.
+    # arguments it means, and it raises it on the production system with the arm live.
     bad = [(i, a) for i, a in enumerate(cmd) if not isinstance(a, str)]
     if bad:
         raise CaptureRefused(

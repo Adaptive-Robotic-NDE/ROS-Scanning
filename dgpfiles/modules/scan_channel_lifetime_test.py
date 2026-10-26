@@ -40,7 +40,7 @@
 # Created: 2026-09-29
 # Description:
 #   Proves a scan's recording-database channels can be taken, handed back and
-#   taken again, so a second scan in one session does not abort the process.
+#   taken again, so a second scan in one process does not abort the process.
 # Derived From:
 #
 #########################################################################

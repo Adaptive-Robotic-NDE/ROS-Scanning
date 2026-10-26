@@ -944,7 +944,8 @@ def main(argv):
             req = json.load(fh)
     else:
         # A PLY straight off the command line, so the window can be opened on a
-        # real scan at the cell without dgpy and without hand-writing a request
+        # real scan on the production system without dgpy and without
+        # hand-writing a request
         # -- which is how you tell "the selector is broken" from "the scan is
         # broken" in one command.
         import tempfile

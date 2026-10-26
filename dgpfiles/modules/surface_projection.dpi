@@ -755,9 +755,9 @@ class SurfaceProjector(object):
         # synthesised plane patch is already in world coordinates, so there is
         # nothing to register and the offset stays zero -- this is the slot a
         # real registration transform goes in, and it is load-bearing as soon as
-        # a mesh authored somewhere else is placed in the cell: the SAME offset
-        # has to move the toolpath and the projection surface, or the traces land
-        # on the wrong part of the image and nothing says so.
+        # a mesh authored somewhere else is placed in the work cell: the SAME
+        # offset has to move the toolpath and the projection surface, or the traces
+        # land on the wrong part of the image and nothing says so.
         pose_ref.data[0] = np.array(((1.0, 0.0, 0.0, 0.0),
                                      (self.offset[0], self.offset[1], self.offset[2], 1.0)),
                                     dtype=ORIENT_DTYPE)

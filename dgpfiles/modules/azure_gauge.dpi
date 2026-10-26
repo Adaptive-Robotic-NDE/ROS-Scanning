@@ -77,8 +77,8 @@
 # disagreement BEFORE a raster is planned, on the actual part, at several
 # places, so that the number can be trusted, reported, or fed back. That is
 # this file, and it is what makes the pipeline self-correcting: the Azure's
-# constant correction is a number the cell re-measures every session, in about
-# a minute, with no human touch-off.
+# constant correction is a number the work cell re-measures every session, in
+# about a minute, with no human touch-off.
 #
 # THIS NEVER TOUCHES THE PART. It is an optical gauge. The Keyence is a
 # triangulation profiler standing off 57..103 mm; nothing here contacts
@@ -225,7 +225,7 @@
 # confirm() DELIBERATELY REFUSES TO BE AUTOMATED ON HARDWARE:
 #
 #     if CAPTURE_AUTO_CONFIRM and CELL_MODE != "sim":
-#         raise CaptureRefused("... every motion at the cell is confirmed by
+#         raise CaptureRefused("... every motion on the production system is confirmed by
 #             the operator.")
 #
 # That contract is RIGHT and nothing here weakens it. CAPTURE_AUTO_CONFIRM is
@@ -265,7 +265,7 @@
 #                       install_cable_guard() is in front of every call.
 #   the speed limits    _speed_class() gives near/away and its limit in m/s;
 #                       path_motion_scaling() converts that to the MoveIt
-#                       scaling for THIS path, falling back to the cell-wide
+#                       scaling for THIS path, falling back to the work-cell-wide
 #                       velocity curve -- the same two-step the sweep uses, and
 #                       the reason it exists is that handing a speed through as
 #                       a scaling flies it about 1.6x too fast.
@@ -397,7 +397,7 @@ AZURE_GAUGE_MIN_SPREAD_M = 0.040
 #: and agree to the sensor's own noise unless TF and the commanded pose
 #: disagree -- a stale transform, a description that moved since the pose was
 #: computed, an arm that did not arrive. Reported, not refused: it is a note
-#: about the cell, and the world-frame number is the one used.
+#: about the work cell, and the world-frame number is the one used.
 AZURE_GAUGE_TF_TOL_M = 0.001
 
 #: How close the tool must land to the pose that was commanded before the
@@ -1621,10 +1621,9 @@ def gauge_mesh_against_keyence(mesh=None, points=None, n=3, start_standoff=None,
             res["samples"].append(s_row)
     except _gauge_stops() as e:
         # THESE END THE RUN AND ARE NOT THIS FUNCTION'S TO SWALLOW. A monitor
-        # stop means a human has to look at the cell before the arm moves
-        # again; the taxonomy is in cell_capture_node.dpi and the reason it
-        # matters is in the sensor-calibration-runs skill. ScanAborted is in
-        # the tuple because the unattended route's only operator control is the
+        # stop means a human has to look at the work cell before the arm moves
+        # again; the taxonomy is in cell_capture_node.dpi. ScanAborted is in the
+        # tuple because the unattended route's only operator control is the
         # pendant -- see _gauge_stops().
         res["why"] = _cal_stop_why(e)
         _gauge_finalise(res, say, ref, lo_hard)

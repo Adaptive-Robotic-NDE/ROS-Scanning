@@ -1,4 +1,4 @@
-# Cell visit, Monday 2026-10-05
+# Site visit, Monday 2026-10-05
 
 Written 2026-10-03, after the 2026-10-02 run (`results18`). Everything below
 either **verifies a fix that has not yet run on hardware**, or **answers a
@@ -34,8 +34,8 @@ build phase finished **zero** packages. Expect it to behave differently:
 - It warns if `setuptools` in your own `~/.local` shadows the system one, which
   the previous warning claimed to have fixed and could not.
 
-Machine-side items from that run, still outstanding — see the commit message on
-`tari_workspace_staging@iron` for the full list:
+Machine-side items from that run, still outstanding — see the latest commit message of
+the workspace repository for the full list:
 
 ```bash
 # the global safe.directory the first run needed is no longer required, and it
@@ -48,16 +48,16 @@ python3 -m pip uninstall -y setuptools
 python3 -c 'import setuptools; print(setuptools.__version__, setuptools.__file__)'
 ```
 
-Then bring the cell up as usual and **read three new lines before moving the
+Then bring the work cell up as usual and **read three new lines before moving the
 arm**:
 
 | line | means |
 |---|---|
-| `Mount check: world -> base_link agrees with TF to … mm and … deg` | the planner and the rest of the cell agree about where the arm is bolted |
+| `Mount check: world -> base_link agrees with TF to … mm and … deg` | the planner and the rest of the work cell agree about where the arm is bolted |
 | `projection surface UV mirrored back…` or nothing | the parameterization is usable |
 | `Raster time parameterization: TOTG (retime_backend 'totg')` | today's timing, unchanged |
 
-If instead you see **`MOUNT MISMATCH`**, stop and send me the line. It means the
+If instead you see **`MOUNT MISMATCH`**, stop and record the line. It means the
 planner is interpreting every Cartesian waypoint in the wrong place, and
 nothing else will look wrong because joint trajectories still execute.
 
@@ -156,7 +156,7 @@ If there is time, repeat the sweep travelling `contact_b → contact_a`.
 **Why:** the within-pass trend is currently ambiguous. A registration error is a
 function of *position* and reverses sign with travel direction; drift is a
 function of *time* and does not. All five passes last time went one way, so the
-two cannot be separated — and I gave you the wrong answer on it once already,
+two cannot be separated — and an earlier analysis answered it wrongly,
 calling the trend "registration" when the measured drift of **0.016 signal
 units/s**, consistent across all five passes and nearly independent of tilt,
 accounts for a quarter to a half of it.
@@ -170,7 +170,7 @@ accounts for a quarter to a half of it.
 ### 3a. Photograph the markings
 
 A phone photo, close, square on, of the markings at the **left third** of the
-plate. They exist — I found them in `scene_0200.jpg` from 2026-09-20 — but at
+plate. They exist (visible in `scene_0200.jpg` from 2026-09-20) but at
 roughly 1.3–2.5 mm per pixel a 4 mm character is 2–3 pixels, so no processing
 recovers them. Thirty seconds with a phone settles it.
 
@@ -264,7 +264,7 @@ stalls now you should get, once:
    recdb: <latest ready>/<latest defined>
 ```
 
-**Send me that line.** `ready` lagging `defined` means a globalrev that cannot
+**Record that line.** `ready` lagging `defined` means a globalrev that cannot
 complete; equal means a stage that is merely slow. It distinguishes the
 candidates in one line.
 

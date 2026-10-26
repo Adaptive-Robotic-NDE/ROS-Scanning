@@ -136,7 +136,7 @@ def _stub(ns, reach):
 
 
 def _reach_x(limit=REACH_X_LIMIT, joints=(0.0,)*5 + (math.radians(166.0),)):
-    """Reachable below `limit` in x. Returns the SOLUTION, as the cell's does."""
+    """Reachable below `limit` in x. Returns the SOLUTION, as the work cell's does."""
     def ok(position, quat):
         return list(joints) if float(position[0]) < limit else None
     return ok

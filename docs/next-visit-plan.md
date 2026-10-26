@@ -21,7 +21,7 @@ still bite.
 ## 0. Before you leave
 
 - Replace `ros_ws/src` and `ROS-Scanning` as whole trees; do not merge. Copying over an older
-  tree leaves deleted files behind, and the cell then runs an `ECAutomatedScan.dgp` that
+  tree leaves deleted files behind, and the work cell then runs an `ECAutomatedScan.dgp` that
   differs from the workspace copy — the acceptance suite's `installed but not in src:
   dgpfiles` warning is that condition.
 - Delete `build/` and `install/` for anything that moved, then build. `azure_kinect_ros_driver`
@@ -41,7 +41,7 @@ export TARI_CELL_PATH=tari_cell_configs
 ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=hardware
 ```
 
-The manifest carries the real robot address (192.168.1.150) and the measured work volume
+The manifest carries the real robot controller's address and the measured work volume
 (x 0.560..1.145, y -0.509..0.454, z 0.925..1.245). Load and **play** the External Control
 program on the pendant.
 
@@ -112,7 +112,7 @@ The exact argument lines are in `cell-data-capture.md`.
   inside the monitor's tolerance and is reported rather than stopped. 10.8 MB of bag, 69 122
   messages over 439.9 s, 26 `/joint_states` lost. There is no wrench in simulation
   (`force_torque_sensor_broadcaster` is absent), so **the force limit is the one part of this
-  scenario that only the cell can exercise** — run the 0° pass first and watch the wrench.
+  scenario that only the work cell can exercise** — run the 0° pass first and watch the wrench.
 - `capture_full_pipeline(...)` — the whole pipeline, recorded. Flown in simulation: the Azure
   dome's 5 rows all flew 100%, the Keyence raster planned 3041 Noether poses, cropped to 1364
   inside the region and the work volume, gave up 19.6% of the path to the tooling-clearance
@@ -124,7 +124,7 @@ The exact argument lines are in `cell-data-capture.md`.
   and the gate are dealt with — see section 4c** — so it no longer needs `line_spacing=0.010`
   to finish and it releases YOLO itself. Two things still to know before you run it at the
   cell:
-  * **Know how much RAM the cell PC has, and print the cost first.** `preview_ec_scan()` with
+  * **Know how much RAM the controlling computer has, and print the cost first.** `preview_ec_scan()` with
     nothing planned now prices the area from the three technician controls alone and says what
     the plan will cost in memory and in time. `plan_ec_path()` refuses a plan that will not
     fit instead of discovering it by being OOM-killed.
@@ -137,7 +137,7 @@ The exact argument lines are in `cell-data-capture.md`.
 ## 4a. What the pipeline does, measured in simulation
 
 The whole capture pipeline flown in the simulated cell. What it does, and what it still gets
-wrong, so nobody rediscovers it at the cell.
+wrong, so nobody rediscovers it on the production system.
 
 ### The guard, and what it now measures
 
@@ -183,12 +183,12 @@ second.
   approach over `CAPTURE_APPROACH_MAX_DEG` (20°, measured: honest row approaches are
   0.0-12.2°) now goes through `capture_transit` instead — up, across, down, each leg a
   Cartesian move whose speed *is* bounded correctly — and then re-solves the row-spanning
-  configuration. **Watch this one at the cell**: the joint-space model is still what bounds
+  configuration. **Watch this one on the production system**: the joint-space model is still what bounds
   every other joint move, and it is the model that was wrong, not the arm.
 - **The Azure sweep is a PAN now, not a dome, and the standoff question is settled.** The
   depth mode's minimum is a distance from the camera to the surface, not a height, and the
   height a straight-down sweep needs -- camera 1.455, probe_end 1.380 -- is not reachable
-  across this bench: solved against the cell's own kinematics (analytic UR IK on the rendered
+  across this bench: solved against the work cell's own kinematics (analytic UR IK on the rendered
   `ur_cell.urdf`, 8 x 13 aim points over the measured work volume), it has **no solution at
   all** over x >= 1.145 and reaches 84.6% of the volume. Standing off to the side and aiming
   back buys the same distance at a reachable height, and every rung from 0.25 to 0.50 m above
@@ -209,7 +209,7 @@ second.
   collision checking before anything moves, and a direction that does not solve is dropped by
   name.
 
-  Two things to watch at the cell. That check means **planning takes 2-5 minutes before
+  Two things to watch on the production system. That check means **planning takes 2-5 minutes before
   anything moves** -- that is the search, not a hang. And the aim plane defaults to the work
   volume's floor, so pass a tall part's top as `surface_z=` or the range is measured to the
   bench while the part is that much closer.
@@ -231,7 +231,7 @@ second.
   | plate top | -0.98 mm | -1.27 mm |
   | vertices | 9 547 | 9 712 |
 
-  A top-down sweep, flown at a height this cell cannot reach, gives crest
+  A top-down sweep, flown at a height this work cell cannot reach, gives crest
   +0.4 mm and plate -0.07 mm -- so the pan sweep costs roughly a millimetre of bias, low, in
   exchange for being flyable. On a 6 mm-voxel planning surface that is inside the voxel; do not
   spend it twice by also trusting the rough mesh where the Keyence should measure.
@@ -277,11 +277,11 @@ the recorded stop call lands tens of seconds of bag time late for a reason not y
 The full numbers, and what that means for quoting them, are in `cell-data-capture.md`.
 
 **So a bag you bring back is enough to re-run the reconstruction here.** That is what makes
-scenario 8 worth recording even if its post-processing falls over at the cell.
+scenario 8 worth recording even if its post-processing falls over on the production system.
 
 `/profiles` delivered 800 points with none empty throughout (42-99 Hz depending on the pass).
 `/joint_states` loss is 0.05-0.07% and is the recorder's own accounting, not a gap in the
-trajectory. Four topics are **absent in simulation** and will only appear at the cell:
+trajectory. Four topics are **absent in simulation** and will only appear on the production system:
 `io_states`, `robot_program_running`, `speed_scaling`, and the force/torque wrench — so the
 contact scenario's force limit, and the speed-scaling slider, are untested until you are
 there.
@@ -309,7 +309,7 @@ certificate guarantees.
 nothing planned now prices the area from the three technician controls alone — passes,
 travel, waypoints, the planner's reply size, the gate's working set, planning time, then the
 scan — and `plan_ec_path()` refuses a plan over `EC_PLAN_LIMITS` before it calls Noether.
-Print it before you commit the cell to anything at 0.30 mm.
+Print it before you commit the work cell to anything at 0.30 mm.
 
 **YOLO was never released.** `run_automated_scan(region=...)` skips detection, so it also
 skipped the one place that turned the detector off, and `yolo_node` held 400% of a core and

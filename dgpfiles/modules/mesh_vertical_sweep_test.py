@@ -151,7 +151,7 @@ HOME_QUAT = (0.0, 0.0, 0.0, 1.0)
 
 # ==============================================================================
 # THE MEASUREMENT: one cell's capture_cable_envelope() output, as it appears in
-# the cell manifest's cable_envelope.hardware block. The x row was swept to
+# the work-cell manifest's cable_envelope.hardware block. The x row was swept to
 # +/-40 but the y row stops at +/-20, so any direction needing more tilt in y
 # than that is unmeasured rather than out of band.
 # ==============================================================================
@@ -366,8 +366,8 @@ def test_the_tilt_each_rung_asks_for_against_the_measurement():
 @_checked
 def test_the_lateral_ladder_has_no_margin():
     print("=== the lateral ladder has no margin at all ===")
-    # WHAT THE HOST CAN AND CANNOT SHOW. The cable half is exact -- the
-    # measurement in the cell manifest, run through cable_envelope.dpi's own
+    # WHAT THIS TEST CAN AND CANNOT SHOW. The cable half is exact -- the
+    # measurement in the work-cell manifest, run through cable_envelope.dpi's own
     # model. The reach half is not: a part against the edge of the arm's reach
     # loses az 90 and az 270 on /compute_ik, and there is no IK solver here to
     # reproduce that. What IS shown is why a single reach failure is fatal:

@@ -100,7 +100,7 @@ import types
 import numpy as np
 
 # sensor_msgs is imported INSIDE _cal_depth_points; stub it so the real function
-# body runs on the host. Nothing here touches ROS beyond the name.
+# body runs where ROS is not sourced. Nothing here touches ROS beyond the name.
 _sm = types.ModuleType("sensor_msgs")
 _sm.msg = types.ModuleType("sensor_msgs.msg")
 _sm.msg.Image = type("Image", (), {})
@@ -177,7 +177,7 @@ class FakeTake(object):
 
 
 def _install(ns, image, K, frame="rgb_camera_link", cam_z=1.4674):
-    """Stub the ROS-facing helpers so the real code path can run on the host."""
+    """Stub the ROS-facing helpers so the real code path can run without ROS."""
     msg = FakeMsg()
     msg.header.frame_id = frame
     ns["_cal_one_message"] = lambda *a, **k: [msg]

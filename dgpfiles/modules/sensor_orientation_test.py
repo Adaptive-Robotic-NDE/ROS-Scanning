@@ -437,8 +437,8 @@ def test_manifest_block():
 # The pattern is set_ec_preload()'s: one validator both ways in, a setter that
 # prints what it did, and a describe_* the banner and the stage share. What this
 # section is really pinning is the DEFAULT: an unchanged run has to fly the
-# sweeps this cell has always flown, so "z" for both and "fixed" once it reaches
-# the planner.
+# sweeps this work cell has always flown, so "z" for both and "fixed" once it
+# reaches the planner.
 
 ORIENT_WANT = ("check_sensor_orientation", "set_sensor_orientation",
                "sensor_orientation", "describe_sensor_orientation")

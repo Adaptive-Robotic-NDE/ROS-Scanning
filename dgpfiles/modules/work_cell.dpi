@@ -1,22 +1,22 @@
 # ==============================================================================
-# WHERE THE WORK HAPPENS -- ONE BOX, READ FROM THE CELL MANIFEST
+# WHERE THE WORK HAPPENS -- ONE BOX, READ FROM THE WORK-CELL MANIFEST
 # ==============================================================================
 # The volume parts are placed inside. Everything outside it is cropped, by every
 # stage, always.
 #
-# It is not defined here. It is `work_volume:` in the cell manifest that
-# tari_bringup already uses to describe the cell -- per mode, because the
+# It is not defined here. It is `work_volume:` in the work-cell manifest that
+# tari_bringup already uses to describe the work cell -- per mode, because the
 # simulated cell and the real cell are different rooms -- and this module is the
 # one place that reads it, so a stage cannot quietly disagree with the bring-up
-# about where the cell is.
+# about where the work cell is.
 #
 # WHY IT EXISTS AT ALL. Without it every stage invents a crop from whatever it
 # happens to know, and those crops accumulate: a pad around a detected region
 # that swallows the part in table (30 k vertices of plate against 107 k of
 # table); a z floor guessed from the detected surface; a correction to that floor
 # when it clips the part's low steps; a support-z cutoff documented as a property
-# of the cell that is really a property of the specimen. None of that is about
-# the part. One declared box replaces all of it.
+# of the work cell that is really a property of the specimen. None of that is
+# about the part. One declared box replaces all of it.
 #
 # WHAT IT IS NOT. It bounds the WORK VOLUME, not the part. Its floor sits just
 # above the surface parts rest on, so the bench is cropped and parts on it are
@@ -825,7 +825,7 @@ def describe_work_volume():
 
 
 # ==============================================================================
-# THE CELL'S OWN SPEED CURVE
+# THE WORK CELL'S OWN SPEED CURVE
 # ==============================================================================
 # A MoveIt velocity scaling is a fraction of the arm's JOINT limits, not a speed.
 # The technician's control is in mm/s, so something has to convert, and the
@@ -833,13 +833,13 @@ def describe_work_volume():
 # the robot model. capture_robot_velocity() (cell_capture_scenarios.dpi) flies a
 # ladder of speeds and records the pair.
 #
-# IT BELONGS IN THE CELL MANIFEST, for the same reason the work volume and the
-# cable envelope do: the manifest travels with the cell and the capture file does
-# not. A number that lives only in a config is transcribed by hand every time,
-# and a number transcribed by hand is a number that is eventually not
+# IT BELONGS IN THE WORK-CELL MANIFEST, for the same reason the work volume and
+# the cable envelope do: the manifest travels with the work cell and the capture
+# file does not. A number that lives only in a config is transcribed by hand every
+# time, and a number transcribed by hand is a number that is eventually not
 # transcribed -- the pipeline then converts through a curve measured somewhere
 # else, commands the wrong scaling, and the arm sweeps at a speed nobody asked
-# for. That has already cost a scan.
+# for.
 #
 # PER MODE, and never substituted across modes. A simulated curve applied to real
 # hardware is exactly the failure above; a mode that declares none gets None here
@@ -873,7 +873,7 @@ def robot_velocity_calibration(cell=None, mode=None, quiet=False):
     # envelope uses, and for the same reason. A session on the machine that just
     # ran capture_robot_velocity() should use what it measured, with no edit and no
     # restart; every other machine uses the manifest, which is what travels with
-    # the cell. Without this the operator has to hand-edit a file before the
+    # the work cell. Without this the operator has to hand-edit a file before the
     # measurement they just took has any effect, which is the step that gets
     # skipped.
     locate = globals().get("_robot_velocity_file")
@@ -1049,12 +1049,12 @@ def describe_robot_velocity(fallback=None, pass_length_m=None):
 # ==============================================================================
 # WHAT SOFTWARE IS ACTUALLY RUNNING
 # ==============================================================================
-# The cell, the container and a developer's host run different builds of the same
-# stack, and the differences are invisible until they cost a run. A dataguzzler
-# install eighteen months behind the workspace produced a KeyError inside the
-# Ctrl-C handler -- a fault that had been fixed long before, in a traceback that
-# named none of this. A compiled extension older than the library it links
-# against produces a segfault instead.
+# The work cell, the container and a developer's host run different builds of the
+# same stack, and the differences are invisible until they cost a run. A
+# dataguzzler install eighteen months behind the workspace produced a KeyError
+# inside the Ctrl-C handler -- a fault that had been fixed long before, in a
+# traceback that named none of this. A compiled extension older than the library
+# it links against produces a segfault instead.
 #
 # None of that is diagnosable after the fact from a log that does not say what was
 # loaded. So a config prints this at startup: the version of each thing that
@@ -1232,7 +1232,7 @@ def _light_switch(pin, on, what):
 
 
 def warning_light(what="automated motion"):
-    """Hold the cell's warning light ON for a block of automated motion.
+    """Hold the work cell's warning light ON for a block of automated motion.
 
         with warning_light("Keyence raster"):
             ...

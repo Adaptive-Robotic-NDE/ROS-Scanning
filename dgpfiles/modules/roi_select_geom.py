@@ -463,8 +463,8 @@ def bounding_region(verts, mask=None):
     # A NON-FINITE VERTEX COSTS ITSELF AND NOT THE REGION. The reconstruction's
     # own smoothing emits a handful of NaN vertices per mesh, and one of them
     # inside a selection would otherwise make every number downstream NaN --
-    # including the cell index selection_region() floors, which is then an error
-    # rather than a wide region.
+    # including the grid cell index selection_region() floors, which is then an
+    # error rather than a wide region.
     if len(sel):
         sel = sel[np.isfinite(sel[:, :2]).all(axis=1)]
     if not len(sel):
@@ -522,7 +522,7 @@ def region_mask(verts, region):
 #     motion, and motion is never grown past what was taught. The clip is HERE,
 #     on the one rectangle an operator's drawing produces, rather than left to
 #     whatever plans the raster.
-#   3 IT IS CHECKED AGAINST THE LINE SPACING, not against the cell size. A
+#   3 IT IS CHECKED AGAINST THE LINE SPACING, not against the grid cell size. A
 #     rectangle too narrow to hold SELECTION_MIN_LINES passes is not a scan, and
 #     the operator hears that while the window is open and the selection is
 #     still theirs to redraw -- not from the reconstruction a minute and a half
@@ -831,8 +831,8 @@ def _footprint_cells_from_tris(verts, tris, cell):
     tri = verts[tris][:, :, :3]
     # A NaN corner would floor() to INT_MIN and ask for a grid the size of the
     # integers, and the reconstruction does emit a handful of NaN vertices per
-    # mesh. Only x and y decide that: a NaN z costs the cell its height, not its
-    # place.
+    # mesh. Only x and y decide that: a NaN z costs the grid cell its height, not
+    # its place.
     good = np.isfinite(tri[:, :, :2]).all(axis=(1, 2))
     if not good.all():
         tri = tri[good]

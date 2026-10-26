@@ -304,7 +304,7 @@ CAL_ARTIFACT_TABLE_EXTENT = 0.30
 
 #: The LJ-V7080's SPECIFIED reference distance, metres, and the same number as
 #: keyence_ref_dist in lj_v7080_macro.xacro and KEYENCE_REF_DIST_M in
-#: keyence_standoff.dpi. Used for exactly one thing -- reading the cell's
+#: keyence_standoff.dpi. Used for exactly one thing -- reading the work cell's
 #: keyence_ref_dist_cal back out of live TF, since TF publishes only the sum.
 #: A cell that has fitted a different head changes it in all three places.
 CAL_KEYENCE_REF_DIST = 0.080
@@ -595,7 +595,7 @@ CAL_AZURE_DISTANCE = 0.55
 
 #: WHICH DEPTH verify_calibration() compares against the Keyence.
 #:
-#: The cell feeds it REGISTERED depth -- /azure/depth_to_rgb/image_raw with
+#: The work cell feeds it REGISTERED depth -- /azure/depth_to_rgb/image_raw with
 #: /azure/rgb/camera_info, which is depth resampled into the COLOUR camera's
 #: frame through the K4A's factory depth-to-colour extrinsics. That resampling
 #: has never been tested against the alternative, and it is a plausible place
@@ -748,7 +748,7 @@ global CAL_VERIFY_TILT_BLOCKS
 CAL_VERIFY_TILT_BLOCKS = 4
 
 #: The IR amplitude image. DELIBERATELY A CONSTANT AND NOT sensor_topic():
-#: the cell manifest declares colour, depth, camera_info and points for the
+#: the work-cell manifest declares colour, depth, camera_info and points for the
 #: Azure and has never needed the IR image, and sensor_topic() raises on
 #: hardware for a key the manifest does not carry.
 #:
@@ -1966,11 +1966,11 @@ def _cal_fly_to(p, label=None, routes=None):
 # The dataset on disk -- written as it is collected, not at the end
 # ------------------------------------------------------------------------------
 # THE FILE IS THE DELIVERABLE, not the solve. A calibration run is half an hour
-# of arm time and a trip to the cell; the arithmetic afterwards is seconds and
-# can be repeated as often as anybody likes. So the expensive half is committed
-# to disk the moment it exists, one file per pose, and the solve reads it back
-# -- in the same process on a good day, in another process next week on a bad
-# one.
+# of arm time and a trip to the work cell; the arithmetic afterwards is seconds
+# and can be repeated as often as anybody likes. So the expensive half is
+# committed to disk the moment it exists, one file per pose, and the solve reads
+# it back -- in the same process on a good day, in another process next week on
+# a bad one.
 #
 # THE SHAPE IS THE ONE THE OFFLINE TOOLING ALREADY CONSUMES: labels, G (world
 # -> probe_end, 4x4 per pose), X_urdf (probe_end -> the sensor frame as the
@@ -3745,8 +3745,8 @@ def _cal_verify_why(out, bright=None):
              "error, not a pose error. Re-running calibrate_azure() will not "
              "move it: a hand-eye solve fixes where the camera is, not what "
              "its depth returns." % (dz,))
-    # TWO LINES, because the operator reads these standing at the cell. Do not
-    # add a reassurance that the Azure is better on real parts: the only
+    # TWO LINES, because the operator reads these standing at the work cell. Do
+    # not add a reassurance that the Azure is better on real parts: the only
     # measurement that ever suggested it came off a patch with a 36% return
     # rate, against eight measurements reading -11.6 to -13.6 mm.
     L.append("  this cell's standing disagreement is -12.45 mm, sd 0.68 mm over "
@@ -4249,12 +4249,12 @@ def verify_calibration(point=None, patch=None, tol_mm=None, tilt_mrad=None,
 # ------------------------------------------------------------------------------
 
 def _cal_site_package():
-    """The per-cell tari_site package name for this cell."""
+    """The per-cell site package name for this cell."""
     return "tari_cell_" + str(CELL_NAME).replace("-", "_")
 
 
 def _cal_site_urdf_dir():
-    """(the cell package's SOURCE urdf directory, how it was found), or (None, why).
+    """(the work cell package's SOURCE urdf directory, how it was found), or (None, why).
 
     The file has to land in the SOURCE tree, not in the install tree, or the
     next colcon build throws the calibration away. Three routes, in order:
@@ -4471,7 +4471,7 @@ def _cal_correction_in_force(sensor):
 
 
 def _cal_deployed_file():
-    """The cell package's own sensor_calibration.urdf.xacro, or None."""
+    """The work cell package's own sensor_calibration.urdf.xacro, or None."""
     try:
         d, _how = _cal_site_urdf_dir()
     except Exception:                                    # noqa: BLE001
@@ -4698,7 +4698,7 @@ def write_calibration(sensor, res, frame, take=None, force=False):
 
 
 def deploy_calibration(dest=None):
-    """Copy the drop-in file into the cell's tari_site package. One command.
+    """Copy the drop-in file into the work cell's site package. One command.
 
     Does the copy and nothing else -- no build, no restart, no TF. Those are
     the operator's, deliberately: a rebuild takes a minute and a restart takes

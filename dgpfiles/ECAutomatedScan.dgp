@@ -122,17 +122,17 @@ RECDB_TRANSACTION_MANAGER = "timed"
 # without trouble, the window is latency the correlation pays on every reading,
 # and nothing measured here is a reason to widen it there.
 #
-# WIDER IN SIMULATION, because this machine is not the cell PC. One simulated
-# scan reported 33 late transactions since startup, worst 25.4 ms older than its
-# predecessor -- committed, but with their globalrev timestamps out of order --
-# and the manager refused 22 more at the door. Of those refusals only 2 were the
-# simulated instrument (which counts them as dropped samples and carries on);
-# the rest belonged to other producers. That is what an eight-core box running
-# Gazebo, RViz, MoveIt, the profiler, the reconstruction and the acquisition all
-# at once does to thread scheduling, and it is a property of this bench rather
-# than of the pipeline.
+# WIDER IN SIMULATION, because this machine is not the controlling computer. One
+# simulated scan reported 33 late transactions since startup, worst 25.4 ms older
+# than its predecessor -- committed, but with their globalrev timestamps out of
+# order -- and the manager refused 22 more at the door. Of those refusals only 2
+# were the simulated instrument (which counts them as dropped samples and carries
+# on); the rest belonged to other producers. That is what an eight-core box
+# running Gazebo, RViz, MoveIt, the profiler, the reconstruction and the
+# acquisition all at once does to thread scheduling, and it is a property of this
+# bench rather than of the pipeline.
 #
-# Overridable so a bench can be told to behave like the cell:
+# Overridable so a bench can be told to behave like the production system:
 #     TARI_TRANSACTION_LATENCY=0.02 dataguzzler-python ...
 #
 # Read from the ENVIRONMENT rather than from CELL_MODE, which is not defined
@@ -186,10 +186,10 @@ live_pose = ros.live_pose
 # ==============================================================================
 # WHICH CELL, AND IN WHICH MODE
 # ==============================================================================
-# The cell manifest under tari_bringup already describes the robot, the sensors
-# and the topics; naming it here lets this config read that description instead
-# of repeating it. What it reads is the WORK VOLUME -- the box parts are placed
-# inside, which every reconstruction and every toolpath planner crops to.
+# The work-cell manifest under tari_bringup already describes the robot, the
+# sensors and the topics; naming it here lets this config read that description
+# instead of repeating it. What it reads is the WORK VOLUME -- the box parts are
+# placed inside, which every reconstruction and every toolpath planner crops to.
 #
 # Without it each stage invents its own crop from whatever it happens to know
 # and gets it wrong differently each time. modules/work_cell.dpi refuses rather
@@ -199,7 +199,7 @@ CELL_NAME = os.environ.get("TARI_CELL_NAME") or "ex-ur10e-1"
 # environment is what lets the wiring that only runs at load time -- the cable
 # guard, the supervisor, the band handed to the motion module -- be rehearsed
 # against the simulated cell without editing this file. The DEFAULT is
-# hardware, so a cell PC that sets nothing runs as hardware.
+# hardware, so a controlling computer that sets nothing runs as hardware.
 CELL_MODE = os.environ.get("TARI_CELL_MODE") or "hardware"
 
 # The transaction window was chosen from the same environment variable before
@@ -314,10 +314,10 @@ EC_IMAG_PATH = "/%s/%s" % (EC_DAQ_DEVICE, EC_CHANNELS[1])
 # any of that, because it refuses the scan instead of running it.
 #
 # Overridable by the EC_SOURCE environment variable so that a simulation run
-# does not need this file edited. The cell PC gets ROS-Scanning by hand copy (no
-# git yet), so a local edit made to test in simulation travels to the cell on
-# the next copy. An environment variable leaves the file that reaches the arm
-# saying "hardware".
+# does not need this file edited. The controlling computer gets ROS-Scanning by
+# hand copy (no git yet), so a local edit made to test in simulation travels to
+# the production system on the next copy. An environment variable leaves the file
+# that reaches the arm saying "hardware".
 #
 #     EC_SOURCE=sim dataguzzler-python dgpfiles/ECAutomatedScan.dgp
 EC_SOURCE = os.environ.get("EC_SOURCE", "hardware")
@@ -370,8 +370,8 @@ EC_PLATE = os.environ.get("EC_PLATE", "")
 # axis, degrees. NOT KNOWN for the real probe -- it is a pencil probe in a
 # holder and its rotation about its own axis was never recorded -- and it
 # matters, because it decides which tilt is the dangerous one and rotates every
-# notch's apparent orientation by the same amount. Measuring it is on the cell
-# visit plan. Zero means the coils lie along probe_end x.
+# notch's apparent orientation by the same amount. It still has to be measured on
+# the production visit plan. Zero means the coils lie along probe_end x.
 EC_COIL_AXIS_DEG = float(os.environ.get("EC_COIL_AXIS_DEG", "0.0"))
 
 # Instrument output scale, volts per ohm, and None to take the model's own
@@ -525,7 +525,7 @@ RASTER_ACCEL = 0.05
 # constant factor -- it is a curve. Measured on this cell IN SIMULATION:
 # commanded, observed. Every speed below goes through it (motion_scaling()),
 # so on hardware 10 mm/s is only as right as this table: re-measure it there
-# (technician-scan-controls skill) and read the observed speed the dry run and
+# and read the observed speed the dry run and
 # every scan report.
 ROBOT_VELOCITY_CALIBRATION = [
     (0.0050, 0.0079),
@@ -558,8 +558,8 @@ NEAR_PART_SPEED = 0.010          # m/s: the sweep, and every move onto or off th
 # that matter most are JOINT_MOVE_SCALING and EC_AXIS_SPEED below. Do not raise
 # those from a guess: the numbers justifying them are simulated peak speeds, and
 # simulation says 0.020 joint scaling already peaks at 55 mm/s -- over the limit.
-# The cell may well be slower than that and have room, but "may well be" is not
-# a measurement, and the thing being bounded is tip speed near a part.
+# The production robot may well be slower than that and have room, but "may well
+# be" is not a measurement, and the thing being bounded is tip speed near a part.
 TRANSIT_SPEED = 0.040
 
 # A contact probe reaches and leaves the surface only along its own axis
@@ -631,7 +631,7 @@ WARNING_LIGHT_PIN = 0
 WARNING_LIGHT_REQUIRED = None
 
 # Where the arm goes to look for the part, and where it is left at the end: a
-# named state in the cell's SRDF (tari_cell_ex_ur10e_1). None = do not move
+# named state in the work cell's SRDF (tari_cell_ex_ur10e_1). None = do not move
 # there.
 DETECT_POSE = "over_table"
 PARK_POSE = "over_table"
@@ -945,8 +945,8 @@ EC_CLEAN_PLANNING_MESH = True
 #     certified, 366 MB peak. Two things it depends on: cores (the distance
 #     kernel is threaded -- see SURFACE_QUERY_WORKERS) and how much of the path
 #     runs close to the limit, since that is what the sampler refines into. The
-#     cell PC is slower than the dev host, so leave headroom. Re-measure it if
-#     the tooling changes; it is a rate, not a law.
+#     controlling computer is slower than the dev host, so leave headroom.
+#     Re-measure it if the tooling changes; it is a rate, not a law.
 #
 #     THAT RATE IS THE SAMPLER'S, and only paths over
 #     TOOLING_GATE_SAMPLE_ABOVE poses get the sampler. A SHORTER path is
@@ -956,7 +956,7 @@ EC_CLEAN_PLANNING_MESH = True
 #     operator saw. The silence is fixed in tooling_clearance.dpi
 #     (TOOLING_GATE_PROGRESS_ABOVE); the price is fixed here. EC_GATE_SECONDS_PER_POSE_EXACT is that path's own measured
 #     rate: 231 s / 1749 poses over an 8254-triangle mesh with the probe in
-#     contact, on the cell's 48-thread Xeon. The estimate below picks the rate
+#     contact, on a 48-thread Xeon. The estimate below picks the rate
 #     that matches the gate that will actually run.
 NOETHER_POSE_SPACING_M = 0.00042
 NOETHER_POSE_REPLY_BYTES = 316
@@ -986,9 +986,10 @@ EC_CHECK_CLEARANCE = True
 # Stage 2a of run_automated_scan() gauges the rough mesh against the Keyence and
 # refuses stage 3 when they are more than AZURE_GAUGE_MAX_MM apart, because that
 # disagreement is subtracted straight off the profiler's standoff: a 13.6 mm
-# disagreement has cost 26-39% of a 10 inch plate. This is the deliberate "I
-# know, fly it anyway" for an unattended run -- run_automated_scan(allow_azure_bias=True)
-# is the same override for one call. Same shape and same meaning as
+# disagreement has lost 26-39% of a 10 inch plate. This is the deliberate "fly
+# it anyway" override for an unattended run --
+# run_automated_scan(allow_azure_bias=True) is the same override for one call.
+# Same shape and same meaning as
 # SPECIMEN_ALLOW_DEAD_ZONE below.
 EC_ALLOW_AZURE_BIAS = False
 
@@ -1122,7 +1123,7 @@ KEYENCE_BACKEND = "pc"           # tari_pc_reconstruction; see the Phase B map
 # _KeyenceReconstruction.ORIENT untouched.
 
 #: How the Azure rough sweep is pointed. "z" is the straight-down dome at one
-#: fixed orientation -- what this cell has flown since the pan sweep was found
+#: fixed orientation -- what the sweep has flown since the pan sweep was found
 #: to orbit a plate whose sides cannot be reached. See reconstruct_rough() for
 #: the full history and for what "orbit" costs.
 AZURE_ORIENTATION = "z"
@@ -1179,7 +1180,7 @@ KEYENCE_ORIENT_FALLBACK = True
 #: is 90 deg wide, which is not enough room to fly a raster in.
 KEYENCE_NORMAL_MAX_TILT_DEG = 30.0
 #: Metres of tooling clearance a tilted waypoint must leave against the planning
-#: mesh. None means TOOLING_CLEARANCE_M, the cell-wide default the untilted
+#: mesh. None means TOOLING_CLEARANCE_M, the global default the untilted
 #: raster is already held to.
 KEYENCE_NORMAL_CLEARANCE_M = None
 #: Degrees of wrist-3 travel the measured cable band must STILL leave at a
@@ -1212,12 +1213,12 @@ SCAN_ORIGIN = (0.75, -0.35)
 
 # --- recording ----------------------------------------------------------------
 RECORD_TRACE_LIST = True
-# Where scans are written. NOT a hardcoded home directory: the cell PC runs
-# under a different account and writes to /data/scandata, so a path like
-# "/home/user/scandata" is unwritable there and a session dies with
+# Where scans are written. NOT a hardcoded home directory: the controlling
+# computer runs under a different account and writes to /data/scandata, so a path
+# like "/home/user/scandata" is unwritable there and a session dies with
 # PermissionError before anything can be recorded. Same resolution order as
 # the capture tool's CAPTURE_ROOT (cell_capture_node.dpi): what the site says,
-# then the mount the cell actually has, then this account's own home.
+# then the mount the work cell actually has, then this account's own home.
 SCAN_STORAGE_DIR = (os.environ.get("TARI_SCANDATA")
                     or os.environ.get("SCANDATA_ROOT")
                     or ("/data/scandata" if os.path.isdir("/data/scandata")
@@ -1341,10 +1342,10 @@ include(None, os.path.join(SCAN_MODULE_DIR, "scan_parameters.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_plan.dpi"))
 include(None, os.path.join(SCAN_MODULE_DIR, "scan_accumulation.dpi"))
 
-# THE CELL'S MEASURED SPEED CURVE REPLACES THE ONE ABOVE, when the manifest has
-# one. Here, after scan_parameters.dpi and scan_plan.dpi, because those are what
-# consume it -- and before anything plans, so nothing converts a speed through the
-# transcribed table first. The config's own value stays as
+# THE WORK CELL'S MEASURED SPEED CURVE REPLACES THE ONE ABOVE, when the manifest
+# has one. Here, after scan_parameters.dpi and scan_plan.dpi, because those are
+# what consume it -- and before anything plans, so nothing converts a speed
+# through the transcribed table first. The config's own value stays as
 # ROBOT_VELOCITY_CALIBRATION_CONFIG.
 adopt_measured_velocity_curve()
 # The Keyence's measuring window, and the three checks that keep the sensor
@@ -1379,12 +1380,12 @@ SCAN_LIMITS = dict(DEFAULT_LIMITS)
 
 # EXCEPT THE LIVE TRACE RATE, IN SIMULATION ONLY.
 #
-# The measured 10.0 traces/s in DEFAULT_LIMITS is the ultrasound pipeline's
-# number on the cell PC. This bench is not that machine: it runs Gazebo, RViz,
-# MoveIt, the simulated profiler, the reconstruction and the acquisition on
-# eight cores, and the staging queue has backed up on every simulated scan so
-# far -- to 29 at a planned 10 traces/s, and still to 31 at 6.2, which is the
-# scan's own report saying the ceiling is above what this machine can hold.
+# The measured 10.0 traces/s in DEFAULT_LIMITS is the ultrasound pipeline's number
+# on the controlling computer. This bench is not that machine: it runs Gazebo,
+# RViz, MoveIt, the simulated profiler, the reconstruction and the acquisition on
+# eight cores, and the staging queue has backed up on every simulated scan so far
+# -- to 29 at a planned 10 traces/s, and still to 31 at 6.2, which is the scan's
+# own report saying the ceiling is above what this machine can hold.
 #
 # 6.2 was never this constant, incidentally: it is the TRANSACTION_LATENCY
 # floor. waits_per_trace["live"] is 2, so the sim window of 0.08 s caps the rate
@@ -1392,9 +1393,10 @@ SCAN_LIMITS = dict(DEFAULT_LIMITS)
 # out-of-order commits cost trace rate directly, and this constant has to come
 # below the floor to bind at all.
 #
-# HARDWARE IS UNTOUCHED. The cell PC has not shown this and its 10.0 is a
-# measurement; a simulated number must not travel there, which is the same rule
-# the velocity curve in the cell manifest follows and for the same reason.
+# HARDWARE IS UNTOUCHED. The controlling computer has not shown this and its 10.0
+# is a measurement; a simulated number must not travel there, which is the same
+# rule the velocity curve in the work-cell manifest follows and for the same
+# reason.
 if CELL_MODE != "hardware":
     SCAN_LIMITS["max_trace_rate_hz"] = dict(SCAN_LIMITS["max_trace_rate_hz"])
     SCAN_LIMITS["max_trace_rate_hz"]["live"] = float(
@@ -1517,9 +1519,9 @@ elif EC_SOURCE != "none":
 # front panel before or after this config starts, in either order. Nothing here
 # ever writes a setting -- the null is the only command this config sends.
 #
-# THAT DEPENDS ON THE INSTALLED DRIVER, NOT ON THIS FILE. An older
-# dgpython-uniwest switches all five instrument channels off as it opens, and the
-# instrument then looks correctly configured on its front panel while the DAQ
+# THAT DEPENDS ON THE INSTALLED DRIVER, NOT ON THIS FILE. An older driver for the
+# ultrasound instrument switches all five instrument channels off as it opens, and
+# the instrument then looks correctly configured on its front panel while the DAQ
 # reads nothing. A flat scan with a healthy-looking instrument is that: check the
 # channel is on, and check the installed driver against the source (the startup
 # banner prints the version and the path of everything loaded).
@@ -1949,7 +1951,7 @@ def _check_contact_speed():
 
 global move_to_named_pose
 def move_to_named_pose(name):
-    """Joint move to a named state in the cell's SRDF. Raises if refused.
+    """Joint move to a named state in the work cell's SRDF. Raises if refused.
 
     Holds the warning light itself, so it is on even when this is called from
     the prompt rather than from a stage (holds nest; see warning_light()).
@@ -3272,7 +3274,7 @@ def ec_plan_cost(region=None, line_spacing=None, mesh=None, step_m=None,
     # two cost about 80x different per pose -- so one rate cannot price both.
     # The counter-intuitive consequence is that a SMALLER region can plan for
     # far longer than a bigger one, and that is worth printing rather than
-    # discovering at the cell.
+    # discovering on the production system.
     gate_sampled = waypoints > int(globals().get("TOOLING_GATE_SAMPLE_ABOVE",
                                                  2000))
     gate_seconds = waypoints*(EC_GATE_SECONDS_PER_POSE if gate_sampled
@@ -3363,7 +3365,7 @@ def preview_ec_scan(path=None):
         # NOTHING PLANNED YET, which is exactly when the operator most needs
         # this. Price the area from the three technician controls instead: it
         # takes no toolpath, no planner and no robot, and it is the answer to
-        # "can I scan this at 0.30 mm?" before half an hour is spent finding
+        # "is this scannable at 0.30 mm?" before half an hour is spent finding
         # out. plan_ec_path() runs the same check and refuses on it.
         print("  no toolpath planned yet -- pricing the area from the current "
               "settings instead (plan_ec_path() will build it)")
@@ -3933,9 +3935,9 @@ def run_automated_scan(index=0, scan=True, cutoff=None, line_spacing=None,
             # DETECTION IS OVER. Everything from here -- two reconstruction
             # sweeps, a mesh filter, a Noether plan, the clearance gate -- is
             # the expensive half, and it is where a run gets OOM-killed.
-            # yolo_node has been measured at 646% of one core at the cell and
-            # still holds 400% after detection has finished, with its model
-            # loaded and its image subscription live. Release it here, once,
+            # yolo_node has been measured at 646% of one core on the production
+            # system and still holds 400% after detection has finished, with its
+            # model loaded and its image subscription live. Release it here, once,
             # whichever branch above ran: a region given by hand never touches
             # the detector at all, so it never turns it off either, which is how
             # a run with no detection still pays for one.
@@ -4253,12 +4255,12 @@ except Exception as _e:
           "(%s); IK will not reseed out-of-band solutions." % (_e,))
 
 print("ECAutomatedScan ready.")
-# WHAT IS ACTUALLY LOADED, with the path each component came from. The cell, the
-# container and a developer's host run different builds of this stack, and the
-# differences do not announce themselves: an install behind the workspace shows up
-# as a fault that was fixed long ago, and a compiled extension older than the
-# library it links against shows up as a segfault. Neither is diagnosable from a
-# log that does not say what was imported.
+# WHAT IS ACTUALLY LOADED, with the path each component came from. A production
+# system, a container and a developer's machine run different builds of this
+# stack, and the differences do not announce themselves: an installed copy older
+# than the source shows up as a fault that was fixed long ago, and a compiled
+# extension older than the library it links against shows up as a segfault.
+# Neither is diagnosable from a log that does not say what was imported.
 try:
     print(describe_software_versions())
 except Exception as _e:                                       # noqa: BLE001
@@ -4275,7 +4277,7 @@ try:
 except Exception as _e:
     print("  work volume: unavailable (%s)" % (_e,))
 # AND THE SAFE MOTION VOLUME, because what it permits is the whole reason a
-# tilted sensor pose can be flown at all. Silent when the cell declares none,
+# tilted sensor pose can be flown at all. Silent when the work cell declares none,
 # which is the honest state for a room nobody has walked -- and that silence
 # means "the motion volume bounds navigation, as it always did".
 try:

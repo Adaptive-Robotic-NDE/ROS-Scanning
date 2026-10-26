@@ -1,4 +1,4 @@
-# Cell visit procedure
+# Site visit procedure
 
 What to set, what to run, and what to check, for the next eddy-current scan at
 cell ex-ur10e-1. Undated: nothing here goes stale with time, only with the next
@@ -16,7 +16,7 @@ Three things this procedure exists to hold in place:
 
 ## 1. Deploy
 
-From the workspace root on the cell PC:
+From the workspace root on the controlling computer:
 
 ```bash
 ./tari.bash --layer site
@@ -26,13 +26,13 @@ That is the whole deployment. Do not install a package by hand -- the layer
 chain fetches the manifests, builds and verifies, and it is idempotent, so
 running it again is the way to fix a partial state.
 
-## 2. Bring the cell up
+## 2. Bring the work cell up
 
 ```bash
 ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=hw
 ```
 
-From the cell PC's own desktop session, so `DISPLAY` is already set. Then check
+From the controlling computer's own desktop session, so `DISPLAY` is already set. Then check
 that the pieces are there rather than assuming:
 
 ```bash

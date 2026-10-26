@@ -124,7 +124,7 @@ callouts get added afterwards, deliberately, by whoever is making the argument.
 `Peak Position Along` / `Across` until 2026-10-17, and before that they were the world grid's
 x and y — where which of them was "along" depended on how the part happened to be lying.
 EASEL caches the property list per executable path, so it keeps offering the old pair until
-it is restarted, and the `.norms` files already written at the cell keep the old names.
+it is restarted, and the `.norms` files already written on the production system keep the old names.
 
 **Read the conditioned figure's right pane, not the raw ones.** Lift-off
 is what the probe does riding over an imperfect surface and it is far larger than any flaw, so
@@ -152,7 +152,7 @@ meaningful while the instrument's front-panel rotation is unchanged.
 
 The two DAQ channel paths are recorded as `Horizontal Channel` and `Vertical Channel`. They
 were `Real Channel` and `Imaginary Channel` until 2026-10-15 and carried the same misreading;
-the `.norms` written at the cell on that date still uses the old names, and nothing rewrites
+the `.norms` written on the production system on that date still uses the old names, and nothing rewrites
 it. The scan's own saved metadata still calls them `real_path` and `imag_path` — that is
 deliberately left alone, so the plug-in keeps reading scans recorded before the rename, and
 the translation happens on the way out.

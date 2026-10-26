@@ -53,7 +53,7 @@
 #
 #
 #########################################################################
-"""Why is RViz slow? Measure it, instead of guessing at the cell.
+"""Why is RViz slow? Measure it, instead of guessing on the production system.
 
 The failure this is built around: RViz is usable all session and then, from the
 Keyence measurement onward, renders about one frame every few seconds and never
@@ -106,7 +106,8 @@ import re
 import sys
 import time
 
-#: Where the shipped config lives on a cell PC. Overridable on the command line.
+#: Where the shipped config lives on a controlling computer. Overridable on the
+#: command line.
 DEFAULT_CONFIG = (
     "ros_ws/src/tari_ros/tari_ur_description/rviz/view_robot.rviz")
 
@@ -119,13 +120,13 @@ BYTES_PER_POINT = 303.0
 
 
 # ==============================================================================
-# /proc, so there is no psutil dependency on a cell PC
+# /proc, so there is no psutil dependency on a controlling computer
 # ==============================================================================
 
 def find_pid(name="rviz2"):
     """The PID of the running RViz, or None. Matches the executable, not the
     command line -- matching a command line is how a probe kills its own
-    shell (see the ros2-container skill)."""
+    shell."""
     for d in os.listdir("/proc"):
         if not d.isdigit():
             continue

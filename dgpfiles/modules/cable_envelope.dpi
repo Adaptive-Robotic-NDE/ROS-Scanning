@@ -111,7 +111,7 @@
 # tooling_clearance.dpi.
 #
 # Pure model, no ROS, no robot, no dgpy: cable_envelope_test.py runs the whole
-# of it on the host with numpy.
+# of it with numpy alone.
 
 # Each .dpi is its own function body: another part's imports are not visible,
 # and anything the including config must see is declared global before it is
@@ -177,7 +177,7 @@ _CABLE_WARNED = []
 #: about the pose in hand refuses moves the cables can hold.
 #:
 #: Raise it from the prompt if a specific loom needs it, and say why in the
-#: capture session notes. Pass margin_deg= to one call to narrow just that one.
+#: notes of the capture. Pass margin_deg= to one call to narrow just that one.
 CABLE_ENVELOPE_MARGIN_DEG = 0.0
 
 #: How far a commanded tilt may sit outside the measured hull and still be
@@ -839,7 +839,7 @@ def cable_envelope_document(rows, **kw):
 
 
 def cable_envelope_manifest_block(model=None, mode=None):
-    """The `cable_envelope:` YAML for the cell manifest, ready to paste.
+    """The `cable_envelope:` YAML for the work-cell manifest, ready to paste.
 
     The measurement file lives under CAPTURE_ROOT on whichever machine ran the
     test, and no other machine can see it. The manifest travels with the cell,
@@ -892,7 +892,7 @@ def _cable_envelope_from_doc(doc, source=None):
 
 
 def _cable_envelope_from_manifest(cell=None, mode=None):
-    """(model, where) from the cell manifest's `cable_envelope:` block.
+    """(model, where) from the work-cell manifest's `cable_envelope:` block.
 
     THE MANIFEST IS THE DEFAULT SOURCE. A fresh dgpy session has to know the
     band without the operator re-running a 40 minute wrist test, which is
@@ -983,7 +983,7 @@ def load_cable_envelope(path_or_dict=None, quiet=True):
     # reloads from the DEFAULT locations, and overwrites what was just asked for.
     #     load_cable_envelope("/path/to/a/fresh/measurement.json")
     # would then appear to work and silently do nothing, which is exactly what an
-    # operator reaches for at the cell after re-measuring.
+    # operator reaches for on the production system after re-measuring.
     _CABLE_LOOKED[0] = True
     if not quiet:
         if model is None:

@@ -76,7 +76,7 @@
 #       - BEFORE: the MoveIt scaling is bounded from the joint velocity limits
 #         MoveIt itself applies (read from mtc_hub_node), through IK along a
 #         Cartesian path or FK along a joint move, so no checked point of the
-#         tooling can exceed 0.8-0.85 x the limit; the cell's velocity
+#         tooling can exceed 0.8-0.85 x the limit; the work cell's velocity
 #         calibration can only make it slower;
 #       - DURING: the tool's speed is measured from TF, in TF's own stamps; above
 #         CAPTURE_OVERSPEED_FACTOR x the limit the arm is STOPPED (UR program
@@ -237,7 +237,7 @@ def _cap_densify(points, step=0.005):
 
 
 def capture_envelope():
-    """Where the ARM may go: the motion volume when the cell declares one, else
+    """Where the ARM may go: the motion volume when the work cell declares one, else
     the work volume's x/y from its floor up to CAPTURE_ABOVE_VOLUME over its top.
     None when no volume is declared at all.
 
@@ -348,7 +348,7 @@ def _scaling_for(speed):
 
 
 def _speed_of_scaling(s):
-    """The tool speed a MoveIt scaling produces, from the cell's calibration
+    """The tool speed a MoveIt scaling produces, from the work cell's calibration
     (commanded scaling -> observed m/s), for capping a scaling pipeline code
     asked for. Below the table: its first ratio; above it: its last slope --
     the curve saturates, so this errs slow, which is the safe way round."""
@@ -988,7 +988,7 @@ def capture_move(poses, label, speed=None, scaling=None, min_fraction=1.0,
     # it goes, and the tightest tilt is not always the one at the end.
     _check_wrist3(qs, label, quats=[q for _x, q in path])
     s_bound, full_scale = _cartesian_scaling_bound(path, qs, v)
-    # THE PATH'S OWN KINEMATICS DECIDE THE SCALING, not the cell-wide velocity
+    # THE PATH'S OWN KINEMATICS DECIDE THE SCALING, not the work-cell-wide velocity
     # curve, whenever IK along the path succeeded (full_scale is not None).
     #
     # NOT min(curve, bound): that makes every move as slow as the more
@@ -1000,7 +1000,7 @@ def capture_move(poses, label, speed=None, scaling=None, min_fraction=1.0,
     # long way for very little tip motion and `full_scale` falls to 0.26 m/s
     # against the 2-4 m/s of a row.
     #
-    # MEASURED OVER 50 Cartesian moves at the cell:
+    # MEASURED OVER 50 Cartesian moves on the production system:
     #   where the bound already bound (verify, pipeline)  0.85..0.94 x commanded
     #   where the curve bound     (keyence and azure cal) 0.12..0.67 x commanded
     # -- 14 keyence calibration moves flew at a median 0.30 of the 10 mm/s they
@@ -2072,7 +2072,7 @@ class _CableGuardedRos(object):
 
 
 def install_cable_guard(quiet=False):
-    """Put the cable guard in front of `ros` for the rest of this session.
+    """Put the cable guard in front of `ros` for the rest of this run.
 
     Idempotent. Called once from ECAutomatedScan.dgp after every module is
     loaded, so run_automated_scan() and everything it calls are covered without

@@ -1,4 +1,4 @@
-"""Where the cell's speed curve lives, and what happens when it does not.
+"""Where the work cell's speed curve lives, and what happens when it does not.
 
 WHY THIS MATTERS. A MoveIt velocity scaling is a fraction of the arm's JOINT
 limits, not a speed. The technician's control is mm/s, so every commanded speed
@@ -30,7 +30,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-#: The cell whose manifest this checks, and the mode the hardware curve is for.
+#: The work cell whose manifest this checks, and the mode the hardware curve is
+#: for.
 CELL = "ex-ur10e-1"
 #: The workspace root, found from this file rather than hardcoded: these
 #: suites run from a checkout that may live anywhere.

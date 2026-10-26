@@ -41,7 +41,7 @@ PLUGIN = os.path.normpath(os.path.join(HERE, "..", "..", "norms", "ec_scan_plugi
 
 # The sections EASEL owns. A plug-in property that lands in one of these
 # REPLACES what the operator typed on the form, so the plug-in must not use
-# them (SKILL.md section 3 rule 5).
+# them.
 EASEL_SECTIONS = {"Software", "Overview", "Data File Format", "Notes", "Sample",
                   "Probe", "Scan Classification", "Remote Backup", "JSON Parameters"}
 

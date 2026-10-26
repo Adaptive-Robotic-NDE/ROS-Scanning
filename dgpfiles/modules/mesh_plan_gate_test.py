@@ -212,7 +212,7 @@ def write_ply(path, v, n, t):
 
 
 def plate(name, nu=121, nv=121, bow=0.0):
-    """A plate over ground this cell can reach, at the real specimen's place.
+    """A plate over ground this work cell can reach, at the real specimen's place.
 
     121 x 121 over 120 x 120 mm is a 1.0 mm median edge -- the resolution a real
     Poisson reconstruction gives (0.98 mm), so a threshold that passes here
@@ -332,7 +332,7 @@ def test_one_defect_at_a_time():
           "one here would be refusing what the planner accepts")
     check(gate(plate("fine.ply", nu=81, nv=81))["verdict"] == "plan",
           "a 1.5 mm median edge plans with nothing to say")
-    # Out of the cell. A mesh authored about its own origin lands in the floor.
+    # Out of the work cell. A mesh authored about its own origin lands in the floor.
     vo = v - np.array([0.757, 0.030, 0.9245])
     origin_mesh = write_ply(os.path.join(TMP, "atorigin.ply"), vo, n, t)
     rep = gate(origin_mesh)

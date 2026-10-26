@@ -117,7 +117,7 @@ def _checked(fn):
     return wrapper
 
 def fresh():
-    """A supervisor with no ROS behind it, as on the host."""
+    """A supervisor with no ROS behind it, as where ROS is not sourced."""
     s = Supervisor()
     s.clear()
     return s

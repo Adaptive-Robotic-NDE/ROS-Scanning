@@ -26,7 +26,7 @@
 #   divides by 1000 unconditionally -- so in simulation it turns a 0.5 m
 #   standoff into 0.5 mm. The encoding says which, so read it.
 #
-# And the TOPICS are the cell manifest's (work_cell.dpi's sensor_topic), the
+# And the TOPICS are the work-cell manifest's (work_cell.dpi's sensor_topic), the
 # ones the bring-up gave yolo and the reconstruction. On hardware the depth
 # is depth_to_rgb, registered into the colour camera, because a detection's
 # pixels are colour pixels; the depth camera's own image is 640x576 and would
@@ -86,10 +86,10 @@ YOLO_ENABLE_SERVICE = YOLO_NS + "/enable"
 YOLO_DETECTIONS_TOPIC = YOLO_NS + "/detections"
 
 
-#: Session-wide overrides. None takes the cell manifest's Azure topics, which
-#: is what the bring-up pointed YOLO and the reconstruction at; each function
-#: also takes a per-call override. The detections come back stamped with the
-#: frame the image carried, so the frame is read off the detection rather
+#: Session-wide overrides. None takes the work-cell manifest's Azure topics,
+#: which is what the bring-up pointed YOLO and the reconstruction at; each
+#: function also takes a per-call override. The detections come back stamped with
+#: the frame the image carried, so the frame is read off the detection rather
 #: than named here.
 YOLO_COLOR_TOPIC = None
 YOLO_DEPTH_TOPIC = None
@@ -249,7 +249,7 @@ def release_yolo(deactivate=True, quiet=False):
 
     The detection is over long before the scan is; everything after it -- two
     reconstruction sweeps, a mesh filter, a Noether plan and the clearance gate
-    -- is the expensive half, and that is exactly when the cell can least afford
+    -- is the expensive half, and that is exactly when the work cell can least afford
     a detector holding four to six cores and a loaded model. Measured at
     ex-ur10e-1: yolo_node at 646% of one core, the largest single consumer in the
     cell, and 400% still held after detection had finished.

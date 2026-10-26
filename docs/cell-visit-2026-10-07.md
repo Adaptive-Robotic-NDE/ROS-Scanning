@@ -1,4 +1,4 @@
-# Cell visit, Wednesday 2026-10-07
+# Site visit, Wednesday 2026-10-07
 
 > **SUPERSEDED by `cell-visit-next.md`.** Its section 2 assumes a serpentine
 > raster and no tool-axis smoothing; both changed after `results21`, so the
@@ -7,7 +7,7 @@
 
 Written 2026-10-06 from `results20`. The previous plan asked for two
 measurements and got neither, for reasons that were mostly defects in this
-pipeline rather than in the cell. Those are fixed. **This plan has one
+pipeline rather than in the work cell. Those are fixed. **This plan has one
 objective — a working scan over the 0.040/0.060/0.080" notches — and everything
 else is either free or optional.**
 
@@ -83,7 +83,7 @@ a refusal naming what is wrong. **Any of the three is the gate working.** What
 must not happen any more is reaching `nulling the INSTRUMENT` and *then* failing.
 
 If it refuses at plan time: the arm has not moved and nothing is lost. Re-run
-`reconstruct_fine()` and plan again, and send me the refusal text.
+`reconstruct_fine()` and plan again, and record the refusal text.
 
 ---
 
@@ -134,8 +134,8 @@ p99 normal tilt of **2.5–2.9°**, so mesh noise alone contributes about **2 V*
 On the *small* notches at rotation 0 the response was 0.10–0.62 V. The larger
 notches are 2–16× deeper so they may well win — but if the image is a wash, that
 arithmetic is why, and the fix is to stop following per-vertex normals on a part
-we know is flat to 25 µm rms. Tell me and I will add the flat-normal planning
-option; the shape of it depends on what this scan shows.
+we know is flat to 25 µm rms. A flat-normal planning option is the remedy;
+the shape of it depends on what this scan shows.
 
 ---
 
@@ -161,7 +161,7 @@ and flew at 3.9, so asking for 20 may well produce 3.9 again and the whole
 delivered, and if it then flies at ~2 you have two speeds that differ by a real
 factor. Read the per-pass elapsed time, not the setting.
 
-`set_scan_velocity()` is new and **unproven at the cell** — a bare
+`set_scan_velocity()` is new and **unproven on the production system** — a bare
 `SCAN_VELOCITY = 0.004` at the prompt is the same trap as `EC_PRELOAD_M`, which
 is why it exists, but its reader lives in a different module from the two
 setters that are proven. So check it rather than trusting it, which costs five
@@ -174,16 +174,16 @@ scan_velocity()
 
 then **read the `velocity` line in the printed scan plan before confirming the
 run**. If the plan still says 10.0 mm/s, the setting did not reach the planner —
-tell me, and use the scan settings panel instead, which writes it the way the
+report it, and use the scan settings panel instead, which writes it the way the
 GUI always has.
 
-**Stop and tell me rather than spending the time if:** the achieved speed in
+**Stop and report rather than spending the time if:** the achieved speed in
 section 2.3 was close to the commanded 10 mm/s after all (then ask for 20
 instead), or if this run also lands near 3.9 (then the arm is doing the same
 thing whatever it is asked, and the velocity question has to be answered before
 the lag one).
 
-I will extract the lag from the saved `pass*.npz`; nothing to analyse at the
+The lag is extracted afterwards from the saved `pass*.npz`; nothing to analyse at the
 cell. **Bring back the `ec_scan_*` directory and the log.**
 
 ---
@@ -191,7 +191,7 @@ cell. **Bring back the `ec_scan_*` directory and the log.**
 ## 4. Optional, if there is time
 
 **RViz memory.** The session ground to a halt yesterday. Your yolo hypothesis
-does not match the log — I see three `yolo enabled` / four `yolo disabled` pairs,
+does not match the log, which shows three `yolo enabled` / four `yolo disabled` pairs,
 so it is being released after each detection. To find the real one, in a third
 terminal before you start:
 
@@ -203,8 +203,8 @@ Kill it at the end and bring `~/mem.log` back. One number per process per minute
 is enough to say which one grows.
 
 **Keyence comb return leg.** You noticed the return movement accumulating points
-while moving faster. I have not looked at it yet. If it is easy to confirm — does
-`/stop_recording` land before or after the return? — that would tell me where to
+while moving faster. It has not been investigated yet. If it is easy to confirm — does
+`/stop_recording` land before or after the return? — that would show where to
 start.
 
 ---
@@ -216,4 +216,4 @@ start.
 3. The `ec_scan_*` directories, `dataguzzler.log`, `ros.log`.
 4. `~/mem.log` if you ran section 4.
 5. Any refusal whose wording did not tell you what to do — those are bugs in the
-   message and I would rather fix them than have you decode them.
+   message and are better fixed than decoded.

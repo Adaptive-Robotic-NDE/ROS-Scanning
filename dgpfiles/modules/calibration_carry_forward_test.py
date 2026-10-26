@@ -38,7 +38,7 @@
 # Authors: Tyler Lesthaeghe
 # Created: 2026-10-15
 # Description:
-#   Regenerating the cell's calibration file must not un-calibrate a
+#   Regenerating the work cell's calibration file must not un-calibrate a
 #   sensor whose correction never passed through the JSON record.
 # Derived From:
 #

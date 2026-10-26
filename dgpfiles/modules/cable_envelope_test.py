@@ -158,7 +158,7 @@ def joints(wrist3_deg):
 # ==============================================================================
 # The 2026-09-14 sweep of this cell, in SCHEMA 1 (labels, no tx_deg/ty_deg),
 # because reading a schema 1 file is a requirement -- a measurement written
-# before the schema carried tilt coordinates is still on the cell PC.
+# before the schema carried tilt coordinates is still on the controlling computer.
 #
 # It is the earlier of the two sweeps the manifest merges, and it is used here
 # for two things: as the fixture the band arithmetic is checked on, and as one of
@@ -397,12 +397,12 @@ raises(lambda: CableEnvelope([(0.0, 0.0, 1.0, 0.5, "backwards")]),
        "an inside-out sample is rejected", exc=ValueError)
 
 # ==============================================================================
-# THE CELL MANIFEST
+# THE WORK-CELL MANIFEST
 # ==============================================================================
 # The measurement file lives under CAPTURE_ROOT on whichever machine ran the
 # test; the manifest is what every other session can see, and is therefore the
 # default source. A typo in it is a wrong cable limit, so it is checked here
-# rather than at the cell.
+# rather than on the production system.
 print("")
 MANIFEST = os.path.join(
     HERE, "..", "..", "..", "ros_ws", "src", "tari_site", "tari_cell_configs",
@@ -437,7 +437,7 @@ if data is not None:
     # The numbers do not describe the simulated cell's physics. They describe the
     # constraint the pipeline must plan within, and the pipeline is what is under
     # test. They must not DRIFT from hardware either: a sim enforcing a different
-    # band than the cell proves nothing, and would fail silently the same way.
+    # band than the work cell proves nothing, and would fail silently the same way.
     sim_b, hw_b = block.get("sim"), block.get("hardware")
     check(isinstance(sim_b, dict) and bool(sim_b.get("per_tilt")),
           "the manifest declares a band for sim, so the guard is exercised there")
@@ -750,7 +750,7 @@ check(gns["remove_cable_guard"]() is fake, "remove_cable_guard() unwraps cleanly
 # a Pose with no fields would have made all of it pass while measuring nothing.
 # So say it as a check, with a KNOWN-POSITIVE and a KNOWN-NEGATIVE, before the
 # stub goes back: the pose really is built, and the guard really does distinguish
-# a legal wrist_3 from the one that stopped the cell.
+# a legal wrist_3 from the one that stopped the work cell.
 _probe_pose = gns["_cap_pose"]((0.1, 0.2, 0.3), (0.0, 0.0, 0.0, 1.0))
 check(abs(_probe_pose.position.x - 0.1) < 1e-12
       and abs(_probe_pose.position.z - 0.3) < 1e-12
@@ -776,9 +776,9 @@ ros_msg_stubs.restore_msgs(_MSG_TOKEN)
 # ------------------------------------------------------------------------------
 # If load_cable_envelope(path) sets the model but leaves _CABLE_LOOKED False, the
 # next cable_envelope_model() -- which every wrist3_band() goes through --
-# reloads from the DEFAULT locations and overwrites it. At the cell that is the
-# one command an operator reaches for after re-measuring, so it silently doing
-# nothing is the worst available failure.
+# reloads from the DEFAULT locations and overwrites it. On the production system
+# that is the one command an operator reaches for after re-measuring, so it silently
+# doing nothing is the worst available failure.
 import json as _json
 import tempfile as _tempfile
 

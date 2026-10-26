@@ -170,7 +170,7 @@ class Refused(Exception):
 
 
 def _lift(extra=None):
-    """The named defs and constants of calibration.dpi, executed on the host.
+    """The named defs and constants of calibration.dpi, executed without ROS.
 
     The .dpi is a function body when dgpy loads it, but its top-level defs are
     top-level statements either way, so one AST pass picks them out.
@@ -351,7 +351,7 @@ def keyence_patch(normal=KEYENCE_NORMAL_2026_09_24, at=RECORDED_AIM,
     return np.vstack(out)
 
 
-#: What the cell actually ships, read out of the file rather than assumed.
+#: What the work cell actually ships, read out of the file rather than assumed.
 GRID = [tuple(float(v) for v in o) for o in
         dpi_const("CAL_VERIFY_KEYENCE_OFFSETS")]
 
@@ -479,7 +479,7 @@ def _fake_sensor_msgs():
 
 
 def test_brightness_reads_the_manifests_color_key():
-    """The cell declares "color", so the lookup must find it under that key."""
+    """The work cell declares "color", so the lookup must find it under that key."""
     ns, seen = _brightness_ns({"color": "/rgb8/rgb/image_raw",
                                "depth": "/azure/depth_to_rgb/image_raw"})
     why = []
@@ -526,7 +526,7 @@ def test_nothing_asks_for_an_rgb_topic_without_a_color_fallback():
 # ------------------------------------------------------------------------------
 
 def test_the_09_24_grab_reproduces_the_recorded_numbers():
-    """Before anything is judged: is this the same data the cell measured?"""
+    """Before anything is judged: is this the same data the work cell measured?"""
     path = real_grab_path()
     if path is None:
         return _skip("no saved grab matching the recorded aim in the fixtures")
@@ -1223,7 +1223,7 @@ def test_the_keyence_patch_is_saved_with_its_grouping():
         assert z["T_world_sensor"].shape == (len(GRID), 4, 4)
         assert meta["labels"][0] == "+0,+0 mm", meta["labels"]
         # AND THE POINT OF IT: the scatter comes back out of the file, without
-        # the take, the cell, or an assumption about the rms
+        # the take, the work cell, or an assumption about the rms
         again = NS["_cal_keyence_scatter"](np.asarray(z["points"], float),
                                            z["group"])
         print("      re-measured offline: scatter %.3f mm, off %s"

@@ -251,10 +251,10 @@ def place_gazebo_specimen(name="test_plate", replace=True, collision=True,
     _spawn_sdf(name, sdf)
     print("    spawned into Gazebo as %r" % (name,))
 
-    # THE SECOND HALF OF PUTTING A PART IN THE CELL -- see the section comment
-    # above write_keyence_sim_scene(). The Gazebo model is what the simulated
-    # camera renders; the simulated profiler raycasts against its own scene, and
-    # without this it goes on measuring whatever was there last.
+    # THE SECOND HALF OF PUTTING A PART IN THE WORK CELL -- see the section
+    # comment above write_keyence_sim_scene(). The Gazebo model is what the
+    # simulated camera renders; the simulated profiler raycasts against its own
+    # scene, and without this it goes on measuring whatever was there last.
     if keyence_scene:
         write_keyence_sim_scene([stl])
     return stl, sdf
@@ -322,7 +322,7 @@ def _wait_for_model(name, present, timeout=15.0, settle=None):
 # ==============================================================================
 # THE OTHER SIMULATED SENSOR'S IDEA OF THE WORLD
 # ==============================================================================
-# SPAWNING A MODEL INTO GAZEBO IS ONLY HALF OF PUTTING A PART IN THE CELL.
+# SPAWNING A MODEL INTO GAZEBO IS ONLY HALF OF PUTTING A PART IN THE WORK CELL.
 #
 # The simulated Azure is a Gazebo camera: it renders the world, so a spawned
 # model is all it needs. The simulated Keyence is NOT a Gazebo sensor at all.
@@ -341,7 +341,7 @@ def _wait_for_model(name, present, timeout=15.0, settle=None):
 # Nothing anywhere says "your specimen is not in the profiler's scene".
 #
 # So the scene is maintained HERE, next to the spawn, because the two facts are
-# one fact: what part is in the cell.
+# one fact: what part is in the work cell.
 
 def _sim_get_param(node_name, param, timeout=5.0):
     """One parameter off a running node, or None. Never raises for absence."""

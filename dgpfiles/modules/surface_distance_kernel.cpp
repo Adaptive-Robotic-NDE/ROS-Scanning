@@ -66,10 +66,11 @@
  *   best + the largest triangle's radius).  That is exact in the limit, but the
  *   limit is not always reached: the widening stops at max_k, and for a point
  *   that is simply far from the sheet the test never fires at all because every
- *   centroid is about equally far away.  Measured on the cell's 198 422-triangle
- *   reconstruction, roughly one random point in ten thousand comes back with a
- *   distance up to 0.14 mm LARGER than the true one -- the optimistic direction,
- *   on a gate whose job is to notice a probe inside the part.
+ *   centroid is about equally far away.  Measured on the production system's
+ *   198 422-triangle reconstruction, roughly one random point in ten thousand
+ *   comes back with a distance up to 0.14 mm LARGER than the true one -- the
+ *   optimistic direction, on a gate whose job is to notice a probe inside the
+ *   part.
  *
  *   A BVH answers the question directly.  Descend nearest-child-first, prune any
  *   node whose box is already farther than the best triangle found so far, and
@@ -137,8 +138,8 @@
  *
  * Build: g++ -O3 -march=native -ffp-contract=off -std=c++17 -shared -fPIC
  * Nothing beyond libstdc++ and pthreads -- deliberately no pybind11 and no
- * Python headers, so ONE .so serves Python 3.10 on the cell and 3.14 on the dev
- * host through ctypes.
+ * Python headers, so ONE .so serves Python 3.10 on the production system and
+ * 3.14 on the dev host through ctypes.
  */
 
 #include <cstdint>

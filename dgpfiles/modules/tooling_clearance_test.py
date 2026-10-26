@@ -137,8 +137,8 @@ def check(name, condition, detail=""):
 #: on the other side of a REVOLUTE joint, which the envelope must not cross.
 #:
 #: The numbers are the measured ones -- probe_end -> lj_v7080_optical_frame is
-#: (-75.15, -2.20, -34.28) mm in the cell's current description, and ec_probe is
-#: a 7.1 mm-radius barrel 68 mm long whose tip is probe_end.
+#: (-75.15, -2.20, -34.28) mm in the work cell's current description, and
+#: ec_probe is a 7.1 mm-radius barrel 68 mm long whose tip is probe_end.
 TOOLING_URDF = """<?xml version="1.0"?>
 <robot name="test_tooling">
   <link name="upper_arm_link">
@@ -1090,7 +1090,7 @@ check("a sink that throws does not take the gate down with it",
 # that path is UNDER TOOLING_GATE_SAMPLE_ABOVE (2000). The two conditions could
 # not both hold, so the exact gate never reported anything, whatever its length.
 # A 1749-pose eddy-current toolpath over a 24 x 18 mm region then sat silent at
-# the cell for 231 s on 2026-10-15, after a plan that had priced it at 3.
+# the work cell for 231 s on 2026-10-15, after a plan that had priced it at 3.
 #
 # Two things had to change: the threshold has to be a POSE COUNT, and the block
 # has to be divided, because a path shorter than one block ticks once, at zero,

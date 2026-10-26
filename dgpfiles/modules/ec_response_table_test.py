@@ -88,11 +88,11 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 # ecsim is developed in its own repository and is deliberately NOT a dependency
-# of anything here -- the container will never have it. But where a checkout
-# exists it is the authority on the table format, and the two tests that
-# compare against it are the most valuable in this file, so they are worth
-# finding rather than skipping by default. ECSIM_DIR overrides; ~/ecsim is
-# where it lives on the machine this was written on; absent, those two skip.
+# of anything here -- a production install will never have it. But where a
+# checkout exists it is the authority on the table format, and the two tests
+# that compare against it are the most valuable in this file, so they are worth
+# finding rather than skipping by default. ECSIM_DIR overrides; ~/ecsim is the
+# default; absent, those two skip.
 _ECSIM = os.environ.get("ECSIM_DIR") or os.path.expanduser("~/ecsim")
 if os.path.isdir(os.path.join(_ECSIM, "ecsim")) and _ECSIM not in sys.path:
     sys.path.append(_ECSIM)

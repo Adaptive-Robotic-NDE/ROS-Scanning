@@ -36,13 +36,13 @@ three local patches that are not upstream:
 | `tari_pc_reconstruction` | clustering opt-in, crop before cluster | `/stop_and_process` fails "DBSCAN did not find any clusters" |
 | `tari_mesh_filter` | colourless-mesh fix | the filter node dies on the Keyence mesh; reads as a timeout |
 
-`spatialnde2` is compiled and is not in those trees. The cell PC needs it rebuilt
+`spatialnde2` is compiled and is not in those trees. The controlling computer needs it rebuilt
 with the recstatus placement-race fix before any timestamped eddy-current
 scan. Without it, the DAQ's acquisition thread can die mid-scan with "becomes
 fully ready with recording not found in instantiated or mdonly".
 
 **Budget time for two measurements the scan needs and does not have.** The
-contact preload is unknown (`EC_PRELOAD_M = 0`, section 3), and the cell's speed
+contact preload is unknown (`EC_PRELOAD_M = 0`, section 3), and the work cell's speed
 curve was measured over a 300 mm line in free space while an eddy-current pass is
 a few tens of millimetres — so the speeds that matter for a contact sweep have not
 been measured. Both are cell work with the arm, not settings to pick: steps 7 and
@@ -54,7 +54,7 @@ been measured. Both are cell work with the arm, not settings to pick: steps 7 an
 |---|---|---|
 | `CELL_MODE` | `"hardware"` | the only switch between the rooms |
 | `EC_DAQ_DEVICE`, `EC_CHANNELS` | `"PXI1Slot2"`, `("ai0","ai1")` | the Uniwest X/Y outputs on the NI card: check the wiring |
-| `WARNING_LIGHT_PIN` | `0` | UR digital output 0 is the cell's warning light |
+| `WARNING_LIGHT_PIN` | `0` | UR digital output 0 is the work cell's warning light |
 | `NEAR_PART_SPEED`, `TRANSIT_SPEED` | 0.010, 0.030 m/s | 10 is the approved near-part limit. Transit is 30, not the 50 limit, because other directions run faster than the calibration: a vertical rise commanded at 50 peaked at 87.6 mm/s in simulation |
 | `SCAN_VELOCITY` | 0.010 m/s | in contact for the whole sweep, so it must not exceed `NEAR_PART_SPEED` |
 | `SCAN_LINE_SPACING` | 0.0003 m | ClientScannerTest's value; makes a whole part hours long -- see `EC_SCAN_REGION` |
@@ -75,7 +75,7 @@ been measured. Both are cell work with the arm, not settings to pick: steps 7 an
 | `SPECIMEN_SWEEP_DIRECTIONS` | 4 | how many of the 8 candidate stand-off directions to fly; fewer than 2 reachable is a refusal |
 | `SPECIMEN_SWEEP_HEIGHT`, `SPECIMEN_SWEEP_STOPS` | `None`, 5x5 | `"dome"` only: the old straight-down raster |
 | `DETECT_POSE`, `PARK_POSE` | `"over_table"` | the named pose ClientScannerTest started and ended at |
-| `ROBOT_VELOCITY_CALIBRATION` | the cell manifest's curve, measured over a 300 mm line | every m/s goes through it, and a pass is a tenth of that line — **re-measure it at pass length before the first scan**, step 7 |
+| `ROBOT_VELOCITY_CALIBRATION` | the work-cell manifest's curve, measured over a 300 mm line | every m/s goes through it, and a pass is a tenth of that line — **re-measure it at pass length before the first scan**, step 7 |
 
 ---
 
@@ -87,7 +87,7 @@ on the planned surface; nothing outside the work volume; the warning light on
 whenever an automated stage moves the arm. Preview every motion in RViz before
 confirming it.
 
-1. **Bring up the cell.**
+1. **Bring up the work cell.**
    `ros2 launch tari_bringup bringup.launch.py cell:=ex-ur10e-1 mode:=hardware`.
    Wait for `N started, 0 skipped` and the `sensor topic audit` line. A skipped
    motion server means nothing will move later.
@@ -110,7 +110,7 @@ confirming it.
    `docs/cell-data-capture.md`). It records the tip at each touch and writes a
    local override manifest, which the running config picks up at once. It also writes the
    `work_volume` block to fold into
-   `ros_ws/src/tari_site/tari_cell_configs/config/cells/ex-ur10e-1.yaml`
+   `tari_cell_configs/config/cells/ex-ur10e-1.yaml` in the site package
    later. By hand instead: touch the probe tip to the bench at two opposite
    corners of the placement area, without compressing the spring, and read
    `ros.t.transform.translation`. Take zmin = bench + 0.0015 and zmax = the
@@ -151,7 +151,7 @@ confirming it.
    with the pose and no sweep can be planned around it.
 6. **Put the calibration plate in the work volume**, in view from `over_table`.
 7. **Velocity calibration — re-measure it over a line as short as a pass.**
-   The curve the cell manifest carries (`robot_velocity: hardware:`) was measured
+   The curve the work-cell manifest carries (`robot_velocity: hardware:`) was measured
    over a **300 mm** line in free space. It records that span because the curve is
    path-length dependent: a move much shorter than the span it was measured over
    is mostly acceleration ramp and never reaches the speed the table promises. An
@@ -163,11 +163,11 @@ confirming it.
 
    Measure it before the first scan, with the line set to the length of the passes
    about to be flown: `capture_robot_velocity(length_mm=<pass length in mm>)`
-   (scenario 9 of the cell capture tool, which lists its scenarios when it
+   (scenario 9 of the work cell capture tool, which lists its scenarios when it
    loads; the procedure is `docs/cell-data-capture.md`). It flies a
    ladder of speeds in free space, nothing near the part, and prints a
    `robot_velocity:` block to paste into
-   `ros_ws/src/tari_site/tari_cell_configs/config/cells/ex-ur10e-1.yaml`. Then
+   `tari_cell_configs/config/cells/ex-ur10e-1.yaml` in the site package. Then
    `robot_velocity_reload()` and `adopt_measured_velocity_curve()` put it in force
    without restarting the config. The manifest holds one curve per mode, so a
    short-line curve replaces the long-line one for every move, transits between
@@ -181,7 +181,7 @@ confirming it.
 
    Either way, compare what was seen against what was commanded. If the observed
    probe speed disagrees with the commanded 10 mm/s by more than 15%, re-measure
-   before scanning (technician-scan-controls skill).
+   before scanning.
 8. **Detect, measure, plan -- no scan.** `run_automated_scan(scan=False)`.
    Section 2 describes each stage's output. It holds the warning light for the
    whole run and parks at `over_table` at the end. If YOLO does not find the
@@ -323,8 +323,8 @@ second each.
 | `... needs this cell's WORK VOLUME, and ex-ur10e-1 has none for mode 'hardware'` | expected until step 4 | `capture_touch_off()`, or measure by hand, write it and `work_volume_reload()` |
 | `no tracking frame: ... published nothing to read a frame_id from` | the depth topic is silent | `ros2 topic hz /azure/depth_to_rgb/image_raw` |
 | `the arm would not go to the first pose of the sweep` | the approach was refused | `mesh_path_feasibility()`-style check; start from `over_table` |
-| `stop_reconstruction failed: The TSDF is empty` | nothing integrated inside the box | hardware first suspect: the camera closer than 0.5 m (step 5); then the reconstructing-a-specimen skill |
-| a later `only N% of ... is inside the cell's work volume` | the mesh landed somewhere else | the tracking frame; see the skill |
+| `stop_reconstruction failed: The TSDF is empty` | nothing integrated inside the box | hardware first suspect: the camera closer than 0.5 m (step 5); then the tracking frame, the depth scale and the crop box |
+| a later `only N% of ... is inside the work cell's work volume` | the mesh landed somewhere else | the tracking frame |
 
 ### reconstruct_fine()
 
@@ -463,7 +463,7 @@ scan is for — so they are bounded along the path and measured at a sample of p
 report, which the same block says.
 
 **Measured** on a calibration plate's own Keyence reconstruction (211 090 triangles)
-with a path at the cell's real spacings — 0.30 mm between passes, 1.00 mm along one, the tip
+with a path on the production system's real spacings — 0.30 mm between passes, 1.00 mm along one, the tip
 on the surface, the tool upright, contact allowed for the probe and its holder:
 
 | the same 933-pose path | seconds | per pose | peak RSS |
@@ -495,7 +495,7 @@ enter only 1 of 5.
 |---|---|---|
 | work-volume refusal | as in reconstruct_rough | step 4 |
 | `noether planning failed for ...` | the service refused the mesh | `principal_axis_noether_srv`'s log |
-| `WARNING: only N% of ... is inside the cell's work volume` | the mesh is somewhere else | the reconstruction's tracking frame |
+| `WARNING: only N% of ... is inside the work cell's work volume` | the mesh is somewhere else | the reconstruction's tracking frame |
 | `N of M waypoints ... are tilted more than EC_MAX_TILT_DEG` | steep poses dropped, passes split | expected at edges and steps; many means a bad mesh |
 | `every waypoint of the eddy-current toolpath is outside EC_SCAN_REGION` | the region misses the part | the region's numbers, against `fine_mesh` |
 | `no scanning pass is left ... after cropping` | everything was cropped away | region, tilt limit, `PATH_MIN_SEGMENT_M` |
@@ -570,7 +570,7 @@ TBD-SIM-2
 |---|---|---|
 | `N passes tried, N entered, N swept` | all | a pass not entered: `no configuration reaches ... above both ends` -- the pass is out of reach at that tilt; drop it with the region or the tilt limit |
 | `tracking` | under a millimetre from the planned line | the arm is not following the path |
-| `along the normal` | near 0 in simulation. On the cell, what the fixture absorbs | on the cell, negative means into the part |
+| `along the normal` | near 0 in simulation. On the production system, what the fixture absorbs | on the production system, negative means into the part |
 | `tilt ... follows the planned normal to within` | a degree or less | |
 | `roll` | 0.0x degrees | anything more means the lock is not what was flown |
 | `speed` | sweep 10, lift and descent at most 10, transit at most 50 mm/s | lower `JOINT_MOVE_SCALING` or `EC_AXIS_SPEED` |
@@ -597,7 +597,7 @@ lifts the probe clear at the end even on error. Per pass it prints
 `pass k/n: N traces (expected M), commanded L m / observed L' m`, and at the end
 the observed speed against the commanded one. A pass that cannot be entered is
 `SKIPPED` with the coverage lost. **Never run in simulation** (there is no
-instrument), so the first run of this is on the cell: start with
+instrument), so the first run of this is on the production system: start with
 `max_passes=1` over good material.
 
 Before it moves it states the preload the path was planned with and what it will
@@ -686,7 +686,7 @@ does to the part.
       "$(python3 -c 'import spatialnde2_ec_functions as m, os; print(os.path.dirname(m.__file__))')"
    ```
 
-   **Check this on the cell PC before the visit.** Compare the build dates of
+   **Check this on the controlling computer before the visit.** Compare the build dates of
    `ec_condition*.so` and `libspatialnde2.so` in the installed
    `site-packages/`; if the library is newer, the extension is stale and the
    scan will die. `ls -la` on both is the whole check, and `setup_ec()` does the
@@ -856,7 +856,7 @@ Probe-tip speeds come from TF sampled at 50 Hz; wrist_3 from `/joint_states`.
 | speeds at MoveIt's joint scaling 0.1 | peak tip speed: **132 mm/s** to `over_table`, **194** in the Azure stage, **245** in the Keyence stage (at z 0.972, 46 mm above the part), 80 in the dry run's transit, 86 parking. Straight-line lift and descent peaked at 12.5 and 11.4 mm/s for a commanded 10 |
 | wrist_3 | Azure 142..159 deg; Keyence 159..248 (the line turned across rows that ran along y); eddy-current dry run 148..244, a 96-degree swing on the first approach, out of the Keyence stage's orientation |
 
-The same plan put through the new crops on the host (`_crop_path_by_mask`,
+The same plan put through the new crops with nothing launched (`_crop_path_by_mask`,
 `_crop_path_to_box`, `orient_segments_along`, on the saved 284,514 poses):
 
 | crop | passes | contact | estimate | tilt mean / max |
@@ -961,7 +961,7 @@ TBD-SIM-2-CYL
 - **Contact.** Gazebo has no spring, no contact force and no friction, and the
   specimen is not in MoveIt's planning scene. The dry run's "along the normal"
   number is the arm's tracking error against the planned surface, nothing
-  more. On the cell the fixture absorbs the mesh error, the tracking error and
+  more. On the production system the fixture absorbs the mesh error, the tracking error and
   the preload together. **The preload is unknown** (`EC_PRELOAD_M = 0`): with
   no preload, a fine mesh 1 mm high is 1 mm of lift-off. Measure the fixture's
   travel, put the probe mid-travel, and `set_ec_preload()` it (section 3).
@@ -995,7 +995,7 @@ TBD-SIM-2-CYL
 ClientScannerTest's values are what ran on the real cell: its `routine()`,
 `newKeyScan()` and `start()`, and the parameter files under
 `dgpython_rosmotion/parameters/`. Each difference is either **changed** here to
-match the cell, or **kept**, with the evidence for keeping it.
+match the work cell, or **kept**, with the evidence for keeping it.
 
 **Whole run**
 
@@ -1026,7 +1026,7 @@ match the cell, or **kept**, with the evidence for keeping it.
 | depth_scale | 1000 | read from the topic's encoding (1000 on hardware) | same on hardware |
 | motion gate | 0 / 0 (every frame) | 0.015 m / 0.02 rad | kept: the sweep speed is derived from the gate |
 | tracking frame | `azure_rgb` | the frame the depth images are stamped with (`rgb_camera_link` on hardware) | kept: `azure_rgb` is a hand-placed stand-in a few mm off |
-| crop box | from the detection | the cell's work volume | kept: the detection box both clipped the part and swallowed table |
+| crop box | from the detection | the work cell's work volume | kept: the detection box both clipped the part and swallowed table |
 | normal filter | 90 deg | none | kept: a filter that removes everything kills `industrial_reconstruction` |
 | mesh filter after | vertex filter, world z 0.965 | none -- the work volume crops the TSDF | kept: 0.965 deletes the cal plate outright in simulation (its top is 0.948) |
 
@@ -1086,6 +1086,6 @@ match the cell, or **kept**, with the evidence for keeping it.
 | | ClientScannerTest | ECAutomatedScan | verdict |
 |---|---|---|---|
 | null | operator nulls the Uniwest at the first point | `ec_touch_down(0)`, null on the instrument, then `null_here()` in software | same step, plus a software null |
-| contact force | the UR force/torque reading stored with every point (`/msg_sync/force_msg`) | **not recorded** | gap: `msg_sync` is started by neither bring-up mode. Worth adding once the cell's wrench topic is confirmed |
+| contact force | the UR force/torque reading stored with every point (`/msg_sync/force_msg`) | **not recorded** | gap: `msg_sync` is started by neither bring-up mode. Worth adding once the work cell's wrench topic is confirmed |
 | output | a pickle per scan, with flaw metadata typed in | the recording database (`/ec/traces`, `/ec/trace_poses`), file-backed under `/home/user/scandata` | gap: no export file yet |
 | projection | `x3d_converter` + `mapScan()` | Blender planar UV + `SurfaceProjector`, live | kept: the old exporter's 4-decimal UVs broke the loader |

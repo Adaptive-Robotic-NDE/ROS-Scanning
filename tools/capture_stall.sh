@@ -12,15 +12,16 @@
 #
 #########################################################################
 #
-# WHY THIS EXISTS. A scan stalled at the cell on 2026-10-15 at pass 31 of 74.
-# The evidence it left behind was one line -- "37 trace(s) queued, 2845 staged,
-# 0 error(s)" -- and that line cannot distinguish the three things it could have
-# been: a lock nobody will release, a globalrev that will never complete, or a
-# disk read that has not come back. By the time anyone could have asked, the
-# process was gone. Ctrl-C does not work during that stall either (the GUI loop
-# owns dataguzzler-python's real main thread, so SIGINT lands in Qt's C++ event
-# loop with the GIL released and no handler ever runs), so there is no graceful
-# way to make the process tell you anything. This asks the kernel instead.
+# WHY THIS EXISTS. A scan stalled on the production system on 2026-10-15 at pass
+# 31 of 74. The evidence it left behind was one line -- "37 trace(s) queued, 2845
+# staged, 0 error(s)" -- and that line cannot distinguish the three things it
+# could have been: a lock nobody will release, a globalrev that will never
+# complete, or a disk read that has not come back. By the time anyone could have
+# asked, the process was gone. Ctrl-C does not work during that stall either (the
+# GUI loop owns dataguzzler-python's real main thread, so SIGINT lands in Qt's
+# C++ event loop with the GIL released and no handler ever runs), so there is no
+# graceful way to make the process tell you anything. This asks the kernel
+# instead.
 #
 # ORDER MATTERS. Everything cheap and non-invasive is collected FIRST, because
 # the one step that could go wrong -- attaching gdb -- SUSPENDS the process it
@@ -42,8 +43,8 @@
 #                    everything on this machine was blocked on storage for the
 #                    last ten seconds, which settles the question on its own.
 #   python.txt       which Python line every thread is on (needs py-spy).
-#   storage.txt      PCIe AER counters and NVMe health. The cell PC was
-#                    throwing ~11 corrected PCIe receiver errors a MINUTE on
+#   storage.txt      PCIe AER counters and NVMe health. The controlling computer
+#                    was throwing ~11 corrected PCIe receiver errors a MINUTE on
 #                    its NVMe on 2026-10-15, continuously.
 #   cpu.txt          who else was running. An antivirus on-demand scan was.
 #

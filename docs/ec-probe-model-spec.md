@@ -230,7 +230,7 @@ file, and do not silently drop an axis to avoid one.**
   with the normalisation declared. Not instrument volts.
 - **Lift-off response is wanted as part of the model**, not only as a modifier of
   the flaw response: with no flaw present, varying lift-off and tilt must still
-  produce the correct complex trajectory. That trajectory is what the cell's
+  produce the correct complex trajectory. That trajectory is what the work cell's
   conditioning procedure rotates onto the horizontal axis, and it is half of what
   we need to simulate.
 

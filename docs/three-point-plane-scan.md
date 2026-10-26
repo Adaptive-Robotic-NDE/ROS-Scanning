@@ -19,11 +19,11 @@ transactions.
 ## 0. What you need running
 
 Two terminals. The first runs the robot cell (ROS 2), the second runs
-dataguzzler-python. In simulation both are inside the `ros2-workstation`
+dataguzzler-python. In simulation both are inside the ROS 2 simulation
 container; on hardware they are wherever the robot's ROS installation lives.
 
-**In simulation**, get a shell in the container first — from the workspace root
-on the host:
+**In simulation**, get a shell in the ROS 2 container first — from the workspace root
+of the machine that runs it:
 
 ```bash
 ./ros2_docker.sh shell
@@ -36,7 +36,7 @@ source /opt/ros/iron/setup.bash
 source ~/ros_ws/install/setup.bash
 ```
 
-## 1. Terminal 1 — start the cell
+## 1. Terminal 1 — start the work cell
 
 One command brings up the robot, MoveIt, RViz, both motion action servers and
 the shared services. In simulation it also starts Gazebo:
@@ -77,7 +77,7 @@ ros2 topic echo /tf --once
 ## 2. Terminal 2 — start dataguzzler-python
 
 ```bash
-cd ~/software_ws/ROS-Scanning/dgpfiles      # in the container
+cd ~/software_ws/ROS-Scanning/dgpfiles      # inside the ROS 2 container
 dataguzzler-python UTPlaneScan.dgp
 ```
 
@@ -242,7 +242,7 @@ which is the default here.
 
 | symptom | cause |
 |---|---|
-| `capture_point` raises "nothing has been heard from TF" | the cell is not running, or this process cannot see it. Check terminal 1 and `ros2 topic echo /tf`. In simulation after the cell has been up a long time, DDS discovery can go stale for *new* processes — restart the container |
+| `capture_point` raises "nothing has been heard from TF" | the work cell is not running, or this process cannot see it. Check terminal 1 and `ros2 topic echo /tf`. In simulation after the work cell has been up a long time, DDS discovery can go stale for *new* processes — restart the container |
 | `no A-scan on /ut_ascan after 30 s` | with `ASCAN_TRIGGER_MODE="position"` the simulator only emits when the probe MOVES, so the first scan of a session needs the arm to have moved at least one trigger pitch. Jog it, then scan |
 | a pass reports `fraction` well below 1.0 | the arm entered the row in a configuration that cannot follow it. The scan refuses to fill in the rest — see the trap below |
 | everything refuses to plan | the arm may be parked in an invalid state. `ros2 service call /check_state_validity moveit_msgs/srv/GetStateValidity "{group_name: ur_manipulator}"` |
@@ -286,7 +286,7 @@ independently of `m`.
 
 **The volume is built from the trace poses, not from arrival order.** At the end
 of a triggered scan `regrid_volume()` rewrites `/ut_scan_volume` by putting each
-trace in the cell its recorded pose falls in. That matters because a trace can go
+trace in the work cell its recorded pose falls in. That matters because a trace can go
 missing -- a transaction the recording database refused because its timestamp
 could no longer be ordered, a crossing the trigger never published, a pass that
 came up short -- and filling the volume in arrival order turns one missing trace
@@ -338,7 +338,7 @@ captures stay distinct while the arm keeps moving — verified: `p1` still read
 x = 0.7496 after the arm had moved to x = 1.0499 and `p2` had been taken, no
 `deepcopy` needed. What it is NOT is None before TF exists: the motion module
 initialises it to a blank `TransformStamped`, so a bare `p1 = ros.t` on a
-process that cannot see the cell yields a corner at the origin, silently. That
+process that cannot see the work cell yields a corner at the origin, silently. That
 is why `capture_point()` exists and why it checks.
 
 **A pass that runs short is a fabricated C-scan, not a gap.** The volume is

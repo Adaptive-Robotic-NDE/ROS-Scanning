@@ -825,8 +825,8 @@ def check_region(region, what="this stage", quiet=False):
         WOULD give a sane region, the message says so and prints the region to
         pass instead. That is the fix, spelled out, rather than "invalid
         region";
-      * containment in the cell's declared work volume, which is what catches a
-        transposition whose halves both happen to increase.
+      * containment in the work cell's declared work volume, which is what
+        catches a transposition whose halves both happen to increase.
 
     Deliberately NOT silently reordered. Sorting the four values of a
     transposed region generally still gives a region nowhere near the part, so
@@ -1037,12 +1037,12 @@ def dome_sweep_path(x=5, y=5, length=0.30, width=0.30, origin=(0.75, -0.35),
 # URDF stand-in puts it 3.7 degrees outside the colour FOV, which is inside the
 # stand-in's own stated error. Settle it with
 #     ros2 run tf2_ros tf2_echo probe_end rgb_camera_link
-# at the cell, or by looking at one WFOV frame.
+# on the production system, or by looking at one WFOV frame.
 
 #: Directions a pan sweep may stand off in, degrees in the world x-y plane from
 #: +x. Eight candidates, of which the reachable ones are used: which directions
-#: work is a property of where the part sits in the cell, so it is measured per
-#: sweep rather than declared.
+#: work is a property of where the part sits in the work cell, so it is measured
+#: per sweep rather than declared.
 AZURE_PAN_AZIMUTHS = (0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0)
 
 #: How many of those directions a sweep flies. Four is two opposed pairs, which
@@ -2589,9 +2589,9 @@ class ReconstructionSource(object):
         #
         # AND CHECK THAT IT HAPPENED. A refused approach is invisible if the
         # result is not tested: the sweep then starts from wherever the arm was
-        # parked, the first Cartesian segment quietly drags it across the cell to
-        # the start of row 1 while capture is running, and the result is a
-        # reconstruction that is merely worse rather than obviously broken.
+        # parked, the first Cartesian segment quietly drags it across the work
+        # cell to the start of row 1 while capture is running, and the result is
+        # a reconstruction that is merely worse rather than obviously broken.
         #
         # ApproachInConfiguration rather than FreeMove, and for two reasons.
         # The one that matters for whether it works at all: a free-space pose
@@ -2694,19 +2694,19 @@ class ReconstructionSource(object):
             # meaningful after it.
             if vel is None:
                 # sweep_velocity() is a probe SPEED in m/s; CartesianMove takes a
-                # MoveIt SCALING, which on this cell is not the same number (see
-                # motion_scaling() in scan_plan.dpi). Handing the speed straight
-                # through flies a 28 mm/s sweep at ~40 mm/s and a 50 mm/s
-                # ceiling at 53.
+                # MoveIt SCALING, which on this work cell is not the same number
+                # (see motion_scaling() in scan_plan.dpi). Handing the speed
+                # straight through flies a 28 mm/s sweep at ~40 mm/s and a 50
+                # mm/s ceiling at 53.
                 speed = self.sweep_velocity()
-                # THIS PATH'S OWN KINEMATICS FIRST, the cell-wide curve only when
-                # IK along it cannot be had. A sweep speed is a MEASUREMENT, not a
-                # limit: fly it slower and the run takes longer, fly it faster and
-                # the accumulator's motion gate opens on travel for which no frame
-                # exists and the mesh comes back holed. One curve for every path
-                # does both -- asked for 10 mm/s it delivers 2.5 on a dense
-                # pose set and 17 on a free-space row near the part. See
-                # path_motion_scaling() for the measurements.
+                # THIS PATH'S OWN KINEMATICS FIRST, the work-cell-wide curve only
+                # when IK along it cannot be had. A sweep speed is a MEASUREMENT,
+                # not a limit: fly it slower and the run takes longer, fly it
+                # faster and the accumulator's motion gate opens on travel for
+                # which no frame exists and the mesh comes back holed. One curve
+                # for every path does both -- asked for 10 mm/s it delivers 2.5
+                # on a dense pose set and 17 on a free-space row near the part.
+                # See path_motion_scaling() for the measurements.
                 per_path = globals().get("path_motion_scaling")
                 vel = None
                 if per_path is not None:
@@ -3402,7 +3402,7 @@ def _region_box(region, pad=0.0):
 
 
 def _crop_path_to_work_volume(path, what="sweep", min_points=4, bounds=None):
-    """Drop waypoints that fall outside the cell's work volume.
+    """Drop waypoints that fall outside the work cell's work volume.
 
     `bounds` is (lo, hi) to use instead -- the MOTION volume, for a path whose
     waypoints are probe_end during a sensor sweep rather than the eddy-current
@@ -3554,7 +3554,7 @@ class AzureReconstruction(ReconstructionSource):
                  voxel_length=0.002, sdf_trunc=0.008,
                  depth_scale=None, depth_trunc=1.0,
                  # The topic industrial_reconstruction is SUBSCRIBED to. None
-                 # reads it from the cell manifest (work_cell.dpi), which is
+                 # reads it from the work-cell manifest (work_cell.dpi), which is
                  # where the bring-up got it: in simulation the 16UC1
                  # republication of the Gazebo camera (tari_bringup's
                  # depth_to_16uc1.py), on hardware depth_to_rgb. The depth
@@ -3597,7 +3597,8 @@ class AzureReconstruction(ReconstructionSource):
             "azure", "depth", "/azure/depth/image_raw_16uc1")
         self.convert_rgb_to_intensity = convert_rgb_to_intensity
         # Resolved here rather than at plan time so that a bad mode name is a
-        # ValueError when the object is built, not a missing check at the cell.
+        # ValueError when the object is built, not a missing check on the
+        # production system.
         self.depth_mode = azure_depth_mode(depth_mode)[0]
         if depth_range is None:
             self.depth_range = tuple(AZURE_DEPTH_MODES[self.depth_mode][:2])
@@ -3791,13 +3792,13 @@ class AzureReconstruction(ReconstructionSource):
         The crop box is applied to the TSDF, before any of that noise becomes
         vertices.
         """
-        # THE BOX IS THE CELL'S WORK VOLUME, not something derived from the
+        # THE BOX IS THE WORK CELL'S WORK VOLUME, not something derived from the
         # region. `region` says where to FLY; the work volume says what is
-        # inside the cell, and those are different questions. Everything the
+        # inside the work cell, and those are different questions. Everything the
         # pad/box_z arithmetic is for -- keeping the room out, keeping the arm
         # out, keeping the bench out -- is what the work volume already means,
-        # and it is declared once in the cell manifest instead of guessed per
-        # run. See work_cell.dpi.
+        # and it is declared once in the work-cell manifest instead of guessed
+        # per run. See work_cell.dpi.
         #
         # pad and box_z remain as explicit overrides for a caller that really
         # does want a different box for one sweep, and for cells that have not
@@ -5405,8 +5406,8 @@ class _KeyenceReconstruction(ReconstructionSource):
 
         # The tilted waypoints may be held to a STRICTER clearance than the
         # untilted raster, because tilting is what swings the eddy-current probe
-        # toward the part. None at both levels means the cell-wide default, which
-        # is what the vertical raster is already held to.
+        # toward the part. None at both levels means the work-cell-wide default,
+        # which is what the vertical raster is already held to.
         limit = clearance
         if limit is None:
             limit = globals().get("KEYENCE_NORMAL_CLEARANCE_M")
@@ -6074,10 +6075,10 @@ class _KeyenceReconstruction(ReconstructionSource):
         # agree with what the plan COMMANDED at this waypoint?
         #
         # The difference is a direct measurement of the rough mesh's error --
-        # commanded 80.0 mm against a measured 66.4, say -- taken at the cell
-        # with no touch-off and no calibration rig. Unchecked, a sweep over a
-        # mesh that wrong flies anyway and a third of the plate comes back as
-        # noise.
+        # commanded 80.0 mm against a measured 66.4, say -- taken on the
+        # production system with no touch-off and no calibration rig. Unchecked,
+        # a sweep over a mesh that wrong flies anyway and a third of the plate
+        # comes back as noise.
         gate = globals().get("keyence_range_gate")
         if self.check_standoff and gate is not None \
                 and len(facts.get("standoff", ())):
@@ -6267,9 +6268,9 @@ class KeyenceReconstructionPC(_KeyenceReconstruction):
         # dbscan_eps_multiplier = 0, which means DO NOT CLUSTER AT ALL, and this
         # is the interesting one. The server's rule was "keep the largest
         # connected cluster", which is a guess at which points are the part; the
-        # crop box is the thing that actually knows, because it is the cell's
-        # measured work volume. Measured on the calibration plate, which has
-        # holes through it and so does not sample as one component: a raster
+        # crop box is the thing that actually knows, because it is the work
+        # cell's measured work volume. Measured on the calibration plate, which
+        # has holes through it and so does not sample as one component: a raster
         # that captured 96.2% of the plate left this step at 55%, and 21% once
         # the mesh was smoothed. The acquisition was never the problem.
         #
@@ -6321,14 +6322,14 @@ class KeyenceReconstructionPC(_KeyenceReconstruction):
         output_path = os.path.abspath(output_path)
         _ensure_dir(output_path)
         base = os.path.splitext(os.path.basename(output_path))[0]
-        # CROP TO THE CELL'S WORK VOLUME unless told otherwise. This used to
+        # CROP TO THE WORK CELL'S WORK VOLUME unless told otherwise. This used to
         # crop to nothing at all -- `crop=None` meant perform_cropping=False --
         # so every profile the laser caught on the way to the part, and every
-        # reflection off the bench beside it, went into the cloud DBSCAN then
-        # had to make sense of. The box is declared once in the cell manifest
+        # reflection off the bench beside it, went into the cloud DBSCAN then had
+        # to make sense of. The box is declared once in the work-cell manifest
         # and is the same one the Azure integrates inside, which is the point:
-        # two sensors measuring the same cell should not disagree about where
-        # it is. Pass crop=(lo, hi) for a different box, or crop=False for none.
+        # two sensors measuring the same cell should not disagree about where it
+        # is. Pass crop=(lo, hi) for a different box, or crop=False for none.
         crop = self.crop
         if crop is None:
             _frame, wlo, whi = require_work_volume("a keyence sweep")
@@ -6643,8 +6644,8 @@ def mesh_to_x3d(mesh_path, x3d_path=None, method=None):
 
     noether_path.mesh_uv_x3d() -- the local Blender path -- and deliberately NOT
     the ROS x3d_converter service: that service has known problems, and the UT
-    path already depends on Blender's UV parameterization behaving the way the
-    noether-mesh-scanning skill documents. x3d_converter is still started by
+    path already depends on Blender's UV parameterization behaving the way
+    mesh_uv_x3d() documents. x3d_converter is still started by
     tari_bringup because other workflows call it; this one does not.
 
     A projection surface without a UV map is the single most common reason a scan

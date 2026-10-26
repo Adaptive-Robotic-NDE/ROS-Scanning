@@ -15,7 +15,7 @@ while p1 is None:
 
 print(f"Initial p1: x={p1.transform.translation.x}, y={p1.transform.translation.y}, z={p1.transform.translation.z}")
 
-# Apply AGENTS.md collision avoidance rules
+# Collision avoidance: raise the pose to 1.0 m above the origin.
 p1.transform.translation.z = 1.0
 
 p2 = copy.deepcopy(p1)

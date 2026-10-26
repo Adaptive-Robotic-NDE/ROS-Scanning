@@ -77,8 +77,8 @@ that a fitted coil geometry will move.
 | `dgpfiles/modules/ec_plate_model.py` | Pose in, volts out. numpy only. |
 | `dgpfiles/modules/sim_ec_source.dpi` | Publishes the two channels, from the model or from the synthetic signal. |
 
-`ecsim` is **not** installed in the container and is not meant to be — it is a
-night's compute on a workstation, and all the container does is read the file it
+`ecsim` is **not** installed in the simulation image and is not meant to be — it is a
+night's compute on a workstation, and all the image does is read the file it
 produced. `python3-h5py` is in the image for that; without it the synthetic
 signal still runs.
 
@@ -172,7 +172,7 @@ provenance** so the file is self-describing; the reader does not need it.
   coil-separation axis. **NOT KNOWN.** It is a pencil probe in a holder and its
   rotation about its own axis was never recorded. Getting it wrong rotates
   every notch's apparent yaw by the same amount and swaps which tilt is the
-  dangerous one. **Measuring it is the first thing to do at the cell**, and
+  dangerous one. **Measuring it is the first thing to do on the production system**, and
   until then it is a declared constant set to zero rather than a quiet
   assumption.
 
@@ -254,7 +254,7 @@ never ends and blocks every globalrev wait in the process. That bug cost 59
 passes once.
 
 `model_no_pose` is counted separately from `model_errors`, because they want
-opposite responses: no pose resolves itself as soon as the cell comes up, and a
+opposite responses: no pose resolves itself as soon as the work cell comes up, and a
 nonzero count *after* a finished scan means the model was never consulted at
 all.
 
@@ -326,7 +326,7 @@ plate in none:
 
 ## Testing it
 
-Everything runs on the host with no ROS, no cell, no arm and no spatialnde2,
+Everything runs with no ROS, no cell, no arm and no spatialnde2,
 against a stub table built in the test's own temporary directory:
 
 ```bash
@@ -450,7 +450,7 @@ was "10× oversampled" against our pitch was about the FIELD, not about the
 response: against the response the pitch is marginal, and `SCAN_STEP_SIZE` is
 worth revisiting.
 
-## Verified in the container, 2026-10-04
+## Verified in the simulation image, 2026-10-04
 
 The config loaded with the stub table, and with a pose placed on the `L3_D0`
 notch the two published channels read **(1.3312, −0.1756) V** against a
@@ -467,13 +467,13 @@ job: it is how you tell a run that never consulted the model from one that did.
 
 ## Open
 
-- **`COIL_AXIS_DEG` is unmeasured.** First thing to settle at the cell.
+- **`COIL_AXIS_DEG` is unmeasured.** First thing to settle on the production system.
 - **The coil geometry is a placeholder, not a fit.** Needs an unclipped tilt
   ladder with the probe's own rotation recorded.
 - **`yaw_period_rad` is not in the real table's provenance.** Handled in the
   reader; the file would be better self-describing.
 - **The trace pitch is marginal against the real response width** (lobes at
   ±1 mm, pitch 1 mm). Worth a simulated pitch study now that one is possible.
-- **`test_data/` is not mounted into the ros2-workstation container**, so a
+- **`test_data/` is not mounted into the simulation container**, so a
   simulated scan there cannot read the table from where it lives. Either mount
   it read-only or copy the pair into `scandata/`, which is mounted.

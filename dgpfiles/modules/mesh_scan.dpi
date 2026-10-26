@@ -197,12 +197,13 @@ def plan_mesh_path(mesh=None, line_spacing=None, z_offset=None, snake=None,
               % ("estimated by the planner (this mesh carries none)"
                  if estimate_normals else "the mesh's own"))
 
-    # Is this mesh even in the cell? A mesh authored about its own origin plans
-    # a toolpath in the floor, and a reconstruction that tracked the wrong frame
-    # lands a metre away and reconstructs cleanly while it does it. Both failure
-    # modes are silent: the first sign is an unreachable toolpath rather than
-    # anything about the mesh. The work volume is what "in the cell" means, so it
-    # can be checked in one line before the planner is asked for anything.
+    # Is this mesh even in the work cell? A mesh authored about its own origin
+    # plans a toolpath in the floor, and a reconstruction that tracked the wrong
+    # frame lands a metre away and reconstructs cleanly while it does it. Both
+    # failure modes are silent: the first sign is an unreachable toolpath rather
+    # than anything about the mesh. The work volume is what "in the work cell"
+    # means, so it can be checked in one line before the planner is asked for
+    # anything.
     _check_mesh_in_work_volume(mesh)
 
     # WILL NOETHER GET A USABLE PATH OUT OF THIS AT ALL? Ask before the service
@@ -602,7 +603,7 @@ def _gate_planning_mesh(mesh, line_spacing=None, estimate_normals=None,
 
 global _check_mesh_in_work_volume
 def _check_mesh_in_work_volume(mesh, warn_fraction=0.5):
-    """Say how much of a mesh lies inside the cell, before planning over it.
+    """Say how much of a mesh lies inside the work cell, before planning over it.
 
     A warning rather than a refusal, and deliberately: a legitimate mesh can
     overhang the box a little, and the reconstructions this is most useful for
@@ -1162,9 +1163,10 @@ def sanitize_tool_axis(path, window_m=None, outlier_deg=None,
                   "rotating mid-sweep (%d passes -> %d; no waypoint dropped)"
                   % (s["split"], split_deg, s["passes_before"], s["passes_after"]))
         if s["residual_over_bound_deg"] > 1e-6:
-            # Cannot happen: one forward sweep settles every pair. Reported
-            # rather than asserted, because a planning stage must not die on its
-            # own invariant at the cell -- but it means this function is wrong.
+            # Cannot happen: one forward sweep settles every pair. Reported rather
+            # than asserted, because a planning stage must not die on its own
+            # invariant on the production system -- but it means this function is
+            # wrong.
             print("    WARNING: %.3g deg still over the turn-rate bound. That is "
                   "a fault in sanitize_tool_axis(), not in the mesh: the forward "
                   "sweep is supposed to settle every pair."
@@ -1380,7 +1382,7 @@ def describe_tool_axis_continuity(rep, indent="  "):
 #   surface, which is the whole requirement. What is in question is the ARM: the
 #   IK branch, the measured cable envelope (cable_envelope.dpi), and whether the
 #   Keyence body and the Azure bracket clear the part at that attitude
-#   (tooling_clearance.dpi). Those are properties of the cell, not of the mesh.
+#   (tooling_clearance.dpi). Those are properties of the work cell, not of the mesh.
 #
 # LOWERING THE CAP IS NOT A FIX FOR BAD NORMALS; repairing the normals is. A
 # region the cap excludes is REPORTED -- what it is, where it is, how much of the

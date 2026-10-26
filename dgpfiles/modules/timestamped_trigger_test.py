@@ -378,7 +378,7 @@ if __name__ == "__main__":
 
 
 def test_a_globalrev_that_never_arrives_does_not_stop_the_scan():
-    """2026-10-09, twice: the correlator waited forever and took the cell down.
+    """2026-10-09, twice: the correlator waited forever and took the work cell down.
 
     Both freezes that day were this thread, parked in
 

@@ -7,8 +7,8 @@ seconds and never recovers until it is restarted.
 It is neither a leak nor a message rate. **It is seven displays that hold onto a
 cloud forever, and they all receive that cloud at the Keyence measurement.** The
 fix is in `tari_ur_description/rviz/view_robot.rviz`; §3 is how to confirm it on
-the arm, because it was verified in the container, which renders through
-software GL over VNC while the cell has a discrete GPU. Absolute frame rates do
+the arm, because it was verified in the simulation image, which renders through
+software GL over VNC while the work cell has a discrete GPU. Absolute frame rates do
 not transfer between the two. The *shape* — a step change at a known moment that
 never comes back — does.
 
@@ -42,7 +42,7 @@ profiler's pitch puts about 2.85 million.
 
 ### Measured
 
-In the container, one 2.85 M-point message on that topic, nothing else
+In the simulation image, one 2.85 M-point message on that topic, nothing else
 publishing, display enabled:
 
 | | CPU | RSS |
@@ -85,14 +85,14 @@ as a `.ply`** and the dgpy log prints the stage table with exact point counts.
 The displays were a convenience; the files are the record. Tick one on when you
 are debugging that stage, and restart RViz afterwards.
 
-> **This reaches the cell only when `ros_ws/src` is copied across**, and RViz
+> **This reaches the work cell only when `ros_ws/src` is copied across**, and RViz
 > must be restarted to pick up a config change. If RViz has ever been used to
-> *save* the config (File > Save Config), the cell's copy may have been
+> *save* the config (File > Save Config), the work cell's copy may have been
 > overwritten with displays re-enabled — check with `rviz_probe.py displays`.
 
 ---
 
-## 3. Confirming it at the cell
+## 3. Confirming it on the production system
 
 `dgpfiles/utils/rviz_probe.py` does all three steps. It reads `/proc`, so it
 needs no extra packages; only `census` needs ROS sourced.
@@ -109,7 +109,7 @@ reached this machine, or the config was re-saved from RViz.
 
 ### Step 2 — watch RViz across a whole run
 
-Start RViz and the cell as usual, then, in its own terminal, **before** you
+Start RViz and the work cell as usual, then, in its own terminal, **before** you
 start the scan:
 
 ```bash
@@ -179,14 +179,14 @@ Multiply the biggest by ~300 bytes to estimate what a display holding it costs.
    step.
 5. **GPU rather than RViz.** If `watch` shows CPU flat and modest while the frame
    rate is still terrible, the cost is in the driver, not in RViz's own loop.
-   `nvidia-smi` during a scan will say. The container cannot test this.
+   `nvidia-smi` during a scan will say. The simulation image cannot test this.
 
 ---
 
-## 5. What cannot be tested off the cell
+## 5. What cannot be tested off the work cell
 
 The container renders with software GL (llvmpipe) over KasmVNC, so rviz2 sits at
 ~240 % CPU there before anything is displayed. That number is a property of the
-container and says nothing about the cell. **RSS growth and its permanence are
+container and says nothing about the work cell. **RSS growth and its permanence are
 GPU-independent**, which is why the diagnosis above rests on those and why
 `watch` measures them.

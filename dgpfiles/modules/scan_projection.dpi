@@ -93,5 +93,5 @@ class ScanProjectionManager:
         for name, accum in self.ndaccumulators.items():
             print(f"Clearing accumulator {name}...")
             self.recdb.send_math_message(accum, "clear", None)
-        # Required flush delay from AGENTS.md
+        # Required flush delay after the clear message
         time.sleep(0.2)

@@ -188,8 +188,8 @@ NS["PROGRESS_ENABLED"] = False
 exec(compile(_load("noether_path.dpi"), "noether_path.dpi", "exec"), NS)
 NS["PATH_MIN_SEGMENT_M"] = 0.005
 exec(compile(_load("mesh_scan.dpi"), "mesh_scan.dpi", "exec"), NS)
-# A planning stage must not die on its own postcondition at the cell, but a TEST
-# must, so the sections that want the exception ask for it by hand.
+# A planning stage must not die on its own postcondition on the production system,
+# but a TEST must, so the sections that want the exception ask for it by hand.
 NS["MESH_NORMAL_POSTCONDITION"] = "warn"
 
 ScanPath = NS["ScanPath"]
@@ -605,7 +605,7 @@ def test_a_subtle_outlier_is_caught_at_three_degrees():
     # Measured on the ROI the 2026-10-02 eddy-current scan actually flew: no
     # artefact anywhere near 80 degrees, and instead a handful of vertices
     # disagreeing with their own fit by 8. The repair at 15 replaced NOTHING --
-    # the cell log reads "0 of 2765 (0.00%)" -- and those normals were flown.
+    # the log reads "0 of 2765 (0.00%)" -- and those normals were flown.
     #
     # The cost is not subtle even though the angle is. The toolpath pose is
     # specified at probe_end, so a commanded tilt rotates about the TIP: the
