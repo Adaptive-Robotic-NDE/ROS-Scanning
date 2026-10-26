@@ -1,9 +1,0 @@
-def azureConvert(pixel_x, pixel_y, depth):
-
-                  
-    x = (pixel_x - Azure.cx) * depth / Azure.fx
-    y = (pixel_y - Azure.cy) * depth / Azure.fy
-    z = depth
-
-
-    return [x, y, z]

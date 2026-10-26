@@ -1,12 +1,12 @@
-# colcon build products. `build/lib/` and `dgpfiles.egg-info/` predate this file
-# and stay tracked; these are the paths a plain `colcon build` adds on top.
-/build/.built_by
-/build/COLCON_IGNORE
-/build/dgpfiles/
+# colcon build products. Nothing under build/, install/ or log/ is source, and
+# the generated packaging metadata is not either. build/lib/ and
+# dgpfiles.egg-info/ were tracked for a while; they are not any more, so there
+# is no longer an exception to carve out here.
+/build/
 /install/
 /log/
+*.egg-info/
 
-# Python bytecode. Some .pyc under dgpfiles/ predates this file and stays
-# tracked; nothing new should be added.
+# Python bytecode.
 __pycache__/
 *.pyc
